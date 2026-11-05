@@ -1,1 +1,423 @@
-[]
+[
+  {
+    "name": "elf_rebuild",
+    "description": "Rebuild an analyzer-friendly ELF from an ELF artifact (e.g. memory_elf_dump output): parses PT_DYNAMIC / PT_SCE_DYNLIBDATA (Orbis DT_SCE_* tags), adds section headers (.text/.data/.bss, .got/.got.plt, .init_array, .eh_frame_hdr/.eh_frame, .dynsym/.dynstr/.rela.*), a standard dynamic table, demangled NID symbol names and __imp_ GOT labels. With pid, maps each live GOT value to the exporting module/symbol. Local artifact output only; console access is read-only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Relative path inside configured artifact directory"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647,
+          "description": "Live process for GOT unresolution (read-only)"
+        },
+        "module": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Live module name of this image (default: provenance sidecar module)"
+        },
+        "runtime_base": {
+          "type": "string",
+          "maxLength": 20,
+          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+          "description": "Explicit runtime address of the image's lowest PT_LOAD"
+        },
+        "image_base": {
+          "type": "string",
+          "maxLength": 20,
+          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+          "description": "Rebase the static view so the lowest PT_LOAD starts here"
+        },
+        "restore_relocations": {
+          "type": "boolean",
+          "description": "Restore relocated slots to pre-relocation values (RELATIVE -> image_base+addend, JUMP_SLOT/GLOB_DAT/64 -> 0)"
+        },
+        "normalize_type": {
+          "type": "boolean",
+          "description": "Map ET_SCE_* to ET_EXEC/ET_DYN (default true)"
+        },
+        "nid_dictionary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Optional NID dictionary artifact (same formats as nid_resolve)"
+        },
+        "export_artifacts": {
+          "type": "array",
+          "maxItems": 64,
+          "description": "Already-decrypted module ELF artifacts that supply export tables for live modules",
+          "items": {
+            "type": "object",
+            "properties": {
+              "module": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "artifact": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024,
+                "description": "Relative path inside configured artifact directory"
+              }
+            },
+            "required": [
+              "module",
+              "artifact"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "artifact"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  },
+  {
+    "name": "process_dump",
+    "description": "Whole-process dump in one call: every module via memory_elf_dump plus elf_rebuild (raw segments when no in-memory ELF header), readable heap/stack/anonymous maps (include/exclude/protection filters), and thread registers/FPU/TLS when a debugger session is already attached. Writes a manifest artifact (per-item path, sha256, address range, status/partial-failure reason). Budgeted; failures are recorded, not fatal. Read-only toward the console.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "include": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Map-name substrings to include (case-insensitive; <anon> matches unnamed maps)"
+        },
+        "exclude": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Map-name substrings to exclude"
+        },
+        "protection": {
+          "type": "string",
+          "pattern": "^r?w?x?$",
+          "maxLength": 3,
+          "description": "Required protection bits, e.g. r, rw, rx (read is always required)"
+        },
+        "module_names": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Restrict module dumps to these name substrings"
+        },
+        "modules": {
+          "type": "boolean",
+          "description": "Dump modules (default true)"
+        },
+        "rebuild_modules": {
+          "type": "boolean",
+          "description": "Run elf_rebuild on each module dump (default true)"
+        },
+        "regions": {
+          "type": "boolean",
+          "description": "Dump non-module maps (default true)"
+        },
+        "threads": {
+          "type": "boolean",
+          "description": "Capture thread state when attached to pid (default true)"
+        },
+        "max_total_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 17179869184,
+          "description": "Total byte budget for memory data (default: profile transfer_bytes)"
+        },
+        "max_region_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 17179869184,
+          "description": "Skip single regions larger than this"
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  },
+  {
+    "name": "process_core_dump",
+    "description": "Write a FreeBSD-style ELF64 core (ET_CORE, OSABI FreeBSD) of a process: PT_NOTE with NT_PRPSINFO and, when a debugger session is attached to pid, per-thread NT_PRSTATUS/NT_FPREGSET/NT_THRMISC/NT_X86_XSTATE; one PT_LOAD per selected readable map (maps beyond the budget keep memsz only). Without attachment the core is memory-only. Read-only toward the console.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "include": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Map-name substrings to include (<anon> matches unnamed maps)"
+        },
+        "exclude": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Map-name substrings to exclude"
+        },
+        "protection": {
+          "type": "string",
+          "pattern": "^r?w?x?$",
+          "maxLength": 3,
+          "description": "Required protection bits, e.g. r, rw, rx (read is always required)"
+        },
+        "threads": {
+          "type": "boolean",
+          "description": "Include thread notes when attached (default true)"
+        },
+        "max_total_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 17179869184,
+          "description": "Total byte budget for memory data (default: profile transfer_bytes)"
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  },
+  {
+    "name": "memory_snapshot_capture",
+    "description": "Capture a deduplicated memory snapshot: explicit ranges or maps selected by name/protection filter (default rw maps) are split into 4 KiB pages, hashed with SHA-256 and stored once as content-addressed chunks; unchanged pages cost nothing on later captures. Returns the snapshot id. Non-atomic; read-only toward the console.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "ranges": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "type": "string",
+                "maxLength": 20,
+                "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+              },
+              "length": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 17179869184
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 256
+              }
+            },
+            "required": [
+              "address",
+              "length"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "include": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Map-name substrings to include when ranges is omitted"
+        },
+        "exclude": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "description": "Map-name substrings to exclude"
+        },
+        "protection": {
+          "type": "string",
+          "pattern": "^r?w?x?$",
+          "maxLength": 3,
+          "description": "Required protection bits, e.g. r, rw, rx (read is always required)"
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "max_total_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 17179869184,
+          "description": "Total byte budget for memory data (default: profile transfer_bytes)"
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  },
+  {
+    "name": "memory_snapshot_list",
+    "description": "List stored memory snapshots (id, label, pid, time, size, new chunks) oldest first. Local only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  },
+  {
+    "name": "memory_snapshot_timeline",
+    "description": "Compare 2-64 snapshots in the given order: per-step changed/added/removed pages and byte regions, u8/u32/f32/u64 interpretations of small changes, how many transitions each aligned word changed in (N of M), and value series for the most frequently changing words. Local only.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "snapshots": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 64,
+          "items": {
+            "type": "string",
+            "pattern": "^snap-[0-9]{1,20}-[0-9a-f]{8}$"
+          }
+        },
+        "address": {
+          "type": "string",
+          "maxLength": 20,
+          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+          "description": "Range filter start (requires length)"
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 17179869184
+        },
+        "max_regions_per_step": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4096
+        },
+        "max_values_per_step": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "top_addresses": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4096
+        },
+        "series_addresses": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        }
+      },
+      "required": [
+        "snapshots"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  }
+]

@@ -29,3 +29,9 @@ pub mod binstatic;
 pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// Dumping area (process/module dumps, ELF rebuild, core files, snapshots).
+pub mod orbisdyn;
+pub mod elfrebuild;
+pub mod coredump;
+pub mod snapstore;
