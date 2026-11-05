@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-pub const AGENT_TARGETS: [&str; 2] = ["ida", "ghidra"];
+pub const AGENT_TARGETS: [&str; 4] = ["ida", "ghidra", "binja", "iaito"];
 pub const AGENT_LIVENESS: Duration = Duration::from_secs(30);
 pub const MAX_JOBS: usize = 32;
 pub const JOB_TIMEOUT: Duration = Duration::from_secs(20);
@@ -101,7 +101,7 @@ impl AnalysisAgents {
         let target = target.as_str().filter(|name| AGENT_TARGETS.contains(name));
         let program = program.as_str().filter(|text| text.chars().count() <= 2048);
         let (Some(target), Some(program)) = (target, program) else {
-            bail!("Register ida/ghidra with a bounded program identity");
+            bail!("Register ida/ghidra/binja/iaito with a bounded program identity");
         };
         let mut state = self.lock();
         if let Some(previous) = state.agents.get(target)
@@ -356,6 +356,16 @@ mod tests {
         assert!(agents.register("x", &json!("radare"), &json!("p")).is_err());
         assert_eq!(agents.unregister("first", &json!("ghidra")).unwrap()["unregistered"], true);
         assert_eq!(agents.unregister("first", &json!("ghidra")).unwrap()["unregistered"], false);
+    }
+
+    #[test]
+    fn binja_and_iaito_targets_are_accepted() {
+        let agents = AnalysisAgents::new();
+        agents.register("b", &json!("binja"), &json!("program")).unwrap();
+        agents.register("i", &json!("iaito"), &json!("program")).unwrap();
+        assert!(agents.register("x", &json!("nope"), &json!("p")).is_err());
+        assert!(agents.submit("iaito", "functions", json!({}), Duration::from_millis(10)).is_err());
+        assert_eq!(agents.status()["binja"]["connected"], true);
     }
 
     #[test]

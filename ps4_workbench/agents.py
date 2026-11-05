@@ -19,8 +19,8 @@ class AnalysisAgents:
                              "program": state["program"]} for target, state in self.agents.items()}
 
     def register(self, client, target, program):
-        if target not in ("ida", "ghidra") or not isinstance(program, str) or len(program) > 2048:
-            raise WorkbenchError("Register ida/ghidra with a bounded program identity")
+        if target not in ("ida", "ghidra", "binja", "iaito") or not isinstance(program, str) or len(program) > 2048:
+            raise WorkbenchError("Register ida/ghidra/binja/iaito with a bounded program identity")
         with self.lock:
             previous = self.agents.get(target)
             if previous and previous["client"] != client and time.monotonic() - previous["last_seen"] < 30:
@@ -70,7 +70,7 @@ class AnalysisAgents:
         return {"accepted": True}
 
     def submit(self, target, operation, arguments, timeout=20):
-        if target not in ("ida", "ghidra") or operation not in ("decompile", "functions", "xrefs"):
+        if target not in ("ida", "ghidra", "binja", "iaito") or operation not in ("decompile", "functions", "xrefs"):
             raise WorkbenchError("Unsupported static-analysis target or operation")
         if not isinstance(arguments, dict):
             raise WorkbenchError("Analysis arguments must be an object")

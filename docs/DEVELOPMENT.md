@@ -117,6 +117,28 @@ hash and requested image-base instructions. It does not reconstruct SELF/ELF,
 perform decryption or import the binary into Ghidra automatically. Raw memory
 can be imported as `x86:LE:64:default` with a deliberately selected image base.
 
+## Binary Ninja and iaito (radare2)
+
+Both register as read-only static-analysis agents (`target: "binja"` /
+`"iaito"`) for `analysis_functions`, `analysis_decompile` and
+`analysis_xrefs`, exactly like the IDA/Ghidra agents. Discovery is reported by
+`desktop_status` via `PS4_BINJA_DIRECTORY` / `PS4_IAITO_DIRECTORY`.
+
+- **Binary Ninja:** `ps4_workbench/adapters/binja.py`. Run
+  `integrations/binja/ps4_connect.py` inside Binary Ninja's Python (plugin /
+  Script Manager, where the open view is the global `bv`), or headless with
+  BN's bundled Python: `bv = binaryninja.load(path)` then `connect(bv)`.
+  Decompilation uses HLIL (falls back to MLIL/LLIL); xrefs use
+  `get_code_refs_to`. The input SHA-256 is verified before every job.
+- **iaito/radare2:** `ps4_workbench/adapters/iaito.py`, driven through r2pipe
+  (needs `r2` on PATH and `pip install r2pipe`):
+  `python integrations/iaito/ps4_connect.py D:/dumps/eboot.bin`.
+  `aaa` runs once at startup; functions via `aflj`, decompilation via `pdc`
+  (falls back to `pdf` disassembly), xrefs via `axtj`.
+
+Neither launches a console connection; both refuse to answer if the input
+file's hash changes while the agent runs.
+
 ## Optional IDA
 
 https://github.com/mrexodia/ida-pro-mcp

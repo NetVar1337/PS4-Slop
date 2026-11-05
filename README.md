@@ -87,7 +87,7 @@ by `serve`. Profile changes require a restart.
 
 ## Tool groups
 
-There are **55 standalone tools**, **40 visible with the default profile**. Shared
+There are **61 standalone tools**, **45 visible with the default profile**. Shared
 mode adds static-analysis and session-observer tools. Run `tools` for
 the complete, machine-readable schemas and current policy-filtered tool list.
 
@@ -112,9 +112,11 @@ the complete, machine-readable schemas and current policy-filtered tool list.
   halt/resume, step into/over/out, run-to-address and conditional run with
   breakpoint hit counting, software breakpoints with conditions/log/stop-after,
   aligned hardware watchpoints, live disassembly with masked breakpoint bytes,
-  module lists, expression evaluation on live registers/memory, and call-stack
-  unwinding. Stop handling re-reads live registers because the pinned server
-  steps past a breakpoint instruction before reporting the hit.
+  module lists, expression evaluation on live registers/memory, call-stack
+  unwinding, live code xrefs (call/jump/lea targeting an address), live memory
+  pattern search, host-side labels, breakpoint/watchpoint export and re-apply,
+  and watchpoint listing. Stop handling re-reads live registers because the
+  pinned server steps past a breakpoint instruction before reporting the hit.
 - **Memory mutations:** compare expected bytes, preserve original/replacement
   artifacts, write, independently read back, and persist an uncertainty journal.
   Kernel access is separately gated and is not kernel breakpoint debugging.
@@ -126,9 +128,9 @@ the complete, machine-readable schemas and current policy-filtered tool list.
   address; `artifact_strings` extracts bounded printable strings.
 - **Development:** local SDK discovery, three SDK recipe/reference scaffolds,
   hash-allowlisted local builds with bounded logs/time and captured outputs.
-- **Shared analysis:** IDA/Ghidra functions, decompilation and cross-references
-  through explicitly connected local agents, with one live-debug controller and
-  independent event cursors for observers.
+- **Shared analysis:** IDA/Ghidra/Binary Ninja/iaito (radare2) functions,
+  decompilation and cross-references through explicitly connected local agents,
+  with one live-debug controller and independent event cursors for observers.
 
 Large results become local artifacts, not enormous MCP replies. Addresses/RVAs
 are strings (`"0x400000"`) to avoid JavaScript integer precision loss. Captures
@@ -188,7 +190,7 @@ src/                 Rust: MCP server, CLI, transports, broker, RSP/GDB bridge, 
 ps4_workbench/       Python IDA/Ghidra adapter client only (legacy backend superseded by src/)
 profiles/            Console profile; local qualification files are ignored
 examples/            MCP configs, manifest and evidence templates
-integrations/        IDA connection script; Ghidra Java/Python clients and annotations
+integrations/        IDA/Binary Ninja/iaito connection scripts; Ghidra Java/Python clients and annotations
 docs/                Compatibility, qualification, development, protocol notes
 tests/               Offline unit and loopback integration tests
 workspace/           Generated captures, logs, audit journal, projects (ignored)

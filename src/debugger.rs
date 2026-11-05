@@ -10,6 +10,15 @@ use std::{
 mod ops;
 pub use ops::BreakpointRecord;
 
+#[derive(Debug, Clone)]
+pub struct WatchpointRecord {
+    pub index: u32,
+    pub address: u64,
+    pub length: u32,
+    pub access: String,
+    pub enabled: bool,
+}
+
 pub const MAGIC: u32 = 0xffaabbcc;
 pub const SUCCESS: u32 = 0x80000000;
 pub const EVENT_SIZE: usize = 1184;
@@ -82,6 +91,7 @@ pub struct Debugger {
     pub identity: Option<Value>,
     pub attached_pid: Option<u32>,
     pub breakpoints: std::collections::BTreeMap<u32, BreakpointRecord>,
+    pub watchpoints: std::collections::BTreeMap<u32, WatchpointRecord>,
     stash: Vec<Value>,
     pub labels: std::collections::BTreeMap<String, u64>,
 }
@@ -97,6 +107,7 @@ impl Debugger {
             identity: None,
             attached_pid: None,
             breakpoints: Default::default(),
+            watchpoints: Default::default(),
             stash: Vec::new(),
             labels: Default::default(),
         }
@@ -108,6 +119,7 @@ impl Debugger {
         self.identity = None;
         self.attached_pid = None;
         self.breakpoints.clear();
+        self.watchpoints.clear();
         self.event_buffer.clear();
     }
 
@@ -567,6 +579,7 @@ impl Debugger {
             address.is_multiple_of(length as u64) && (access != "execute" || length == 1),
             "Watchpoint must be aligned; execute length is 1"
         );
+        let access_name = access;
         let access: u32 = match access {
             "execute" => 0,
             "write" => 1,
@@ -584,11 +597,22 @@ impl Debugger {
         body.extend(encoding.to_le_bytes());
         body.extend(access.to_le_bytes());
         body.extend(address.to_le_bytes());
-        self.exchange(|debugger| {
+        let result = self.exchange(|debugger| {
             debugger.packet(0xbdbb0004, &body)?;
             debugger.status()?;
             Ok(json!({"index":index,"enabled":enabled}))
-        })
+        });
+        if result.is_ok() {
+            if enabled {
+                self.watchpoints.insert(
+                    index,
+                    WatchpointRecord { index, address, length, access: access_name.to_owned(), enabled },
+                );
+            } else {
+                self.watchpoints.remove(&index);
+            }
+        }
+        result
     }
 
     pub fn poll_events(&mut self) -> Result<Value> {

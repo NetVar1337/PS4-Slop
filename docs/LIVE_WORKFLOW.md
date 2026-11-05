@@ -165,6 +165,20 @@ Observer refresh is explicit, not a full Ghidra trace/timeline synchronization
 plugin. Native Ghidra/GDB UI integration has not been exercised here because
 the local GDB dependency is absent.
 
+## 3b. Connect Binary Ninja or iaito as static-analysis agents
+
+With the broker running (`ps4-workbench broker`), register an agent so the
+shared MCP's `analysis_*` tools can reach it:
+
+- Binary Ninja: run `integrations/binja/ps4_connect.py` in BN's Python (the
+  open view is the global `bv`), or headless: `bv = binaryninja.load(path)`.
+- iaito/radare2: `python integrations/iaito/ps4_connect.py <binary>` (r2 on
+  PATH, `r2pipe` installed). Addresses are r2's static addresses.
+
+Then `analysis_functions` / `analysis_decompile` / `analysis_xrefs` accept
+`"target": "binja"` or `"iaito"` alongside `"ida"` / `"ghidra"`.
+`analysis_status` shows which agents are live.
+
 ## 4. Extract files and dump runtime regions
 
 Single file: `ftp_download`. Several selected files: `ftp_extract` with
@@ -219,6 +233,12 @@ console calls back on TCP 755). Then, in any order:
   `condition`, `max_stops`, `timeout_seconds`), `debug_stack` for a call-stack
   unwind, `debug_registers_set` to patch registers (readback-verified),
   `debug_control` for halt/resume, `debug_events` / `session_events` for stops.
+- `code_xrefs` (find live call/jump/lea instructions targeting an address),
+  `memory_search` (live hex-pattern scan over a bounded range),
+  `debug_label` (set/remove/list host-side labels used by `debug_eval` and
+  `disassemble`), `debug_watchpoint_list`, and
+  `debug_breakpoint_save` / `debug_breakpoint_load` to export and re-apply the
+  breakpoint+watchpoint set as a versioned JSON document.
 - `debug_detach` when done; payload sending stays blocked while attached.
 
 All-stop semantics: `resume`/`debug_run` continue every thread. After every stop

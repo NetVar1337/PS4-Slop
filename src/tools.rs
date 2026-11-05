@@ -333,6 +333,38 @@ impl ToolRegistry {
                 .workbench
                 .debugger
                 .module_list(number(args, "pid")? as u32),
+            "code_xrefs" => self.workbench.debugger.code_xrefs(
+                number(args, "pid")? as u32,
+                address(&args["target_address"])?,
+                args["max_results"].as_u64().unwrap_or(256) as usize,
+            ),
+            "memory_search" => self.workbench.debugger.memory_search(
+                number(args, "pid")? as u32,
+                address(&args["address"])?,
+                number(args, "length")? as usize,
+                string(args, "pattern")?,
+                args["max_results"].as_u64().unwrap_or(256) as usize,
+            ),
+            "debug_label" => match string(args, "action")? {
+                "set" => self
+                    .workbench
+                    .debugger
+                    .label_set(string(args, "name")?, address(&args["address"])?),
+                "remove" => self.workbench.debugger.label_remove(string(args, "name")?),
+                "list" => Ok(self.workbench.debugger.label_list()),
+                other => bail!("Unsupported label action: {other}"),
+            },
+            "debug_breakpoint_save" => Ok(self.workbench.debugger.breakpoints_export()),
+            "debug_watchpoint_list" => Ok(self.workbench.debugger.watchpoint_list()),
+            "debug_breakpoint_load" => {
+                self.workbench.store.audit(
+                    "debug_control_intent",
+                    json!({"method":name,"arguments":args}),
+                )?;
+                let result = self.workbench.debugger.breakpoints_import(&args["document"]);
+                self.workbench.audit_result("debug_control", &result)?;
+                result
+            }
             "debug_step" | "debug_run" | "debug_registers_set" => {
                 self.workbench.store.audit(
                     "debug_control_intent",
@@ -498,12 +530,14 @@ mod tests {
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
         let catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json")).unwrap();
-        assert_eq!(catalog.len(), 55);
+        assert_eq!(catalog.len(), 61);
         for expected in [
             "debug_step", "debug_run", "debug_stack", "debug_eval", "disassemble",
             "module_list", "debug_registers_set", "debug_registers_fpu",
             "debug_registers_dr", "debug_breakpoint_list", "artifact_info",
-            "artifact_disasm", "artifact_strings",
+            "artifact_disasm", "artifact_strings", "code_xrefs", "memory_search",
+            "debug_label", "debug_breakpoint_save", "debug_breakpoint_load",
+            "debug_watchpoint_list",
         ] {
             assert!(catalog.iter().any(|tool| tool["name"] == expected), "{expected}");
         }
