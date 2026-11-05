@@ -29,3 +29,8 @@ pub mod binstatic;
 pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// Access/crash/pointer/struct/script feature area.
+pub mod pointerscan;
+pub mod structinfer;
+pub mod hostscript;
