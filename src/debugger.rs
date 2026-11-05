@@ -1,4 +1,4 @@
-use crate::{Result, config::Profile};
+use crate::{Result, config::Profile, link};
 use anyhow::{Context, bail, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -206,12 +206,59 @@ impl Debugger {
     }
 
     fn exchange<T>(&mut self, action: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let attached = self.attached_pid;
         self.deadline = Instant::now() + self.profile.timeout();
         let result = self.connect().and_then(|()| action(self));
-        if result.is_err() {
-            self.reset();
+        match result {
+            Ok(value) => {
+                link::record_ok("debug");
+                Ok(value)
+            }
+            Err(error) => {
+                link::record_err("debug", &error);
+                self.reset();
+                Err(Self::lost(error, attached))
+            }
         }
-        result
+    }
+
+    /// For read-only commands only: when the connection fails transiently and no
+    /// attachment exists to lose, reconnect (re-running the identity handshake)
+    /// and repeat the read once. Mutations must use `exchange`.
+    fn exchange_read<T>(
+        &mut self,
+        mut action: impl FnMut(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let attached = self.attached_pid;
+        for attempt in 0..2 {
+            self.deadline = Instant::now() + self.profile.timeout();
+            match self.connect().and_then(|()| action(self)) {
+                Ok(value) => {
+                    link::record_ok("debug");
+                    return Ok(value);
+                }
+                Err(error) => {
+                    link::record_err("debug", &error);
+                    self.reset();
+                    if attempt == 0 && attached.is_none() && link::is_transient(&error) {
+                        link::record_retry("debug");
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        continue;
+                    }
+                    return Err(Self::lost(error, attached));
+                }
+            }
+        }
+        unreachable!("loop returns on both attempts")
+    }
+
+    fn lost(error: anyhow::Error, attached: Option<u32>) -> anyhow::Error {
+        match attached {
+            Some(pid) => error.context(format!(
+                "Debugger connection lost while attached to pid {pid}; the attachment was cleared locally and the console-side state is uncertain. Call debug_attach again"
+            )),
+            None => error,
+        }
     }
 
     pub fn close(&mut self) -> Result<()> {
@@ -224,7 +271,7 @@ impl Debugger {
     }
 
     pub fn probe(&mut self) -> Result<Value> {
-        self.exchange(|debugger| Ok(debugger.identity.clone().unwrap()))
+        self.exchange_read(|debugger| Ok(debugger.identity.clone().unwrap()))
     }
 
     fn list(
@@ -234,7 +281,7 @@ impl Debugger {
         size: usize,
         decode: impl Fn(&[u8]) -> Result<Value>,
     ) -> Result<Value> {
-        self.exchange(|debugger| {
+        self.exchange_read(|debugger| {
             debugger.packet(command, body)?;
             debugger.status()?;
             let count = word(&debugger.read(4)?, 0) as usize;
@@ -310,7 +357,7 @@ impl Debugger {
         } else {
             Self::pid(pid)?;
         }
-        self.exchange(|debugger| {
+        self.exchange_read(|debugger| {
             debugger.packet(
                 if kernel { 0xbdcc0002 } else { 0xbdaa0002 },
                 &Self::memory_body(pid, address, length, kernel),
@@ -353,7 +400,7 @@ impl Debugger {
 
     pub fn kernel_base(&mut self) -> Result<Value> {
         self.require_qualified_debugger("kernel_read")?;
-        self.exchange(|debugger| {
+        self.exchange_read(|debugger| {
             debugger.packet(0xbdcc0001, &[])?;
             debugger.status()?;
             Ok(json!({"kernel_base":format!("{:#x}",qword(&debugger.read(8)?,0))}))
@@ -555,6 +602,79 @@ impl Debugger {
 }
 
 #[cfg(test)]
+pub(crate) mod fake {
+    //! Minimal in-process ps4debug-NG protocol 1.3 server for offline tests.
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    pub struct FakeDebugger {
+        pub port: u16,
+        pub connections: Arc<AtomicUsize>,
+    }
+
+    fn text(stream: &mut TcpStream, value: &[u8]) {
+        let mut out = (value.len() as u32).to_le_bytes().to_vec();
+        out.extend(value);
+        let _ = stream.write_all(&out);
+    }
+
+    /// `drop_first_list`: the first connection to receive a process-list command is
+    /// closed without answering (simulates a console-side drop).
+    pub fn spawn(drop_first_list: bool) -> FakeDebugger {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    loop {
+                        let mut header = [0; 12];
+                        if stream.read_exact(&mut header).is_err() {
+                            return;
+                        }
+                        let command = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                        let length = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                        let mut body = vec![0; length as usize];
+                        if stream.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        match command {
+                            0xbd000001 => text(&mut stream, b"1.3\0"),
+                            0xbd000501 => text(&mut stream, b"ps4debug-NG by Pharaoh2k v1.0\x001.1\0"),
+                            0xbd000500 => {
+                                let _ = stream.write_all(&1400u16.to_le_bytes());
+                            }
+                            0xbd000502 => {
+                                let _ = stream.write_all(&4u16.to_le_bytes());
+                            }
+                            0xbdaa0001 => {
+                                if drop_first_list && index == 0 {
+                                    return;
+                                }
+                                let mut out = SUCCESS.to_le_bytes().to_vec();
+                                out.extend(1u32.to_le_bytes());
+                                let mut entry = [0u8; 36];
+                                entry[..4].copy_from_slice(b"eboo");
+                                entry[32..36].copy_from_slice(&77u32.to_le_bytes());
+                                out.extend(entry);
+                                let _ = stream.write_all(&out);
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+        FakeDebugger { port, connections }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -570,5 +690,38 @@ mod tests {
         assert!(address_range(u64::MAX, 1, 1).is_ok());
         assert!(address_range(u64::MAX, 2, 2).is_err());
         assert!(address_range(0, 0, 1).is_err());
+    }
+
+    fn profile(port: u16) -> (tempfile::TempDir, Profile) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile = crate::artifacts::tests::test_profile(directory.path());
+        profile.data["ports"]["debug"] = json!(port);
+        (directory, profile)
+    }
+
+    #[test]
+    fn read_only_command_reconnects_once_after_a_dropped_connection() {
+        let fake = fake::spawn(true);
+        let (_directory, profile) = profile(fake.port);
+        let mut debugger = Debugger::new(profile);
+        let list = debugger.processes().unwrap();
+        assert_eq!(list[0]["pid"], 77);
+        assert_eq!(list[0]["name"], "eboo");
+        assert_eq!(
+            fake.connections.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "second connection after the first was dropped"
+        );
+    }
+
+    #[test]
+    fn lost_attachment_is_reported_not_silently_cleared() {
+        let fake = fake::spawn(true);
+        let (_directory, profile) = profile(fake.port);
+        let mut debugger = Debugger::new(profile);
+        debugger.attached_pid = Some(5);
+        let error = debugger.processes().unwrap_err();
+        assert!(format!("{error:#}").contains("attached to pid 5"), "{error:#}");
+        assert!(debugger.attached_pid.is_none());
     }
 }

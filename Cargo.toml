@@ -19,6 +19,7 @@ anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }
 hex = "0.4"
+iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "intel", "instr_info"] }
 jsonschema = { version = "0.46", default-features = false }
 rand = "0.9"
 regex = "1"

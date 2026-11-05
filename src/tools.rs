@@ -132,6 +132,9 @@ impl ToolRegistry {
                 .status(args["probe"].as_bool().unwrap_or(false)),
             "desktop_status" => desktop_status(),
             "debugger_info" => self.workbench.debugger.probe(),
+            "link_status" => self
+                .workbench
+                .link_status(args["probe"].as_bool().unwrap_or(false)),
             "ftp_list" => crate::transports::ftp_list(
                 &self.workbench.profile,
                 args["path"].as_str().unwrap_or("/"),
@@ -157,13 +160,17 @@ impl ToolRegistry {
             ),
             "klog_capture" => {
                 let seconds = args["seconds"].as_u64().unwrap_or(5);
-                let content = crate::transports::klog_capture(&self.workbench.profile, seconds)?;
-                self.workbench.store.save(
+                let capture = crate::transports::klog_capture(&self.workbench.profile, seconds)?;
+                let mut saved = self.workbench.store.save(
                     "klog",
-                    &content,
-                    json!({"seconds":seconds,"reconnected":false}),
+                    &capture.content,
+                    json!({"seconds":seconds,"reconnects":capture.reconnects,
+                        "ended_early":capture.ended_early}),
                     "bin",
-                )
+                )?;
+                saved["reconnects"] = json!(capture.reconnects);
+                saved["ended_early"] = json!(capture.ended_early);
+                Ok(saved)
             }
             "payload_inspect" => self.workbench.inspect_payload(string(args, "manifest")?),
             "payload_execute" => self
@@ -384,7 +391,7 @@ mod tests {
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
         let catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json")).unwrap();
-        assert_eq!(catalog.len(), 41);
+        assert_eq!(catalog.len(), 42);
         for tool in catalog {
             let validator = jsonschema::validator_for(&tool["inputSchema"]).unwrap();
             assert!(!validator.is_valid(&json!({"unexpected":true})));

@@ -63,6 +63,23 @@ impl Workbench {
         read_bounded(self.store.path(artifact)?, maximum)
     }
 
+    /// Passive per-service health plus payload rate-limit policy. `probe` adds an
+    /// explicit reachability check (never of the payload port).
+    pub fn link_status(&self, probe: bool) -> Result<Value> {
+        let probed = if probe {
+            Some(transports::probe_services(&self.profile)?)
+        } else {
+            None
+        };
+        Ok(json!({"health":crate::link::snapshot(),"probe":probed,
+            "policy":{"idempotent_retry":"reads, listings and connection setup: up to 3 attempts with 150/450 ms backoff",
+                "never_retried":["payload_execute","ftp_upload","memory_write","kernel_write","debug_control"],
+                "ftp":"each session sends QUIT on close; ftp_extract reuses one session with NOOP revalidation",
+                "payload":"validated before send, serialized, cooldown enforced, graceful close; loader cannot be restarted from the PC",
+                "background_probing":false},
+            "hardware_compatibility_guaranteed":false}))
+    }
+
     pub fn status(&self, probe: bool) -> Result<Value> {
         let mut services = json!({});
         for service in ["payload", "ftp", "klog", "debug"] {
@@ -83,6 +100,7 @@ impl Workbench {
         Ok(
             json!({"host":self.profile.host(),"firmware_claim":"14.00","services":services,
             "compatibility":qualification,"profile_sha256":self.profile.fingerprint(),
+            "link":crate::link::snapshot(),
             "permissions":self.profile.data["permissions"],"hardware_compatibility_guaranteed":false,
             "implementation":"native-rust","version":env!("CARGO_PKG_VERSION")}),
         )
@@ -102,9 +120,10 @@ impl Workbench {
         let mut files = Vec::new();
         let mut total = 0;
         let mut complete = true;
+        let mut session = transports::FtpBatch::new(&self.profile);
         for path in paths {
             let result = (|| -> Result<Value> {
-                let content = transports::ftp_download(&self.profile, path)?;
+                let content = session.download(path)?;
                 ensure!(
                     content.len() <= self.profile.limit("transfer_bytes") - total,
                     "Cumulative transfer limit exceeded"
@@ -185,17 +204,15 @@ impl Workbench {
             record["format"] == "bin" && record["loader"] == "goldhen-binloader",
             "Only qualified GoldHEN BinLoader BIN artifacts may execute"
         );
-        ensure!(
-            !content.is_empty() && !content.starts_with(b"\x7fELF"),
-            "Empty/ELF files cannot be sent as BIN payloads"
-        );
+        let validation =
+            transports::validate_payload(&content, self.profile.limit("transfer_bytes"))?;
         ensure!(
             regex::Regex::new("^[0-9a-f]{40}$")?
                 .is_match(record["source_commit"].as_str().unwrap_or("")),
             "Payload needs source commit"
         );
         Ok(
-            json!({"manifest":record,"actual_sha256":hash,"size":content.len(),"execution_verified":false}),
+            json!({"manifest":record,"actual_sha256":hash,"size":content.len(),"validation":validation,"execution_verified":false}),
         )
     }
 
