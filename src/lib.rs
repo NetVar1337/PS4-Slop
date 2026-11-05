@@ -42,3 +42,5 @@ pub mod unreal;
 pub mod rtti;
 pub mod yara;
 pub mod cryptoscan;
+// trace area (run-loop tracing & coverage)
+pub mod tracekit;
