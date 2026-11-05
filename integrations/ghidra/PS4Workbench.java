@@ -17,15 +17,37 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
+import java.awt.Color;
+
+import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.script.GhidraScript;
+import ghidra.app.script.ImproperUseException;
+import ghidra.app.util.parser.FunctionSignatureParser;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.data.ArrayDataType;
+import ghidra.program.model.data.ByteDataType;
+import ghidra.program.model.data.DataType;
+import ghidra.program.model.data.DataTypeConflictHandler;
+import ghidra.program.model.data.DataTypeManager;
+import ghidra.program.model.data.DoubleDataType;
+import ghidra.program.model.data.DWordDataType;
+import ghidra.program.model.data.FloatDataType;
+import ghidra.program.model.data.FunctionDefinitionDataType;
+import ghidra.program.model.data.PointerDataType;
+import ghidra.program.model.data.QWordDataType;
+import ghidra.program.model.data.StructureDataType;
+import ghidra.program.model.data.WordDataType;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionIterator;
 import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.symbol.Reference;
 import ghidra.program.model.symbol.ReferenceIterator;
+import ghidra.program.model.symbol.SourceType;
+import ghidra.program.model.symbol.Symbol;
+import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.util.task.TaskMonitor;
 
 public class PS4Workbench extends GhidraScript {
@@ -125,6 +147,18 @@ public class PS4Workbench extends GhidraScript {
             }
             return result;
         }
+        if (operation.startsWith("apply_")) {
+            int transaction = currentProgram.startTransaction("PS4 " + operation);
+            boolean committed = false;
+            try {
+                JsonObject report = apply(operation, arguments);
+                committed = true;
+                return report;
+            }
+            finally {
+                currentProgram.endTransaction(transaction, committed);
+            }
+        }
         Address address = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(arguments.get("address").getAsString());
         if ("xrefs".equals(operation)) {
             int limit = arguments.has("limit") ? arguments.get("limit").getAsInt() : 100;
@@ -160,6 +194,264 @@ public class PS4Workbench extends GhidraScript {
         }
         finally {
             decompiler.dispose();
+        }
+    }
+
+    // ---- analysis_apply_* (local database only; batches validated and rebased by the broker) ----------
+
+    private static final String COVERAGE_COMMENT = "PS4 coverage hits=";
+
+    private static final class ApplyReport {
+        int applied;
+        int skipped;
+        int failed;
+        final JsonArray errors = new JsonArray();
+        final JsonArray unsupported = new JsonArray();
+
+        void error(String where, Exception error) {
+            failed++;
+            if (errors.size() < 20) {
+                JsonObject entry = new JsonObject();
+                entry.addProperty("at", where);
+                entry.addProperty("error", String.valueOf(error.getMessage()));
+                errors.add(entry);
+            }
+        }
+
+        void unsupported(String feature) {
+            JsonElement value = new com.google.gson.JsonPrimitive(feature);
+            if (!unsupported.contains(value)) {
+                unsupported.add(value);
+            }
+        }
+
+        boolean lacks(String feature) {
+            return unsupported.contains(new com.google.gson.JsonPrimitive(feature));
+        }
+
+        JsonObject result() {
+            if (applied == 0 && unsupported.size() > 0) {
+                throw new UnsupportedOperationException(unsupported + " unsupported by the Ghidra Java agent");
+            }
+            JsonObject result = new JsonObject();
+            result.addProperty("applied", applied);
+            result.addProperty("skipped", skipped);
+            result.addProperty("failed", failed);
+            result.add("errors", errors);
+            result.add("unsupported", unsupported);
+            return result;
+        }
+    }
+
+    private Address itemAddress(JsonObject item) {
+        if (item.has("address")) {
+            return toAddr(Long.parseUnsignedLong(item.get("address").getAsString().replaceFirst("^0x", ""), 16));
+        }
+        long rva = Long.parseUnsignedLong(item.get("rva").getAsString().replaceFirst("^0x", ""), 16);
+        return currentProgram.getImageBase().addWrap(rva);
+    }
+
+    private static boolean isDefaultName(Symbol symbol) {
+        return symbol == null || symbol.getSource() == SourceType.DEFAULT;
+    }
+
+    private boolean flag(JsonObject arguments, String key) {
+        return arguments.has(key) && arguments.get(key).getAsBoolean();
+    }
+
+    private JsonObject apply(String operation, JsonObject arguments) throws Exception {
+        ApplyReport report = new ApplyReport();
+        switch (operation) {
+            case "apply_symbols": applySymbols(arguments, report); break;
+            case "apply_prototypes": applyPrototypes(arguments, report); break;
+            case "apply_struct": applyStruct(arguments, report); break;
+            case "apply_coverage": applyCoverage(arguments, report); break;
+            default: throw new IllegalArgumentException("Unsupported apply operation");
+        }
+        return report.result();
+    }
+
+    private void applySymbols(JsonObject arguments, ApplyReport report) {
+        boolean overwrite = flag(arguments, "overwrite");
+        for (JsonElement element : arguments.getAsJsonArray("symbols")) {
+            JsonObject item = element.getAsJsonObject();
+            boolean changed = false;
+            try {
+                Address address = itemAddress(item);
+                if (item.has("name")) {
+                    String name = item.get("name").getAsString();
+                    Symbol current = currentProgram.getSymbolTable().getPrimarySymbol(address);
+                    boolean keep = (current != null && current.getName().equals(name)) ||
+                        (!isDefaultName(current) && (flag(item, "only_if_unnamed") || !overwrite));
+                    if (!keep) {
+                        Function function = currentProgram.getFunctionManager().getFunctionAt(address);
+                        if (function != null) {
+                            function.setName(name, SourceType.USER_DEFINED);
+                        }
+                        else {
+                            currentProgram.getSymbolTable().createLabel(address, name, SourceType.USER_DEFINED);
+                        }
+                        changed = true;
+                    }
+                }
+                if (item.has("comment")) {
+                    setEOLComment(address, item.get("comment").getAsString());
+                    changed = true;
+                }
+            }
+            catch (Exception error) {
+                report.error(item.toString(), error);
+                continue;
+            }
+            if (changed) {
+                report.applied++;
+            }
+            else {
+                report.skipped++;
+            }
+        }
+    }
+
+    private Function findFunction(String name) {
+        SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(name);
+        while (symbols.hasNext()) {
+            Symbol symbol = symbols.next();
+            Object target = symbol.getObject();
+            if (target instanceof Function) {
+                return (Function) target;
+            }
+            Function function = currentProgram.getFunctionManager().getFunctionAt(symbol.getAddress());
+            if (function != null) {
+                return function;
+            }
+        }
+        return null;
+    }
+
+    private void applyPrototypes(JsonObject arguments, ApplyReport report) {
+        boolean overwrite = flag(arguments, "overwrite");
+        FunctionSignatureParser parser = new FunctionSignatureParser(currentProgram.getDataTypeManager(), null);
+        for (JsonElement element : arguments.getAsJsonArray("prototypes")) {
+            JsonObject item = element.getAsJsonObject();
+            String name = item.get("name").getAsString();
+            Function function = findFunction(name);
+            if (function == null && item.has("nid")) {
+                function = findFunction(item.get("nid").getAsString());
+            }
+            if (function == null || (!overwrite && function.getSignatureSource() == SourceType.USER_DEFINED)) {
+                report.skipped++;
+                continue;
+            }
+            try {
+                FunctionDefinitionDataType signature = parser.parse(function.getSignature(), item.get("declaration").getAsString());
+                ApplyFunctionSignatureCmd command = new ApplyFunctionSignatureCmd(function.getEntryPoint(), signature, SourceType.USER_DEFINED);
+                if (command.applyTo(currentProgram, monitor)) {
+                    report.applied++;
+                }
+                else {
+                    report.error(name, new IllegalStateException(String.valueOf(command.getStatusMsg())));
+                }
+            }
+            catch (Exception error) {
+                report.error(name, error);
+            }
+        }
+    }
+
+    private static DataType fieldType(String kind, int size) {
+        String text = kind == null ? "" : kind.replace(" ", "").toLowerCase();
+        if (text.contains("*") && size == 8) {
+            return new PointerDataType();
+        }
+        if (text.equals("float") && size == 4) {
+            return new FloatDataType();
+        }
+        if (text.equals("double") && size == 8) {
+            return new DoubleDataType();
+        }
+        switch (size) {
+            case 1: return new ByteDataType();
+            case 2: return new WordDataType();
+            case 4: return new DWordDataType();
+            case 8: return new QWordDataType();
+            default: return new ArrayDataType(new ByteDataType(), size, 1);
+        }
+    }
+
+    private void applyStruct(JsonObject arguments, ApplyReport report) {
+        JsonObject definition = arguments.getAsJsonObject("struct");
+        String name = definition.get("name").getAsString();
+        DataTypeManager manager = currentProgram.getDataTypeManager();
+        if (!flag(arguments, "overwrite") && manager.getDataType("/" + name) != null) {
+            report.skipped++;
+            return;
+        }
+        try {
+            StructureDataType structure = new StructureDataType(name, definition.get("size").getAsInt());
+            for (JsonElement element : definition.getAsJsonArray("fields")) {
+                JsonObject field = element.getAsJsonObject();
+                int size = field.get("size").getAsInt();
+                String kind = field.has("type") ? field.get("type").getAsString() : null;
+                String comment = field.has("comment") ? field.get("comment").getAsString() : null;
+                structure.replaceAtOffset(field.get("offset").getAsInt(), fieldType(kind, size), size,
+                                          field.get("name").getAsString(), comment);
+            }
+            manager.addDataType(structure, DataTypeConflictHandler.REPLACE_HANDLER);
+            report.applied++;
+        }
+        catch (Exception error) {
+            report.error(name, error);
+        }
+    }
+
+    private void applyCoverage(JsonObject arguments, ApplyReport report) {
+        boolean clear = flag(arguments, "clear");
+        boolean comment = flag(arguments, "comment");
+        int rgb = Integer.parseInt(arguments.get("color").getAsString().replaceFirst("^0x", ""), 16);
+        Color color = new Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF);
+        for (JsonElement element : arguments.getAsJsonArray("blocks")) {
+            JsonObject block = element.getAsJsonObject();
+            boolean changed = false;
+            try {
+                Address start = itemAddress(block);
+                Address end = start.addWrap(Math.max(block.get("size").getAsLong(), 1) - 1);
+                if (!report.lacks("color")) {
+                    try {
+                        if (clear) {
+                            clearBackgroundColor(new AddressSet(start, end));
+                        }
+                        else {
+                            setBackgroundColor(new AddressSet(start, end), color);
+                        }
+                        changed = true;
+                    }
+                    catch (ImproperUseException headless) {
+                        report.unsupported("color");
+                    }
+                }
+                if (comment) {
+                    String existing = getEOLComment(start);
+                    if (clear && existing != null && existing.startsWith(COVERAGE_COMMENT)) {
+                        setEOLComment(start, null);
+                        changed = true;
+                    }
+                    else if (!clear) {
+                        long hits = block.has("hits") ? block.get("hits").getAsLong() : 1;
+                        setEOLComment(start, COVERAGE_COMMENT + hits);
+                        changed = true;
+                    }
+                }
+            }
+            catch (Exception error) {
+                report.error(block.toString(), error);
+                continue;
+            }
+            if (changed) {
+                report.applied++;
+            }
+            else {
+                report.skipped++;
+            }
         }
     }
 

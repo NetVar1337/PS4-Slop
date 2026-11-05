@@ -29,3 +29,7 @@ pub mod binstatic;
 pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// Project area modules.
+pub mod recipes;
+pub mod analysis_apply;

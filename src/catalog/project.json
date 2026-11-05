@@ -1,1 +1,496 @@
-[]
+[
+ {
+  "name": "project_open",
+  "description": "Create or select the current per-game project (local index under the artifact directory; never touches the console). Identify it by title_id (+ app_version) or name, or select an existing project id. With no arguments, lists projects and the active one.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "title_id": {
+     "type": "string",
+     "description": "PS4 title id, e.g. CUSA12345",
+     "minLength": 1,
+     "maxLength": 32
+    },
+    "name": {
+     "type": "string",
+     "description": "Human-readable game/project name",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "app_version": {
+     "type": "string",
+     "description": "Application version, e.g. 01.02",
+     "minLength": 1,
+     "maxLength": 32
+    },
+    "content_id": {
+     "type": "string",
+     "description": "Content id",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "description": {
+     "type": "string",
+     "description": "Free-form description",
+     "minLength": 0,
+     "maxLength": 2048
+    },
+    "tags": {
+     "type": "array",
+     "maxItems": 32,
+     "items": {
+      "type": "string",
+      "description": "Tag",
+      "minLength": 1,
+      "maxLength": 64
+     }
+    },
+    "create": {
+     "type": "boolean",
+     "description": "Create when missing (default true)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_record",
+  "description": "Attach artifacts (metadata auto-read from provenance sidecars: kind, sha256, tool, module, pid, address), module hashes, notes, findings and open questions to the current project; resolve questions by record id. Tags apply to every record in the call (or to the project when given alone).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "artifacts": {
+     "type": "array",
+     "maxItems": 100,
+     "items": {
+      "type": "string",
+      "description": "Relative path inside configured artifact directory",
+      "minLength": 1,
+      "maxLength": 1024
+     }
+    },
+    "modules": {
+     "type": "array",
+     "maxItems": 100,
+     "items": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "Module name",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "sha256": {
+        "type": "string",
+        "description": "SHA-256 hex",
+        "pattern": "^[0-9a-fA-F]{64}$",
+        "minLength": 64,
+        "maxLength": 64
+       },
+       "base": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "size": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1099511627776
+       },
+       "path": {
+        "type": "string",
+        "description": "Source path or artifact",
+        "minLength": 1,
+        "maxLength": 1024
+       },
+       "version": {
+        "type": "string",
+        "description": "Module/app version",
+        "minLength": 1,
+        "maxLength": 64
+       }
+      },
+      "required": [
+       "name"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "notes": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "string",
+      "description": "Note text",
+      "minLength": 1,
+      "maxLength": 8192
+     }
+    },
+    "tags": {
+     "type": "array",
+     "maxItems": 32,
+     "items": {
+      "type": "string",
+      "description": "Tag",
+      "minLength": 1,
+      "maxLength": 64
+     }
+    },
+    "findings": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "object",
+      "properties": {
+       "title": {
+        "type": "string",
+        "description": "Finding title",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "text": {
+        "type": "string",
+        "description": "Details",
+        "minLength": 0,
+        "maxLength": 8192
+       },
+       "address": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "module": {
+        "type": "string",
+        "description": "Module name",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "severity": {
+        "type": "string",
+        "enum": [
+         "info",
+         "low",
+         "medium",
+         "high"
+        ]
+       },
+       "evidence": {
+        "type": "array",
+        "maxItems": 20,
+        "items": {
+         "type": "string",
+         "description": "Artifact path or evidence reference",
+         "minLength": 1,
+         "maxLength": 1024
+        }
+       },
+       "tags": {
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+         "type": "string",
+         "description": "Tag",
+         "minLength": 1,
+         "maxLength": 64
+        }
+       }
+      },
+      "required": [
+       "title"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "questions": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "description": "Open question",
+        "minLength": 1,
+        "maxLength": 4096
+       },
+       "address": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "module": {
+        "type": "string",
+        "description": "Module name",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "tags": {
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+         "type": "string",
+         "description": "Tag",
+         "minLength": 1,
+         "maxLength": 64
+        }
+       }
+      },
+      "required": [
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "resolve_questions": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "string",
+      "description": "Question record id",
+      "minLength": 1,
+      "maxLength": 14,
+      "pattern": "^r-[0-9a-f]{12}$"
+     }
+    },
+    "resolution": {
+     "type": "string",
+     "description": "Answer recorded with resolve_questions",
+     "minLength": 0,
+     "maxLength": 8192
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_query",
+  "description": "Filter the current project's records by type, artifact kind, tool, tag, module name/sha256, free text and ISO time range; returns a bounded page (newest first by default).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "type": {
+     "type": "string",
+     "enum": [
+      "artifact",
+      "module",
+      "note",
+      "finding",
+      "question",
+      "resolution"
+     ]
+    },
+    "kind": {
+     "type": "string",
+     "description": "Artifact kind, e.g. elfdump or coverage",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "tool": {
+     "type": "string",
+     "description": "Producing tool name",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "tag": {
+     "type": "string",
+     "description": "Tag",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "module": {
+     "type": "string",
+     "description": "Module name substring",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "SHA-256 hex",
+     "pattern": "^[0-9a-fA-F]{64}$",
+     "minLength": 64,
+     "maxLength": 64
+    },
+    "text": {
+     "type": "string",
+     "description": "Case-insensitive text match",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "since": {
+     "type": "string",
+     "description": "Inclusive ISO-8601 lower bound, e.g. 2026-11-01",
+     "minLength": 1,
+     "maxLength": 40
+    },
+    "until": {
+     "type": "string",
+     "description": "Inclusive ISO-8601 upper bound",
+     "minLength": 1,
+     "maxLength": 40
+    },
+    "offset": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 1000000
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100
+    },
+    "order": {
+     "type": "string",
+     "enum": [
+      "newest",
+      "oldest"
+     ]
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_summary",
+  "description": "What exists for this game: modules and hashes, dumps, traces, coverage, annotations, findings, open questions, tag and artifact-kind counts.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "recipe_list",
+  "description": "List built-in recipes (bounded chains of tool calls) with their inputs, steps and whether every step tool is currently available.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "recipe_run",
+  "description": "Run a recipe: built-in by name, a JSON recipe artifact, or an inline ps4wb-recipe-v1 definition. Steps run in order with ${input} / ${steps.N.path} / ${steps.N.@artifact} substitution, stop on the first error and return per-step summaries. Every step is validated and permission-checked exactly like a direct tool call; recipes cannot nest. Through the broker, recipes containing debugger control steps require the caller to hold the debug lease.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "recipe": {
+     "type": "string",
+     "description": "Built-in recipe name (see recipe_list)",
+     "minLength": 1,
+     "maxLength": 64,
+     "pattern": "^[A-Za-z0-9_]{1,64}$"
+    },
+    "recipe_artifact": {
+     "type": "string",
+     "description": "Relative path of a ps4wb-recipe-v1 JSON artifact",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "definition": {
+     "type": "object",
+     "description": "Inline ps4wb-recipe-v1 recipe: {format,name,description,inputs,steps:[{tool,arguments}]}"
+    },
+    "inputs": {
+     "type": "object",
+     "description": "Recipe input values"
+    },
+    "dry_run": {
+     "type": "boolean",
+     "description": "Resolve and show the plan without calling any tool"
+    },
+    "max_steps": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 32
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": false
+  },
+  "permission": null
+ }
+]

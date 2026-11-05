@@ -12,8 +12,15 @@ analysis_decompile / analysis_functions / analysis_xrefs jobs from the shared
 broker. Addresses are STATIC addresses as shown by r2 (image base + offset).
 """
 
-from .base import LiveAnalysis, clipped
+import re
+
+from .base import APPLY_OPERATIONS, LiveAnalysis, Unsupported, clipped, struct_c_declaration
 from ..config import WorkbenchError
+
+# radare2 treats ; | @ ` > < ~ $ ! " specially; only plain C declaration characters may reach a command.
+_R2_DECLARATION = re.compile(r"[A-Za-z0-9_ *,()\[\]]{1,1024}")
+_R2_IDENTIFIER = re.compile(r"[A-Za-z0-9_.$@?:+-]{1,256}")
+_R2_FLAG = re.compile(r"[A-Za-z0-9_.]{1,256}")
 
 
 def _sha256_file(path, maximum=1 << 30):
@@ -61,6 +68,8 @@ class IaitoWorkbench(LiveAnalysis):
         digest = self.input_hash()
         if expected and digest != expected:
             raise WorkbenchError("iaito input file changed; stop and restart its analysis agent")
+        if operation in APPLY_OPERATIONS:
+            return self.apply(operation, arguments)
         flt = (arguments.get("filter") or "").lower()
         if operation == "functions":
             offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
@@ -154,3 +163,66 @@ class IaitoWorkbench(LiveAnalysis):
                 self.r2.cmd(f"CC- @ {where}")
             return {"address": where, "text": text, "applied": True}
         raise WorkbenchError("Unsupported iaito analysis operation")
+
+    # Apply primitives (best effort over r2 commands) -------------------------------------------------
+    def image_base(self):
+        info = self.r2.cmdj("ij") or {}
+        return int(info.get("bin", {}).get("baddr", 0))
+
+    def find_function(self, name):
+        if not _R2_FLAG.fullmatch(name):
+            return None
+        for flag in (name, "sym." + name, "sym.imp." + name, "fcn." + name):
+            entries = self.r2.cmdj(f"afij @ {flag}") or []
+            if entries:
+                return int(entries[0].get("offset", 0)) or None
+        return None
+
+    def set_prototype(self, handle, declaration):
+        declaration = declaration.rstrip(";")
+        if not _R2_DECLARATION.fullmatch(declaration):
+            raise WorkbenchError("Declaration contains characters radare2 cannot take safely")
+        self.r2.cmd(f"afs {declaration} @ {hex(handle)}")
+        return True
+
+    def name_at(self, address):
+        entries = self.r2.cmdj(f"afij @ {hex(address)}") or []
+        if entries and int(entries[0].get("offset", -1)) == address:
+            return str(entries[0].get("name", ""))
+        return str(self.r2.cmd(f"fd. @ {hex(address)}") or "").strip()
+
+    def set_name(self, address, name):
+        if not _R2_IDENTIFIER.fullmatch(name):
+            raise WorkbenchError("Invalid r2 identifier")
+        entries = self.r2.cmdj(f"afij @ {hex(address)}") or []
+        if entries and int(entries[0].get("offset", -1)) == address:
+            self.r2.cmd(f"afn {name} @ {hex(address)}")
+        else:
+            self.r2.cmd(f"f {name} 1 @ {hex(address)}")
+        return True
+
+    def comment_at(self, address):
+        return str(self.r2.cmd(f"CC. @ {hex(address)}") or "").strip() or None
+
+    def set_comment(self, address, text):
+        import base64
+        if text:
+            encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+            self.r2.cmd(f"CCu base64:{encoded} @ {hex(address)}")
+        else:
+            self.r2.cmd(f"CC- @ {hex(address)}")
+        return True
+
+    def type_exists(self, name):
+        return name in (self.r2.cmd("ts") or "").split()
+
+    def define_struct(self, struct, declaration):
+        # The artifact's free-form c_declaration is never passed to r2; only the validated field layout is.
+        text = struct_c_declaration(struct, typed=False).replace("\n", " ")
+        if not re.fullmatch(r"[A-Za-z0-9_ *;{}\[\]]+", text):
+            raise WorkbenchError("Struct layout contains characters radare2 cannot take safely")
+        self.r2.cmd(f'"td {text}"')
+        return struct["name"] in (self.r2.cmd("ts") or "").split()
+
+    def color_block(self, address, size, rgb):
+        raise Unsupported("color", "radare2/iaito keeps no persistent block highlight; use comment=true")
