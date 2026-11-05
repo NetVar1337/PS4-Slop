@@ -1760,5 +1760,187 @@
    "openWorldHint": true
   },
   "permission": null
+ },
+ {
+  "name": "code_xrefs",
+  "description": "Find live instructions that reference a target address: call/jmp rel32 and rip-relative operands, decoded locally over executable mappings. No server-side scan.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "target_address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1024
+    }
+   },
+   "required": [
+    "pid",
+    "target_address"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_search",
+  "description": "Live pattern search (hex bytes with ?? wildcards) over a bounded readable range; the scan runs locally on chunked reads.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1048576
+    },
+    "pattern": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 4096
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "length",
+    "pattern"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_label",
+  "description": "Set/remove/list host-side labels used by debug_eval and disassembly annotations (e.g. a function name at an address). Local only; no console mutation.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "action": {
+     "type": "string",
+     "enum": [
+      "set",
+      "remove",
+      "list"
+     ]
+    },
+    "name": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    }
+   },
+   "required": [
+    "action"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_breakpoint_save",
+  "description": "Export tracked breakpoints (with condition/log/stop_after/hits) and watchpoints as a versioned JSON document.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_breakpoint_load",
+  "description": "Re-apply a document from debug_breakpoint_save; sets/clears console breakpoint and watchpoint slots.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "document": {
+     "type": "object"
+    }
+   },
+   "required": [
+    "document"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_watchpoint_list",
+  "description": "List tracked hardware watchpoints (slot, address, length, access).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
  }
 ]

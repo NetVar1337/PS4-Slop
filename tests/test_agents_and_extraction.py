@@ -28,6 +28,10 @@ class AgentTests(BrokerCase):
     def test_no_agent_is_an_explicit_failure(self):
         with self.assertRaisesRegex(WorkbenchError, "No live ghidra"):
             self.hub.call("mcp", "analysis_functions", {"target": "ghidra"})
+        with self.assertRaisesRegex(WorkbenchError, "No live binja"):
+            self.hub.call("mcp", "analysis_functions", {"target": "binja"})
+        with self.assertRaisesRegex(WorkbenchError, "No live iaito"):
+            self.hub.call("mcp", "analysis_xrefs", {"target": "iaito", "address": "0x1000"})
 
     def test_only_readonly_allowlisted_analysis_operations(self):
         with self.assertRaisesRegex(WorkbenchError, "Unsupported"):

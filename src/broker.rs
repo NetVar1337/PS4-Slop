@@ -28,9 +28,10 @@ pub const MAX_CONNECTIONS: usize = 32;
 pub const MAX_INLINE_RESULT: usize = 24_576;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 pub const PUMP_INTERVAL: Duration = Duration::from_millis(50);
-pub const CONTROL_TOOLS: [&str; 10] = [
+pub const CONTROL_TOOLS: [&str; 11] = [
     "debug_attach", "debug_control", "debug_breakpoint", "debug_watchpoint", "memory_write",
     "kernel_write", "debug_detach", "debug_step", "debug_run", "debug_registers_set",
+    "debug_breakpoint_load",
 ];
 const MAX_TOKEN_FILE: u64 = 1024;
 const SAFE_INTEGER: i128 = 9_007_199_254_740_991;
@@ -91,11 +92,11 @@ fn address_schema() -> Value {
 
 pub fn analysis_tools() -> Vec<Value> {
     let mut target = text_schema("Live static-analysis application", 4096);
-    target["enum"] = json!(["ida", "ghidra"]);
+    target["enum"] = json!(["ida", "ghidra", "binja", "iaito"]);
     let operations = [
-        ("analysis_status", "Connected IDA/Ghidra analysis agents; no application is launched automatically.",
+        ("analysis_status", "Connected IDA/Ghidra/Binary Ninja/iaito (radare2) analysis agents; no application is launched automatically.",
          json!({}), json!([])),
-        ("analysis_decompile", "Decompile a function in a connected IDA/Ghidra database. Address is STATIC, not a runtime VA.",
+        ("analysis_decompile", "Decompile a function in a connected IDA/Ghidra/Binary Ninja/iaito database. Address is STATIC, not a runtime VA.",
          json!({"target": target, "address": address_schema()}), json!(["target", "address"])),
         ("analysis_functions", "List a bounded page of functions from a connected static-analysis database.",
          json!({"target": target, "offset": integer_schema(0, 1_000_000), "limit": integer_schema(1, 100)}), json!(["target"])),
@@ -190,7 +191,9 @@ fn fallback_permission(name: &str) -> Option<&'static str> {
         "memory_write" => Some("process_write"),
         "kernel_read" | "kernel_base" => Some("kernel_read"),
         "kernel_write" => Some("kernel_write"),
-        "debug_attach" | "debug_control" | "debug_breakpoint" | "debug_watchpoint" | "debug_step" | "debug_run" | "debug_registers_set" => Some("debug_control"),
+        "debug_attach" | "debug_control" | "debug_breakpoint" | "debug_watchpoint" | "debug_step" | "debug_run" | "debug_registers_set" | "debug_breakpoint_load" => {
+            Some("debug_control")
+        }
         "ftp_upload" => Some("ftp_upload"),
         "sdk_build" => Some("build"),
         _ => None,

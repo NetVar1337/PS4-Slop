@@ -201,7 +201,7 @@ class SessionHub:
 
 def analysis_tools():
     from .tools import ADDRESS, integer, text
-    target = text("Live static-analysis application", enum=["ida", "ghidra"])
+    target = text("Live static-analysis application", enum=["ida", "ghidra", "binja", "iaito"])
     operations = [
         ("analysis_status", "Connected IDA/Ghidra analysis agents; no application is launched automatically.", {}, []),
         ("analysis_decompile", "Decompile a function in a connected IDA/Ghidra database. Address is STATIC, not a runtime VA.",

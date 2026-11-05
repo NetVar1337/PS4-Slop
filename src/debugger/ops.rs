@@ -324,6 +324,23 @@ impl Debugger {
             {
                 entry["branch_target_symbol"] = json!(label);
             }
+            if let Some(label) = self
+                .labels
+                .iter()
+                .find(|(_, value)| **value == item.address)
+                .map(|(name, _)| name.clone())
+            {
+                entry["label"] = json!(label);
+            }
+            if let Some(target) = item.branch_target
+                && let Some(label) = self
+                    .labels
+                    .iter()
+                    .find(|(_, value)| **value == target)
+                    .map(|(name, _)| name.clone())
+            {
+                entry["branch_target_label"] = json!(label);
+            }
             if self.breakpoints.values().any(|record| record.enabled && record.address == item.address) {
                 entry["breakpoint"] = json!(true);
             }
@@ -696,6 +713,241 @@ impl Debugger {
             "rbp":format!("{rbp:#x}"),"frames":frames,"frame_pointer_complete":chain_complete,
             "stack_scanned_bytes":scanned,
             "note":"Heuristic unwind (frame-pointer chain plus stack scan); verify frames against disassembly"}))
+    }
+
+    // ---- xrefs, search, labels, persistence --------------------------------
+
+    /// Read a code range without re-validating maps per chunk; own breakpoint
+    /// bytes are restored, same as `read_code`.
+    fn read_code_fast(&mut self, pid: u32, address: u64, length: usize) -> Result<Vec<u8>> {
+        let mut content = Vec::new();
+        for (chunk_address, chunk_length) in Self::page_chunks(address, length) {
+            content.extend(self.read_memory(pid, chunk_address, chunk_length, false)?);
+        }
+        for record in self.breakpoints.values().filter(|record| record.enabled) {
+            if let Some(original) = record.original
+                && record.address >= address
+                && ((record.address - address) as usize) < content.len()
+            {
+                content[(record.address - address) as usize] = original;
+            }
+        }
+        Ok(content)
+    }
+
+    /// Find instructions whose branch target or rip-relative memory operand is
+    /// `target`, decoded locally over readable+executable mappings (no
+    /// server-side scan). Bounded by `max_results` and `memory_bytes`.
+    pub fn code_xrefs(&mut self, pid: u32, target: u64, max_results: usize) -> Result<Value> {
+        ensure!((1..=1024).contains(&max_results), "max_results must be 1-1024");
+        Self::pid(pid)?;
+        let maps = self.maps(pid)?;
+        let entries = maps.as_array().context("Expected maps")?;
+        let mut exec = Vec::new();
+        for entry in entries {
+            let protection = entry["protection"].as_u64().unwrap_or(0);
+            if protection & 5 == 5 {
+                exec.push((
+                    entry["start"].as_u64().unwrap_or(0),
+                    entry["end"].as_u64().unwrap_or(0),
+                    entry["name"].as_str().unwrap_or("").to_owned(),
+                ));
+            }
+        }
+        let cap = self.profile.limit("memory_bytes").max(4096) as u64;
+        let mut refs = Vec::new();
+        let mut scanned = 0u64;
+        'outer: for (start, end, name) in exec {
+            if start >= end {
+                continue;
+            }
+            let length = (end - start).min(cap.saturating_sub(scanned));
+            if length == 0 {
+                break;
+            }
+            let bytes = self.read_code_fast(pid, start, length as usize)?;
+            scanned += length;
+            let mut position = 0usize;
+            while position < bytes.len() {
+                let items = disasm::decode(
+                    &bytes[position..],
+                    start + position as u64,
+                    disasm::MAX_INSTRUCTIONS,
+                );
+                if items.is_empty() {
+                    position += 1;
+                    continue;
+                }
+                let last = items.last().unwrap();
+                let consumed = ((last.address + last.length as u64) - (start + position as u64)) as usize;
+                for item in &items {
+                    if item.branch_target == Some(target) || item.memory_target == Some(target) {
+                        if refs.len() >= max_results {
+                            break 'outer;
+                        }
+                        let kind = if item.branch_target == Some(target) {
+                            match item.flow {
+                                "call" | "indirect_call" => "call",
+                                _ => "jump",
+                            }
+                        } else {
+                            "rip_relative"
+                        };
+                        refs.push(json!({"address":format!("{:#x}",item.address),"module":name,
+                            "instruction":item.text,"kind":kind,"target":format!("{target:#x}")}));
+                    }
+                }
+                position += consumed.max(1);
+            }
+            if scanned >= cap {
+                break;
+            }
+        }
+        let modules = self.module_bases(pid).unwrap_or_default();
+        let target_symbol = Self::annotate(target, &modules)
+            .or_else(|| self.labels.iter().find(|(_, value)| **value == target).map(|(name, _)| name.clone()));
+        Ok(json!({"target":format!("{target:#x}"),"target_symbol":target_symbol,
+            "references":refs,"count":refs.len(),"scanned_bytes":scanned,
+            "truncated":refs.len() >= max_results || scanned >= cap,
+            "note":"Decoded locally over readable+executable mappings with own int3 bytes masked; bounded by memory_bytes"}))
+    }
+
+    /// Live pattern search (hex bytes with ?? wildcards) over a bounded range,
+    /// chunked by page; the scan itself runs locally on the captured bytes.
+    pub fn memory_search(
+        &mut self,
+        pid: u32,
+        address: u64,
+        length: usize,
+        pattern: &str,
+        max_matches: usize,
+    ) -> Result<Value> {
+        ensure!((1..=4096).contains(&max_matches), "max_matches must be 1-4096");
+        address_range(address, length, self.profile.limit("memory_bytes"))?;
+        let mut matches = Vec::new();
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        for (chunk_address, chunk_length) in Self::page_chunks(address, length) {
+            let content = self.read_memory(pid, chunk_address, chunk_length, false)?;
+            scanned += chunk_length;
+            let found = crate::analysis::scan_pattern_at(
+                &content,
+                pattern,
+                chunk_address,
+                max_matches - matches.len(),
+            )?;
+            if let Some(items) = found["matches"].as_array() {
+                for item in items {
+                    matches.push(item.clone());
+                }
+            }
+            if matches.len() >= max_matches {
+                truncated = true;
+                break;
+            }
+        }
+        Ok(json!({"address":format!("{address:#x}"),"length":length,"pattern":pattern,
+            "matches":matches,"count":matches.len(),"scanned_bytes":scanned,"truncated":truncated,
+            "note":"Local scan of chunked reads; a match spanning a 4 KiB chunk boundary is not found"}))
+    }
+
+    // ---- labels ------------------------------------------------------------
+
+    pub fn label_set(&mut self, name: &str, address: u64) -> Result<Value> {
+        let bytes = name.as_bytes();
+        ensure!(
+            !name.is_empty()
+                && name.len() <= 128
+                && (bytes[0].is_ascii_alphabetic() || matches!(bytes[0], b'_' | b'$' | b'@'))
+                && bytes.iter().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'$' | b'@')
+                }),
+            "Invalid label name (use [A-Za-z_$@][A-Za-z0-9_.$@]*, max 128 chars)"
+        );
+        self.labels.insert(name.to_ascii_lowercase(), address);
+        Ok(json!({"name":name.to_ascii_lowercase(),"address":format!("{address:#x}"),"labels":self.label_list()}))
+    }
+
+    pub fn label_remove(&mut self, name: &str) -> Result<Value> {
+        let removed = self.labels.remove(&name.to_ascii_lowercase());
+        Ok(json!({"name":name.to_ascii_lowercase(),"removed":removed.is_some(),"labels":self.label_list()}))
+    }
+
+    pub fn label_list(&self) -> Value {
+        json!(self
+            .labels
+            .iter()
+            .map(|(name, value)| json!({"name":name,"address":format!("{value:#x}")}))
+            .collect::<Vec<_>>())
+    }
+
+    // ---- breakpoint / watchpoint persistence -------------------------------
+
+    /// Export tracked breakpoints and watchpoints as a versioned JSON document
+    /// that `breakpoints_import` can re-apply.
+    pub fn breakpoints_export(&self) -> Value {
+        json!({"version":1,"breakpoints":self.breakpoint_list(),
+            "watchpoints":self.watchpoint_list()})
+    }
+
+    /// Re-apply a document produced by `breakpoints_export`. Console-mutating:
+    /// requires the debug_control permission and qualification.
+    pub fn breakpoints_import(&mut self, document: &Value) -> Result<Value> {
+        self.require_qualified_debugger("debug_control")?;
+        ensure!(document["version"] == 1, "Unsupported breakpoint document version");
+        let breakpoints = document["breakpoints"].as_array().context("breakpoints array required")?;
+        let watchpoints = document["watchpoints"].as_array().context("watchpoints array required")?;
+        ensure!(
+            breakpoints.len() <= 30 && watchpoints.len() <= 4,
+            "Document exceeds slot counts"
+        );
+        let mut applied = Vec::new();
+        for entry in breakpoints {
+            if entry["enabled"].as_bool() == Some(false) {
+                continue;
+            }
+            let index = entry["index"].as_u64().context("breakpoint index")? as u32;
+            let address = parse_hex(&entry["address"]).context("breakpoint address")?;
+            if self.breakpoints.contains_key(&index) {
+                self.breakpoint(index, 0, false)?;
+                self.breakpoints.remove(&index);
+            }
+            self.breakpoint_ex(
+                index,
+                address,
+                true,
+                entry["condition"].as_str().map(str::to_owned),
+                entry["log"].as_str().map(str::to_owned),
+                entry["stop_after"].as_u64().unwrap_or(0),
+            )?;
+            applied.push(json!({"kind":"breakpoint","index":index,"address":format!("{address:#x}")}));
+        }
+        for entry in watchpoints {
+            if entry["enabled"].as_bool() == Some(false) {
+                continue;
+            }
+            let index = entry["index"].as_u64().context("watchpoint index")? as u32;
+            let address = parse_hex(&entry["address"]).context("watchpoint address")?;
+            let length = entry["length"].as_u64().context("watchpoint length")? as u32;
+            let access = entry["access"].as_str().context("watchpoint access")?;
+            if self.watchpoints.contains_key(&index) {
+                self.watchpoint(index, 0, 1, "write", false)?;
+                self.watchpoints.remove(&index);
+            }
+            self.watchpoint(index, address, length, access, true)?;
+            applied.push(json!({"kind":"watchpoint","index":index,"address":format!("{address:#x}")}));
+        }
+        Ok(json!({"applied":applied,"count":applied.len(),
+            "breakpoints":self.breakpoint_list(),"watchpoints":self.watchpoint_list()}))
+    }
+
+    pub fn watchpoint_list(&self) -> Value {
+        json!(self
+            .watchpoints
+            .values()
+            .map(|record| json!({"index":record.index,"address":format!("{:#x}",record.address),
+                "length":record.length,"access":record.access,"enabled":record.enabled}))
+            .collect::<Vec<_>>())
     }
 }
 
