@@ -154,3 +154,58 @@ Matches are searched as bytes and as little/big-endian 16/32/64-bit words.
 Confidence: `high` full table; `medium` full but short/generic constant or ≥ 50 %
 of a table; `low` shorter partial or sparse immediates. Filter with
 `min_confidence`; cap with `max_results`.
+
+## `source_dump`
+
+Source-engine runtime metadata: Valve Source and forks such as Respawn's engine
+(Titanfall / Apex Legends). Live (`pid`, default module `eboot.bin`) or a mapped
+artifact (an `elf_rebuild` / `memory_elf_dump` ELF, or a raw dump with `base`).
+
+Recovered structures:
+
+| Section | Structure | Output |
+|---|---|---|
+| `client_classes` | `ClientClass` linked list | name, class id, RecvTable name, address |
+| `recv_tables` | `RecvTable` / `RecvProp` (nested via the data-table pointer) | prop name, offset, raw type, nested table |
+| `datamaps` | `datamap_t` / `typedescription_t` | class, base class, field name, offset, raw type |
+| `convars` | `ConCommandBase` linked list | name, help text (flags only when the layout is SDK 2013) |
+| `interfaces` | `InterfaceReg` linked list | version name (`VClient018`), create function |
+
+**Nothing about the layout is assumed.** Forks reorder and extend these structs,
+and the PS4 builds have not been checked here, so every field offset is
+inferred:
+
+1. Classified identifier strings are indexed in the module's non-executable
+   ranges (`C*` class names, `DT_*` tables, `m_*` members, cvar-style names,
+   `Name###` interfaces), then aligned pointers to them are located.
+2. Linked lists: every (name, next) offset pair is scored by how many valid
+   links it produces from the anchors; whole chains (including non-anchor
+   members such as `quit`) are then walked from their heads.
+3. Pointer fields (RecvTable, nested table, base map, help text, create
+   function) are chosen by what they point at; integer fields (class id, prop
+   and field offsets, types) by value statistics (distinct, aligned, small enum).
+4. Arrays (RecvProp, typedescription): stride and name offset are validated
+   over whole arrays. Datamap layouts that validate equally when shifted are
+   disambiguated by base-map pointers (which point at true struct starts).
+
+`layouts` in the result reports every chosen offset with `confidence`, runner-up
+`*_alternatives`, and `layout_matches_sdk2013` (the public Source SDK 2013 64-bit
+layout, used only as a label). Pin any offset with `layout` (`cc_*`, `rt_*`,
+`rp_*`, `dm_*`, `td_*`, `cv_*`, `if_*`); a pinned offset is used as given, never
+replaced by inference. `heuristics` explains each decision.
+
+Outputs: a `ps4wb-source-v1` JSON artifact and a text listing (classes, tables
+with nested references, datamaps, convars, interfaces). Offsets in RecvTables
+are relative to their own table; nested tables (`baseclass`, `m_Local`, …) are
+listed separately rather than flattened.
+
+Limits and caveats:
+
+* Type values are raw: the SDK 2013 `SendPropType` names are shown only as a
+  hint in the listing; forks use different enums.
+* Live runs read the module's non-executable ranges twice (strings, then
+  pointers), plus once more for datamaps, against `max_bytes` (clamped to
+  `transfer_bytes`); check `source.budget_exhausted`.
+* ConVar flags and default values are only reported for the SDK 2013 layout.
+* Verified on synthetic images in the SDK 2013 layout and a reshuffled layout,
+  and live through the protocol fixture; **not yet run against a real PS4 game**.

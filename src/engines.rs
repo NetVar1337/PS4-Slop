@@ -14,6 +14,7 @@ pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option
         "rtti_recover" => crate::rtti::run(workbench, args),
         "yara_scan" => crate::yara::run(workbench, args),
         "crypto_scan" => crate::cryptoscan::run(workbench, args),
+        "source_dump" => crate::source_engine::run(workbench, args),
         _ => return None,
     })
 }

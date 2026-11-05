@@ -1,135 +1,685 @@
 [
-  {
-    "name": "il2cpp_dump",
-    "description": "Unity IL2CPP metadata recovery: parse global-metadata.dat (magic 0xFAB11BAF, versions 24.0-29) from an artifact or locate it in live memory (pid; validated header), optionally map method pointers to RVAs by locating Il2CppCodeRegistration code-gen modules (or <=24.1 method pointer array) in the game binary (ELF/raw artifact or pid+module), with explicit address/version overrides. Saves a dump.cs-like text and a ps4wb-il2cpp-v1 JSON (methods with rva/name/class/namespace/signature, types, string literals). Read-only.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "metadata_artifact": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "global-metadata.dat artifact (relative path)"},
-        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647, "description": "Live process: search readable maps for the metadata (unless metadata_artifact is given) and/or read the binary module"},
-        "metadata_address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Explicit live address of the metadata header (skips the search)"},
-        "binary_artifact": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "Decrypted game ELF (mapped by PT_LOAD with relocations) or raw memory dump (see binary_base)"},
-        "binary_base": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Load address of a raw binary dump artifact"},
-        "module": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Live binary module name (with pid), e.g. eboot.bin"},
-        "version": {"type": "number", "minimum": 24, "maximum": 29, "description": "Override metadata version (e.g. 24.1, 24.2, 27)"},
-        "code_gen_modules": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Override: address of the Il2CppCodeGenModule* array (v24.2+)"},
-        "method_pointers": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Override: address of the global methodPointers array (v24.0/24.1)"},
-        "metadata_registration": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Override: address of Il2CppMetadataRegistration (enables type names)"},
-        "include_dump_cs": {"type": "boolean", "description": "Also save the dump.cs-like text (default true)"},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 17179869184, "description": "Live byte budget (clamped to the profile transfer_bytes)"}
-      },
-      "additionalProperties": false
+ {
+  "name": "il2cpp_dump",
+  "description": "Unity IL2CPP metadata recovery: parse global-metadata.dat (magic 0xFAB11BAF, versions 24.0-29) from an artifact or locate it in live memory (pid; validated header), optionally map method pointers to RVAs by locating Il2CppCodeRegistration code-gen modules (or <=24.1 method pointer array) in the game binary (ELF/raw artifact or pid+module), with explicit address/version overrides. Saves a dump.cs-like text and a ps4wb-il2cpp-v1 JSON (methods with rva/name/class/namespace/signature, types, string literals). Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "metadata_artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "global-metadata.dat artifact (relative path)"
     },
-    "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
-    "permission": null
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Live process: search readable maps for the metadata (unless metadata_artifact is given) and/or read the binary module"
+    },
+    "metadata_address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Explicit live address of the metadata header (skips the search)"
+    },
+    "binary_artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Decrypted game ELF (mapped by PT_LOAD with relocations) or raw memory dump (see binary_base)"
+    },
+    "binary_base": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address of a raw binary dump artifact"
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live binary module name (with pid), e.g. eboot.bin"
+    },
+    "version": {
+     "type": "number",
+     "minimum": 24,
+     "maximum": 29,
+     "description": "Override metadata version (e.g. 24.1, 24.2, 27)"
+    },
+    "code_gen_modules": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Override: address of the Il2CppCodeGenModule* array (v24.2+)"
+    },
+    "method_pointers": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Override: address of the global methodPointers array (v24.0/24.1)"
+    },
+    "metadata_registration": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Override: address of Il2CppMetadataRegistration (enables type names)"
+    },
+    "include_dump_cs": {
+     "type": "boolean",
+     "description": "Also save the dump.cs-like text (default true)"
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184,
+     "description": "Live byte budget (clamped to the profile transfer_bytes)"
+    }
+   },
+   "additionalProperties": false
   },
-  {
-    "name": "unreal_dump",
-    "description": "Unreal Engine name/object recovery from live memory (pid [+ module]) or a raw memory-dump artifact: locate GNames (UE4 <4.23 TNameEntryArray or 4.23+/UE5 FNamePool) via the 'None','ByteProperty' first-entries heuristic or explicit gnames, walk GObjects (FUObjectArray chunked) for class/outer names, and optionally emit a best-effort SDK-style class/property listing (UStruct/FProperty offsets overridable). Bounded counts. Read-only.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "Raw memory dump artifact (pointers must resolve inside it)"},
-        "base": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Load address of the dump artifact"},
-        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
-        "module": {"type": "string", "minLength": 1, "maxLength": 256, "description": "Live module whose writable data holds GNames/GObjects (default: search all writable maps)"},
-        "gnames": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Override: FNamePool Blocks[0] slot address (name_pool) or TNameEntryArray address (name_array)"},
-        "gnames_kind": {"type": "string", "enum": ["auto", "name_pool", "name_array"]},
-        "gobjects": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Override: address of FUObjectArray (GUObjectArray)"},
-        "version": {"type": "string", "maxLength": 16, "pattern": "^[45](\\.[0-9]{1,2}){0,2}$", "description": "Engine version hint, e.g. 4.22, 4.27, 5.1"},
-        "max_names": {"type": "integer", "minimum": 1, "maximum": 2000000},
-        "max_objects": {"type": "integer", "minimum": 1, "maximum": 2000000},
-        "sdk": {"type": "boolean", "description": "Emit best-effort class/property listing (default true)"},
-        "offsets": {
-          "type": "object",
-          "description": "Layout overrides (bytes)",
-          "properties": {
-            "object_class": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "object_name": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "object_outer": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "objobjects": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "item_size": {"type": "integer", "minimum": 8, "maximum": 256},
-            "name_entry_string": {"type": "integer", "minimum": 0, "maximum": 64},
-            "struct_super": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "struct_children": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "struct_child_properties": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "struct_size": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "field_next": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "field_name": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "field_class": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "property_element_size": {"type": "integer", "minimum": 0, "maximum": 4096},
-            "property_offset": {"type": "integer", "minimum": 0, "maximum": 4096}
-          },
-          "additionalProperties": false
-        },
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 17179869184}
-      },
-      "additionalProperties": false
-    },
-    "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
   },
-  {
-    "name": "rtti_recover",
-    "description": "Itanium C++ ABI RTTI/vtable recovery over an ELF artifact (PT_LOAD mapping, relocations applied), raw dump (base) or pid+module: finds class/si/vmi type_info objects structurally, demangles class names (subset; keeps mangled when unsure), recovers inheritance and vtables with virtual function RVAs. Saves ps4wb-classes-v1 JSON. Read-only.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {"type": "string", "minLength": 1, "maxLength": 1024},
-        "base": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Load address for raw (non-ELF) artifacts"},
-        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
-        "module": {"type": "string", "minLength": 1, "maxLength": 256},
-        "class_typeinfo_vtable": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Override: vptr value of __class_type_info objects"},
-        "si_typeinfo_vtable": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
-        "vmi_typeinfo_vtable": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
-        "max_classes": {"type": "integer", "minimum": 1, "maximum": 1000000},
-        "max_virtuals": {"type": "integer", "minimum": 1, "maximum": 8192},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 17179869184}
-      },
-      "additionalProperties": false
+  "permission": null
+ },
+ {
+  "name": "unreal_dump",
+  "description": "Unreal Engine name/object recovery from live memory (pid [+ module]) or a raw memory-dump artifact: locate GNames (UE4 <4.23 TNameEntryArray or 4.23+/UE5 FNamePool) via the 'None','ByteProperty' first-entries heuristic or explicit gnames, walk GObjects (FUObjectArray chunked) for class/outer names, and optionally emit a best-effort SDK-style class/property listing (UStruct/FProperty offsets overridable). Bounded counts. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Raw memory dump artifact (pointers must resolve inside it)"
     },
-    "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
-    "permission": null
+    "base": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address of the dump artifact"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live module whose writable data holds GNames/GObjects (default: search all writable maps)"
+    },
+    "gnames": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Override: FNamePool Blocks[0] slot address (name_pool) or TNameEntryArray address (name_array)"
+    },
+    "gnames_kind": {
+     "type": "string",
+     "enum": [
+      "auto",
+      "name_pool",
+      "name_array"
+     ]
+    },
+    "gobjects": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Override: address of FUObjectArray (GUObjectArray)"
+    },
+    "version": {
+     "type": "string",
+     "maxLength": 16,
+     "pattern": "^[45](\\.[0-9]{1,2}){0,2}$",
+     "description": "Engine version hint, e.g. 4.22, 4.27, 5.1"
+    },
+    "max_names": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2000000
+    },
+    "max_objects": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2000000
+    },
+    "sdk": {
+     "type": "boolean",
+     "description": "Emit best-effort class/property listing (default true)"
+    },
+    "offsets": {
+     "type": "object",
+     "description": "Layout overrides (bytes)",
+     "properties": {
+      "object_class": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "object_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "object_outer": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "objobjects": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "item_size": {
+       "type": "integer",
+       "minimum": 8,
+       "maximum": 256
+      },
+      "name_entry_string": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 64
+      },
+      "struct_super": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "struct_children": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "struct_child_properties": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "struct_size": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "field_next": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "field_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "field_class": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "property_element_size": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "property_offset": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      }
+     },
+     "additionalProperties": false
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184
+    }
+   },
+   "additionalProperties": false
   },
-  {
-    "name": "yara_scan",
-    "description": "YARA-subset scan (text/hex/regex strings with nocase/wide/ascii/fullword/private; any/all/N/N% of them or ($a*), $a, $a at/in, #a, @a[i], !a[i], and/or/not, arithmetic, filesize, rule references) over an artifact (file bytes) or pid + module / address+length (chunked with overlap). Unsupported syntax is rejected with a clear error. Read-only.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "rules": {"type": "string", "minLength": 1, "maxLength": 1048576, "description": "Rules text"},
-        "rules_artifact": {"type": "string", "minLength": 1, "maxLength": 1024},
-        "artifact": {"type": "string", "minLength": 1, "maxLength": 1024},
-        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
-        "module": {"type": "string", "minLength": 1, "maxLength": 256},
-        "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
-        "length": {"type": "integer", "minimum": 1, "maximum": 17179869184},
-        "max_matches": {"type": "integer", "minimum": 1, "maximum": 100000},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 17179869184}
-      },
-      "additionalProperties": false
-    },
-    "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
   },
-  {
-    "name": "crypto_scan",
-    "description": "FindCrypt-style constant detection (AES S-box/inverse/Te/Td/rcon, SHA-1/224/256/384/512 init and K tables, MD5 T, CRC-32/CRC-32C tables, DEFLATE tables, ChaCha/Salsa sigma/tau, Blowfish P/S init, PKCS#1 DigestInfo/RSA OID/PEM markers, sparse immediates) in bytes and little/big-endian words over an artifact or pid + module / address+length. Reports algorithm, location and confidence. Read-only.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {"type": "string", "minLength": 1, "maxLength": 1024},
-        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
-        "module": {"type": "string", "minLength": 1, "maxLength": 256},
-        "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
-        "length": {"type": "integer", "minimum": 1, "maximum": 17179869184},
-        "max_results": {"type": "integer", "minimum": 1, "maximum": 100000},
-        "min_confidence": {"type": "string", "enum": ["low", "medium", "high"]},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 17179869184}
-      },
-      "additionalProperties": false
+  "permission": null
+ },
+ {
+  "name": "rtti_recover",
+  "description": "Itanium C++ ABI RTTI/vtable recovery over an ELF artifact (PT_LOAD mapping, relocations applied), raw dump (base) or pid+module: finds class/si/vmi type_info objects structurally, demangles class names (subset; keeps mangled when unsure), recovers inheritance and vtables with virtual function RVAs. Saves ps4wb-classes-v1 JSON. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024
     },
-    "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
-    "permission": null
-  }
+    "base": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address for raw (non-ELF) artifacts"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "class_typeinfo_vtable": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Override: vptr value of __class_type_info objects"
+    },
+    "si_typeinfo_vtable": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "vmi_typeinfo_vtable": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "max_classes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1000000
+    },
+    "max_virtuals": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 8192
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184
+    }
+   },
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "yara_scan",
+  "description": "YARA-subset scan (text/hex/regex strings with nocase/wide/ascii/fullword/private; any/all/N/N% of them or ($a*), $a, $a at/in, #a, @a[i], !a[i], and/or/not, arithmetic, filesize, rule references) over an artifact (file bytes) or pid + module / address+length (chunked with overlap). Unsupported syntax is rejected with a clear error. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "rules": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1048576,
+     "description": "Rules text"
+    },
+    "rules_artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184
+    },
+    "max_matches": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100000
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184
+    }
+   },
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "crypto_scan",
+  "description": "FindCrypt-style constant detection (AES S-box/inverse/Te/Td/rcon, SHA-1/224/256/384/512 init and K tables, MD5 T, CRC-32/CRC-32C tables, DEFLATE tables, ChaCha/Salsa sigma/tau, Blowfish P/S init, PKCS#1 DigestInfo/RSA OID/PEM markers, sparse immediates) in bytes and little/big-endian words over an artifact or pid + module / address+length. Reports algorithm, location and confidence. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100000
+    },
+    "min_confidence": {
+     "type": "string",
+     "enum": [
+      "low",
+      "medium",
+      "high"
+     ]
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 17179869184
+    }
+   },
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "source_dump",
+  "description": "Source-engine metadata recovery (Valve Source and forks such as Respawn's Titanfall/Apex Legends engine) from live memory (pid + module, default eboot.bin) or a mapped artifact (ELF, or raw dump with base): ClientClass list (names, class ids, RecvTables), nested RecvTable/RecvProp network tables (names, offsets, raw types), datamap_t/typedescription_t data descriptions, ConVar/ConCommand list and InterfaceReg (CreateInterface) list. Field layouts are inferred from how anchor strings link up (never assumed); results include the chosen layout per structure with confidence and alternatives, and every offset can be pinned via `layout`. Saves a JSON artifact and a text listing. Read-only.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Module ELF artifact (e.g. elf_rebuild output) or raw memory dump (with base)"
+    },
+    "base": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address of a raw dump artifact"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live module to search (default eboot.bin)"
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 4096,
+     "maximum": 4294967296,
+     "description": "Live read budget (clamped to the profile transfer_bytes)"
+    },
+    "sections": {
+     "type": "array",
+     "minItems": 1,
+     "maxItems": 5,
+     "uniqueItems": true,
+     "items": {
+      "type": "string",
+      "enum": [
+       "client_classes",
+       "recv_tables",
+       "datamaps",
+       "convars",
+       "interfaces"
+      ]
+     },
+     "description": "Default: all"
+    },
+    "layout": {
+     "type": "object",
+     "additionalProperties": false,
+     "description": "Pin field offsets (bytes) instead of inferring them: cc_* ClientClass, rt_* RecvTable, rp_* RecvProp, dm_* datamap_t, td_* typedescription_t, cv_* ConCommandBase, if_* InterfaceReg",
+     "properties": {
+      "cc_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "cc_next": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "cc_recv_table": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "cc_class_id": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rt_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rt_props": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rt_count": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rp_stride": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rp_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rp_offset": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rp_type": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "rp_data_table": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "dm_desc": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "dm_count": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "dm_class": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "dm_base": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "td_stride": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "td_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "td_offset": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "td_type": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "cv_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "cv_next": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "cv_help": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "if_name": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "if_next": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      },
+      "if_create": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 4096
+      }
+     }
+    },
+    "max_classes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 65536,
+     "description": "Default 4096"
+    },
+    "max_tables": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 65536,
+     "description": "Default 8192"
+    },
+    "max_props": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2000000,
+     "description": "Default 500000"
+    },
+    "max_datamaps": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 65536,
+     "description": "Default 8192"
+    },
+    "max_convars": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Default 20000"
+    },
+    "max_interfaces": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 65536,
+     "description": "Default 1024"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
+  },
+  "permission": null
+ }
 ]
