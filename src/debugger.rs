@@ -7,6 +7,9 @@ use std::{
     time::Instant,
 };
 
+mod ops;
+pub use ops::BreakpointRecord;
+
 pub const MAGIC: u32 = 0xffaabbcc;
 pub const SUCCESS: u32 = 0x80000000;
 pub const EVENT_SIZE: usize = 1184;
@@ -78,6 +81,9 @@ pub struct Debugger {
     deadline: Instant,
     pub identity: Option<Value>,
     pub attached_pid: Option<u32>,
+    pub breakpoints: std::collections::BTreeMap<u32, BreakpointRecord>,
+    stash: Vec<Value>,
+    pub labels: std::collections::BTreeMap<String, u64>,
 }
 
 impl Debugger {
@@ -90,6 +96,9 @@ impl Debugger {
             deadline: Instant::now(),
             identity: None,
             attached_pid: None,
+            breakpoints: Default::default(),
+            stash: Vec::new(),
+            labels: Default::default(),
         }
     }
 
@@ -98,6 +107,7 @@ impl Debugger {
         self.events = None;
         self.identity = None;
         self.attached_pid = None;
+        self.breakpoints.clear();
         self.event_buffer.clear();
     }
 
@@ -475,8 +485,15 @@ impl Debugger {
         self.session()?;
         self.list(0xbdbb0005, &[], 4, |data| Ok(json!(word(data, 0))))
     }
-    pub fn thread_info(&mut self, _thread_id: u32) -> Result<Value> {
-        bail!("Thread-info command is not exposed by pinned protocol")
+    pub fn thread_info(&mut self, thread_id: u32) -> Result<Value> {
+        self.session()?;
+        Self::pid(thread_id)?;
+        self.exchange_read(|debugger| {
+            debugger.packet(0xbdbb0011, &thread_id.to_le_bytes())?;
+            debugger.status()?;
+            let data = debugger.read(40)?;
+            Ok(json!({"thread_id":word(&data,0),"priority":word(&data,4),"name":cstring(&data[8..40])}))
+        })
     }
     pub fn get_registers(&mut self, thread_id: u32) -> Result<Value> {
         self.session()?;
@@ -576,6 +593,12 @@ impl Debugger {
 
     pub fn poll_events(&mut self) -> Result<Value> {
         self.session()?;
+        let mut result = std::mem::take(&mut self.stash);
+        result.extend(self.read_events()?);
+        Ok(json!(result))
+    }
+
+    fn read_events(&mut self) -> Result<Vec<Value>> {
         let mut result = Vec::new();
         while result.len() < 16 {
             while self.event_buffer.len() < EVENT_SIZE {
@@ -589,7 +612,7 @@ impl Debugger {
                     Ok(0) => bail!("Debug callback disconnected; inspect console state"),
                     Ok(count) => self.event_buffer.extend(&buffer[..count]),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        return Ok(json!(result));
+                        return Ok(result);
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -597,7 +620,7 @@ impl Debugger {
             let data = std::mem::take(&mut self.event_buffer);
             result.push(json!({"thread_id":word(&data,0),"status":word(&data,4),"name":cstring(&data[8..48]),"registers":registers(&data[48..224])?,"raw_hex":hex::encode(data)}));
         }
-        Ok(json!(result))
+        Ok(result)
     }
 }
 
