@@ -35,3 +35,10 @@ pub mod orbisdyn;
 pub mod elfrebuild;
 pub mod coredump;
 pub mod snapstore;
+// Engine & metadata recovery area (src/engines.rs).
+pub mod bytesource;
+pub mod il2cpp;
+pub mod unreal;
+pub mod rtti;
+pub mod yara;
+pub mod cryptoscan;

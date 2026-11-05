@@ -1456,6 +1456,7 @@ dependencies = [
 name = "ps4-debugmcps"
 version = "0.3.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "axum",
  "clap",
