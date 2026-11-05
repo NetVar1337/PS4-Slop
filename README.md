@@ -96,7 +96,7 @@ the running exe aside) before `cargo build --release`.
 
 ## Tool groups
 
-There are **111 standalone tools**, **82 visible with the default read-only profile**.
+There are **112 standalone tools**, **83 visible with the default read-only profile**.
 Shared broker mode adds **15 static-analysis, synchronization & application tools** plus
 3 session-observer tools. Run `tools` for the complete, machine-readable schemas and
 current policy-filtered tool list. Every tool has exactly one implementation (Rust);
@@ -174,7 +174,8 @@ Reverse-engineering suite (each area documented in `docs/features/`):
   (`memory_snapshot_capture`/`_list`/`_timeline`).
 - **Engine & metadata recovery** ([engines.md](docs/features/engines.md)): `il2cpp_dump`
   (global-metadata v24–29 + registrations), `unreal_dump` (GNames/GObjects, FNamePool and
-  TNameEntryArray), `rtti_recover` (Itanium typeinfo/vtables/inheritance), `yara_scan`
+  TNameEntryArray), `rtti_recover` (Itanium typeinfo/vtables/inheritance), `source_dump` (Source / Respawn
+  ClientClass, RecvTable netvars, datamaps, ConVars, interfaces with inferred layouts), `yara_scan`
   (YARA-subset engine) and `crypto_scan` (FindCrypt-style constants), over artifacts or live memory.
 - **Tracing & coverage** ([trace.md](docs/features/trace.md)): `debug_trace_imports`
   (ltrace-like API trace), `debug_trace_syscalls`, `debug_trace_function` (args, caller,

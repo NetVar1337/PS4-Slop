@@ -42,6 +42,7 @@ pub mod unreal;
 pub mod rtti;
 pub mod yara;
 pub mod cryptoscan;
+pub mod source_engine;
 // trace area (run-loop tracing & coverage)
 pub mod tracekit;
 // Access/crash/pointer/struct/script feature area.
