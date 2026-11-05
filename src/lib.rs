@@ -20,5 +20,12 @@ pub mod broker;
 pub mod client;
 pub mod rsp;
 pub mod mcp;
+pub mod extensions;
+pub mod dumping;
+pub mod engines;
+pub mod dyntrace;
+pub mod dynaccess;
+pub mod binstatic;
+pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;

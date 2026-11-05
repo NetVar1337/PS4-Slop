@@ -28,7 +28,7 @@ pub const MAX_CONNECTIONS: usize = 32;
 pub const MAX_INLINE_RESULT: usize = 24_576;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 pub const PUMP_INTERVAL: Duration = Duration::from_millis(50);
-pub const CONTROL_TOOLS: [&str; 18] = [
+pub const CONTROL_TOOLS: &[&str] = &[
     "debug_attach",
     "debug_control",
     "debug_breakpoint",
@@ -47,6 +47,26 @@ pub const CONTROL_TOOLS: [&str; 18] = [
     "memory_alloc",
     "memory_free",
     "memory_protect",
+    // Run-loop tools: each resumes the target and owns execution until it stops.
+    "debug_trace_imports",
+    "debug_trace_syscalls",
+    "debug_trace_function",
+    "debug_coverage",
+    "debug_find_accesses",
+    "debug_crash_triage",
+    "debug_run_script",
+];
+
+/// Control tools that resume the target (the broker reports `running` while they execute).
+pub const RESUMING_TOOLS: &[&str] = &[
+    "debug_run",
+    "debug_trace_imports",
+    "debug_trace_syscalls",
+    "debug_trace_function",
+    "debug_coverage",
+    "debug_find_accesses",
+    "debug_crash_triage",
+    "debug_run_script",
 ];
 const MAX_TOKEN_FILE: u64 = 1024;
 const SAFE_INTEGER: i128 = 9_007_199_254_740_991;
@@ -679,7 +699,7 @@ impl SessionHub {
                 state.session_id = Some(uuid::Uuid::new_v4().simple().to_string());
                 state.execution_state = "attaching";
                 state.last_stop = Value::Null;
-            } else if name == "debug_run"
+            } else if RESUMING_TOOLS.contains(&name)
                 || (matches!(name, "debug_control" | "debug_step")
                     && matches!(
                         arguments.get("action").and_then(Value::as_str),

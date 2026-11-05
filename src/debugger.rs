@@ -8,6 +8,10 @@ use std::{
 };
 
 mod ops;
+/// Run-loop tracing: import/syscall/function tracing and breakpoint coverage.
+pub mod trace;
+/// Access finding (watchpoints), crash triage and host-scripted breakpoints.
+pub mod access;
 pub use ops::{BreakpointRecord, PatchRecord, parse_protection_spec};
 
 #[derive(Debug, Clone)]
@@ -711,6 +715,48 @@ pub mod fake {
         pub connections: Arc<AtomicUsize>,
     }
 
+    /// The pinned protocol fixes the debug callback port at 755: every test that
+    /// attaches must hold this guard for its whole lifetime.
+    static CALLBACK_PORT: Mutex<()> = Mutex::new(());
+
+    /// Serialize use of callback port 755; `None` when this host cannot bind it
+    /// (unprivileged-port floor), in which case the caller should skip.
+    pub fn callback_port_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+        let guard = CALLBACK_PORT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if TcpListener::bind(("127.0.0.1", 755)).is_err() {
+            eprintln!("skipping: cannot bind the fixed callback port 755 on this host");
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// A profile pointing at a fake on `port`, with `debug_control` and
+    /// `process_write` enabled and a matching local qualification record.
+    pub fn qualified_profile(directory: &std::path::Path, port: u16) -> Profile {
+        let mut data: Value =
+            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        data["host"] = json!("127.0.0.1");
+        data["artifact_directory"] = json!("artifacts");
+        data["qualification_file"] = json!("qualification.json");
+        data["ports"]["debug"] = json!(port);
+        data["permissions"]["debug_control"] = json!(true);
+        data["permissions"]["process_write"] = json!(true);
+        data["jailbreak"]["installed_commit"] = json!("a".repeat(40));
+        data["jailbreak"]["hen_build"] = json!("test-hen");
+        data["debugger"]["expected_brand"] = json!("ps4debug-NG by Pharaoh2k v1.3.4");
+        data["debugger"]["payload_sha256"] = json!("b".repeat(64));
+        let path = directory.join("profile.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        let profile = Profile::load(path).unwrap();
+        let record = json!({
+            "profile_sha256": profile.fingerprint(), "attestation": crate::config::ATTESTATION,
+            "approved_permissions": ["debug_control", "process_write"], "debugger_payload_sha256": "b".repeat(64),
+            "payload_sha256_allowlist": [], "build_recipe_sha256_allowlist": [],
+        });
+        std::fs::write(profile.qualification_path(), record.to_string()).unwrap();
+        profile
+    }
+
     pub const FAKE_BRAND: &[u8] = b"ps4debug-NG by Pharaoh2k v1.3.4\x001.1\0";
     pub const FAKE_RIP: u64 = 0x1000;
     pub const FAKE_STACK: u64 = 0x7fff_0000;
@@ -724,25 +770,120 @@ pub mod fake {
     /// Opt-in behaviour for installed-app bridge tests: `image` mapped at `base`,
     /// a SIGTRAP stop event on attach and on halt, and single-steps that advance
     /// RIP by the decoded instruction length.
-    #[derive(Clone)]
+    ///
+    /// `program` scripts what a resume "executes" (this is not an emulator): steps
+    /// are consumed in order until one hits an enabled software breakpoint, an armed
+    /// hardware watchpoint, or raises a fault signal; that step produces one stop
+    /// event. A resume that exhausts the program produces no event (still running).
+    #[derive(Clone, Default)]
     pub struct Fixture {
         pub pid: u32,
         pub thread_id: u32,
         pub base: u64,
         pub image: Vec<u8>,
         pub rip: u64,
+        pub program: Vec<FixtureStep>,
+        /// Additional named maps `(start, end, protection bits, name)`.
+        pub extra_maps: Vec<(u64, u64, u64, String)>,
+        /// Additional memory contents `(address, bytes)` (other modules, heap, stack).
+        pub extra_memory: Vec<(u64, Vec<u8>)>,
+    }
+
+    /// One scripted instruction for [`Fixture::program`].
+    #[derive(Clone, Default, Debug)]
+    pub struct FixtureStep {
+        pub rip: u64,
+        /// Register values (by name, e.g. `rdi`, `rsp`) in effect while this step executes.
+        pub registers: Vec<(String, u64)>,
+        /// Data access `(address, length, is_write)` performed by the instruction.
+        pub access: Option<(u64, u64, bool)>,
+        /// Fault signal raised by this step (e.g. 11 = SIGSEGV); execution stops here.
+        pub signal: Option<u32>,
     }
 
     /// FreeBSD wait status for a SIGTRAP stop.
     const STOP_STATUS: u32 = 0x57f;
 
     fn fixture_event(fixture: &Fixture, registers: &[u8; 176]) -> Vec<u8> {
+        fixture_event_status(fixture, registers, STOP_STATUS)
+    }
+
+    fn fixture_event_status(fixture: &Fixture, registers: &[u8; 176], status: u32) -> Vec<u8> {
         let mut event = vec![0u8; EVENT_SIZE];
         event[..4].copy_from_slice(&fixture.thread_id.to_le_bytes());
-        event[4..8].copy_from_slice(&STOP_STATUS.to_le_bytes());
+        event[4..8].copy_from_slice(&status.to_le_bytes());
         event[8..15].copy_from_slice(b"fixture");
         event[48..224].copy_from_slice(registers);
         event
+    }
+
+    fn set_register(registers: &mut [u8; 176], name: &str, value: u64) {
+        if let Some(offset) = crate::expr::offset_of(name) {
+            registers[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn instruction_length(address: u64, fixture: &Fixture) -> u64 {
+        let code = fake_memory(address, 15, &BTreeMap::new(), Some(fixture));
+        iced_x86::Decoder::with_ip(64, &code, address, iced_x86::DecoderOptions::NONE)
+            .decode()
+            .len()
+            .max(1) as u64
+    }
+
+    /// Consume `fixture.program` until a breakpoint, watchpoint or fault produces a stop.
+    fn run_program(guard: &mut Shared, fixture: &Fixture) {
+        while guard.cursor < fixture.program.len() {
+            let step = fixture.program[guard.cursor].clone();
+            guard.cursor += 1;
+            set_register(&mut guard.registers, "rip", step.rip);
+            for (name, value) in &step.registers {
+                set_register(&mut guard.registers, name, *value);
+            }
+            let next = step.rip + instruction_length(step.rip, fixture);
+            let execute_watch = guard
+                .watchpoints
+                .iter()
+                .find(|(_, (address, _, access))| *access == 0 && *address == step.rip)
+                .map(|(index, _)| *index);
+            if guard.breakpoints.values().any(|address| *address == step.rip) {
+                // The pinned server reports the trap (rip just past int3) after stepping
+                // the thread over the original instruction.
+                let mut reported = guard.registers;
+                set_register(&mut reported, "rip", step.rip + 1);
+                set_register(&mut guard.registers, "rip", next);
+                let event = fixture_event(fixture, &reported);
+                push_event(guard, &event);
+                return;
+            }
+            if let Some(index) = execute_watch {
+                guard.dr6 = 1 << index;
+                let event = fixture_event(fixture, &guard.registers);
+                push_event(guard, &event);
+                return;
+            }
+            if let Some(signal) = step.signal {
+                let event = fixture_event_status(fixture, &guard.registers, (signal << 8) | 0x7f);
+                push_event(guard, &event);
+                return;
+            }
+            if let Some((address, length, write)) = step.access {
+                let hit = guard.watchpoints.iter().find(|(_, (start, size, access))| {
+                    address < start + size
+                        && *start < address + length
+                        && (*access == 3 || (*access == 1 && write))
+                });
+                if let Some((index, _)) = hit {
+                    // Data watchpoints trap after the accessing instruction retires.
+                    guard.dr6 = 1 << index;
+                    set_register(&mut guard.registers, "rip", next);
+                    let event = fixture_event(fixture, &guard.registers);
+                    push_event(guard, &event);
+                    return;
+                }
+            }
+            set_register(&mut guard.registers, "rip", next);
+        }
     }
 
     fn register_rip(registers: &[u8; 176]) -> u64 {
@@ -797,6 +938,11 @@ pub mod fake {
                 if let Some(value) = at.checked_sub(fixture.base).and_then(|offset| fixture.image.get(offset as usize)) {
                     *byte = *value;
                 }
+                for (start, bytes) in &fixture.extra_memory {
+                    if let Some(value) = at.checked_sub(*start).and_then(|offset| bytes.get(offset as usize)) {
+                        *byte = *value;
+                    }
+                }
             }
         } else if address < FAKE_EXEC_END && end > FAKE_RIP {
             for (index, byte) in content.iter_mut().enumerate() {
@@ -834,6 +980,13 @@ pub mod fake {
         maps: Vec<(u64, u64, u64, String)>,
         next_alloc: u64,
         fixture: Option<Fixture>,
+        /// Enabled software breakpoints by slot.
+        breakpoints: BTreeMap<u32, u64>,
+        /// Armed hardware watchpoints by slot: (address, length, access 0/1/3).
+        watchpoints: BTreeMap<u32, (u64, u64, u32)>,
+        /// Next `Fixture::program` step to execute.
+        cursor: usize,
+        dr6: u64,
     }
 
     /// Full fake: attach binds nothing itself; on BDBB0001 it connects back to the
@@ -853,10 +1006,14 @@ pub mod fake {
         let connections = Arc::new(AtomicUsize::new(0));
         let rip = fixture.as_ref().map_or(FAKE_RIP, |fixture| fixture.rip);
         let maps = match &fixture {
-            Some(fixture) => vec![
-                (fixture.base, fixture.base + ((fixture.image.len() as u64 + 0xfff) & !0xfff), 5, "fixture.elf".to_owned()),
-                (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
-            ],
+            Some(fixture) => {
+                let mut maps = vec![
+                    (fixture.base, fixture.base + ((fixture.image.len() as u64 + 0xfff) & !0xfff), 5, "fixture.elf".to_owned()),
+                    (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
+                ];
+                maps.extend(fixture.extra_maps.iter().cloned());
+                maps
+            }
             None => vec![
                 (FAKE_RIP, FAKE_EXEC_END, 5, "eboot.bin".to_owned()),
                 (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
@@ -879,6 +1036,10 @@ pub mod fake {
             maps,
             next_alloc: 0x9000_0000,
             fixture,
+            breakpoints: BTreeMap::new(),
+            watchpoints: BTreeMap::new(),
+            cursor: 0,
+            dr6: 0,
         }));
         let counter = connections.clone();
         let state = shared.clone();
@@ -1013,7 +1174,40 @@ pub mod fake {
                                 }
                             }
                             0xbdbb0002 => success(&mut stream),
-                            0xbdbb0003 | 0xbdbb0004 => success(&mut stream),
+                            0xbdbb0003 => {
+                                if body.len() >= 16 {
+                                    let index = u32::from_le_bytes(body[0..4].try_into().unwrap());
+                                    let enabled = u32::from_le_bytes(body[4..8].try_into().unwrap()) != 0;
+                                    let address = u64::from_le_bytes(body[8..16].try_into().unwrap());
+                                    let mut guard = state.lock().unwrap();
+                                    if enabled {
+                                        guard.breakpoints.insert(index, address);
+                                    } else {
+                                        guard.breakpoints.remove(&index);
+                                    }
+                                }
+                                success(&mut stream);
+                            }
+                            0xbdbb0004 => {
+                                if body.len() >= 24 {
+                                    let word = |at: usize| u32::from_le_bytes(body[at..at + 4].try_into().unwrap());
+                                    let (index, enabled, encoding, access) = (word(0), word(4) != 0, word(8), word(12));
+                                    let address = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                                    let length = match encoding {
+                                        0 => 1,
+                                        1 => 2,
+                                        3 => 4,
+                                        _ => 8,
+                                    };
+                                    let mut guard = state.lock().unwrap();
+                                    if enabled {
+                                        guard.watchpoints.insert(index, (address, length, access));
+                                    } else {
+                                        guard.watchpoints.remove(&index);
+                                    }
+                                }
+                                success(&mut stream);
+                            }
                             0xbdbb0005 => {
                                 success(&mut stream);
                                 let thread = state.lock().unwrap().fixture.as_ref().map_or(1, |fixture| fixture.thread_id);
@@ -1051,7 +1245,14 @@ pub mod fake {
                             }
                             0xbdbb000c => {
                                 success(&mut stream);
-                                let _ = stream.write_all(&[0u8; 128]);
+                                let guard = state.lock().unwrap();
+                                let mut out = [0u8; 128];
+                                for (index, (address, _, _)) in &guard.watchpoints {
+                                    let at = *index as usize * 8;
+                                    out[at..at + 8].copy_from_slice(&address.to_le_bytes());
+                                }
+                                out[48..56].copy_from_slice(&guard.dr6.to_le_bytes());
+                                let _ = stream.write_all(&out);
                             }
                             0xbdbb000e => {
                                 success(&mut stream);
@@ -1082,7 +1283,7 @@ pub mod fake {
                                         let event = fixture_event(&fixture, &guard.registers);
                                         push_event(&mut guard, &event);
                                     }
-                                    Some(_) => {}
+                                    Some(fixture) => run_program(&mut guard, &fixture),
                                     None if resume => push_event(&mut guard, &event_bytes()),
                                     None => {}
                                 }
