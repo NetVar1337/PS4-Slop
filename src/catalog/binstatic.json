@@ -1,1 +1,624 @@
-[]
+[
+ {
+  "name": "artifact_functions",
+  "description": "Discover functions without an external analyzer: .eh_frame FDEs, symbols (NID-demangled), direct call targets, optional prologue heuristic; merged and deduplicated with sources. Also saves the ps4wb-blocks-v1 basic-block artifact used by coverage tools. Input: ELF artifact or pid+module (read-only).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "ELF artifact (or raw code with base_address). Exclusive with pid/module"
+    },
+    "base_address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address for a raw (non-ELF) artifact"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Live input: process id (read-only memory reads)"
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live input: module name from module_list"
+    },
+    "eh_frame": {
+     "type": "boolean",
+     "description": "Use .eh_frame FDE ranges (default true)"
+    },
+    "symbols": {
+     "type": "boolean",
+     "description": "Use .dynsym/.symtab function symbols (default true)"
+    },
+    "call_targets": {
+     "type": "boolean",
+     "description": "Follow direct call targets (default true)"
+    },
+    "linear_sweep": {
+     "type": "boolean",
+     "description": "Linear-sweep executable segments for call rel32 targets (default true)"
+    },
+    "prologues": {
+     "type": "boolean",
+     "description": "Add push rbp; mov rbp,rsp prologues after padding (default false; true for live input)"
+    },
+    "max_functions": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Function cap (default 50000)"
+    },
+    "max_instructions": {
+     "type": "integer",
+     "minimum": 16,
+     "maximum": 200000,
+     "description": "Instruction cap per function (default 20000)"
+    },
+    "save_blocks": {
+     "type": "boolean",
+     "description": "Save the blocks artifact (default true)"
+    },
+    "offset": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 1000000,
+     "description": "Result paging offset"
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 5000,
+     "description": "Functions listed in the response (default 200)"
+    }
+   },
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "artifact_cfg",
+  "description": "Basic blocks and edges of one function (recursive descent: jcc/jmp/call/ret, best-effort jump tables marked with their bound source, int3/ud2/hlt terminators, tail calls), as JSON and/or Graphviz DOT; mode=module writes the whole-module ps4wb-blocks-v1 artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "ELF artifact (or raw code with base_address). Exclusive with pid/module"
+    },
+    "base_address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address for a raw (non-ELF) artifact"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Live input: process id (read-only memory reads)"
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live input: module name from module_list"
+    },
+    "eh_frame": {
+     "type": "boolean",
+     "description": "Use .eh_frame FDE ranges (default true)"
+    },
+    "symbols": {
+     "type": "boolean",
+     "description": "Use .dynsym/.symtab function symbols (default true)"
+    },
+    "call_targets": {
+     "type": "boolean",
+     "description": "Follow direct call targets (default true)"
+    },
+    "linear_sweep": {
+     "type": "boolean",
+     "description": "Linear-sweep executable segments for call rel32 targets (default true)"
+    },
+    "prologues": {
+     "type": "boolean",
+     "description": "Add push rbp; mov rbp,rsp prologues after padding (default false; true for live input)"
+    },
+    "max_functions": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Function cap (default 50000)"
+    },
+    "max_instructions": {
+     "type": "integer",
+     "minimum": 16,
+     "maximum": 200000,
+     "description": "Instruction cap per function (default 20000)"
+    },
+    "mode": {
+     "type": "string",
+     "enum": [
+      "function",
+      "module"
+     ],
+     "description": "function (default) or module"
+    },
+    "address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Function start VA (function mode)"
+    },
+    "format": {
+     "type": "string",
+     "enum": [
+      "json",
+      "dot",
+      "both"
+     ],
+     "description": "Function-mode output (default json)"
+    }
+   },
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "artifact_callgraph",
+  "description": "Callers and callees of a function (direct calls, tail calls, PLT/import thunks and [rip+GOT] calls resolved to import names) and bounded-BFS shortest call paths to another function or import.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "ELF artifact (or raw code with base_address). Exclusive with pid/module"
+    },
+    "base_address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address for a raw (non-ELF) artifact"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Live input: process id (read-only memory reads)"
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live input: module name from module_list"
+    },
+    "eh_frame": {
+     "type": "boolean",
+     "description": "Use .eh_frame FDE ranges (default true)"
+    },
+    "symbols": {
+     "type": "boolean",
+     "description": "Use .dynsym/.symtab function symbols (default true)"
+    },
+    "call_targets": {
+     "type": "boolean",
+     "description": "Follow direct call targets (default true)"
+    },
+    "linear_sweep": {
+     "type": "boolean",
+     "description": "Linear-sweep executable segments for call rel32 targets (default true)"
+    },
+    "prologues": {
+     "type": "boolean",
+     "description": "Add push rbp; mov rbp,rsp prologues after padding (default false; true for live input)"
+    },
+    "max_functions": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Function cap (default 50000)"
+    },
+    "max_instructions": {
+     "type": "integer",
+     "minimum": 16,
+     "maximum": 200000,
+     "description": "Instruction cap per function (default 20000)"
+    },
+    "address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Function VA (or an address inside it)"
+    },
+    "direction": {
+     "type": "string",
+     "enum": [
+      "callers",
+      "callees",
+      "both"
+     ]
+    },
+    "to_address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Path target function VA"
+    },
+    "to_name": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Path target: function or import name"
+    },
+    "max_depth": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 16,
+     "description": "Path search depth (default 6)"
+    },
+    "max_paths": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 32,
+     "description": "Shortest paths returned (default 4)"
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 5000,
+     "description": "Callers/callees listed (default 200)"
+    }
+   },
+   "additionalProperties": false,
+   "required": [
+    "address"
+   ]
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "binary_diff",
+  "description": "Match functions between two ELF builds (e.g. game 1.00 vs 1.01): symbol names, masked exact bytes (relocation/branch/RIP-relative/absolute-address bytes wildcarded), mnemonic hash, constants/strings, CFG shape, then call-graph neighbourhood propagation. Saves a ps4wb-bindiff-v1 artifact with confidence and method per match, unmatched and changed functions.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact_a": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Old build ELF artifact"
+    },
+    "artifact_b": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "New build ELF artifact"
+    },
+    "eh_frame": {
+     "type": "boolean",
+     "description": "Use .eh_frame FDE ranges (default true)"
+    },
+    "symbols": {
+     "type": "boolean",
+     "description": "Use .dynsym/.symtab function symbols (default true)"
+    },
+    "call_targets": {
+     "type": "boolean",
+     "description": "Follow direct call targets (default true)"
+    },
+    "linear_sweep": {
+     "type": "boolean",
+     "description": "Linear-sweep executable segments for call rel32 targets (default true)"
+    },
+    "prologues": {
+     "type": "boolean",
+     "description": "Add push rbp; mov rbp,rsp prologues after padding (default false; true for live input)"
+    },
+    "max_functions": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Function cap (default 50000)"
+    },
+    "max_instructions": {
+     "type": "integer",
+     "minimum": 16,
+     "maximum": 200000,
+     "description": "Instruction cap per function (default 20000)"
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1000,
+     "description": "Changed/unmatched entries shown inline (default 50)"
+    }
+   },
+   "additionalProperties": false,
+   "required": [
+    "artifact_a",
+    "artifact_b"
+   ]
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "annotation_port",
+  "description": "Port names/labels/comments from module A to module B through a binary_diff artifact. Sources: annotation_save evidence, debug_label_save exports (with label_base), earlier ported sets, or a JSON {rva: name}. Writes a new ported set bound to module B's SHA-256 (and optionally a debug_label_load document); originals are never modified.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "diff": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "binary_diff artifact"
+    },
+    "sources": {
+     "type": "array",
+     "minItems": 1,
+     "maxItems": 32,
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Relative path inside configured artifact directory"
+     },
+     "description": "Annotation source artifacts"
+    },
+    "label_base": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Runtime base of module A for debugger label exports"
+    },
+    "runtime_base_b": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Runtime base of module B: also emit a debug_label_load document"
+    },
+    "artifact_a": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Module A ELF (enables instruction alignment inside changed functions)"
+    },
+    "artifact_b": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Module B ELF"
+    },
+    "min_confidence": {
+     "type": "number",
+     "minimum": 0,
+     "maximum": 1
+    },
+    "allow_hash_mismatch": {
+     "type": "boolean",
+     "description": "Accept evidence whose module_sha256 differs from the diff's module A"
+    }
+   },
+   "additionalProperties": false,
+   "required": [
+    "diff",
+    "sources"
+   ]
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "signature_make",
+  "description": "Shortest unique wildcarded AOB signature for an address (relative branches, RIP-relative displacements and absolute addresses wildcarded via instruction decoding; grown until unique in the module's executable segments, then trimmed), verified with the pattern_scan engine. Falls back to a signature on a call/lea referencing the target plus the resolve formula. Output syntax works with pattern_scan and memory_search.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "ELF artifact (or raw code with base_address). Exclusive with pid/module"
+    },
+    "base_address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Load address for a raw (non-ELF) artifact"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Live input: process id (read-only memory reads)"
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Live input: module name from module_list"
+    },
+    "address": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$",
+     "description": "Target VA"
+    },
+    "min_length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 256,
+     "description": "Minimum pattern bytes (default 5)"
+    },
+    "max_length": {
+     "type": "integer",
+     "minimum": 8,
+     "maximum": 256,
+     "description": "Maximum pattern bytes (default 64)"
+    },
+    "wildcard_operands": {
+     "type": "boolean",
+     "description": "Also wildcard all 32/64-bit displacements and immediates"
+    },
+    "via_reference": {
+     "type": "string",
+     "enum": [
+      "auto",
+      "never",
+      "only"
+     ],
+     "description": "Reference-site fallback (default auto: only when direct fails)"
+    }
+   },
+   "additionalProperties": false,
+   "required": [
+    "address"
+   ]
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "orbis_prototypes",
+  "description": "Build or query a ps4wb-prototypes-v1 database: C declarations parsed from real headers (OpenOrbis include dir via include_dir or OO_PS4_TOOLCHAIN, or header artifacts) and/or a user JSON dictionary, keyed by computed Orbis NID; a tiny certain built-in set is marked source=builtin. action=imports lists an ELF's imports with matched prototypes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "action": {
+     "type": "string",
+     "enum": [
+      "build",
+      "lookup",
+      "imports"
+     ]
+    },
+    "include_dir": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Host directory of headers (read-only, recursive, bounded)"
+    },
+    "use_sdk": {
+     "type": "boolean",
+     "description": "Use $OO_PS4_TOOLCHAIN/include when include_dir is absent (default true)"
+    },
+    "headers": {
+     "type": "array",
+     "maxItems": 256,
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "description": "Relative path inside configured artifact directory"
+     },
+     "description": "Header artifacts"
+    },
+    "dictionary": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "User JSON: prototype DB, list of {name, declaration|return+params}, or {name: declaration}"
+    },
+    "database": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Existing ps4wb-prototypes-v1 artifact (skips building)"
+    },
+    "include_builtin": {
+     "type": "boolean",
+     "description": "Include built-in libc/sceKernelUsleep prototypes (default true)"
+    },
+    "save": {
+     "type": "boolean",
+     "description": "Save the database artifact (default true for build)"
+    },
+    "names": {
+     "type": "array",
+     "maxItems": 1024,
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+     }
+    },
+    "nids": {
+     "type": "array",
+     "maxItems": 1024,
+     "items": {
+      "type": "string",
+      "minLength": 11,
+      "maxLength": 256
+     }
+    },
+    "artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "ELF artifact (action=imports)"
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 20000,
+     "description": "Rows returned (default 200)"
+    }
+   },
+   "additionalProperties": false,
+   "required": [
+    "action"
+   ]
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ }
+]

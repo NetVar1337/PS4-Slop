@@ -48,3 +48,9 @@ pub mod tracekit;
 pub mod pointerscan;
 pub mod structinfer;
 pub mod hostscript;
+// Native static analysis (binstatic area).
+pub mod binimage;
+pub mod cfg;
+pub mod sigmaker;
+pub mod bindiff;
+pub mod prototypes;
