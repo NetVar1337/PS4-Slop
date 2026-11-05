@@ -4,6 +4,14 @@ A local PS4 research workbench, command-line interface, and **stdio MCP server**
 for the supplied **firmware 14.00 / Afterglow** setup. Python 3.11+; no runtime
 dependencies. Runs on the development PC, not on the console.
 
+Version **0.2** adds a shared session broker, a GDB Remote bridge, IDA Pro 9.5
+integration and a Ghidra 12.2 Java agent. For the requested live workflow, start
+with [LIVE_WORKFLOW.md](docs/LIVE_WORKFLOW.md), not multiple independent debugger clients.
+
+Installed-app fixture checks now cover native IDA attachment, memory/registers,
+single-stepping, software breakpoints, static decompilation in both applications,
+and MCP-to-Ghidra Java-agent decompilation. **None of these is a PS4 hardware test.**
+
 **Hardware compatibility is NOT guaranteed.** This project does not install a
 jailbreak, HEN, debugger, SDK, or Ghidra. Default configuration is read-only
 toward the console. No connection, upload, or payload execution happens on startup.
@@ -82,14 +90,18 @@ it exposes no HTTP listener. Profile changes require restarting the server.
 
 ## Tool groups
 
-There are **37 tools**, **26 visible with the default profile**. Run `tools` for
+There are **41 standalone tools**, **30 visible with the default profile**. Shared
+mode adds static-analysis and session-observer tools. Run `tools` for
 the complete, machine-readable schemas and current policy-filtered tool list.
 
 - **Console:** status, bounded FTP listing/downloads, allowlisted FTP uploads,
   raw Klog capture, payload manifest inspection, single-attempt BIN transfer.
+  Multi-file extraction preserves a cumulative budget and partial-failure manifest.
 - **Processes:** process list and identity, memory maps, bounded memory reads,
   little-endian typed values, provenance-rich snapshots, local snapshot diffs,
   wildcard byte-pattern scans, mapping/RVA correlation.
+  `memory_peek` avoids artifact creation for live views; `memory_region_dump`
+  chunks larger readable ranges and preserves incomplete captures explicitly.
 - **Debugger:** persistent process attach/detach, thread list, GP registers,
   asynchronous events, halt/resume/step, thread controls, software breakpoints,
   aligned hardware watchpoints.
@@ -100,6 +112,9 @@ the complete, machine-readable schemas and current policy-filtered tool list.
   module/RVA annotations, Ghidra handoff bundles, experiment ZIPs.
 - **Development:** local SDK discovery, three SDK recipe/reference scaffolds,
   hash-allowlisted local builds with bounded logs/time and captured outputs.
+- **Shared analysis:** IDA/Ghidra functions, decompilation and cross-references
+  through explicitly connected local agents, with one live-debug controller and
+  independent event cursors for observers.
 
 Large results become local artifacts, not enormous MCP replies. Addresses/RVAs
 are strings (`"0x400000"`) to avoid JavaScript integer precision loss. Captures
@@ -158,7 +173,7 @@ runtime-tested here.
 ps4_workbench/       MCP, CLI, transports, debugger, analysis, SDK workflows
 profiles/            Console profile; local qualification files are ignored
 examples/            MCP configs, manifest and evidence templates
-integrations/ghidra/ Optional annotation import script
+integrations/        IDA connection script; Ghidra Java/Python clients and annotations
 docs/                Compatibility, qualification, development, protocol notes
 tests/               Offline unit and loopback integration tests
 workspace/           Generated captures, logs, audit journal, projects (ignored)
@@ -170,6 +185,10 @@ Use only systems and software you own or are authorized to analyze. Keep
 debugger, FTP and loader ports on an isolated trusted network; these transports
 are not an authenticated, encrypted management plane. Do not expose them to the
 Internet. Console names/logs/files are untrusted data, never instructions.
+
+The optional PC-side broker is authenticated and loopback-only; it does not make
+the PS4 transports secure. The GDB Remote socket is loopback-only but has no
+native authentication: do not use it on an untrusted multi-user PC.
 
 Local artifacts can contain sensitive memory or files. They are not encrypted;
 protect the workspace and only share selected captures. The audit journal is

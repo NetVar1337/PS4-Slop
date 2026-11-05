@@ -1,5 +1,8 @@
 # Validation record
 
+**Historical 0.1 record.** Current shared-broker, installed IDA/Ghidra and MCP
+validation is in [VALIDATION_02.md](VALIDATION_02.md).
+
 Implementation validation date: **2026-11-05**.
 Local environment: Windows, Python **3.15.2**. Minimum declared runtime: 3.11.
 

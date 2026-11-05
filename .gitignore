@@ -6,4 +6,5 @@ build/
 dist/
 workspace/
 profiles/*.local.json
+profiles/broker-token.local
 .coverage

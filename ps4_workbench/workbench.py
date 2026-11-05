@@ -29,6 +29,45 @@ class Workbench:
             result["hex"] = content.hex()
         return result
 
+    def memory_peek(self, pid, address, length):
+        content = self.debugger.read_memory(pid, address, length)
+        return {"pid": pid, "address": hex(address), "length": len(content), "hex": content.hex(),
+                "atomic_snapshot": False, "runtime_identity": self.debugger.identity}
+
+    def region_dump(self, pid, address, length):
+        import time
+        from .debugger import address_range
+        address_range(address, length, self.profile.limit("transfer_bytes"))
+        maps = self.debugger.maps(pid)
+        position = address
+        for entry in sorted(maps, key=lambda item: item["start"]):
+            if entry["start"] <= position < entry["end"] and entry["protection"] & 1:
+                position = min(address + length, entry["end"])
+        if position != address + length:
+            raise WorkbenchError("Requested dump crosses an unmapped or unreadable region")
+        process = self.debugger.process_info(pid)
+        identity = dict(self.debugger.identity or {})
+        content = bytearray()
+        deadline = time.monotonic() + 60
+        error_text = None
+        try:
+            while len(content) < length:
+                if time.monotonic() >= deadline:
+                    raise WorkbenchError("Region dump exceeded 60-second deadline")
+                count = min(self.profile.limit("memory_bytes"), length - len(content))
+                chunk = self.debugger.read_memory(pid, address + len(content), count)
+                if len(chunk) != count:
+                    raise WorkbenchError("Short region read")
+                content.extend(chunk)
+        except Exception as error:
+            error_text = str(error)
+        artifact = self.store.save("region", bytes(content), {"pid": pid, "address": address,
+                                    "requested_length": length, "complete": len(content) == length,
+                                    "error": error_text, "process": process, "maps": maps,
+                                    "runtime_identity": identity, "atomic_snapshot": False,
+                                    "format": "raw_memory_not_reconstructed_elf"})
+        return {"artifact": artifact, "complete": len(content) == length, "error": error_text}
+
     def kernel_read(self, address, length):
         content = self.debugger.read_memory(0, address, length, kernel=True)
         return self.store.save("kernel", content, {"address": address, "runtime_identity": self.debugger.identity})

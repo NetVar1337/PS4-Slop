@@ -44,3 +44,29 @@ ping, tools/list and tools/call. Supported protocol versions are 2025-11-25,
 2025-06-18, 2025-03-26 and 2024-11-05. It advertises only tool capabilities;
 resources, prompts, HTTP, batching and asynchronous task APIs are not advertised.
 Transport reference: https://modelcontextprotocol.io/specification/2025-11-25/basic/transports
+
+## Shared service and native debugger bridge
+
+The optional broker is a separate, bearer-authenticated JSON service bound to
+IPv4 loopback only. It is not MCP Streamable HTTP. MCP clients still use the
+stdio proxy; app agents and the GDB bridge use the private broker API. Requests
+are profile-fingerprint-bound and no policy changes or arbitrary remote eval
+are exposed. One controller owns execution; retained events have per-client cursors.
+
+The RSP listener is loopback-only, supports one native connection per listener,
+and is configured with an explicit PID. Implemented packets include checksummed/
+escaped framing, ACK/NAK and no-ACK negotiation, target-description XML, cached
+memory-map XML, thread selection/listing, GP register reads, bounded memory
+reads, attach/detach, all-stop continue, selected-thread step, interrupt and
+software/aligned hardware breakpoints. Stops are derived from actual callback
+events. The known FreeBSD stop-signal subset is mapped explicitly; unsupported
+wait statuses are errors, not guessed stop replies.
+
+The x86-64 core description includes x87 register slots as unavailable; only
+the existing NG GP layout is implemented. No register-setting, arbitrary RSP
+memory writes, kill/reboot, monitor commands, reverse execution, mixed-thread
+vCont, multiprocess or native trace-replay protocol is advertised. These are
+intentional boundaries, not a complete gdbserver implementation.
+
+Packet reference: https://sourceware.org/gdb/current/onlinedocs/gdb.html/Packets.html
+Ghidra launcher reference: its installed `Debugger-agent-gdb/data/debugger-launchers/remote-gdb.ps1`.

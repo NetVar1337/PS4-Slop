@@ -2,6 +2,7 @@ import hashlib
 import io
 import json
 import os
+import threading
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -18,6 +19,7 @@ class ArtifactStore:
     def __init__(self, profile):
         self.profile = profile
         self.root = profile.artifact_root
+        self.audit_lock = threading.Lock()
 
     def path(self, relative, must_exist=True):
         if (not isinstance(relative, str) or not relative or Path(relative).is_absolute()
@@ -57,7 +59,7 @@ class ArtifactStore:
     def audit(self, action, **fields):
         self.root.mkdir(parents=True, exist_ok=True)
         entry = {"time": utc_now(), "action": action, "profile_sha256": self.profile.fingerprint, **fields}
-        with self.path("audit.jsonl", must_exist=False).open("a", encoding="utf-8") as stream:
+        with self.audit_lock, self.path("audit.jsonl", must_exist=False).open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, sort_keys=True) + "\n")
             stream.flush()
             os.fsync(stream.fileno())

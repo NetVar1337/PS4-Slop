@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "ps4-shared": {
+      "command": "python",
+      "args": [
+        "-m", "ps4_workbench", "--profile",
+        "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/profiles/ps4-1400.json",
+        "serve", "--broker", "http://127.0.0.1:8765", "--client-id", "mcp-primary"
+      ],
+      "cwd": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs"
+    }
+  }
+}

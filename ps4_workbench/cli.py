@@ -64,7 +64,28 @@ def parser():
     result = argparse.ArgumentParser(description="Local PS4 14.00 / Afterglow research workbench. No compatibility guarantee.")
     result.add_argument("--profile", default="profiles/ps4-1400.json")
     commands = result.add_subparsers(dest="command", required=True)
-    commands.add_parser("serve", help="Local newline-delimited JSON-RPC MCP over stdio; persistent debug sessions")
+    serve = commands.add_parser("serve", help="Local stdio MCP, optionally connected to a shared broker")
+    serve.add_argument("--broker", help="Shared broker URL, e.g. http://127.0.0.1:8765")
+    serve.add_argument("--token-file")
+    serve.add_argument("--client-id")
+    broker = commands.add_parser("broker", help="Authenticated loopback shared session service; no console connection on startup")
+    broker.add_argument("--port", type=int, default=8765)
+    broker.add_argument("--token-file")
+    remote = commands.add_parser("remote-call", help="Call a tool through the already-running shared broker")
+    remote.add_argument("tool")
+    remote.add_argument("--broker", default="http://127.0.0.1:8765")
+    remote.add_argument("--token-file")
+    remote.add_argument("--client-id", default="cli")
+    remote_inputs = remote.add_mutually_exclusive_group()
+    remote_inputs.add_argument("--arguments", default="{}")
+    remote_inputs.add_argument("--arguments-file")
+    gdb = commands.add_parser("gdb-server", help="Loopback x86-64 GDB Remote bridge for IDA/Ghidra; attaches on debugger request")
+    gdb.add_argument("--broker", default="http://127.0.0.1:8765")
+    gdb.add_argument("--token-file")
+    gdb.add_argument("--port", type=int, default=1234)
+    gdb.add_argument("--pid", type=int, required=True)
+    gdb.add_argument("--listen-address", required=True, help="PC IPv4 reachable from console callback on 755")
+    gdb.add_argument("--observer", action="store_true", help="Observe an already attached session; deny controls")
     commands.add_parser("tools", help="List tools allowed by the local profile; no network")
     commands.add_parser("validate", help="Validate local profile and show configured services; no network")
     call = commands.add_parser("call", help="Invoke a tool once; debug session auto-detaches at exit")
@@ -91,7 +112,39 @@ def main(argv=None):
     workbench = None
     try:
         profile = Profile.load(arguments.profile)
-        if arguments.command == "hash":
+        if arguments.command in ("broker", "gdb-server", "remote-call") or (arguments.command == "serve" and arguments.broker):
+            from .broker import BrokerServer, SessionHub, load_token, token_file
+            from .client import BrokerClient, RemoteRegistry
+            secret_path = Path(arguments.token_file).resolve() if arguments.token_file else token_file(profile)
+            if secret_path.is_relative_to(profile.artifact_root):
+                raise WorkbenchError("Broker token must stay outside MCP-readable artifact storage")
+            if arguments.command == "broker":
+                token = load_token(secret_path, create=True)
+                workbench = Workbench(profile)
+                hub = SessionHub(ToolRegistry(workbench))
+                with BrokerServer(hub, token, arguments.port) as server:
+                    print(f"Broker: http://127.0.0.1:{server.server_port}; token file: {secret_path}", file=sys.stderr)
+                    hub.start()
+                    try:
+                        server.serve_forever(poll_interval=0.1)
+                    finally:
+                        hub.close()
+                return 0
+            if arguments.command == "gdb-server":
+                from .rsp import RspServer
+                BrokerClient(arguments.broker, secret_path, expected_profile=profile.fingerprint)
+                with RspServer(arguments.broker, secret_path, arguments.pid, arguments.listen_address,
+                               arguments.port, arguments.observer, profile.fingerprint) as server:
+                    print(f"GDB Remote: 127.0.0.1:{server.server_address[1]}; PID {arguments.pid}; observer={arguments.observer}", file=sys.stderr)
+                    server.serve_forever(poll_interval=0.1)
+                return 0
+            client = BrokerClient(arguments.broker, secret_path, arguments.client_id, expected_profile=profile.fingerprint)
+            if arguments.command == "serve":
+                MCPServer(RemoteRegistry(client)).serve()
+                return 0
+            content = Path(arguments.arguments_file).read_text(encoding="utf-8-sig") if arguments.arguments_file else arguments.arguments
+            result = RemoteRegistry(client).call(arguments.tool, json.loads(content))
+        elif arguments.command == "hash":
             with Path(arguments.file).open("rb") as stream:
                 result = {"sha256": hashlib.file_digest(stream, "sha256").hexdigest()}
         elif arguments.command == "qualify":
@@ -116,6 +169,8 @@ def main(argv=None):
                 content = Path(arguments.arguments_file).read_text(encoding="utf-8-sig") if arguments.arguments_file else arguments.arguments
                 result = registry.call(arguments.tool, json.loads(content))
         print(json.dumps(result, indent=2, ensure_ascii=True, allow_nan=False))
+        return 0
+    except KeyboardInterrupt:
         return 0
     except (WorkbenchError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"error: {error}", file=sys.stderr)

@@ -99,7 +99,10 @@ failed transfer; inspect console state and recover manually first.
 
 ## 5. Debug sessions
 
-Use the persistent MCP server, not a series of independent CLI calls:
+Use one persistent owner. Shared mode (`LIVE_WORKFLOW.md`) is recommended when
+combining IDA, Ghidra and MCP. Independent standalone CLI invocations do not
+retain their sessions; `remote-call --client-id NAME` can deliberately share a
+stable identity with an already-running broker:
 
 1. `debug_attach` needs a known disposable process PID and your PC's explicit
    console-reachable local IPv4 interface (`listen_address`).

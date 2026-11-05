@@ -79,14 +79,14 @@ class ConsoleTransports:
             client.retrlines("LIST " + path, collect)
         return {"path": path, "listing": entries, "format": "server_supplied_LIST"}
 
-    def _ftp_read(self, client, path):
+    def _ftp_read(self, client, path, maximum=None):
         output = bytearray()
         deadline = time.monotonic() + 60
 
         def collect(chunk):
             if time.monotonic() > deadline:
                 raise WorkbenchError("FTP download exceeded 60 second deadline")
-            if len(output) + len(chunk) > self.profile.limit("transfer_bytes"):
+            if len(output) + len(chunk) > (self.profile.limit("transfer_bytes") if maximum is None else maximum):
                 raise WorkbenchError("FTP download exceeds transfer limit")
             output.extend(chunk)
 
@@ -98,6 +98,32 @@ class ConsoleTransports:
         with self.ftp() as client:
             content = self._ftp_read(client, path)
         return self.store.save("ftp", content, {"remote_path": path, "source": "FTP"})
+
+    def ftp_extract(self, paths):
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 64:
+            raise WorkbenchError("Select 1 to 64 explicit remote file paths")
+        paths = [remote_path(path) for path in paths]
+        if len(set(paths)) != len(paths):
+            raise WorkbenchError("Duplicate extraction paths are not allowed")
+        entries = []
+        total = 0
+        error_text = None
+        deadline = time.monotonic() + 120
+        try:
+            with self.ftp() as client:
+                for path in paths:
+                    if time.monotonic() >= deadline:
+                        raise WorkbenchError("Extraction exceeded 120-second deadline")
+                    content = self._ftp_read(client, path, self.profile.limit("transfer_bytes") - total)
+                    total += len(content)
+                    entries.append(self.store.save("extracted", content, {"remote_path": path, "source": "FTP"}))
+        except Exception as error:
+            error_text = str(error)
+        manifest = {"requested_paths": paths, "files": entries, "total_bytes": total,
+                    "complete": len(entries) == len(paths), "error": error_text,
+                    "note": "Raw FTP files, not decrypted/reconstructed executables; no automatic retry"}
+        saved = self.store.save("extraction", json.dumps(manifest, indent=2).encode(), extension="json")
+        return {"manifest": saved, **manifest}
 
     def ftp_upload(self, artifact, path, sha256):
         self.profile.require("ftp_upload")

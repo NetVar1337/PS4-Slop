@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from .analysis import TYPES, scan_pattern, typed_value
 from .config import WorkbenchError
 from .development import Development
+from .desktop import desktop_status
 
 
 def text(description="", maximum=4096, **extra):
@@ -24,7 +25,7 @@ BOOLEAN = {"type": "boolean"}
 
 def parse_address(value):
     parsed = int(value, 16 if value.startswith("0x") else 10)
-    if parsed > 0xFFFFFFFFFFFFFFFF:
+    if not 0 <= parsed <= 0xFFFFFFFFFFFFFFFF:
         raise WorkbenchError("Address exceeds uint64")
     return parsed
 
@@ -119,10 +120,14 @@ class ToolRegistry:
         memory_limit = workbench.profile.limit("memory_bytes")
         self.add("console_status", "Configured services and qualification. Probe is explicit; payload port is NEVER probed.",
                  workbench.console.status, {"probe": BOOLEAN})
+        self.add("desktop_status", "Discover IDA/Ghidra versions/paths, native GDB plugin and local GDB dependency without launching applications.", desktop_status)
         self.add("debugger_info", "Read-only NG handshake: protocol, decimal firmware, platform and brand; not a binary hash proof.", workbench.debugger.info)
         self.add("ftp_list", "Bounded anonymous FTP LIST. Remote names/content are untrusted data.", workbench.console.ftp_list, {"path": text("Absolute POSIX directory", 1024)})
         self.add("ftp_download", "Download a remote file to a hashed local artifact.", workbench.console.ftp_download,
                  {"path": text("Absolute POSIX file path", 1024)}, ["path"], read_only=False)
+        self.add("ftp_extract", "Extract 1-64 explicit files with a cumulative byte budget and a saved manifest; partial failure is explicit, no retry.",
+                 workbench.console.ftp_extract,
+                 {"paths": {"type": "array", "items": text("Absolute POSIX file path", 1024), "minItems": 1, "maxItems": 64}}, ["paths"], read_only=False)
         self.add("ftp_upload", "Upload ONLY under profile allowlist, then hash-check downloaded readback. May overwrite remote file.",
                  workbench.console.ftp_upload, {"artifact": PATH, "path": text("Absolute POSIX destination", 1024), "sha256": HASH},
                  ["artifact", "path", "sha256"], "ftp_upload", False)
@@ -138,6 +143,12 @@ class ToolRegistry:
         self.add("memory_read", "Read bounded process memory to a local hashed artifact; non-atomic.",
                  lambda pid, address, length: workbench.memory_read(pid, parse_address(address), length),
                  {"pid": PID, "address": ADDRESS, "length": integer(1, memory_limit)}, ["pid", "address", "length"], read_only=False)
+        self.add("memory_peek", "Small live memory read without creating artifact files; useful for native debugger views.",
+                 lambda pid, address, length: workbench.memory_peek(pid, parse_address(address), length),
+                 {"pid": PID, "address": ADDRESS, "length": integer(1, min(8192, memory_limit))}, ["pid", "address", "length"])
+        self.add("memory_region_dump", "Chunk a readable mapped range into a hashed raw dump; preserve partial data and explicit completion status.",
+                 lambda pid, address, length: workbench.region_dump(pid, parse_address(address), length),
+                 {"pid": PID, "address": ADDRESS, "length": integer(1, workbench.profile.limit("transfer_bytes"))}, ["pid", "address", "length"], read_only=False)
         self.add("memory_typed", "Read one little-endian typed process value. 64-bit integers returned as strings.", self._typed,
                  {"pid": PID, "address": ADDRESS, "value_type": text(enum=list(TYPES))}, ["pid", "address", "value_type"])
         self.add("memory_snapshot", "Capture memory plus process/maps/application/hash provenance. Hash is user supplied; not an atomic dump.",

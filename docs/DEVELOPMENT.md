@@ -1,7 +1,12 @@
 # Development and analysis integrations
 
-These are optional external projects. None is installed, loaded on the console,
-or declared hardware-qualified by this repository.
+These SDKs and third-party MCP projects are optional. This repository does not
+automatically install them or declare their console output hardware-qualified.
+The already-installed IDA and Ghidra applications are used by the local tests.
+
+For the implemented live IDA Pro 9.5 / Ghidra 12.2 connections, shared broker,
+native GDB bridge and built-in static agents, see `LIVE_WORKFLOW.md`. The
+third-party MCP integrations below are optional alternatives, not prerequisites.
 
 ## OpenOrbis homebrew
 
@@ -102,7 +107,7 @@ Research loop:
 6. Use the separate GhidraMCP server for interactive decompilation, references,
    symbols and analysis, with the permissions you explicitly choose there.
 
-The Java import script's APIs were checked against Ghidra's public source, but
+The annotation-only Java import script's APIs were checked against Ghidra's public source, but
 the script was not compiled/run inside Ghidra in this environment. It refuses a
 hash mismatch rather than applying annotations to a different binary. It does
 not independently verify the console-capture provenance or user-supplied module hash.
@@ -116,7 +121,9 @@ can be imported as `x86:LE:64:default` with a deliberately selected image base.
 
 https://github.com/mrexodia/ida-pro-mcp
 
-If you already use a suitably licensed IDA installation, run its upstream MCP
-integration separately. It is not bundled, installed or tested here. Workbench
-capture/annotation JSON and experiment ZIPs are the handoff format; no direct
-IDA automation adapter is included. Prefer one analysis toolchain initially.
+The optional upstream IDA MCP is not bundled or installed. This repository now
+also includes its own read-only IDA analysis agent and live broker client in
+`ps4_workbench/adapters/ida.py`, plus the native GDB bridge. The installed IDA
+Pro 9.5 adapter/decompiler and native debugger have passed fixture tests; see
+`VALIDATION_02.md`. Running two independent console debugger clients is still not
+supported: share the broker and one control lease.
