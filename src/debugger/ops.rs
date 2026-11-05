@@ -763,6 +763,13 @@ mod tests {
 
     #[test]
     fn attach_step_run_stack_eval_and_registers_against_fake() {
+        // The pinned protocol fixes the debug callback port at 755. Hosts with
+        // an unprivileged-port floor above 755 (some CI runners) cannot bind it;
+        // skip there instead of failing — other runners cover the full path.
+        if std::net::TcpListener::bind(("127.0.0.1", 755)).is_err() {
+            eprintln!("skipping: cannot bind the fixed callback port 755 on this host");
+            return;
+        }
         let fake = fake::spawn_debuggable();
         let directory = tempfile::tempdir().unwrap();
         let profile = qualified_profile(directory.path(), fake.port);
