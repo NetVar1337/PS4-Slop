@@ -379,6 +379,324 @@ impl Debugger {
             "rsp":format!("{:#x}",file.get("rsp").unwrap_or(0)),
             "location":Self::annotate(rip, &modules),"registers":registers(&raw)?}))
     }
+
+    // ---- execution control -------------------------------------------------
+
+    /// Slot of an already-tracked enabled breakpoint at `address`, if any.
+    fn target_slot_for(&self, address: u64) -> Option<u32> {
+        self.breakpoints
+            .iter()
+            .find(|(_, record)| record.enabled && record.address == address)
+            .map(|(slot, _)| *slot)
+    }
+
+    /// Temporary breakpoint in a free slot, tracked as internal so it never
+    /// shows up in `breakpoint_list` and is always cleared by the caller.
+    fn set_internal_breakpoint(&mut self, address: u64) -> Result<u32> {
+        let slot = self.free_slot()?;
+        self.breakpoint_ex(slot, address, true, None, None, 0)?;
+        if let Some(record) = self.breakpoints.get_mut(&slot) {
+            record.internal = true;
+        }
+        Ok(slot)
+    }
+
+    fn clear_internal_breakpoint(&mut self, slot: u32) -> Result<()> {
+        let result = self.breakpoint(slot, 0, false).map(|_| ());
+        self.breakpoints.remove(&slot);
+        result
+    }
+
+    /// Step one instruction (`into`), over calls and repeated string ops
+    /// (`over`), or out of the current function (`out`). Over/out fall back to a
+    /// temporary breakpoint at the next instruction / stack return address when
+    /// a single step cannot produce that stop. After every stop the live
+    /// registers are re-read: the pinned server steps past a breakpoint
+    /// instruction before reporting, so event registers can be stale.
+    pub fn step(&mut self, mode: &str, thread_id: u32, timeout: Duration) -> Result<Value> {
+        self.require_qualified_debugger("debug_control")?;
+        let pid = self.attached()?;
+        Self::pid(thread_id)?;
+        let raw = self.get_registers_raw(thread_id)?;
+        let file = RegisterFile(&raw);
+        let rip = file.get("rip").context("Thread has no rip")?;
+        let plan = match mode {
+            "into" => disasm::StepPlan::Single,
+            "over" => {
+                let bytes = self.read_code(pid, rip, 16)?;
+                disasm::step_over_plan(&bytes, rip)?
+            }
+            "out" => {
+                let bytes = self.read_code(pid, rip, 16)?;
+                if disasm::is_return(&bytes, rip) {
+                    disasm::StepPlan::Single
+                } else {
+                    let rsp = file.get("rsp").context("Thread has no rsp")?;
+                    let bytes = self.read_memory(pid, rsp, 8, false)?;
+                    let target = u64::from_le_bytes(
+                        <[u8; 8]>::try_from(bytes.as_slice())
+                            .map_err(|_| anyhow::anyhow!("Short read at rsp"))?,
+                    );
+                    let executable = self
+                        .maps(pid)?
+                        .as_array()
+                        .context("Expected maps")?
+                        .iter()
+                        .any(|entry| {
+                            let protection = entry["protection"].as_u64().unwrap_or(0);
+                            protection & 4 != 0
+                                && entry["start"].as_u64().unwrap_or(0) <= target
+                                && target < entry["end"].as_u64().unwrap_or(0)
+                        });
+                    ensure!(
+                        executable,
+                        "Stack top {target:#x} is not executable; step out refused"
+                    );
+                    disasm::StepPlan::RunTo(target)
+                }
+            }
+            other => bail!("Unsupported step mode: {other} (use into, over or out)"),
+        };
+        let (stop, note) = match plan {
+            disasm::StepPlan::Single => {
+                self.control("step_thread", thread_id)?;
+                (self.wait_stop(timeout)?, "single_step")
+            }
+            disasm::StepPlan::RunTo(target) => {
+                let internal = match self.target_slot_for(target) {
+                    Some(_) => None,
+                    None => Some(self.set_internal_breakpoint(target)?),
+                };
+                let resumed = self.control("resume", 0);
+                let stopped = self.wait_stop(timeout);
+                let cleared = internal.map_or(Ok(()), |slot| self.clear_internal_breakpoint(slot));
+                resumed?;
+                let stop = stopped?;
+                cleared?;
+                (
+                    stop,
+                    "run_to_temp_breakpoint: the server executes the instruction at the breakpoint before reporting the stop, so live rip can be one instruction past the target",
+                )
+            }
+        };
+        let state = self.live_state(thread_id).ok();
+        Ok(json!({"mode":mode,"thread_id":thread_id,"plan":note,"stop":stop,"state":state}))
+    }
+
+    /// Resume all threads and report stop events. Stops at the first event
+    /// unless a `condition` is given and evaluates false on the stopped thread
+    /// (then it resumes again). Also stops when the run-to `target` is hit or a
+    /// tracked breakpoint reaches its `stop_after` hit count. Bounded by
+    /// `max_stops` events and `timeout`; never resumes after the final stop.
+    pub fn run(
+        &mut self,
+        target: Option<u64>,
+        condition: Option<&str>,
+        max_stops: u32,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.require_qualified_debugger("debug_control")?;
+        let pid = self.attached()?;
+        if let Some(text) = condition {
+            expr::validate(text)?;
+        }
+        ensure!((1..=64).contains(&max_stops), "max_stops must be 1-64");
+        let (target_slot, internal) = match target {
+            Some(address) => match self.target_slot_for(address) {
+                Some(slot) => (Some(slot), false),
+                None => (Some(self.set_internal_breakpoint(address)?), true),
+            },
+            None => (None, false),
+        };
+        let outcome = self.run_loop(pid, target, target_slot, condition, max_stops, timeout);
+        if internal
+            && let Some(slot) = target_slot
+            && let Err(error) = self.clear_internal_breakpoint(slot)
+            && outcome.is_ok()
+        {
+            return Err(error.context("Run finished but the temporary breakpoint could not be cleared; console state uncertain"));
+        }
+        outcome
+    }
+
+    fn run_loop(
+        &mut self,
+        pid: u32,
+        target: Option<u64>,
+        target_slot: Option<u32>,
+        condition: Option<&str>,
+        max_stops: u32,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.control("resume", 0)?;
+        let deadline = Instant::now() + timeout;
+        let mut stops = Vec::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .context("Run timeout; threads may still be running; call debug_control halt")?;
+            let Some(event) = self.wait_stop(remaining)? else {
+                break;
+            };
+            let event_thread = event["thread_id"].as_u64().unwrap_or(0) as u32;
+            let event_rip = parse_hex(&event["registers"]["rip"]).unwrap_or(0);
+            let mut hit_slot = None;
+            for (slot, record) in self.breakpoints.iter_mut() {
+                if record.enabled
+                    && (record.address == event_rip || record.address + 1 == event_rip)
+                {
+                    record.hits += 1;
+                    hit_slot = Some(*slot);
+                }
+            }
+            let state = self.live_state(event_thread).ok();
+            let mut condition_value = Value::Null;
+            let mut condition_met = true;
+            if let Some(text) = condition {
+                match self.evaluate(text, Some(pid), Some(event_thread)) {
+                    Ok(value) => {
+                        condition_value = value["value"].clone();
+                        condition_met = parse_hex(&value["value"]).unwrap_or(0) != 0;
+                    }
+                    Err(error) => {
+                        return Err(error.context(
+                            "Condition evaluation failed; stopped without resuming",
+                        ));
+                    }
+                }
+            }
+            let stop_after_hit = hit_slot
+                .and_then(|slot| self.breakpoints.get(&slot))
+                .is_some_and(|record| record.stop_after > 0 && record.hits >= record.stop_after);
+            let target_hit = hit_slot.is_some_and(|slot| Some(slot) == target_slot);
+            stops.push(json!({
+                "event":event,"hit_breakpoint":hit_slot,"target_hit":target_hit,
+                "condition":condition_value,"condition_met":condition_met,
+                "stop_after_hit":stop_after_hit,"state":state,
+            }));
+            let keep_running = condition.is_some()
+                && !condition_met
+                && !stop_after_hit
+                && !target_hit
+                && stops.len() < max_stops as usize;
+            if !keep_running {
+                break;
+            }
+            self.control("resume", 0)?;
+        }
+        Ok(json!({
+            "stop_count":stops.len(),"stops":stops,
+            "target":target.map(|address| format!("{address:#x}")),
+            "condition":condition,
+            "breakpoints":self.breakpoint_list(),
+            "note":"All-stop model: resume continues every thread. Event registers can be stale; each stop carries re-read live registers in state.",
+        }))
+    }
+
+    /// Best-effort call-stack unwind for one thread: frame-pointer chain first,
+    /// then a bounded scan of the stack for values inside executable mappings.
+    pub fn stack_trace(&mut self, thread_id: u32, max_frames: usize) -> Result<Value> {
+        ensure!((1..=64).contains(&max_frames), "max_frames must be 1-64");
+        let pid = self.attached()?;
+        Self::pid(thread_id)?;
+        let raw = self.get_registers_raw(thread_id)?;
+        let file = RegisterFile(&raw);
+        let rip = file.get("rip").unwrap_or(0);
+        let rbp = file.get("rbp").unwrap_or(0);
+        let rsp = file.get("rsp").unwrap_or(0);
+        let maps = self.maps(pid)?;
+        let modules = self.module_bases(pid)?;
+        let entries = maps.as_array().context("Expected maps")?;
+        let executable: Vec<(u64, u64)> = entries
+            .iter()
+            .filter(|entry| entry["protection"].as_u64().unwrap_or(0) & 4 != 0)
+            .map(|entry| {
+                (
+                    entry["start"].as_u64().unwrap_or(0),
+                    entry["end"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        let in_executable =
+            |address: u64| executable.iter().any(|(start, end)| *start <= address && address < *end);
+        let stack_entry = entries
+            .iter()
+            .find(|entry| {
+                let protection = entry["protection"].as_u64().unwrap_or(0);
+                let (start, end) = (
+                    entry["start"].as_u64().unwrap_or(0),
+                    entry["end"].as_u64().unwrap_or(0),
+                );
+                protection & 1 != 0 && protection & 4 == 0 && start <= rsp && rsp < end
+            })
+            .cloned();
+        let stack_end = stack_entry
+            .as_ref()
+            .and_then(|entry| entry["end"].as_u64())
+            .unwrap_or(rsp);
+        let mut frames = vec![json!({"depth":0,"address":format!("{rip:#x}"),
+            "symbol":Self::annotate(rip, &modules),"via":"current_rip"})];
+        let mut chain_complete = true;
+        let mut current = rbp;
+        let mut visited = std::collections::HashSet::new();
+        while frames.len() < max_frames
+            && current >= rsp
+            && current < stack_end
+            && current % 8 == 0
+            && visited.insert(current)
+        {
+            let Ok(pair) = self.read_memory(pid, current, 16, false) else {
+                chain_complete = false;
+                break;
+            };
+            let next = qword(&pair, 0);
+            let return_address = qword(&pair, 8);
+            if !in_executable(return_address) {
+                chain_complete = false;
+                break;
+            }
+            frames.push(json!({"depth":frames.len(),"address":format!("{return_address:#x}"),
+                "symbol":Self::annotate(return_address, &modules),"via":"frame_pointer",
+                "frame_pointer":format!("{current:#x}")}));
+            if next <= current || next >= stack_end {
+                chain_complete = false;
+                break;
+            }
+            current = next;
+        }
+        let scan_end = stack_end.min(rsp.saturating_add(16384));
+        let mut scanned = 0u64;
+        if scan_end > rsp {
+            for (chunk_address, length) in Self::page_chunks(rsp, (scan_end - rsp) as usize) {
+                if frames.len() >= max_frames {
+                    break;
+                }
+                let Ok(content) = self.read_memory(pid, chunk_address, length, false) else {
+                    break;
+                };
+                scanned += length as u64;
+                for offset in (0..content.len().saturating_sub(7)).step_by(8) {
+                    if frames.len() >= max_frames {
+                        break;
+                    }
+                    let candidate = qword(&content, offset);
+                    if in_executable(candidate)
+                        && !frames
+                            .iter()
+                            .any(|frame| parse_hex(&frame["address"]) == Some(candidate))
+                    {
+                        frames.push(json!({"depth":frames.len(),"address":format!("{candidate:#x}"),
+                            "symbol":Self::annotate(candidate, &modules),"via":"stack_scan",
+                            "stack_address":format!("{:#x}", chunk_address + offset as u64)}));
+                    }
+                }
+            }
+        }
+        Ok(json!({"thread_id":thread_id,"rip":format!("{rip:#x}"),"rsp":format!("{rsp:#x}"),
+            "rbp":format!("{rbp:#x}"),"frames":frames,"frame_pointer_complete":chain_complete,
+            "stack_scanned_bytes":scanned,
+            "note":"Heuristic unwind (frame-pointer chain plus stack scan); verify frames against disassembly"}))
+    }
 }
 
 struct Live<'a> {
@@ -409,5 +727,159 @@ impl Context for Live<'_> {
         let mut padded = [0u8; 8];
         padded[..size].copy_from_slice(&bytes);
         Ok(u64::from_le_bytes(padded))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ATTESTATION, Profile};
+    use crate::debugger::fake;
+    use std::path::Path;
+
+    fn qualified_profile(directory: &Path, port: u16) -> Profile {
+        let mut data: Value =
+            serde_json::from_str(include_str!("../../profiles/ps4-1400.json")).unwrap();
+        data["host"] = json!("127.0.0.1");
+        data["artifact_directory"] = json!("artifacts");
+        data["qualification_file"] = json!("qualification.json");
+        data["ports"]["debug"] = json!(port);
+        data["permissions"]["debug_control"] = json!(true);
+        data["jailbreak"]["installed_commit"] = json!("a".repeat(40));
+        data["jailbreak"]["hen_build"] = json!("test-hen");
+        data["debugger"]["expected_brand"] = json!("ps4debug-NG by Pharaoh2k v1.3.4");
+        data["debugger"]["payload_sha256"] = json!("b".repeat(64));
+        let path = directory.join("profile.json");
+        std::fs::write(&path, data.to_string()).unwrap();
+        let profile = Profile::load(path).unwrap();
+        let record = json!({
+            "profile_sha256": profile.fingerprint(), "attestation": ATTESTATION,
+            "approved_permissions": ["debug_control"], "debugger_payload_sha256": "b".repeat(64),
+            "payload_sha256_allowlist": [], "build_recipe_sha256_allowlist": [],
+        });
+        std::fs::write(profile.qualification_path(), record.to_string()).unwrap();
+        profile
+    }
+
+    #[test]
+    fn attach_step_run_stack_eval_and_registers_against_fake() {
+        // The pinned protocol fixes the debug callback port at 755. Hosts with
+        // an unprivileged-port floor above 755 (some CI runners) cannot bind it;
+        // skip there instead of failing — other runners cover the full path.
+        if std::net::TcpListener::bind(("127.0.0.1", 755)).is_err() {
+            eprintln!("skipping: cannot bind the fixed callback port 755 on this host");
+            return;
+        }
+        let fake = fake::spawn_debuggable();
+        let directory = tempfile::tempdir().unwrap();
+        let profile = qualified_profile(directory.path(), fake.port);
+        let mut debugger = Debugger::new(profile);
+
+        let attached = debugger.attach(77, "127.0.0.1").unwrap();
+        assert_eq!(attached["attached_pid"], 77);
+
+        let regs = debugger.get_registers(1).unwrap();
+        assert_eq!(regs["rip"], format!("{:#x}", fake::FAKE_RIP));
+
+        // Register write with readback verification.
+        let report = debugger
+            .set_registers(1, &[("rip".to_owned(), 0x1005)])
+            .unwrap();
+        assert_eq!(report["verified"], true);
+        assert_eq!(debugger.get_registers(1).unwrap()["rip"], "0x1005");
+        assert!(debugger.set_registers(1, &[("nope".to_owned(), 1)]).is_err());
+
+        // FPU and debug registers.
+        assert_eq!(
+            debugger.fpu_registers(1).unwrap()["xmm"].as_array().unwrap().len(),
+            16
+        );
+        assert!(debugger.hardware_debug_registers(1).unwrap()["dr7"].is_string());
+
+        // Tracked breakpoint with a condition; disassembly masks its int3 byte.
+        debugger
+            .breakpoint_ex(0, 0x1009, true, Some("rax == 0".to_owned()), None, 0)
+            .unwrap();
+        assert_eq!(debugger.breakpoint_list()[0]["condition"], "rax == 0");
+        let modules = debugger.module_list(77).unwrap();
+        assert_eq!(modules[0]["name"], "eboot.bin");
+        assert_eq!(modules[0]["base"], "0x1000");
+        let listing = debugger.disassemble_live(77, 0x1000, 8).unwrap();
+        let instructions = listing["instructions"].as_array().unwrap();
+        assert_eq!(instructions[0]["text"], "push rbp");
+        let call = &instructions[2];
+        assert_eq!(call["flow"], "call");
+        assert_eq!(call["branch_target"], "0x1019");
+        assert_eq!(call["branch_target_symbol"], "eboot.bin+0x19");
+        let at_bp = instructions
+            .iter()
+            .find(|item| item["address"] == "0x1009")
+            .unwrap();
+        assert_eq!(at_bp["breakpoint"], true);
+        assert_eq!(at_bp["bytes"], "31c0", "original byte restored, not int3");
+        // Clear it so the step-over temporary breakpoint can use the address.
+        debugger.breakpoint_ex(0, 0x1009, false, None, None, 0).unwrap();
+        assert!(debugger.breakpoint_list().as_array().unwrap().is_empty());
+
+        // Expression evaluation against live registers, memory and modules.
+        let value = debugger.evaluate("rip + 1", Some(77), Some(1)).unwrap();
+        assert_eq!(value["value"], "0x1006");
+        let deref = debugger.evaluate("[rsp+8]", Some(77), Some(1)).unwrap();
+        assert_eq!(deref["value"], format!("{:#x}", fake::FAKE_RET));
+        let module = debugger.evaluate("eboot.bin + 0x10", Some(77), None).unwrap();
+        assert_eq!(module["value"], "0x1010");
+
+        // Step into: single-step command plus one stop event.
+        let step = debugger.step("into", 1, Duration::from_secs(5)).unwrap();
+        assert_eq!(step["plan"], "single_step");
+        assert!(step["stop"].is_object());
+        assert_eq!(step["stop"]["thread_id"], 1);
+
+        // Step over the call at 0x1004: temporary breakpoint at the next instruction.
+        debugger
+            .set_registers(1, &[("rip".to_owned(), 0x1004)])
+            .unwrap();
+        let step = debugger.step("over", 1, Duration::from_secs(5)).unwrap();
+        assert!(step["plan"].as_str().unwrap().starts_with("run_to_temp_breakpoint"));
+        assert!(step["stop"].is_object());
+        assert!(
+            debugger.breakpoint_list().as_array().unwrap().is_empty(),
+            "internal breakpoint hidden and cleared"
+        );
+
+        // Run to the tracked breakpoint address: one stop, hit counted.
+        debugger
+            .breakpoint_ex(0, 0x1009, true, Some("rax == 0".to_owned()), None, 0)
+            .unwrap();
+        let run = debugger
+            .run(Some(0x1009), None, 4, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(run["stop_count"], 1);
+        assert_eq!(run["stops"][0]["target_hit"], true);
+        assert_eq!(run["breakpoints"][0]["hits"], 1);
+
+        // Conditional run: false condition keeps resuming up to max_stops.
+        let run = debugger
+            .run(None, Some("rax == 1"), 3, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(run["stop_count"], 3);
+        assert_eq!(run["stops"][0]["condition_met"], false);
+        // True condition stops at the first event.
+        let run = debugger
+            .run(None, Some("rax == 0"), 3, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(run["stop_count"], 1);
+        assert_eq!(run["stops"][0]["condition_met"], true);
+
+        // Call-stack unwind: current rip plus the frame-pointer return address.
+        let stack = debugger.stack_trace(1, 16).unwrap();
+        let frames = stack["frames"].as_array().unwrap();
+        assert_eq!(frames[0]["via"], "current_rip");
+        assert_eq!(frames[1]["address"], format!("{:#x}", fake::FAKE_RET));
+        assert_eq!(frames[1]["symbol"], "eboot.bin+0x500");
+        assert_eq!(frames[1]["via"], "frame_pointer");
+
+        debugger.detach().unwrap();
+        assert!(debugger.attached_pid.is_none());
     }
 }

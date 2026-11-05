@@ -205,6 +205,51 @@ before ending work. Broker shutdown attempts cleanup, but uncertain state is
 never a reason to automatically resend a payload, repeat a write or resume a
 target. Inspect the console and saved audit records first.
 
+## 6. Live debugging loop (debug_control permission + qualification required)
+
+Attach with `debug_attach` (`pid`, `listen_address` = the PC's LAN IPv4; the
+console calls back on TCP 755). Then, in any order:
+
+- `module_list`, `disassemble` (breakpoint bytes masked, branch targets annotated),
+  `debug_eval` (expressions like `[rsp+8]`, `rax == 1`, `eboot.bin+0x1000`),
+  `debug_registers` / `debug_registers_fpu` / `debug_registers_dr`.
+- `debug_breakpoint` (optional `condition`, `log`, `stop_after`; `debug_breakpoint_list`
+  shows hit counts), `debug_watchpoint`.
+- `debug_step` (`into`/`over`/`out`), `debug_run` (optional `target_address`,
+  `condition`, `max_stops`, `timeout_seconds`), `debug_stack` for a call-stack
+  unwind, `debug_registers_set` to patch registers (readback-verified),
+  `debug_control` for halt/resume, `debug_events` / `session_events` for stops.
+- `debug_detach` when done; payload sending stays blocked while attached.
+
+All-stop semantics: `resume`/`debug_run` continue every thread. After every stop
+the live registers are re-read (the pinned server steps past a breakpoint
+instruction before reporting, so event registers can be stale). `step over/out`
+and run-to-address use a temporary internal breakpoint when a single step cannot
+produce the stop; the report says when that happened.
+
+For static work on extracted files (no console needed): `artifact_info` (ELF64
+structure / SELF-PKG identification), `artifact_disasm`, `artifact_strings`,
+`pattern_scan`, plus the IDA/Ghidra agents above for decompilation and xrefs.
+
+## 7. Connection stability (no server restarts needed)
+
+- Invalid payloads are rejected **before any byte is sent** (container magic,
+  size, uniform-fill and text heuristics, manifest hash and allowlist), so the
+  BinLoader/PayLoader never receives garbage and does not need a restart.
+  Sends are single-attempt, rate-limited and closed with a clean EOF; they are
+  never retried automatically.
+- FTP: extraction reuses one session (NOOP-revalidated); single-shot transfers
+  open a fresh connection and retry idempotent reads up to 3 times; sessions are
+  closed with QUIT. `ftp_extract` stops on first failure without retrying partial
+  transfers.
+- Klog: dropped log streams are re-established (up to 3 reconnects) instead of
+  silently truncating the capture.
+- Debugger: read-only commands reconnect once after a transient drop; losing an
+  attachment is reported explicitly (console state uncertain) rather than
+  silently cleared.
+- `link_status` (optionally with `probe: true`) reports per-service health,
+  consecutive failures and retry counts. Nothing probes in the background.
+
 ## Verification boundary
 
 See `VALIDATION.md`. The exact installed IDA native debugger and Ghidra Java

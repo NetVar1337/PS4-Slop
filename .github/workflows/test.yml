@@ -11,6 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # The pinned ps4debug-NG protocol fixes the debug callback port at 755;
+      # allow unprivileged binds below 1024 on Linux runners so the attach
+      # tests exercise the full callback path (Windows needs nothing).
+      - if: runner.os == 'Linux'
+        run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo run --locked -- validate

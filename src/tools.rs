@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, bail, ensure};
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom};
+use std::time::Duration;
 
 pub struct ToolRegistry {
     pub workbench: Workbench,
@@ -280,10 +281,13 @@ impl ToolRegistry {
                         string(args, "action")?,
                         args["thread_id"].as_u64().unwrap_or(0) as u32,
                     ),
-                    "debug_breakpoint" => self.workbench.debugger.breakpoint(
+                    "debug_breakpoint" => self.workbench.debugger.breakpoint_ex(
                         number(args, "index")? as u32,
                         address(&args["address"])?,
                         args["enabled"].as_bool().unwrap_or(true),
+                        args["condition"].as_str().map(str::to_owned),
+                        args["log"].as_str().map(str::to_owned),
+                        args["stop_after"].as_u64().unwrap_or(0),
                     ),
                     _ => self.workbench.debugger.watchpoint(
                         number(args, "index")? as u32,
@@ -302,6 +306,109 @@ impl ToolRegistry {
                 .debugger
                 .get_registers(number(args, "thread_id")? as u32),
             "debug_events" => self.workbench.debugger.poll_events(),
+            "debug_registers_fpu" => self
+                .workbench
+                .debugger
+                .fpu_registers(number(args, "thread_id")? as u32),
+            "debug_registers_dr" => self
+                .workbench
+                .debugger
+                .hardware_debug_registers(number(args, "thread_id")? as u32),
+            "debug_breakpoint_list" => Ok(self.workbench.debugger.breakpoint_list()),
+            "debug_stack" => self.workbench.debugger.stack_trace(
+                number(args, "thread_id")? as u32,
+                args["max_frames"].as_u64().unwrap_or(32) as usize,
+            ),
+            "debug_eval" => self.workbench.debugger.evaluate(
+                string(args, "expression")?,
+                args["pid"].as_u64().map(|pid| pid as u32),
+                args["thread_id"].as_u64().map(|thread| thread as u32),
+            ),
+            "disassemble" => self.workbench.debugger.disassemble_live(
+                number(args, "pid")? as u32,
+                address(&args["address"])?,
+                args["count"].as_u64().unwrap_or(32) as usize,
+            ),
+            "module_list" => self
+                .workbench
+                .debugger
+                .module_list(number(args, "pid")? as u32),
+            "debug_step" | "debug_run" | "debug_registers_set" => {
+                self.workbench.store.audit(
+                    "debug_control_intent",
+                    json!({"method":name,"arguments":args}),
+                )?;
+                let timeout =
+                    Duration::from_secs(args["timeout_seconds"].as_u64().unwrap_or(10).clamp(1, 60));
+                let result = match name {
+                    "debug_step" => self.workbench.debugger.step(
+                        string(args, "action")?,
+                        number(args, "thread_id")? as u32,
+                        timeout,
+                    ),
+                    "debug_run" => self.workbench.debugger.run(
+                        if args["target_address"].is_string() {
+                            Some(address(&args["target_address"])?)
+                        } else {
+                            None
+                        },
+                        args["condition"].as_str(),
+                        args["max_stops"].as_u64().unwrap_or(1) as u32,
+                        timeout,
+                    ),
+                    _ => {
+                        let changes = args["changes"]
+                            .as_array()
+                            .context("Missing changes")?
+                            .iter()
+                            .map(|change| {
+                                Ok((
+                                    string(change, "name")?.to_owned(),
+                                    address(&change["value"])?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        self.workbench
+                            .debugger
+                            .set_registers(number(args, "thread_id")? as u32, &changes)
+                    }
+                };
+                self.workbench.audit_result("debug_control", &result)?;
+                result
+            }
+            "artifact_info" => analysis::artifact_info(&self.workbench.read_artifact(
+                string(args, "artifact")?,
+                self.workbench.profile.limit("transfer_bytes"),
+            )?),
+            "artifact_disasm" => {
+                let data = self.workbench.read_artifact(
+                    string(args, "artifact")?,
+                    self.workbench.profile.limit("transfer_bytes"),
+                )?;
+                let offset = args["offset"].as_u64().unwrap_or(0);
+                let base = if args["address"].is_string() {
+                    address(&args["address"])?
+                } else {
+                    offset
+                };
+                analysis::disassemble_artifact(
+                    &data,
+                    offset as usize,
+                    base,
+                    args["count"].as_u64().unwrap_or(32) as usize,
+                )
+            }
+            "artifact_strings" => {
+                let data = self.workbench.read_artifact(
+                    string(args, "artifact")?,
+                    self.workbench.profile.limit("transfer_bytes"),
+                )?;
+                analysis::strings(
+                    &data,
+                    args["min_length"].as_u64().unwrap_or(6) as usize,
+                    args["max_results"].as_u64().unwrap_or(256) as usize,
+                )
+            }
             "address_correlate" => {
                 let start = address(&args["address"])?;
                 let maps = self.workbench.debugger.maps(number(args, "pid")? as u32)?;
@@ -391,7 +498,15 @@ mod tests {
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
         let catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json")).unwrap();
-        assert_eq!(catalog.len(), 42);
+        assert_eq!(catalog.len(), 55);
+        for expected in [
+            "debug_step", "debug_run", "debug_stack", "debug_eval", "disassemble",
+            "module_list", "debug_registers_set", "debug_registers_fpu",
+            "debug_registers_dr", "debug_breakpoint_list", "artifact_info",
+            "artifact_disasm", "artifact_strings",
+        ] {
+            assert!(catalog.iter().any(|tool| tool["name"] == expected), "{expected}");
+        }
         for tool in catalog {
             let validator = jsonschema::validator_for(&tool["inputSchema"]).unwrap();
             assert!(!validator.is_valid(&json!({"unexpected":true})));
