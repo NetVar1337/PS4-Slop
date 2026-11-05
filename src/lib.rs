@@ -54,3 +54,6 @@ pub mod cfg;
 pub mod sigmaker;
 pub mod bindiff;
 pub mod prototypes;
+// Project area modules.
+pub mod recipes;
+pub mod analysis_apply;

@@ -274,6 +274,60 @@ pub fn analysis_tools() -> Vec<Value> {
             json!(["target"]),
             false,
         ),
+        (
+            "analysis_apply_prototypes",
+            "Apply a ps4wb-prototypes-v1 artifact (e.g. from orbis_prototypes) as function types on matching import/function names in a connected analyzer (local database only; never touches console).",
+            apply_properties(&target, json!({
+                "filter": filter_schema,
+                "overwrite": {"type": "boolean", "description": "Replace existing user-defined types"},
+                "max_items": integer_schema(1, 20_000),
+            })),
+            json!(["target", "artifact"]),
+            false,
+        ),
+        (
+            "analysis_apply_struct",
+            "Create or update a struct type from a ps4wb-struct-v1 artifact in a connected analyzer (local database only).",
+            apply_properties(&target, json!({
+                "overwrite": {"type": "boolean", "description": "Replace an existing type with the same name"},
+            })),
+            json!(["target", "artifact"]),
+            false,
+        ),
+        (
+            "analysis_apply_coverage",
+            "Colour (and optionally comment) covered basic blocks from a ps4wb-coverage-v1 artifact; clear=true removes that colouring. RVAs are rebased to static_base or the analyzer's image base.",
+            apply_properties(&target, json!({
+                "clear": {"type": "boolean", "description": "Remove colour/coverage comments for the listed blocks instead of applying"},
+                "color": {"type": "string", "description": "Highlight colour 0xRRGGBB", "maxLength": 8, "pattern": "^0x[0-9a-fA-F]{6}$"},
+                "comment": {"type": "boolean", "description": "Also add a hit-count comment at each block start"},
+                "min_hits": integer_schema(0, 2_147_483_647),
+                "max_blocks": integer_schema(1, 100_000),
+            })),
+            json!(["target", "artifact"]),
+            false,
+        ),
+        (
+            "analysis_apply_classes",
+            "Label vtables/typeinfo from a ps4wb-classes-v1 artifact (e.g. rtti_recover) and name unnamed virtual functions Class::vfN in a connected analyzer.",
+            apply_properties(&target, json!({
+                "overwrite": {"type": "boolean", "description": "Rename vtable/typeinfo labels even when already named"},
+                "max_items": integer_schema(1, 50_000),
+            })),
+            json!(["target", "artifact"]),
+            false,
+        ),
+        (
+            "analysis_apply_symbols",
+            "Rename/comment addresses from a {rva: name} map, a ps4wb symbols list or a ported annotation set (artifact or inline symbols) in a connected analyzer.",
+            apply_properties(&target, json!({
+                "symbols": {"type": "object", "description": "Inline {\"0x<rva>\": \"name\"} map (instead of artifact)"},
+                "overwrite": {"type": "boolean", "description": "Rename even when the address already has a user-defined name"},
+                "max_items": integer_schema(1, 50_000),
+            })),
+            json!(["target"]),
+            false,
+        ),
     ];
     operations
         .into_iter()
@@ -286,6 +340,21 @@ pub fn analysis_tools() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// Shared `analysis_apply_*` arguments plus tool-specific `extra` properties.
+fn apply_properties(target: &Value, extra: Value) -> Value {
+    let mut properties = json!({
+        "target": target,
+        "artifact": bounded_text_schema("Relative path of the JSON artifact inside the artifact directory", 1, 1024),
+        "static_base": address_schema(),
+        "dry_run": {"type": "boolean", "description": "Validate and show the batches without contacting the analyzer"},
+        "allow_hash_mismatch": {"type": "boolean", "description": "Apply even when the artifact module_sha256 differs from the analyzer's input hash"},
+    });
+    if let (Some(fields), Some(more)) = (properties.as_object_mut(), extra.as_object()) {
+        fields.extend(more.clone());
+    }
+    properties
 }
 
 fn python_list(items: &[String]) -> String {
@@ -661,6 +730,15 @@ impl SessionHub {
         if name.starts_with("analysis_") {
             return self.analysis_call(name, arguments);
         }
+        if name == "recipe_run" {
+            // Recipe steps reach the registry directly, so enforce the shared debug lease up front.
+            let steps = crate::recipes::referenced_tools(&lock(&self.registry), &arguments).unwrap_or_default();
+            if steps.iter().any(|step| CONTROL_TOOLS.contains(&step.as_str()))
+                && lock(&self.debug).controller.as_deref() != Some(client)
+            {
+                bail!("Recipe contains debugger control steps; acquire the debug lease (debug_attach) first");
+            }
+        }
         if !is_shared(name) {
             return lock(&self.registry).call(name, arguments);
         }
@@ -1010,6 +1088,9 @@ impl SessionHub {
         if name == "analysis_sync_annotations" {
             return self.sync_annotations(&fields);
         }
+        if crate::analysis_apply::APPLY_TOOLS.contains(&name) {
+            return self.apply_annotations(name, &fields);
+        }
         let target = fields
             .remove("target")
             .and_then(|value| value.as_str().map(str::to_string))
@@ -1080,6 +1161,89 @@ impl SessionHub {
             return Ok(json!({"result_saved": saved}));
         }
         Ok(result)
+    }
+
+    /// `analysis_apply_*`: read and validate a bounded artifact, then send compact batches to the agent.
+    fn apply_annotations(&self, name: &str, fields: &Map<String, Value>) -> Result<Value> {
+        let target = fields.get("target").and_then(Value::as_str).unwrap_or_default();
+        let static_base = match fields.get("static_base").and_then(Value::as_str) {
+            Some(text) => Some(crate::agents::parse_address(text)?),
+            None => None,
+        };
+        let artifact = fields.get("artifact").and_then(Value::as_str);
+        let document = match (artifact, fields.get("symbols")) {
+            (Some(_), Some(_)) => bail!("Supply artifact or symbols, not both"),
+            (Some(path), None) => {
+                let store = lock(&self.registry).workbench.store.clone();
+                let content = store.read_bounded(path, crate::analysis_apply::MAX_APPLY_ARTIFACT)?;
+                serde_json::from_slice::<Value>(&content).map_err(|error| anyhow!("Artifact is not JSON: {error}"))?
+            }
+            (None, Some(inline)) if name == "analysis_apply_symbols" => inline.clone(),
+            _ => bail!("Supply an artifact"),
+        };
+        let prepared = crate::analysis_apply::prepare(name, &document, fields, static_base)?;
+        let program = self.analysis.status()[target]["program"].as_str().map(str::to_ascii_lowercase);
+        let hash_matches = match (&prepared.module_sha256, &program) {
+            (Some(expected), Some(actual)) if actual.len() == 64 => Some(expected == actual),
+            _ => None,
+        };
+        let mut summary = prepared.summary();
+        summary["target"] = json!(target);
+        summary["artifact"] = json!(artifact);
+        summary["rebased_to"] = match static_base {
+            Some(base) => json!(format!("{base:#x}")),
+            None => json!("analyzer image base"),
+        };
+        summary["module_hash_matches"] = json!(hash_matches);
+        if hash_matches == Some(false) && fields.get("allow_hash_mismatch") != Some(&Value::Bool(true)) {
+            bail!("Artifact module_sha256 differs from the {target} input hash; refusing to apply (allow_hash_mismatch overrides)");
+        }
+        if fields.get("dry_run") == Some(&Value::Bool(true)) {
+            let mut preview = prepared.batches.first().cloned().unwrap_or(Value::Null);
+            if let Some(items) = preview.as_object_mut().and_then(|batch| batch.values_mut().find_map(Value::as_array_mut)) {
+                items.truncate(5);
+            }
+            summary["dry_run"] = json!(true);
+            summary["preview"] = preview;
+            return Ok(summary);
+        }
+        let (mut applied, mut skipped, mut failed) = (0u64, 0u64, 0u64);
+        let mut errors: Vec<Value> = Vec::new();
+        let mut unsupported: Vec<Value> = Vec::new();
+        let mut sent = 0usize;
+        for batch in &prepared.batches {
+            match self.analysis.submit(target, prepared.operation, batch.clone(), JOB_TIMEOUT) {
+                Ok(report) => {
+                    sent += 1;
+                    applied += report["applied"].as_u64().unwrap_or(0);
+                    skipped += report["skipped"].as_u64().unwrap_or(0);
+                    failed += report["failed"].as_u64().unwrap_or(0);
+                    for error in report["errors"].as_array().into_iter().flatten() {
+                        if errors.len() < 50 {
+                            errors.push(error.clone());
+                        }
+                    }
+                    for feature in report["unsupported"].as_array().into_iter().flatten() {
+                        if !unsupported.contains(feature) && unsupported.len() < 16 {
+                            unsupported.push(feature.clone());
+                        }
+                    }
+                }
+                Err(error) if sent == 0 => return Err(error),
+                Err(error) => {
+                    summary["error"] = json!(format!("Stopped after {sent} batches: {error}"));
+                    break;
+                }
+            }
+        }
+        summary["batches_sent"] = json!(sent);
+        summary["applied"] = json!(applied);
+        summary["skipped"] = json!(skipped);
+        summary["failed"] = json!(failed);
+        summary["errors"] = Value::Array(errors);
+        summary["unsupported"] = Value::Array(unsupported);
+        summary["console_changed"] = json!(false);
+        Ok(summary)
     }
 
     pub fn dispatch(&self, client: &str, operation: &Value, arguments: &Map<String, Value>) -> Result<Value> {
@@ -1591,5 +1755,89 @@ mod tests {
         assert_eq!(summary["exported_renames"], 1);
         let labels = caller.call("debug_label", json!({"action": "list"})).unwrap();
         assert!(labels.as_array().unwrap().iter().any(|l| l["name"] == "orbis_main" && l["address"] == "0x401500"));
+    }
+
+    fn next_job(agent: &BrokerClient, target: &str) -> Value {
+        loop {
+            let polled = agent.request("agent_poll", json!({"target": target})).unwrap();
+            if !polled.is_null() {
+                return polled;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn apply_tools_validate_rebase_and_check_module_hash() {
+        let fixture = fixture();
+        let running = run(fixture.hub.clone(), fixture.token.clone());
+        let program = "c".repeat(64);
+        let agent = BrokerClient::new(&running.url, &fixture.token_path, "ida-agent-apply", None).unwrap();
+        agent.request("agent_register", json!({"target": "ida", "program": program})).unwrap();
+        let caller = BrokerClient::new(&running.url, &fixture.token_path, "mcp-apply", None).unwrap();
+        let store = lock(&fixture.hub.registry()).workbench.store.clone();
+        let save = |kind: &str, document: Value| -> String {
+            store.save(kind, document.to_string().as_bytes(), json!({}), "json").unwrap()["path"].as_str().unwrap().to_owned()
+        };
+        let coverage = save("coverage", json!({"format": "ps4wb-coverage-v1", "module": "eboot.bin", "module_sha256": program,
+            "image_base": "0x7fff00000000", "blocks": [{"rva": "0x1000", "size": 12, "hits": 3}, {"rva": "0x1010", "size": 4, "hits": 0}]}));
+
+        // Dry run: validated and rebased without contacting the agent.
+        let dry = caller.call("analysis_apply_coverage", json!({"target": "ida", "artifact": coverage,
+            "static_base": "0x400000", "dry_run": true})).unwrap();
+        assert_eq!(dry["items"], 1);
+        assert_eq!(dry["module_hash_matches"], true);
+        assert_eq!(dry["preview"]["blocks"][0], json!({"address": "0x401000", "size": 12, "hits": 3}));
+
+        let pending = {
+            let caller = caller.clone();
+            let coverage = coverage.clone();
+            std::thread::spawn(move || caller.call("analysis_apply_coverage", json!({"target": "ida", "artifact": coverage, "comment": true})))
+        };
+        let job = next_job(&agent, "ida");
+        assert_eq!(job["operation"], "apply_coverage");
+        assert_eq!(job["arguments"]["blocks"], json!([{"rva": "0x1000", "size": 12, "hits": 3}]));
+        assert_eq!(job["arguments"]["comment"], true);
+        agent.request("agent_result", json!({"identifier": job["id"], "result": {"applied": 1, "skipped": 0, "failed": 0}})).unwrap();
+        let report = pending.join().unwrap().unwrap();
+        assert_eq!(report["applied"], 1);
+        assert_eq!(report["batches_sent"], 1);
+        assert_eq!(report["rebased_to"], "analyzer image base");
+
+        let foreign = save("coverage", json!({"format": "ps4wb-coverage-v1", "module_sha256": "d".repeat(64),
+            "blocks": [{"rva": "0x10", "size": 4, "hits": 1}]}));
+        let refused = caller.call("analysis_apply_coverage", json!({"target": "ida", "artifact": foreign}));
+        assert!(refused.unwrap_err().to_string().contains("module_sha256"));
+        let forced = caller.call("analysis_apply_coverage", json!({"target": "ida", "artifact": foreign,
+            "allow_hash_mismatch": true, "dry_run": true})).unwrap();
+        assert_eq!(forced["module_hash_matches"], false);
+
+        // Agent-side errors propagate; malformed artifacts and arguments are rejected by the broker.
+        let pending = {
+            let caller = caller.clone();
+            std::thread::spawn(move || caller.call("analysis_apply_symbols", json!({"target": "ida", "symbols": {"0x20": "tick"},
+                "static_base": "0x1000"})))
+        };
+        let job = next_job(&agent, "ida");
+        assert_eq!(job["operation"], "apply_symbols");
+        assert_eq!(job["arguments"]["symbols"], json!([{"address": "0x1020", "name": "tick"}]));
+        agent.request("agent_result", json!({"identifier": job["id"], "error": "apply_symbols unsupported by backend"})).unwrap();
+        assert!(pending.join().unwrap().unwrap_err().to_string().contains("unsupported"));
+        let wrong = save("struct", json!({"format": "ps4wb-coverage-v1", "blocks": []}));
+        assert!(caller.call("analysis_apply_struct", json!({"target": "ida", "artifact": wrong})).unwrap_err().to_string().contains("expected ps4wb-struct-v1"));
+        assert!(caller.call("analysis_apply_struct", json!({"target": "ida", "artifact": "../escape.json"})).is_err());
+        assert!(caller.call("analysis_apply_coverage", json!({"target": "ida", "artifact": coverage, "color": "green"})).is_err());
+        assert!(caller.call("analysis_apply_symbols", json!({"target": "ida"})).is_err());
+        assert!(fixture.hub.analysis.submit("ida", "apply_symbols", json!({"symbols": [], "evil": 1}), JOB_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn recipes_with_control_steps_need_the_debug_lease() {
+        let fixture = fixture();
+        let refused = fixture.hub.call("mcp", "recipe_run", json!({"recipe": "crash_capture", "inputs": {"pid": 7}}));
+        assert!(refused.unwrap_err().to_string().contains("debug lease"));
+        let planned = fixture.hub.call("mcp", "recipe_run", json!({"recipe": "static_triage", "inputs": {"artifact": "x.elf"},
+            "dry_run": true})).unwrap();
+        assert_eq!(planned["steps"].as_array().unwrap().len(), 4);
     }
 }
