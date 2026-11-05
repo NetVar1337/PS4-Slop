@@ -29,3 +29,6 @@ pub mod binstatic;
 pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// trace area (run-loop tracing & coverage)
+pub mod tracekit;
