@@ -28,8 +28,10 @@ pub const MAX_CONNECTIONS: usize = 32;
 pub const MAX_INLINE_RESULT: usize = 24_576;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 pub const PUMP_INTERVAL: Duration = Duration::from_millis(50);
-pub const CONTROL_TOOLS: [&str; 7] = ["debug_attach", "debug_control", "debug_breakpoint", "debug_watchpoint",
-    "memory_write", "kernel_write", "debug_detach"];
+pub const CONTROL_TOOLS: [&str; 10] = [
+    "debug_attach", "debug_control", "debug_breakpoint", "debug_watchpoint", "memory_write",
+    "kernel_write", "debug_detach", "debug_step", "debug_run", "debug_registers_set",
+];
 const MAX_TOKEN_FILE: u64 = 1024;
 const SAFE_INTEGER: i128 = 9_007_199_254_740_991;
 
@@ -188,7 +190,7 @@ fn fallback_permission(name: &str) -> Option<&'static str> {
         "memory_write" => Some("process_write"),
         "kernel_read" | "kernel_base" => Some("kernel_read"),
         "kernel_write" => Some("kernel_write"),
-        "debug_attach" | "debug_control" | "debug_breakpoint" | "debug_watchpoint" => Some("debug_control"),
+        "debug_attach" | "debug_control" | "debug_breakpoint" | "debug_watchpoint" | "debug_step" | "debug_run" | "debug_registers_set" => Some("debug_control"),
         "ftp_upload" => Some("ftp_upload"),
         "sdk_build" => Some("build"),
         _ => None,
@@ -419,10 +421,14 @@ impl SessionHub {
             state.session_id = None;
             state.execution_state = "detached";
             state.last_stop = Value::Null;
-        } else if name == "debug_control" {
+        } else if name == "debug_run" {
+            state.execution_state = "running";
+        } else if matches!(name, "debug_control" | "debug_step") {
             match action.as_deref() {
                 Some("halt") => state.execution_state = "halting",
-                Some("resume" | "step" | "step_thread") => state.execution_state = "running",
+                Some("resume" | "step" | "step_thread" | "into" | "over" | "out") => {
+                    state.execution_state = "running";
+                }
                 _ => {}
             }
         }

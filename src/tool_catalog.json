@@ -1,1300 +1,1764 @@
 [
-  {
-    "name": "console_status",
-    "description": "Configured services and qualification. Probe is explicit; payload port is NEVER probed.",
-    "inputSchema": {
+ {
+  "name": "console_status",
+  "description": "Configured services and qualification. Probe is explicit; payload port is NEVER probed.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "probe": {
+     "type": "boolean"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "link_status",
+  "description": "Per-service connection health (ftp, klog, debug, payload) recorded from actual use, retry/backoff policy and payload rate limit. probe=true runs an explicit reachability check; the payload port is never probed. No background probing occurs.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "probe": {
+     "type": "boolean"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "desktop_status",
+  "description": "Discover IDA/Ghidra versions/paths, native GDB plugin and local GDB dependency without launching applications.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debugger_info",
+  "description": "Read-only NG handshake: protocol, decimal firmware, platform and brand; not a binary hash proof.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "ftp_list",
+  "description": "Bounded anonymous FTP LIST. Remote names/content are untrusted data.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute POSIX directory",
+     "maxLength": 1024
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "ftp_download",
+  "description": "Download a remote file to a hashed local artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "path": {
+     "type": "string",
+     "description": "Absolute POSIX file path",
+     "maxLength": 1024
+    }
+   },
+   "required": [
+    "path"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "ftp_extract",
+  "description": "Extract 1-64 explicit files with a cumulative byte budget and a saved manifest; partial failure is explicit, no retry.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "paths": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "description": "Absolute POSIX file path",
+      "maxLength": 1024
+     },
+     "minItems": 1,
+     "maxItems": 64
+    }
+   },
+   "required": [
+    "paths"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "ftp_upload",
+  "description": "Upload ONLY under profile allowlist, then hash-check downloaded readback. May overwrite remote file.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "path": {
+     "type": "string",
+     "description": "Absolute POSIX destination",
+     "maxLength": 1024
+    },
+    "sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": [
+    "artifact",
+    "path",
+    "sha256"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "ftp_upload"
+ },
+ {
+  "name": "klog_capture",
+  "description": "Capture bounded raw Klog bytes and timestamp envelope. Does not enable Klog or reconnect.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 30
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "payload_inspect",
+  "description": "Validate local BIN manifest against claimed firmware, actual host/HEN and artifact hash. Never executes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "manifest": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    }
+   },
+   "required": [
+    "manifest"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "payload_execute",
+  "description": "Send a hardware-allowlisted BIN once. Execution unacknowledged; NEVER automatically retry.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "manifest": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": [
+    "manifest",
+    "sha256"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "payload_execute"
+ },
+ {
+  "name": "process_list",
+  "description": "List processes through firmware-checked debugger.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "process_info",
+  "description": "Get process identity, title ID and content ID.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "pid"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "process_maps",
+  "description": "Get process memory maps. Offsets are not verified ELF image bases.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "pid"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_read",
+  "description": "Read bounded process memory to a local hashed artifact; non-atomic.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1048576
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "length"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_peek",
+  "description": "Small live memory read without creating artifact files; useful for native debugger views.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 8192
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "length"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_region_dump",
+  "description": "Chunk a readable mapped range into a hashed raw dump; preserve partial data and explicit completion status.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 16777216
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "length"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_typed",
+  "description": "Read one little-endian typed process value. 64-bit integers returned as strings.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "value_type": {
+     "type": "string",
+     "description": "",
+     "maxLength": 4096,
+     "enum": [
+      "u8",
+      "i8",
+      "u16",
+      "i16",
+      "u32",
+      "i32",
+      "u64",
+      "i64",
+      "f32",
+      "f64"
+     ]
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "value_type"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_snapshot",
+  "description": "Capture memory plus process/maps/application/hash provenance. Hash is user supplied; not an atomic dump.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1048576
+    },
+    "application_version": {
+     "type": "string",
+     "description": "",
+     "maxLength": 128,
+     "minLength": 1
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "length",
+    "application_version",
+    "module_sha256"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_diff",
+  "description": "Compare two bounded local captures by offset, with capped changed ranges.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "before": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "after": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    }
+   },
+   "required": [
+    "before",
+    "after"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "pattern_scan",
+  "description": "Scan a local bounded capture for hex bytes / ?? wildcards; never triggers server scan extensions.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "pattern": {
+     "type": "string",
+     "description": "",
+     "maxLength": 1024
+    }
+   },
+   "required": [
+    "artifact",
+    "pattern"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "memory_write",
+  "description": "Compare expected bytes, save backup/replacement, write and readback. Non-atomic; no automatic rollback.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "hex_data": {
+     "type": "string",
+     "description": "",
+     "maxLength": 8192
+    },
+    "expected_hex": {
+     "type": "string",
+     "description": "",
+     "maxLength": 8192
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "hex_data",
+    "expected_hex"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "process_write"
+ },
+ {
+  "name": "kernel_read",
+  "description": "Explicitly opted-in bounded kernel read; kernel access is not kernel breakpoint debugging.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1048576
+    }
+   },
+   "required": [
+    "address",
+    "length"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "kernel_read"
+ },
+ {
+  "name": "kernel_base",
+  "description": "Read kernel base only after explicit kernel-read qualification.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "kernel_read"
+ },
+ {
+  "name": "kernel_write",
+  "description": "High-risk kernel write with expected bytes, backup and readback; requires kernel_read too.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "hex_data": {
+     "type": "string",
+     "description": "",
+     "maxLength": 8192
+    },
+    "expected_hex": {
+     "type": "string",
+     "description": "",
+     "maxLength": 8192
+    }
+   },
+   "required": [
+    "address",
+    "hex_data",
+    "expected_hex"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "kernel_write"
+ },
+ {
+  "name": "debug_attach",
+  "description": "Attach to a process; may halt it. Requires explicit local callback interface and inbound TCP 755.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "listen_address": {
+     "type": "string",
+     "description": "Local PC IPv4 reachable from console",
+     "maxLength": 15
+    }
+   },
+   "required": [
+    "pid",
+    "listen_address"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_detach",
+  "description": "Detach/resume and clear backend breakpoints for this session. Available for cleanup.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_threads",
+  "description": "List threads of the attached process. Requires a persistent MCP session.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_registers",
+  "description": "Read exact pinned-source 176-byte GP register layout (not protocol doc's 184).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "thread_id"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_events",
+  "description": "Poll up to 16 asynchronous 1184-byte event packets without blocking.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_control",
+  "description": "Halt/resume/step or suspend/resume a thread. No process kill or reboot command exposed.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "action": {
+     "type": "string",
+     "description": "",
+     "maxLength": 4096,
+     "enum": [
+      "resume",
+      "halt",
+      "step",
+      "step_thread",
+      "suspend_thread",
+      "resume_thread"
+     ]
+    },
+    "thread_id": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "action"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_breakpoint",
+  "description": "Set/clear one of 30 software breakpoint slots; changes target instruction bytes. Optional condition (expression on live registers), log template and stop_after hit count are tracked host-side.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "index": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 29
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "enabled": {
+     "type": "boolean"
+    },
+    "condition": {
+     "type": "string",
+     "maxLength": 512,
+     "description": "Expression evaluated on live registers at each hit; run continues while false"
+    },
+    "log": {
+     "type": "string",
+     "maxLength": 256,
+     "description": "Log template recorded with each hit (event JSON)"
+    },
+    "stop_after": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 1000000,
+     "description": "Stop only after this many hits (0 = every hit)"
+    }
+   },
+   "required": [
+    "index",
+    "address"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_watchpoint",
+  "description": "Set/clear one of four aligned hardware watchpoint slots.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "index": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 3
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 8
+    },
+    "access": {
+     "type": "string",
+     "description": "",
+     "maxLength": 4096,
+     "enum": [
+      "execute",
+      "write",
+      "read_write"
+     ]
+    },
+    "enabled": {
+     "type": "boolean"
+    }
+   },
+   "required": [
+    "index",
+    "address",
+    "length",
+    "access"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "address_correlate",
+  "description": "Correlate runtime address to mapping and estimated image RVA; manually verify ELF layout.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "application_version": {
+     "type": "string",
+     "description": "",
+     "maxLength": 128
+    }
+   },
+   "required": [
+    "pid",
+    "address",
+    "module_sha256",
+    "application_version"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "annotation_save",
+  "description": "Save local evidence-backed module/RVA comment or symbol for analysis handoff; does not mutate Ghidra.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "rva": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "text": {
+     "type": "string",
+     "description": "",
+     "maxLength": 8192
+    },
+    "symbol": {
+     "type": "string",
+     "description": "",
+     "maxLength": 128
+    }
+   },
+   "required": [
+    "artifact",
+    "module_sha256",
+    "rva",
+    "text"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "ghidra_export",
+  "description": "Create a Ghidra handoff bundle with raw artifact and requested image base. Not reconstructed ELF.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "image_base": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": [
+    "artifact",
+    "image_base",
+    "module_sha256"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "artifact_list",
+  "description": "List bounded capture metadata; local files may contain sensitive console data.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "artifact_read",
+  "description": "Read up to 4096 bytes of a local artifact by offset, as hex and UTF-8 preview.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "offset": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 67108864
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 4096
+    }
+   },
+   "required": [
+    "artifact"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "experiment_bundle",
+  "description": "Archive selected artifacts, metadata and profile; no network export.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "paths": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "description": "Relative path inside configured artifact directory",
+      "maxLength": 1024,
+      "minLength": 1
+     },
+     "minItems": 1,
+     "maxItems": 100
+    },
+    "notes": {
+     "type": "string",
+     "description": "",
+     "maxLength": 8192
+    }
+   },
+   "required": [
+    "paths",
+    "notes"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "sdk_status",
+  "description": "Discover local toolchain paths/executables without running or installing them.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "sdk_scaffold",
+  "description": "Create SDK recipe/reference workspace. Requires a pinned upstream sample before build; no fake offsets or APIs.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "kind": {
+     "type": "string",
+     "description": "",
+     "maxLength": 4096,
+     "enum": [
+      "homebrew",
+      "plugin",
+      "payload"
+     ]
+    },
+    "name": {
+     "type": "string",
+     "description": "",
+     "maxLength": 64
+    }
+   },
+   "required": [
+    "kind",
+    "name"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "sdk_build",
+  "description": "Run a locally hash-allowlisted build recipe with bounded logs/time; never deploy automatically.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "recipe": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    },
+    "sha256": {
+     "type": "string",
+     "description": "Lowercase SHA-256",
+     "maxLength": 64,
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": [
+    "recipe",
+    "sha256"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "build"
+ },
+ {
+  "name": "debug_step",
+  "description": "Step one instruction (into), over calls (over), or out of the current function (out). Over/out use a temporary internal breakpoint when a single step cannot stop there. Live registers are re-read after every stop.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "action": {
+     "type": "string",
+     "enum": [
+      "into",
+      "over",
+      "out"
+     ]
+    },
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "timeout_seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 60,
+     "description": "Wall-clock bound for waiting on console stop events"
+    }
+   },
+   "required": [
+    "action",
+    "thread_id"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_run",
+  "description": "Resume all threads and report stop events. Stops at the first event unless condition is given and false (then resumes), when the target address is hit, or when a breakpoint reaches stop_after hits. Bounded by max_stops and timeout_seconds; never resumes after the final stop.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "target_address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "condition": {
+     "type": "string",
+     "maxLength": 512,
+     "description": "Expression evaluated on the stopped thread's live registers, e.g. rax == 0x1234 or [rsp] != 0; run continues while it is false"
+    },
+    "max_stops": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 64
+    },
+    "timeout_seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 60,
+     "description": "Wall-clock bound for waiting on console stop events"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_stack",
+  "description": "Best-effort call-stack unwind for a thread: frame-pointer chain plus a bounded stack scan for executable addresses, annotated with module+offset.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "max_frames": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 64
+    }
+   },
+   "required": [
+    "thread_id"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_eval",
+  "description": "Evaluate an expression against live state: registers (rax, rip, ...), module bases (eboot.bin+0x1000), labels and memory reads ([rsp+8], dword [rax]). Bounded memory reads.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "expression": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 512
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "expression"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "disassemble",
+  "description": "Live x86-64 disassembly from a process address; original bytes of our own breakpoints are masked out and branch targets annotated with module+offset.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 512
+    }
+   },
+   "required": [
+    "pid",
+    "address"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "module_list",
+  "description": "Named modules of a process with base, size and per-segment protection, aggregated from the memory maps.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "pid"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "debug_registers_set",
+  "description": "Write GP registers (rip/rflags included, flag bits masked to writable set) with readback verification. Fails closed if the server wrote a different thread.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "changes": {
+     "type": "array",
+     "minItems": 1,
+     "maxItems": 18,
+     "items": {
       "type": "object",
       "properties": {
-        "probe": {
-          "type": "boolean"
-        }
-      },
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "link_status",
-    "description": "Per-service connection health (ftp, klog, debug, payload) recorded from actual use, retry/backoff policy and payload rate limit. probe=true runs an explicit reachability check; the payload port is never probed. No background probing occurs.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "probe": {
-          "type": "boolean"
-        }
-      },
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "desktop_status",
-    "description": "Discover IDA/Ghidra versions/paths, native GDB plugin and local GDB dependency without launching applications.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "debugger_info",
-    "description": "Read-only NG handshake: protocol, decimal firmware, platform and brand; not a binary hash proof.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "ftp_list",
-    "description": "Bounded anonymous FTP LIST. Remote names/content are untrusted data.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string",
-          "description": "Absolute POSIX directory",
-          "maxLength": 1024
-        }
-      },
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "ftp_download",
-    "description": "Download a remote file to a hashed local artifact.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "path": {
-          "type": "string",
-          "description": "Absolute POSIX file path",
-          "maxLength": 1024
-        }
+       "name": {
+        "type": "string",
+        "enum": [
+         "rax",
+         "rbx",
+         "rcx",
+         "rdx",
+         "rsi",
+         "rdi",
+         "rbp",
+         "rsp",
+         "r8",
+         "r9",
+         "r10",
+         "r11",
+         "r12",
+         "r13",
+         "r14",
+         "r15",
+         "rip",
+         "rflags"
+        ]
+       },
+       "value": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       }
       },
       "required": [
-        "path"
+       "name",
+       "value"
       ],
       "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+     }
+    }
+   },
+   "required": [
+    "thread_id",
+    "changes"
+   ],
+   "additionalProperties": false
   },
-  {
-    "name": "ftp_extract",
-    "description": "Extract 1-64 explicit files with a cumulative byte budget and a saved manifest; partial failure is explicit, no retry.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "paths": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "description": "Absolute POSIX file path",
-            "maxLength": 1024
-          },
-          "minItems": 1,
-          "maxItems": 64
-        }
-      },
-      "required": [
-        "paths"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "ftp_upload",
-    "description": "Upload ONLY under profile allowlist, then hash-check downloaded readback. May overwrite remote file.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "path": {
-          "type": "string",
-          "description": "Absolute POSIX destination",
-          "maxLength": 1024
-        },
-        "sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        }
-      },
-      "required": [
-        "artifact",
-        "path",
-        "sha256"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "ftp_upload"
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_registers_fpu",
+  "description": "Read the FPU/SSE state of a thread: x87 control/status, ST0-7, XMM0-15, YMM high halves, MXCSR.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "thread_id"
+   ],
+   "additionalProperties": false
   },
-  {
-    "name": "klog_capture",
-    "description": "Capture bounded raw Klog bytes and timestamp envelope. Does not enable Klog or reconnect.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "seconds": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 30
-        }
-      },
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "payload_inspect",
-    "description": "Validate local BIN manifest against claimed firmware, actual host/HEN and artifact hash. Never executes.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "manifest": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        }
-      },
-      "required": [
-        "manifest"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "permission": null
+ },
+ {
+  "name": "debug_registers_dr",
+  "description": "Read the hardware debug registers DR0-3/6/7 of a thread.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    }
+   },
+   "required": [
+    "thread_id"
+   ],
+   "additionalProperties": false
   },
-  {
-    "name": "payload_execute",
-    "description": "Send a hardware-allowlisted BIN once. Execution unacknowledged; NEVER automatically retry.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "manifest": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        }
-      },
-      "required": [
-        "manifest",
-        "sha256"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "payload_execute"
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "process_list",
-    "description": "List processes through firmware-checked debugger.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "permission": null
+ },
+ {
+  "name": "debug_breakpoint_list",
+  "description": "List tracked breakpoints with condition, log template, stop_after and hit counts. Internal step/run breakpoints are hidden.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
   },
-  {
-    "name": "process_info",
-    "description": "Get process identity, title ID and content ID.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        }
-      },
-      "required": [
-        "pid"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "process_maps",
-    "description": "Get process memory maps. Offsets are not verified ELF image bases.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        }
-      },
-      "required": [
-        "pid"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "permission": null
+ },
+ {
+  "name": "artifact_info",
+  "description": "Static structural parse of a local artifact: ELF64 header/program headers/sections/symbols/DT_NEEDED imports, or SCE SELF/PKG identification. No console access.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
+    }
+   },
+   "required": [
+    "artifact"
+   ],
+   "additionalProperties": false
   },
-  {
-    "name": "memory_read",
-    "description": "Read bounded process memory to a local hashed artifact; non-atomic.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1048576
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "length"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "memory_peek",
-    "description": "Small live memory read without creating artifact files; useful for native debugger views.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 8192
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "length"
-      ],
-      "additionalProperties": false
+  "permission": null
+ },
+ {
+  "name": "artifact_disasm",
+  "description": "Static x86-64 disassembly of an artifact range without touching the console; address is the virtual address the offset is mapped at.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
     },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
+    "offset": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 16777216
     },
-    "permission": null
+    "address": {
+     "type": "string",
+     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "count": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 512
+    }
+   },
+   "required": [
+    "artifact"
+   ],
+   "additionalProperties": false
   },
-  {
-    "name": "memory_region_dump",
-    "description": "Chunk a readable mapped range into a hashed raw dump; preserve partial data and explicit completion status.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 16777216
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "length"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "memory_typed",
-    "description": "Read one little-endian typed process value. 64-bit integers returned as strings.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "value_type": {
-          "type": "string",
-          "description": "",
-          "maxLength": 4096,
-          "enum": [
-            "u8",
-            "i8",
-            "u16",
-            "i16",
-            "u32",
-            "i32",
-            "u64",
-            "i64",
-            "f32",
-            "f64"
-          ]
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "value_type"
-      ],
-      "additionalProperties": false
+  "permission": null
+ },
+ {
+  "name": "artifact_strings",
+  "description": "Bounded printable-string extraction from a local artifact for reference hunting.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "description": "Relative path inside configured artifact directory",
+     "maxLength": 1024,
+     "minLength": 1
     },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
+    "min_length": {
+     "type": "integer",
+     "minimum": 4,
+     "maximum": 64
     },
-    "permission": null
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 4096
+    }
+   },
+   "required": [
+    "artifact"
+   ],
+   "additionalProperties": false
   },
-  {
-    "name": "memory_snapshot",
-    "description": "Capture memory plus process/maps/application/hash provenance. Hash is user supplied; not an atomic dump.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1048576
-        },
-        "application_version": {
-          "type": "string",
-          "description": "",
-          "maxLength": 128,
-          "minLength": 1
-        },
-        "module_sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "length",
-        "application_version",
-        "module_sha256"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
   },
-  {
-    "name": "memory_diff",
-    "description": "Compare two bounded local captures by offset, with capped changed ranges.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "before": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "after": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        }
-      },
-      "required": [
-        "before",
-        "after"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "pattern_scan",
-    "description": "Scan a local bounded capture for hex bytes / ?? wildcards; never triggers server scan extensions.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "pattern": {
-          "type": "string",
-          "description": "",
-          "maxLength": 1024
-        }
-      },
-      "required": [
-        "artifact",
-        "pattern"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "memory_write",
-    "description": "Compare expected bytes, save backup/replacement, write and readback. Non-atomic; no automatic rollback.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "hex_data": {
-          "type": "string",
-          "description": "",
-          "maxLength": 8192
-        },
-        "expected_hex": {
-          "type": "string",
-          "description": "",
-          "maxLength": 8192
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "hex_data",
-        "expected_hex"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "process_write"
-  },
-  {
-    "name": "kernel_read",
-    "description": "Explicitly opted-in bounded kernel read; kernel access is not kernel breakpoint debugging.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1048576
-        }
-      },
-      "required": [
-        "address",
-        "length"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "kernel_read"
-  },
-  {
-    "name": "kernel_base",
-    "description": "Read kernel base only after explicit kernel-read qualification.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "kernel_read"
-  },
-  {
-    "name": "kernel_write",
-    "description": "High-risk kernel write with expected bytes, backup and readback; requires kernel_read too.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "hex_data": {
-          "type": "string",
-          "description": "",
-          "maxLength": 8192
-        },
-        "expected_hex": {
-          "type": "string",
-          "description": "",
-          "maxLength": 8192
-        }
-      },
-      "required": [
-        "address",
-        "hex_data",
-        "expected_hex"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "kernel_write"
-  },
-  {
-    "name": "debug_attach",
-    "description": "Attach to a process; may halt it. Requires explicit local callback interface and inbound TCP 755.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "listen_address": {
-          "type": "string",
-          "description": "Local PC IPv4 reachable from console",
-          "maxLength": 15
-        }
-      },
-      "required": [
-        "pid",
-        "listen_address"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "debug_control"
-  },
-  {
-    "name": "debug_detach",
-    "description": "Detach/resume and clear backend breakpoints for this session. Available for cleanup.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "debug_threads",
-    "description": "List threads of the attached process. Requires a persistent MCP session.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "debug_registers",
-    "description": "Read exact pinned-source 176-byte GP register layout (not protocol doc's 184).",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "thread_id": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        }
-      },
-      "required": [
-        "thread_id"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "debug_events",
-    "description": "Poll up to 16 asynchronous 1184-byte event packets without blocking.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "debug_control",
-    "description": "Halt/resume/step or suspend/resume a thread. No process kill or reboot command exposed.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "action": {
-          "type": "string",
-          "description": "",
-          "maxLength": 4096,
-          "enum": [
-            "resume",
-            "halt",
-            "step",
-            "step_thread",
-            "suspend_thread",
-            "resume_thread"
-          ]
-        },
-        "thread_id": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 2147483647
-        }
-      },
-      "required": [
-        "action"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "debug_control"
-  },
-  {
-    "name": "debug_breakpoint",
-    "description": "Set/clear one of 30 software breakpoint slots; changes target instruction bytes.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "index": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 29
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "enabled": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "index",
-        "address"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "debug_control"
-  },
-  {
-    "name": "debug_watchpoint",
-    "description": "Set/clear one of four aligned hardware watchpoint slots.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "index": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 3
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 8
-        },
-        "access": {
-          "type": "string",
-          "description": "",
-          "maxLength": 4096,
-          "enum": [
-            "execute",
-            "write",
-            "read_write"
-          ]
-        },
-        "enabled": {
-          "type": "boolean"
-        }
-      },
-      "required": [
-        "index",
-        "address",
-        "length",
-        "access"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "debug_control"
-  },
-  {
-    "name": "address_correlate",
-    "description": "Correlate runtime address to mapping and estimated image RVA; manually verify ELF layout.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "pid": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 2147483647
-        },
-        "address": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "module_sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        },
-        "application_version": {
-          "type": "string",
-          "description": "",
-          "maxLength": 128
-        }
-      },
-      "required": [
-        "pid",
-        "address",
-        "module_sha256",
-        "application_version"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "annotation_save",
-    "description": "Save local evidence-backed module/RVA comment or symbol for analysis handoff; does not mutate Ghidra.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "module_sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        },
-        "rva": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "text": {
-          "type": "string",
-          "description": "",
-          "maxLength": 8192
-        },
-        "symbol": {
-          "type": "string",
-          "description": "",
-          "maxLength": 128
-        }
-      },
-      "required": [
-        "artifact",
-        "module_sha256",
-        "rva",
-        "text"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "ghidra_export",
-    "description": "Create a Ghidra handoff bundle with raw artifact and requested image base. Not reconstructed ELF.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "image_base": {
-          "type": "string",
-          "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-          "maxLength": 20,
-          "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-        },
-        "module_sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        }
-      },
-      "required": [
-        "artifact",
-        "image_base",
-        "module_sha256"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "artifact_list",
-    "description": "List bounded capture metadata; local files may contain sensitive console data.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "artifact_read",
-    "description": "Read up to 4096 bytes of a local artifact by offset, as hex and UTF-8 preview.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "artifact": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "offset": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 67108864
-        },
-        "length": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 4096
-        }
-      },
-      "required": [
-        "artifact"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "experiment_bundle",
-    "description": "Archive selected artifacts, metadata and profile; no network export.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "paths": {
-          "type": "array",
-          "items": {
-            "type": "string",
-            "description": "Relative path inside configured artifact directory",
-            "maxLength": 1024,
-            "minLength": 1
-          },
-          "minItems": 1,
-          "maxItems": 100
-        },
-        "notes": {
-          "type": "string",
-          "description": "",
-          "maxLength": 8192
-        }
-      },
-      "required": [
-        "paths",
-        "notes"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "sdk_status",
-    "description": "Discover local toolchain paths/executables without running or installing them.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {},
-      "required": [],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": true,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "sdk_scaffold",
-    "description": "Create SDK recipe/reference workspace. Requires a pinned upstream sample before build; no fake offsets or APIs.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "kind": {
-          "type": "string",
-          "description": "",
-          "maxLength": 4096,
-          "enum": [
-            "homebrew",
-            "plugin",
-            "payload"
-          ]
-        },
-        "name": {
-          "type": "string",
-          "description": "",
-          "maxLength": 64
-        }
-      },
-      "required": [
-        "kind",
-        "name"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": false,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": null
-  },
-  {
-    "name": "sdk_build",
-    "description": "Run a locally hash-allowlisted build recipe with bounded logs/time; never deploy automatically.",
-    "inputSchema": {
-      "type": "object",
-      "properties": {
-        "recipe": {
-          "type": "string",
-          "description": "Relative path inside configured artifact directory",
-          "maxLength": 1024,
-          "minLength": 1
-        },
-        "sha256": {
-          "type": "string",
-          "description": "Lowercase SHA-256",
-          "maxLength": 64,
-          "pattern": "^[0-9a-f]{64}$"
-        }
-      },
-      "required": [
-        "recipe",
-        "sha256"
-      ],
-      "additionalProperties": false
-    },
-    "annotations": {
-      "readOnlyHint": false,
-      "destructiveHint": true,
-      "idempotentHint": false,
-      "openWorldHint": true
-    },
-    "permission": "build"
-  }
+  "permission": null
+ }
 ]

@@ -87,26 +87,43 @@ by `serve`. Profile changes require a restart.
 
 ## Tool groups
 
-There are **41 standalone tools**, **30 visible with the default profile**. Shared
+There are **55 standalone tools**, **40 visible with the default profile**. Shared
 mode adds static-analysis and session-observer tools. Run `tools` for
 the complete, machine-readable schemas and current policy-filtered tool list.
 
 - **Console:** status, bounded FTP listing/downloads, allowlisted FTP uploads,
   raw Klog capture, payload manifest inspection, single-attempt BIN transfer.
   Multi-file extraction preserves a cumulative budget and partial-failure manifest.
+  Link health is passive (no background probing): read-only debugger commands
+  reconnect once after a transient drop, FTP transfers re-establish the session
+  (NOOP-revalidated for batches) and retry idempotent reads a bounded number of
+  times, Klog captures reconnect instead of truncating, and payloads are
+  validated locally (container magic, size, fill, text heuristics, manifest hash,
+  allowlist) **before any byte is sent**, so an invalid payload never reaches the
+  loader and no service restart is needed. `link_status` reports per-service
+  health; mutations are never auto-retried.
 - **Processes:** process list and identity, memory maps, bounded memory reads,
   little-endian typed values, provenance-rich snapshots, local snapshot diffs,
   wildcard byte-pattern scans, mapping/RVA correlation.
   `memory_peek` avoids artifact creation for live views; `memory_region_dump`
   chunks larger readable ranges and preserves incomplete captures explicitly.
-- **Debugger:** persistent process attach/detach, thread list, GP registers,
-  asynchronous events, halt/resume/step, thread controls, software breakpoints,
-  aligned hardware watchpoints.
+- **Debugger:** persistent process attach/detach, thread list, GP/FPU/debug-register
+  reads, register writes with readback verification, asynchronous stop events,
+  halt/resume, step into/over/out, run-to-address and conditional run with
+  breakpoint hit counting, software breakpoints with conditions/log/stop-after,
+  aligned hardware watchpoints, live disassembly with masked breakpoint bytes,
+  module lists, expression evaluation on live registers/memory, and call-stack
+  unwinding. Stop handling re-reads live registers because the pinned server
+  steps past a breakpoint instruction before reporting the hit.
 - **Memory mutations:** compare expected bytes, preserve original/replacement
   artifacts, write, independently read back, and persist an uncertainty journal.
   Kernel access is separately gated and is not kernel breakpoint debugging.
 - **Research artifacts:** hashes, metadata sidecars, bounded chunk reads,
   module/RVA annotations, Ghidra handoff bundles, experiment ZIPs.
+- **Static analysis (local, no console):** `artifact_info` parses ELF64 structure
+  (loads, sections, symbol counts, DT_NEEDED imports) or identifies SCE SELF/PKG
+  containers; `artifact_disasm` disassembles an artifact range at a chosen base
+  address; `artifact_strings` extracts bounded printable strings.
 - **Development:** local SDK discovery, three SDK recipe/reference scaffolds,
   hash-allowlisted local builds with bounded logs/time and captured outputs.
 - **Shared analysis:** IDA/Ghidra functions, decompilation and cross-references

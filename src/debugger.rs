@@ -627,9 +627,12 @@ impl Debugger {
 #[cfg(test)]
 pub(crate) mod fake {
     //! Minimal in-process ps4debug-NG protocol 1.3 server for offline tests.
+    //! `spawn` only implements the identity/process-list commands; `spawn_debuggable`
+    //! additionally implements attach, the event callback, registers, memory, maps,
+    //! breakpoints and execution control so the higher-level ops can be tested.
     use super::*;
     use std::sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
 
@@ -638,10 +641,223 @@ pub(crate) mod fake {
         pub connections: Arc<AtomicUsize>,
     }
 
+    pub const FAKE_BRAND: &[u8] = b"ps4debug-NG by Pharaoh2k v1.3.4\x001.1\0";
+    pub const FAKE_RIP: u64 = 0x1000;
+    pub const FAKE_STACK: u64 = 0x7fff_0000;
+    pub const FAKE_EXEC_END: u64 = 0x2000;
+    pub const FAKE_RET: u64 = 0x1500;
+    /// push rbp; mov rbp,rsp; call +0x10; xor eax,eax; ret ... at FAKE_RIP.
+    pub const CODE_AT_RIP: [u8; 12] = [
+        0x55, 0x48, 0x89, 0xe5, 0xe8, 0x10, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3,
+    ];
+
     fn text(stream: &mut TcpStream, value: &[u8]) {
         let mut out = (value.len() as u32).to_le_bytes().to_vec();
         out.extend(value);
         let _ = stream.write_all(&out);
+    }
+
+    fn success(stream: &mut TcpStream) {
+        let _ = stream.write_all(&SUCCESS.to_le_bytes());
+    }
+
+    fn event_bytes() -> Vec<u8> {
+        let mut event = vec![0u8; EVENT_SIZE];
+        event[..4].copy_from_slice(&1u32.to_le_bytes());
+        event[4..8].copy_from_slice(&6u32.to_le_bytes());
+        event[8..11].copy_from_slice(b"th\0");
+        let mut regs = vec![0u8; 176];
+        regs[crate::expr::RIP_OFFSET..crate::expr::RIP_OFFSET + 8].copy_from_slice(&0x1009u64.to_le_bytes());
+        regs[80..88].copy_from_slice(&FAKE_STACK.to_le_bytes());
+        regs[160..168].copy_from_slice(&FAKE_STACK.to_le_bytes());
+        event[48..224].copy_from_slice(&regs);
+        event
+    }
+
+    fn map_entry(start: u64, end: u64, protection: u64, name: &str) -> [u8; 64] {
+        let mut entry = [0u8; 64];
+        entry[..8].copy_from_slice(&start.to_le_bytes());
+        entry[8..16].copy_from_slice(&end.to_le_bytes());
+        entry[24..32].copy_from_slice(&protection.to_le_bytes());
+        entry[32..32 + name.len()].copy_from_slice(name.as_bytes());
+        entry
+    }
+
+    fn fake_memory(address: u64, length: usize) -> Vec<u8> {
+        let mut content = vec![0u8; length];
+        let end = address.saturating_add(length as u64);
+        if address < FAKE_EXEC_END && end > FAKE_RIP {
+            for (index, byte) in content.iter_mut().enumerate() {
+                let at = address.saturating_add(index as u64);
+                *byte = if (FAKE_RIP..FAKE_RIP + CODE_AT_RIP.len() as u64).contains(&at) {
+                    CODE_AT_RIP[(at - FAKE_RIP) as usize]
+                } else {
+                    0x90
+                };
+            }
+        } else if address >= FAKE_STACK && end <= FAKE_STACK + 0x10000 {
+            for (index, byte) in content.iter_mut().enumerate() {
+                let offset = address.saturating_add(index as u64) - FAKE_STACK;
+                let value = match offset / 8 {
+                    0 => FAKE_STACK + 8,
+                    1 => FAKE_RET,
+                    _ => 0,
+                };
+                *byte = (value >> (8 * (offset % 8))) as u8;
+            }
+        }
+        content
+    }
+
+    struct Shared {
+        events: Option<TcpStream>,
+        registers: [u8; 176],
+    }
+
+    /// Full fake: attach binds nothing itself; on BDBB0001 it connects back to the
+    /// requested callback address:755 and stores the stream so resume/step commands
+    /// can push one stop event each.
+    pub fn spawn_debuggable() -> FakeDebugger {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(Mutex::new(Shared {
+            events: None,
+            registers: {
+                let mut regs = [0u8; 176];
+                regs[crate::expr::RIP_OFFSET..crate::expr::RIP_OFFSET + 8]
+                    .copy_from_slice(&FAKE_RIP.to_le_bytes());
+                regs[80..88].copy_from_slice(&FAKE_STACK.to_le_bytes());
+                regs[160..168].copy_from_slice(&FAKE_STACK.to_le_bytes());
+                regs
+            },
+        }));
+        let counter = connections.clone();
+        let state = shared.clone();
+        std::thread::spawn(move || {
+            for mut stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    loop {
+                        let mut header = [0; 12];
+                        if stream.read_exact(&mut header).is_err() {
+                            return;
+                        }
+                        let command = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                        let length = u32::from_le_bytes(header[8..12].try_into().unwrap());
+                        let mut body = vec![0; length as usize];
+                        if stream.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        match command {
+                            0xbd000001 => text(&mut stream, b"1.3\0"),
+                            0xbd000501 => text(&mut stream, FAKE_BRAND),
+                            0xbd000500 => {
+                                let _ = stream.write_all(&1400u16.to_le_bytes());
+                            }
+                            0xbd000502 => {
+                                let _ = stream.write_all(&4u16.to_le_bytes());
+                            }
+                            0xbdaa0001 => {
+                                success(&mut stream);
+                                let mut out = 1u32.to_le_bytes().to_vec();
+                                let mut entry = [0u8; 36];
+                                entry[..4].copy_from_slice(b"eboo");
+                                entry[32..36].copy_from_slice(&77u32.to_le_bytes());
+                                out.extend(entry);
+                                let _ = stream.write_all(&out);
+                            }
+                            0xbdaa0004 => {
+                                success(&mut stream);
+                                let mut out = 2u32.to_le_bytes().to_vec();
+                                out.extend(map_entry(FAKE_RIP, FAKE_EXEC_END, 5, "eboot.bin"));
+                                out.extend(map_entry(FAKE_STACK, FAKE_STACK + 0x10000, 3, ""));
+                                let _ = stream.write_all(&out);
+                            }
+                            0xbdaa000a => {
+                                success(&mut stream);
+                                let mut data = vec![0u8; 188];
+                                data[..4].copy_from_slice(&77u32.to_le_bytes());
+                                data[4..9].copy_from_slice(b"eboot");
+                                let _ = stream.write_all(&data);
+                            }
+                            0xbdaa0002 => {
+                                let address = u64::from_le_bytes(body[4..12].try_into().unwrap());
+                                let length = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let _ = stream.write_all(&fake_memory(address, length));
+                            }
+                            0xbdbb0001 => {
+                                let interface = Ipv4Addr::new(body[4], body[5], body[6], body[7]);
+                                success(&mut stream);
+                                if let Ok(events) = TcpStream::connect((interface, 755)) {
+                                    state.lock().unwrap().events = Some(events);
+                                }
+                            }
+                            0xbdbb0002 => success(&mut stream),
+                            0xbdbb0003 | 0xbdbb0004 => success(&mut stream),
+                            0xbdbb0005 => {
+                                success(&mut stream);
+                                let mut out = 1u32.to_le_bytes().to_vec();
+                                out.extend(1u32.to_le_bytes());
+                                let _ = stream.write_all(&out);
+                            }
+                            0xbdbb0008 => {
+                                success(&mut stream);
+                                let regs = state.lock().unwrap().registers;
+                                let _ = stream.write_all(&regs);
+                            }
+                            0xbdbb0009 => {
+                                success(&mut stream);
+                                let mut regs = [0u8; 176];
+                                if stream.read_exact(&mut regs).is_err() {
+                                    return;
+                                }
+                                success(&mut stream);
+                                state.lock().unwrap().registers = regs;
+                            }
+                            0xbdbb000a => {
+                                success(&mut stream);
+                                let _ = stream.write_all(&[0u8; 832]);
+                            }
+                            0xbdbb000c => {
+                                success(&mut stream);
+                                let _ = stream.write_all(&[0u8; 128]);
+                            }
+                            0xbdbb0010 => {
+                                let resume = body.first().copied() == Some(0);
+                                success(&mut stream);
+                                if resume {
+                                    let event = event_bytes();
+                                    let mut guard = state.lock().unwrap();
+                                    if let Some(events) = guard.events.as_mut() {
+                                        let _ = events.write_all(&event);
+                                    }
+                                }
+                            }
+                            0xbdbb0011 => {
+                                success(&mut stream);
+                                let mut data = vec![0u8; 40];
+                                data[..4].copy_from_slice(&1u32.to_le_bytes());
+                                data[8..10].copy_from_slice(b"th");
+                                let _ = stream.write_all(&data);
+                            }
+                            0xbdbb0012 | 0xbdbb0013 => {
+                                success(&mut stream);
+                                let event = event_bytes();
+                                let mut guard = state.lock().unwrap();
+                                if let Some(events) = guard.events.as_mut() {
+                                    let _ = events.write_all(&event);
+                                }
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+        FakeDebugger { port, connections }
     }
 
     /// `drop_first_list`: the first connection to receive a process-list command is
@@ -668,7 +884,7 @@ pub(crate) mod fake {
                         }
                         match command {
                             0xbd000001 => text(&mut stream, b"1.3\0"),
-                            0xbd000501 => text(&mut stream, b"ps4debug-NG by Pharaoh2k v1.0\x001.1\0"),
+                            0xbd000501 => text(&mut stream, FAKE_BRAND),
                             0xbd000500 => {
                                 let _ = stream.write_all(&1400u16.to_le_bytes());
                             }
@@ -696,7 +912,6 @@ pub(crate) mod fake {
         FakeDebugger { port, connections }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

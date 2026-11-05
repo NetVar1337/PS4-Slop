@@ -4,7 +4,7 @@
 //! Debugger round-trips (process info, maps, memory reads) stay with the
 //! caller; `snapshot_record` and `correlate_maps` take their results.
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, ensure};
 use serde_json::{Value, json};
 
 use crate::Result;
@@ -310,6 +310,344 @@ pub fn ghidra_export(
     store.bundle(&[artifact.to_string()], &notes)
 }
 
+
+// ---- static container inspection (pure, local, bounded) ------------------
+//
+// Everything here parses bytes that were already extracted to the local
+// artifact store; nothing touches the console. All reads are bounds-checked
+// and all counts capped, so a hostile file cannot drive unbounded work.
+
+fn le16(data: &[u8], at: usize) -> Result<u16> {
+    Ok(u16::from_le_bytes(
+        data.get(at..at + 2)
+            .ok_or_else(|| anyhow!("Container truncated at {at:#x}"))?
+            .try_into()?,
+    ))
+}
+
+fn le32(data: &[u8], at: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        data.get(at..at + 4)
+            .ok_or_else(|| anyhow!("Container truncated at {at:#x}"))?
+            .try_into()?,
+    ))
+}
+
+fn le64(data: &[u8], at: usize) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        data.get(at..at + 8)
+            .ok_or_else(|| anyhow!("Container truncated at {at:#x}"))?
+            .try_into()?,
+    ))
+}
+
+fn elf_type_name(value: u16) -> String {
+    match value {
+        1 => "relocatable".to_owned(),
+        2 => "executable".to_owned(),
+        3 => "shared_object".to_owned(),
+        4 => "core".to_owned(),
+        other => format!("unknown({other})"),
+    }
+}
+
+fn elf_machine_name(value: u16) -> String {
+    match value {
+        0x3e => "x86-64".to_owned(),
+        0x28 => "arm".to_owned(),
+        0xb7 => "aarch64".to_owned(),
+        0x08 => "mips".to_owned(),
+        other => format!("unknown({other:#x})"),
+    }
+}
+
+fn segment_permissions(flags: u32) -> String {
+    format!(
+        "{}{}{}",
+        if flags & 4 != 0 { 'r' } else { '-' },
+        if flags & 2 != 0 { 'w' } else { '-' },
+        if flags & 1 != 0 { 'x' } else { '-' }
+    )
+}
+
+/// Dispatch on container magic: ELF64 gets a full structural parse, SCE
+/// containers are identified but not decrypted.
+pub fn artifact_info(data: &[u8]) -> Result<Value> {
+    if data.starts_with(b"\x7fELF") {
+        return elf_info(data);
+    }
+    if data.starts_with(b"\x4f\x15\x3d\x1d") {
+        return Ok(json!({
+            "kind": "ps4_self", "size": data.len(), "sha256": sha256_hex(data),
+            "version": data.get(4).copied().unwrap_or(0),
+            "note": "SCE SELF container; only magic and version are read here. Decrypt externally (e.g. ps4dec / make_fself) and re-run artifact_info on the embedded ELF.",
+        }));
+    }
+    if data.starts_with(b"\x7fCNT") {
+        return Ok(json!({
+            "kind": "ps4_pkg", "size": data.len(), "sha256": sha256_hex(data),
+            "note": "PS4 PKG container; extract with an external unpacker first.",
+        }));
+    }
+    Ok(json!({
+        "kind": "raw_binary", "size": data.len(), "sha256": sha256_hex(data),
+        "note": "No known container magic; treated as a flat binary. Use artifact_disasm with an explicit base address.",
+    }))
+}
+
+const MAX_PROGRAM_HEADERS: u16 = 256;
+const MAX_SECTIONS: u16 = 1024;
+const MAX_DYNAMIC_ENTRIES: usize = 512;
+const MAX_NEEDED: usize = 64;
+const MAX_SECTION_LIST: usize = 256;
+
+/// Structural parse of a little-endian ELF64 image: header, program headers
+/// (loads + dynamic), section headers with names, symbol-table sizes and
+/// DT_NEEDED imports. Every offset is bounds-checked against the buffer.
+pub fn elf_info(data: &[u8]) -> Result<Value> {
+    ensure!(data.len() >= 64, "Too small for an ELF64 header");
+    ensure!(data[4] == 2, "Not a 64-bit ELF");
+    ensure!(data[5] == 1, "Not a little-endian ELF");
+    ensure!(data[6] == 1, "Unsupported ELF version");
+    let e_type = le16(data, 16)?;
+    let e_machine = le16(data, 18)?;
+    let entry = le64(data, 24)?;
+    let phoff = le64(data, 32)?;
+    let shoff = le64(data, 40)?;
+    let flags = le32(data, 48)?;
+    let phentsize = le16(data, 54)?;
+    let phnum = le16(data, 56)?;
+    let shentsize = le16(data, 58)?;
+    let shnum = le16(data, 60)?;
+    let shstrndx = le16(data, 62)?;
+    ensure!(phentsize >= 56, "Invalid program header entry size");
+    ensure!(shentsize >= 64, "Invalid section header entry size");
+    ensure!(
+        phnum <= MAX_PROGRAM_HEADERS && shnum <= MAX_SECTIONS,
+        "Header counts exceed supported caps"
+    );
+    ensure!(
+        phoff as u128 + phnum as u128 * phentsize as u128 <= data.len() as u128,
+        "Program header table extends past end of file"
+    );
+
+    let mut loads = Vec::new();
+    let mut dynamic = None;
+    for index in 0..phnum as usize {
+        let base = phoff as usize + index * phentsize as usize;
+        let p_type = le32(data, base)?;
+        let p_flags = le32(data, base + 4)?;
+        let p_offset = le64(data, base + 8)?;
+        let p_vaddr = le64(data, base + 16)?;
+        let p_filesz = le64(data, base + 32)?;
+        let p_memsz = le64(data, base + 40)?;
+        if p_type == 1 {
+            loads.push(json!({
+                "vaddr": format!("{p_vaddr:#x}"), "offset": format!("{p_offset:#x}"),
+                "filesz": p_filesz, "memsz": p_memsz,
+                "permissions": segment_permissions(p_flags),
+            }));
+        } else if p_type == 2 {
+            dynamic = Some((p_offset, p_filesz));
+        }
+    }
+    let image_base = loads
+        .iter()
+        .filter_map(|load| parse_hex_string(load["vaddr"].as_str()?))
+        .min();
+
+    // Section headers and names via the section-header string table.
+    let mut sections = Vec::new();
+    let mut sections_truncated = false;
+    let mut symtab = 0u64;
+    let mut dynsym = 0u64;
+    if shnum > 0 && shoff > 0 {
+        ensure!(
+            shoff as u128 + shnum as u128 * shentsize as u128 <= data.len() as u128,
+            "Section header table extends past end of file"
+        );
+        let strtab = if (shstrndx as usize) < shnum as usize {
+            let base = shoff as usize + shstrndx as usize * shentsize as usize;
+            Some((le64(data, base + 24)?, le64(data, base + 32)?))
+        } else {
+            None
+        };
+        let name_at = |offset: u32| -> String {
+            let Some((table_offset, table_size)) = strtab else {
+                return String::new();
+            };
+            let start = table_offset as usize + offset as usize;
+            let table_size = table_size.min(1024 * 1024) as usize;
+            let end = (table_offset as usize + table_size).min(data.len());
+            if start >= end {
+                return String::new();
+            }
+            let slice = &data[start..end];
+            String::from_utf8_lossy(slice.split(|byte| *byte == 0).next().unwrap_or_default())
+                .into_owned()
+        };
+        for index in 0..shnum as usize {
+            let base = shoff as usize + index * shentsize as usize;
+            let sh_name = le32(data, base)?;
+            let sh_type = le32(data, base + 4)?;
+            let sh_flags = le64(data, base + 8)?;
+            let sh_addr = le64(data, base + 16)?;
+            let sh_offset = le64(data, base + 24)?;
+            let sh_size = le64(data, base + 32)?;
+            if sh_type == 2 {
+                symtab = sh_size / 24;
+            }
+            if sh_type == 11 {
+                dynsym = sh_size / 24;
+            }
+            if sections.len() == MAX_SECTION_LIST {
+                sections_truncated = true;
+                break;
+            }
+            sections.push(json!({
+                "name": name_at(sh_name), "type": sh_type,
+                "flags": format!("{sh_flags:#x}"), "address": format!("{sh_addr:#x}"),
+                "offset": format!("{sh_offset:#x}"), "size": sh_size,
+            }));
+        }
+    }
+
+    // DT_NEEDED imports from the PT_DYNAMIC segment.
+    let mut needed = Vec::new();
+    let mut notes = Vec::new();
+    if let Some((offset, size)) = dynamic {
+        let mut tags = Vec::new();
+        let mut strtab_vaddr = None;
+        let mut strtab_size = 0u64;
+        let entries = ((size / 16) as usize).min(MAX_DYNAMIC_ENTRIES);
+        ensure!(
+            offset as u128 + entries as u128 * 16 <= data.len() as u128,
+            "Dynamic table extends past end of file"
+        );
+        for index in 0..entries {
+            let base = offset as usize + index * 16;
+            let tag = le64(data, base)?;
+            let value = le64(data, base + 8)?;
+            if tag == 0 {
+                break;
+            }
+            match tag {
+                1 => tags.push(value),
+                5 => strtab_vaddr = Some(value),
+                10 => strtab_size = value,
+                _ => {}
+            }
+        }
+        if let Some(vaddr) = strtab_vaddr {
+            let file_offset = loads
+                .iter()
+                .filter_map(|load| {
+                    let v = parse_hex_string(load["vaddr"].as_str()?)?;
+                    let filesz = load["filesz"].as_u64()?;
+                    let off = parse_hex_string(load["offset"].as_str()?)?;
+                    (v <= vaddr && vaddr < v + filesz).then_some(off + (vaddr - v))
+                })
+                .next();
+            if let Some(start) = file_offset {
+                let end = (start as u128 + strtab_size.min(65536) as u128).min(data.len() as u128);
+                for tag in tags.into_iter().take(MAX_NEEDED) {
+                    let at = start as u128 + tag as u128;
+                    if at >= end {
+                        continue;
+                    }
+                    let slice = &data[at as usize..end as usize];
+                    let text = String::from_utf8_lossy(
+                        slice.split(|byte| *byte == 0).next().unwrap_or_default(),
+                    );
+                    if !text.is_empty() {
+                        needed.push(text.into_owned());
+                    }
+                }
+            } else {
+                notes.push("DT_STRTAB virtual address is not backed by a PT_LOAD; imports not resolved");
+            }
+        }
+    } else {
+        notes.push("No PT_DYNAMIC segment; static or prelinked image");
+    }
+    if sections_truncated {
+        notes.push("Section list truncated at the reporting cap");
+    }
+
+    Ok(json!({
+        "kind": "elf64", "size": data.len(), "sha256": sha256_hex(data),
+        "type": elf_type_name(e_type), "machine": elf_machine_name(e_machine),
+        "entry": format!("{entry:#x}"), "flags": format!("{flags:#x}"),
+        "image_base": image_base.map(|base| format!("{base:#x}")),
+        "loads": loads,
+        "section_count": shnum,
+        "sections": sections,
+        "symbols": {"symtab_entries": symtab, "dynsym_entries": dynsym},
+        "dynamic_needed": needed,
+        "notes": notes,
+    }))
+}
+
+fn parse_hex_string(text: &str) -> Option<u64> {
+    u64::from_str_radix(text.strip_prefix("0x")?, 16).ok()
+}
+
+/// Linear x86-64 disassembly of an artifact range. `offset` is the file
+/// offset, `address` the virtual address that offset is mapped at.
+pub fn disassemble_artifact(data: &[u8], offset: usize, address: u64, count: usize) -> Result<Value> {
+    ensure!(
+        (1..=crate::disasm::MAX_INSTRUCTIONS).contains(&count),
+        "Invalid instruction count"
+    );
+    let bytes = data
+        .get(offset..)
+        .ok_or_else(|| anyhow!("Offset {offset:#x} is past the end of the artifact"))?;
+    let items = crate::disasm::decode(bytes, address, count);
+    Ok(json!({
+        "offset": format!("{offset:#x}"), "address": format!("{address:#x}"),
+        "decoded": items.len(), "bytes_available": bytes.len(),
+        "instructions": crate::disasm::to_json(&items),
+    }))
+}
+
+/// Bounded printable-string extraction (x64dbg-style reference strings).
+pub fn strings(data: &[u8], min_length: usize, max_results: usize) -> Result<Value> {
+    ensure!(
+        (4..=64).contains(&min_length),
+        "min_length must be 4-64"
+    );
+    ensure!(
+        (1..=4096).contains(&max_results),
+        "max_results must be 1-4096"
+    );
+    let mut found = Vec::new();
+    let mut start = None;
+    let push = |start: usize, end: usize, found: &mut Vec<Value>| {
+        if end - start >= min_length && found.len() < max_results {
+            found.push(json!({
+                "offset": format!("{start:#x}"), "length": end - start,
+                "text": String::from_utf8_lossy(&data[start..end]),
+            }));
+        }
+    };
+    for (index, byte) in data.iter().enumerate() {
+        if byte.is_ascii_graphic() || *byte == b' ' {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(begin) = start.take() {
+            push(begin, index, &mut found);
+        }
+    }
+    if let Some(begin) = start.take() {
+        push(begin, data.len(), &mut found);
+    }
+    Ok(json!({
+        "count": found.len(), "truncated": found.len() == max_results,
+        "scanned_bytes": data.len(), "strings": found,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +812,134 @@ mod tests {
             record["metadata"]["module_hash_source"],
             json!("user_supplied")
         );
+    }
+
+    fn build_minimal_elf() -> Vec<u8> {
+        // ELF64 header + 2 phdrs (PT_LOAD, PT_DYNAMIC) + dynamic entries +
+        // .dynstr + section headers with a string table.
+        let mut d = vec![0u8; 64];
+        d[..4].copy_from_slice(b"\x7fELF");
+        d[4] = 2;
+        d[5] = 1;
+        d[6] = 1;
+        d[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+        d[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+        d[20..24].copy_from_slice(&1u32.to_le_bytes());
+        d[24..32].copy_from_slice(&0x1000u64.to_le_bytes()); // entry
+        d[32..40].copy_from_slice(&64u64.to_le_bytes()); // phoff
+        d[52..54].copy_from_slice(&64u16.to_le_bytes()); // ehsize
+        d[54..56].copy_from_slice(&56u16.to_le_bytes()); // phentsize
+        d[56..58].copy_from_slice(&2u16.to_le_bytes()); // phnum
+        d[58..60].copy_from_slice(&64u16.to_le_bytes()); // shentsize
+        d[60..62].copy_from_slice(&4u16.to_le_bytes()); // shnum
+        d[62..64].copy_from_slice(&1u16.to_le_bytes()); // shstrndx
+
+        let dyn_off = 64 + 2 * 56; // 176
+        let strtab_off = dyn_off + 4 * 16; // 240
+        let needed = b"libSceX.so\0";
+        let shstr_off = strtab_off + needed.len(); // 251
+        let shstr = b"\0.shstrtab\0.dynsym\0.dynamic\0.text\0";
+        let shoff = shstr_off + shstr.len();
+        let shoff = (shoff + 7) & !7;
+        let total = shoff + 4 * 64;
+        d.resize(total, 0);
+        d[40..48].copy_from_slice(&(shoff as u64).to_le_bytes()); // shoff
+
+        let phdr = |d: &mut Vec<u8>, i: usize, ty: u32, flags: u32, off: u64, vaddr: u64, filesz: u64| {
+            let base = 64 + i * 56;
+            d[base..base + 4].copy_from_slice(&ty.to_le_bytes());
+            d[base + 4..base + 8].copy_from_slice(&flags.to_le_bytes());
+            d[base + 8..base + 16].copy_from_slice(&off.to_le_bytes());
+            d[base + 16..base + 24].copy_from_slice(&vaddr.to_le_bytes());
+            d[base + 32..base + 40].copy_from_slice(&filesz.to_le_bytes());
+            d[base + 40..base + 48].copy_from_slice(&filesz.to_le_bytes());
+        };
+        phdr(&mut d, 0, 1, 5, 0, 0, total as u64); // PT_LOAD r-x, vaddr 0
+        phdr(&mut d, 1, 2, 6, dyn_off as u64, dyn_off as u64, 4 * 16); // PT_DYNAMIC
+
+        let dyn_entry = |d: &mut Vec<u8>, i: usize, tag: u64, value: u64| {
+            let base = dyn_off + i * 16;
+            d[base..base + 8].copy_from_slice(&tag.to_le_bytes());
+            d[base + 8..base + 16].copy_from_slice(&value.to_le_bytes());
+        };
+        dyn_entry(&mut d, 0, 1, 0); // DT_NEEDED -> strtab+0
+        dyn_entry(&mut d, 1, 5, strtab_off as u64); // DT_STRTAB (vaddr == offset here)
+        dyn_entry(&mut d, 2, 10, needed.len() as u64); // DT_STRSZ
+        dyn_entry(&mut d, 3, 0, 0); // DT_NULL
+        d[strtab_off..strtab_off + needed.len()].copy_from_slice(needed);
+        d[shstr_off..shstr_off + shstr.len()].copy_from_slice(shstr);
+
+        // simpler: offsets within shstr
+        let off = |name: &str| shstr.windows(name.len() + 1).position(|w| w == format!("{name}\0").as_bytes()).unwrap() as u32;
+        let shdr = |d: &mut Vec<u8>, i: usize, name: u32, ty: u32, addr: u64, offset: u64, size: u64| {
+            let base = shoff + i * 64;
+            d[base..base + 4].copy_from_slice(&name.to_le_bytes());
+            d[base + 4..base + 8].copy_from_slice(&ty.to_le_bytes());
+            d[base + 8..base + 16].copy_from_slice(&2u64.to_le_bytes()); // SHF_ALLOC
+            d[base + 16..base + 24].copy_from_slice(&addr.to_le_bytes());
+            d[base + 24..base + 32].copy_from_slice(&offset.to_le_bytes());
+            d[base + 32..base + 40].copy_from_slice(&size.to_le_bytes());
+        };
+        shdr(&mut d, 0, 0, 0, 0, 0, 0); // null
+        shdr(&mut d, 1, off(".shstrtab"), 3, 0, shstr_off as u64, shstr.len() as u64);
+        shdr(&mut d, 2, off(".dynsym"), 11, 0, 0, 48); // 2 dynsym entries
+        shdr(&mut d, 3, off(".dynamic"), 6, dyn_off as u64, dyn_off as u64, 4 * 16);
+        d
+    }
+
+    #[test]
+    fn elf_info_parses_header_loads_sections_and_needed() {
+        let info = artifact_info(&build_minimal_elf()).unwrap();
+        assert_eq!(info["kind"], "elf64");
+        assert_eq!(info["type"], "shared_object");
+        assert_eq!(info["machine"], "x86-64");
+        assert_eq!(info["entry"], "0x1000");
+        assert_eq!(info["image_base"], "0x0");
+        assert_eq!(info["loads"][0]["permissions"], "r-x");
+        assert_eq!(info["section_count"], 4);
+        assert_eq!(info["symbols"]["dynsym_entries"], 2);
+        assert_eq!(info["dynamic_needed"], json!(["libSceX.so"]));
+        let names: Vec<&str> = info["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&".dynsym") && names.contains(&".dynamic"));
+    }
+
+    #[test]
+    fn artifact_info_identifies_self_and_rejects_truncated_elf() {
+        let self_file = artifact_info(b"\x4f\x15\x3d\x1d\x07rest").unwrap();
+        assert_eq!(self_file["kind"], "ps4_self");
+        assert_eq!(self_file["version"], 7);
+        assert!(artifact_info(b"\x7fELF\x02\x01").is_err());
+        let raw = artifact_info(b"\x90\x90\x90\x90bin").unwrap();
+        assert_eq!(raw["kind"], "raw_binary");
+    }
+
+    #[test]
+    fn disassemble_artifact_and_strings_are_bounded() {
+        // push rbp; mov rbp,rsp; call +0x10; xor eax,eax; ret
+        let code = [0x55u8, 0x48, 0x89, 0xe5, 0xe8, 0x10, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3];
+        let listing = disassemble_artifact(&code, 0, 0x400000, 8).unwrap();
+        let items = listing["instructions"].as_array().unwrap();
+        assert_eq!(items[0]["address"], "0x400000");
+        assert_eq!(items[0]["text"], "push rbp");
+        assert_eq!(items[2]["flow"], "call");
+        assert_eq!(items[2]["branch_target"], "0x400019");
+        assert!(disassemble_artifact(&code, 0, 0x400000, 0).is_err());
+        assert!(disassemble_artifact(&code, 999, 0x400000, 4).is_err());
+
+        let data = b"\x00\x00hi there\x00\x00ab\x00longer string here\x00";
+        let found = strings(data, 4, 10).unwrap();
+        let texts: Vec<&str> = found["strings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(texts, vec!["hi there", "longer string here"]);
+        assert!(strings(data, 3, 10).is_err());
     }
 }
