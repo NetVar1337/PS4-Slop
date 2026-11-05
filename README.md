@@ -96,8 +96,8 @@ the running exe aside) before `cargo build --release`.
 
 ## Tool groups
 
-There are **76 standalone tools**, **54 visible with the default read-only profile**.
-Shared broker mode adds **10 static-analysis & synchronization tools** plus
+There are **111 standalone tools**, **82 visible with the default read-only profile**.
+Shared broker mode adds **15 static-analysis, synchronization & application tools** plus
 3 session-observer tools. Run `tools` for the complete, machine-readable schemas and
 current policy-filtered tool list. Every tool has exactly one implementation (Rust);
 integers above 2^53 in results are returned as hex strings.
@@ -164,6 +164,42 @@ integers above 2^53 in results are returned as hex strings.
   label/comment synchronization (`analysis_sync_annotations`) through explicitly
   connected local agents, plus an x86-64 + SSE/XMM + SVR4 shared-library GDB Remote
   bridge (`gdb-server`, with opt-in `--allow-writes`).
+
+Reverse-engineering suite (each area documented in `docs/features/`):
+
+- **Dumping** ([dumping.md](docs/features/dumping.md)): `elf_rebuild` (section headers,
+  dynamic tables, NID names, GOT slot naming/unresolution), `process_dump` (all modules +
+  filtered maps + thread state, budgeted manifest), `process_core_dump` (FreeBSD-style ELF
+  core for offline gdb/IDA), and a content-addressed snapshot timeline
+  (`memory_snapshot_capture`/`_list`/`_timeline`).
+- **Engine & metadata recovery** ([engines.md](docs/features/engines.md)): `il2cpp_dump`
+  (global-metadata v24–29 + registrations), `unreal_dump` (GNames/GObjects, FNamePool and
+  TNameEntryArray), `rtti_recover` (Itanium typeinfo/vtables/inheritance), `yara_scan`
+  (YARA-subset engine) and `crypto_scan` (FindCrypt-style constants), over artifacts or live memory.
+- **Tracing & coverage** ([trace.md](docs/features/trace.md)): `debug_trace_imports`
+  (ltrace-like API trace), `debug_trace_syscalls`, `debug_trace_function` (args, caller,
+  return value, duration), `debug_coverage` (rotating one-shot breakpoints; JSON + drcov for
+  Lighthouse/Cartographer) and `coverage_diff`.
+- **Access, crashes, pointers, scripts** ([access.md](docs/features/access.md)):
+  `debug_find_accesses` ("what writes/accesses this address", incl. struct mode),
+  `struct_infer`, `debug_crash_triage`, `memory_pointer_scan`/`memory_pointer_rescan`, and
+  `debug_run_script` (sandboxed read-only Rhai breakpoint scripts).
+- **Native static analysis** ([static.md](docs/features/static.md)): `artifact_functions`,
+  `artifact_cfg` (blocks artifacts feed `debug_coverage`), `artifact_callgraph`,
+  `binary_diff` + `annotation_port` (carry research across game updates), `signature_make`
+  (shortest unique AOB, verified), `orbis_prototypes` (prototypes parsed from your SDK headers).
+- **Project & automation** ([project.md](docs/features/project.md)): per-game project index
+  (`project_open`/`_record`/`_query`/`_summary`, artifacts auto-recorded while a project is
+  open), `recipe_list`/`recipe_run` (chained tool calls that still pass every permission
+  check), and broker `analysis_apply_prototypes`/`_struct`/`_coverage`/`_classes`/`_symbols`
+  to push results into IDA/Ghidra/Binary Ninja/iaito.
+
+Tools that resume the target (`debug_trace_*`, `debug_coverage`, `debug_find_accesses`,
+`debug_crash_triage`, `debug_run_script`) require the qualified `debug_control` permission,
+use only free breakpoint/watchpoint slots, are time-bounded, and clear everything they armed
+on every exit path (reporting "state uncertain" if cleanup fails). All other new tools are
+read-only toward the console. **None of these features has been run on PS4 hardware yet**;
+they are verified against the offline protocol fixture and synthetic binaries only.
 
 Annotation stores and which one is authoritative:
 

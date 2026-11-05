@@ -983,7 +983,7 @@ impl Debugger {
 
     /// Temporary breakpoint in a free slot, tracked as internal so it never
     /// shows up in `breakpoint_list` and is always cleared by the caller.
-    fn set_internal_breakpoint(&mut self, address: u64) -> Result<u32> {
+    pub(super) fn set_internal_breakpoint(&mut self, address: u64) -> Result<u32> {
         let slot = self.free_slot()?;
         self.breakpoint_ex(slot, address, true, None, None, 0)?;
         if let Some(record) = self.breakpoints.get_mut(&slot) {
@@ -992,7 +992,7 @@ impl Debugger {
         Ok(slot)
     }
 
-    fn clear_internal_breakpoint(&mut self, slot: u32) -> Result<()> {
+    pub(super) fn clear_internal_breakpoint(&mut self, slot: u32) -> Result<()> {
         let result = self.breakpoint(slot, 0, false).map(|_| ());
         self.breakpoints.remove(&slot);
         result

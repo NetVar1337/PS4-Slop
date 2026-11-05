@@ -115,6 +115,11 @@ impl ToolRegistry {
             self.workbench.profile.require(permission)?;
         }
         let result = crate::config::json_safe(self.execute(name, &args)?);
+        // Best-effort provenance: never fail a completed tool call because the
+        // project index could not be updated.
+        if let Err(error) = crate::project::auto_record(&self.workbench.store, name, &args, &result) {
+            eprintln!("project auto-record skipped for {name}: {error:#}");
+        }
         let content = serde_json::to_vec(&result)?;
         if content.len() > 24576 {
             let artifact =

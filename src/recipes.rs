@@ -21,25 +21,7 @@ pub const FORMAT: &str = "ps4wb-recipe-v1";
 
 /// Tools referenced by built-in recipes that other feature areas are adding;
 /// delete at merge once they are all in `full_catalog()`.
-pub const PLANNED_TOOLS: &[&str] = &[
-    "elf_rebuild",
-    "process_dump",
-    "process_core_dump",
-    "artifact_functions",
-    "artifact_cfg",
-    "orbis_prototypes",
-    "rtti_recover",
-    "il2cpp_dump",
-    "crypto_scan",
-    "yara_scan",
-    "debug_coverage",
-    "coverage_diff",
-    "debug_crash_triage",
-    "memory_pointer_scan",
-    "binary_diff",
-    "annotation_port",
-    "signature_make",
-];
+pub const PLANNED_TOOLS: &[&str] = &[];
 
 pub const BUILTIN_RECIPES: &str = r#"[
  {"format": "ps4wb-recipe-v1", "name": "dump_and_rebuild",
@@ -48,8 +30,8 @@ pub const BUILTIN_RECIPES: &str = r#"[
              "module": {"type": "string", "description": "Module name; defaults to eboot.bin"}},
   "steps": [
    {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.@artifact}"}},
-   {"tool": "artifact_functions", "arguments": {"artifact": "${steps.1.@artifact}"}}
+   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
+   {"tool": "artifact_functions", "arguments": {"artifact": "${steps.1.artifact.path}"}}
   ]},
  {"format": "ps4wb-recipe-v1", "name": "static_triage",
   "description": "Offline triage of a module artifact: functions, RTTI classes, crypto constants and Orbis import prototypes.",
@@ -58,32 +40,31 @@ pub const BUILTIN_RECIPES: &str = r#"[
    {"tool": "artifact_functions", "arguments": {"artifact": "${artifact}"}},
    {"tool": "rtti_recover", "arguments": {"artifact": "${artifact}"}},
    {"tool": "crypto_scan", "arguments": {"artifact": "${artifact}"}},
-   {"tool": "orbis_prototypes", "arguments": {"artifact": "${artifact}"}}
+   {"tool": "orbis_prototypes", "arguments": {"action": "imports", "artifact": "${artifact}", "use_sdk": true}}
   ]},
  {"format": "ps4wb-recipe-v1", "name": "update_port",
   "description": "Diff two builds of a module and port annotations from the old build to the new one.",
   "inputs": {"old_artifact": {"type": "string", "required": true, "description": "Previously annotated build"},
              "new_artifact": {"type": "string", "required": true, "description": "Updated build"},
-             "annotations": {"type": "string", "description": "Annotation artifact (labels/symbols) for the old build"}},
+             "annotations": {"type": "string", "required": true, "description": "Annotation artifact (annotation_save evidence, ported set or {rva: name} JSON) for the old build"}},
   "steps": [
-   {"tool": "binary_diff", "arguments": {"old_artifact": "${old_artifact}", "new_artifact": "${new_artifact}"}},
-   {"tool": "annotation_port", "arguments": {"diff": "${steps.0.@artifact}", "annotations": "${annotations}"}}
+   {"tool": "binary_diff", "arguments": {"artifact_a": "${old_artifact}", "artifact_b": "${new_artifact}"}},
+   {"tool": "annotation_port", "arguments": {"diff": "${steps.0.artifact}", "sources": ["${annotations}"], "artifact_a": "${old_artifact}", "artifact_b": "${new_artifact}"}}
   ]},
  {"format": "ps4wb-recipe-v1", "name": "crash_capture",
   "description": "Run the attached process until it faults, triage the crash, then save a core dump.",
   "inputs": {"pid": {"type": "integer", "required": true, "description": "Attached target process id"}},
   "steps": [
-   {"tool": "debug_crash_triage", "arguments": {"pid": "${pid}"}},
+   {"tool": "debug_crash_triage", "arguments": {"wait": true}},
    {"tool": "process_core_dump", "arguments": {"pid": "${pid}"}}
   ]},
  {"format": "ps4wb-recipe-v1", "name": "coverage_compare",
   "description": "Record block coverage for the attached process and diff it against a baseline coverage artifact.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Attached target process id"},
-             "module": {"type": "string", "description": "Module to cover; defaults to eboot.bin"},
+  "inputs": {"module": {"type": "string", "description": "Module to cover in the attached process; defaults to eboot.bin"},
              "baseline": {"type": "string", "required": true, "description": "Baseline coverage artifact"}},
   "steps": [
-   {"tool": "debug_coverage", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "coverage_diff", "arguments": {"before": "${baseline}", "after": "${steps.0.@artifact}"}}
+   {"tool": "debug_coverage", "arguments": {"module": "${module}"}},
+   {"tool": "coverage_diff", "arguments": {"a": "${baseline}", "b": "${steps.0.coverage_artifact.path}"}}
   ]}
 ]"#;
 
@@ -503,8 +484,13 @@ mod tests {
                 let schema = catalog.iter().find(|t| t["name"] == tool);
                 assert!(schema.is_some() || PLANNED_TOOLS.contains(&tool), "{tool} is neither cataloged nor planned");
                 if let Some(schema) = schema {
-                    for key in step["arguments"].as_object().unwrap().keys() {
+                    let arguments = step["arguments"].as_object().unwrap();
+                    for key in arguments.keys() {
                         assert!(schema["inputSchema"]["properties"].get(key).is_some(), "{tool} has no argument {key}");
+                    }
+                    for required in schema["inputSchema"]["required"].as_array().into_iter().flatten() {
+                        let required = required.as_str().unwrap();
+                        assert!(arguments.contains_key(required), "{tool} step lacks required argument {required}");
                     }
                 }
             }

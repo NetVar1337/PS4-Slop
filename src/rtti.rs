@@ -384,7 +384,7 @@ impl Demangler<'_> {
                 b'S' if self.peek2() != Some(b't') => {
                     let sub = self.substitution()?;
                     if self.peek() == Some(b'I') {
-                        let out = sub + &self.template_args()?;
+                        let out = sub + self.template_args()?.as_str();
                         self.subs.push(out.clone());
                         out
                     } else {

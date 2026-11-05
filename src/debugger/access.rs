@@ -546,24 +546,6 @@ impl Debugger {
         }
     }
 
-    fn access_internal_breakpoint(&mut self, address: u64) -> Result<u32> {
-        let slot = (0..30)
-            .rev()
-            .find(|index| !self.breakpoints.contains_key(index))
-            .context("All 30 breakpoint slots are in use")?;
-        self.breakpoint_ex(slot, address, true, None, None, 0)?;
-        if let Some(record) = self.breakpoints.get_mut(&slot) {
-            record.internal = true;
-        }
-        Ok(slot)
-    }
-
-    fn access_clear_breakpoint(&mut self, slot: u32) -> Result<()> {
-        let result = self.breakpoint(slot, 0, false).map(|_| ());
-        self.breakpoints.remove(&slot);
-        result
-    }
-
     // ---- find accesses ---------------------------------------------------------
 
     /// Cheat-Engine style "find out what accesses/writes this address": arm
@@ -1042,7 +1024,7 @@ impl Debugger {
             targets.push((name.clone(), *address, 0));
             let existing = self.breakpoints.iter().any(|(_, record)| record.enabled && record.address == *address);
             if !existing {
-                match self.access_internal_breakpoint(*address) {
+                match self.set_internal_breakpoint(*address) {
                     Ok(index) => ours.push(index),
                     Err(error) => {
                         armed = Err(error);
@@ -1057,7 +1039,7 @@ impl Debugger {
         };
         let mut cleanup_errors = Vec::new();
         for index in ours {
-            if let Err(error) = self.access_clear_breakpoint(index) {
+            if let Err(error) = self.clear_internal_breakpoint(index) {
                 cleanup_errors.push(format!("breakpoint slot {index}: {error:#}"));
             }
         }
