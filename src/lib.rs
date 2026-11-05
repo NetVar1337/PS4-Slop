@@ -29,3 +29,10 @@ pub mod binstatic;
 pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// Native static analysis (binstatic area).
+pub mod binimage;
+pub mod cfg;
+pub mod sigmaker;
+pub mod bindiff;
+pub mod prototypes;
