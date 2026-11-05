@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps4-debugmcps"
+version = "0.1.0"
+description = "Firmware-aware PS4 research workbench and local stdio MCP server"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "GPL-3.0-only"
+dependencies = []
+
+[project.scripts]
+ps4-workbench = "ps4_workbench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ps4_workbench*"]

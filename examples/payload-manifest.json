@@ -1,0 +1,10 @@
+{
+  "artifact": "REPLACE_WITH_IMPORTED_BIN_ARTIFACT_PATH",
+  "sha256": "REPLACE_WITH_ACTUAL_BIN_SHA256",
+  "firmware": "14.00",
+  "afterglow_commit": "REPLACE_WITH_ACTUAL_INSTALLED_HOST_COMMIT",
+  "hen_build": "REPLACE_WITH_ACTUAL_HEN_BUILD",
+  "format": "bin",
+  "loader": "goldhen-binloader",
+  "source_commit": "REPLACE_WITH_PAYLOAD_SOURCE_COMMIT"
+}

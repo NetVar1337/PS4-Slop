@@ -1,0 +1,39 @@
+{
+  "name": "ps4-afterglow-1400",
+  "host": "192.168.86.25",
+  "firmware": "14.00",
+  "jailbreak": {
+    "repository": "https://github.com/well0nez/afterglow-web",
+    "reference_commit": "7eb2663a721bf73278680b82c79f14affeeff0db",
+    "installed_commit": null,
+    "hen_build": null
+  },
+  "ports": {"payload": 9090, "ftp": 2121, "klog": 3232, "debug": 744},
+  "debugger": {
+    "backend": "ps4debug-ng",
+    "protocol": "1.3",
+    "reference_commit": "8be828fe09f05f9327d7babdf9dcec4c67fbb816",
+    "expected_brand": null,
+    "payload_sha256": null
+  },
+  "timeout_seconds": 3,
+  "limits": {
+    "memory_bytes": 1048576,
+    "transfer_bytes": 16777216,
+    "log_bytes": 1048576,
+    "log_seconds": 30,
+    "list_entries": 4096
+  },
+  "permissions": {
+    "ftp_upload": false,
+    "payload_execute": false,
+    "process_write": false,
+    "debug_control": false,
+    "kernel_read": false,
+    "kernel_write": false,
+    "build": false
+  },
+  "ftp_upload_roots": ["/data/ps4-debugmcps"],
+  "artifact_directory": "../workspace",
+  "qualification_file": "qualification.local.json"
+}
