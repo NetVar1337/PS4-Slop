@@ -53,6 +53,37 @@ pub fn canonical_json(value: &Value) -> String {
     out
 }
 
+/// Largest integer a JSON consumer using IEEE-754 doubles represents exactly.
+pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// Python `json_safe`: integers whose magnitude exceeds 2^53 - 1 become
+/// `hex()` strings (`"0x.."` / `"-0x.."`) so JavaScript-based clients never
+/// silently round 64-bit addresses. Applied recursively; other values pass through.
+pub fn json_safe(value: Value) -> Value {
+    match value {
+        Value::Number(number) => {
+            if let Some(unsigned) = number.as_u64() {
+                if unsigned > MAX_SAFE_INTEGER {
+                    return Value::String(format!("{unsigned:#x}"));
+                }
+            } else if let Some(signed) = number.as_i64()
+                && signed.unsigned_abs() > MAX_SAFE_INTEGER
+            {
+                return Value::String(format!("-{:#x}", signed.unsigned_abs()));
+            }
+            Value::Number(number)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(json_safe).collect()),
+        Value::Object(fields) => Value::Object(
+            fields
+                .into_iter()
+                .map(|(key, item)| (key, json_safe(item)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Python `json.dumps(value, indent=indent, sort_keys=sort_keys)` with
 /// `ensure_ascii=True`. With `indent=None` this uses Python's default
 /// `", "`/`": "` separators.
@@ -774,6 +805,22 @@ mod tests {
         assert_eq!(
             python_json_ordered(&[("z", json!(1)), ("a", json!("q"))], 2),
             "{\n  \"z\": 1,\n  \"a\": \"q\"\n}"
+        );
+    }
+
+    /// Python `test_large_wire_integers_are_exact_strings`.
+    #[test]
+    fn large_wire_integers_become_exact_hex_strings() {
+        let value = json!({"address": 0xFFFF_FFFF_8000_1000u64, "small": 4096,
+            "edge": 9_007_199_254_740_991u64, "over": 9_007_199_254_740_992u64,
+            "negative": -9_007_199_254_740_992i64, "float": 1.5,
+            "nested": [{"end": u64::MAX}, "text", null]});
+        assert_eq!(
+            json_safe(value),
+            json!({"address": "0xffffffff80001000", "small": 4096,
+                "edge": 9_007_199_254_740_991u64, "over": "0x20000000000000",
+                "negative": "-0x20000000000000", "float": 1.5,
+                "nested": [{"end": "0xffffffffffffffff"}, "text", null]})
         );
     }
 

@@ -671,7 +671,9 @@ pub fn payload_send(profile: &Profile, content: &[u8]) -> Result<Value> {
     })();
     if let Err(error) = sent {
         link::record_err("payload", &error);
-        return Err(error);
+        return Err(error.context(
+            "Payload transfer interrupted after connecting; execution uncertain, never retry",
+        ));
     }
     // Let the loader finish reading and close first; ignore anything it says.
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;

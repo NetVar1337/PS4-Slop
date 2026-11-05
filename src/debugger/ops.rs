@@ -620,31 +620,37 @@ impl Debugger {
 
     // ---- code, modules, evaluation ----------------------------------------
 
+    /// Groups named maps into modules. Only names with at least one executable
+    /// segment count: live consoles name heaps, stacks and shared memory too
+    /// (`anon:…`, `__vm_gc_heap`, `/shm…`), and those are not loadable images.
     pub fn module_list(&mut self, pid: u32) -> Result<Value> {
         let maps = self.maps(pid)?;
-        let mut modules: Vec<(String, u64, u64, Vec<Value>)> = Vec::new();
+        let mut modules: Vec<(String, u64, u64, bool, Vec<Value>)> = Vec::new();
         for entry in maps.as_array().context("Expected maps")? {
             let name = entry["name"].as_str().unwrap_or("");
             if name.is_empty() {
                 continue;
             }
             let (start, end) = (entry["start"].as_u64().unwrap_or(0), entry["end"].as_u64().unwrap_or(0));
+            let bits = entry["protection"].as_u64().unwrap_or(0);
             let segment = json!({"start":format!("{start:#x}"),"end":format!("{end:#x}"),
                 "offset":format!("{:#x}",entry["offset"].as_u64().unwrap_or(0)),
-                "protection":Self::protection(entry["protection"].as_u64().unwrap_or(0))});
+                "protection":Self::protection(bits)});
             match modules.iter_mut().find(|module| module.0 == name) {
                 Some(module) => {
                     module.1 = module.1.min(start);
                     module.2 = module.2.max(end);
-                    module.3.push(segment);
+                    module.3 |= bits & 4 != 0;
+                    module.4.push(segment);
                 }
-                None => modules.push((name.to_owned(), start, end, vec![segment])),
+                None => modules.push((name.to_owned(), start, end, bits & 4 != 0, vec![segment])),
             }
         }
         Ok(json!(
             modules
                 .into_iter()
-                .map(|(name, base, end, segments)| json!({"name":name,"base":format!("{base:#x}"),
+                .filter(|module| module.3)
+                .map(|(name, base, end, _, segments)| json!({"name":name,"base":format!("{base:#x}"),
                     "size":end - base,"segments":segments}))
                 .collect::<Vec<_>>()
         ))

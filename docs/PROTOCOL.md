@@ -14,7 +14,7 @@ Implemented commands:
   capability, `BD000502` platform, `BDAACC06` liveness.
 - Processes: `BDAA0001` list (36-byte entries), `BDAA0002` read,
   `BDAA0003` write (ready status, bytes, terminal status), `BDAA0004` maps
-  (64-byte entries), `BDAA0008` memory protection change (with optional trailing
+  (58-byte packed entries: name[32], start, end, offset u64, prot u16), `BDAA0008` memory protection change (with optional trailing
   `CMD_DATA_NULL` status drain and `maps` readback verification), `BDAA000A`
   process info (188 bytes), `BDAA000B` virtual memory allocation, `BDAA000C`
   virtual memory free, `BDAA000E` hinted virtual memory allocation.

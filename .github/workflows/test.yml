@@ -18,6 +18,7 @@ jobs:
         run: sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
       - run: cargo test --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --features fixture --locked -- -D warnings
       - run: cargo run --locked -- validate
   python:
     strategy:
@@ -27,8 +28,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m compileall -q ps4_workbench tests
+      # Adapter tests talk to the real native broker binary.
+      - run: cargo build --locked
+      - run: python -m compileall -q ps4_workbench tests integrations
       - run: python -m unittest discover -q

@@ -94,8 +94,11 @@ are separate from this workbench's console permissions.
 Research loop:
 
 1. Analyze the authorized original module and retain its SHA-256/application version.
-2. Obtain process maps and captures through the workbench. `address_correlate`
-   returns mapping-relative offset and **estimated** image base/RVA.
+2. Obtain process maps and captures through the workbench. `address_rebase` with a
+   `runtime_address` returns the module/RVA, the containing map's relative offset,
+   and (for addresses outside the module list) an **estimated** image base/RVA with
+   `basis: process_maps_estimate`; pass `module_sha256`/`application_version` to
+   record provenance.
 3. Verify ELF segment layout manually. Mapping offsets are not proof of a module
    image base; similarly named maps may be distinct mappings.
 4. Use `annotation_save` to record a module SHA-256, RVA, evidence artifact,

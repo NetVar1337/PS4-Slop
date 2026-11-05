@@ -369,9 +369,10 @@ impl Debugger {
 
     pub fn maps(&mut self, pid: u32) -> Result<Value> {
         Self::pid(pid)?;
-        self.list(0xbdaa0004,&pid.to_le_bytes(),64,|data| {
-            ensure!(qword(data,8)>=qword(data,0),"Invalid map range");
-            Ok(json!({"start":qword(data,0),"end":qword(data,8),"offset":qword(data,16),"protection":qword(data,24),"name":cstring(&data[32..])}))
+        // Upstream `struct proc_vm_map_entry` (packed): char name[32]; u64 start, end, offset; u16 prot.
+        self.list(0xbdaa0004,&pid.to_le_bytes(),58,|data| {
+            ensure!(qword(data,40)>=qword(data,32),"Invalid map range");
+            Ok(json!({"start":qword(data,32),"end":qword(data,40),"offset":qword(data,48),"protection":u16::from_le_bytes([data[56],data[57]]) as u64,"name":cstring(&data[..32])}))
         })
     }
 
@@ -690,12 +691,14 @@ impl Debugger {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod fake {
+#[cfg(any(test, feature = "fixture"))]
+pub mod fake {
     //! Minimal in-process ps4debug-NG protocol 1.3 server for offline tests.
     //! `spawn` only implements the identity/process-list commands; `spawn_debuggable`
     //! additionally implements attach, the event callback, registers, memory, maps,
     //! breakpoints and execution control so the higher-level ops can be tested.
+    //! `spawn_fixture` adds a loaded image and real stop semantics for the
+    //! installed-app bridge tests (`ps4debug-fixture` binary, `fixture` feature).
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::{
@@ -717,6 +720,40 @@ pub(crate) mod fake {
     pub const CODE_AT_RIP: [u8; 12] = [
         0x55, 0x48, 0x89, 0xe5, 0xe8, 0x10, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3,
     ];
+
+    /// Opt-in behaviour for installed-app bridge tests: `image` mapped at `base`,
+    /// a SIGTRAP stop event on attach and on halt, and single-steps that advance
+    /// RIP by the decoded instruction length.
+    #[derive(Clone)]
+    pub struct Fixture {
+        pub pid: u32,
+        pub thread_id: u32,
+        pub base: u64,
+        pub image: Vec<u8>,
+        pub rip: u64,
+    }
+
+    /// FreeBSD wait status for a SIGTRAP stop.
+    const STOP_STATUS: u32 = 0x57f;
+
+    fn fixture_event(fixture: &Fixture, registers: &[u8; 176]) -> Vec<u8> {
+        let mut event = vec![0u8; EVENT_SIZE];
+        event[..4].copy_from_slice(&fixture.thread_id.to_le_bytes());
+        event[4..8].copy_from_slice(&STOP_STATUS.to_le_bytes());
+        event[8..15].copy_from_slice(b"fixture");
+        event[48..224].copy_from_slice(registers);
+        event
+    }
+
+    fn register_rip(registers: &[u8; 176]) -> u64 {
+        u64::from_le_bytes(registers[crate::expr::RIP_OFFSET..crate::expr::RIP_OFFSET + 8].try_into().unwrap())
+    }
+
+    fn push_event(guard: &mut Shared, event: &[u8]) {
+        if let Some(events) = guard.events.as_mut() {
+            let _ = events.write_all(event);
+        }
+    }
 
     fn text(stream: &mut TcpStream, value: &[u8]) {
         let mut out = (value.len() as u32).to_le_bytes().to_vec();
@@ -741,20 +778,27 @@ pub(crate) mod fake {
         event
     }
 
-    fn map_entry(start: u64, end: u64, protection: u64, name: &str) -> [u8; 64] {
-        let mut entry = [0u8; 64];
-        entry[..8].copy_from_slice(&start.to_le_bytes());
-        entry[8..16].copy_from_slice(&end.to_le_bytes());
-        entry[24..32].copy_from_slice(&protection.to_le_bytes());
+    fn map_entry(start: u64, end: u64, protection: u64, name: &str) -> [u8; 58] {
+        let mut entry = [0u8; 58];
         let cap = name.len().min(31);
-        entry[32..32 + cap].copy_from_slice(&name.as_bytes()[..cap]);
+        entry[..cap].copy_from_slice(&name.as_bytes()[..cap]);
+        entry[32..40].copy_from_slice(&start.to_le_bytes());
+        entry[40..48].copy_from_slice(&end.to_le_bytes());
+        entry[56..58].copy_from_slice(&(protection as u16).to_le_bytes());
         entry
     }
 
-    fn fake_memory(address: u64, length: usize, overlay: &BTreeMap<u64, u8>) -> Vec<u8> {
+    fn fake_memory(address: u64, length: usize, overlay: &BTreeMap<u64, u8>, fixture: Option<&Fixture>) -> Vec<u8> {
         let mut content = vec![0u8; length];
         let end = address.saturating_add(length as u64);
-        if address < FAKE_EXEC_END && end > FAKE_RIP {
+        if let Some(fixture) = fixture {
+            for (index, byte) in content.iter_mut().enumerate() {
+                let at = address.saturating_add(index as u64);
+                if let Some(value) = at.checked_sub(fixture.base).and_then(|offset| fixture.image.get(offset as usize)) {
+                    *byte = *value;
+                }
+            }
+        } else if address < FAKE_EXEC_END && end > FAKE_RIP {
             for (index, byte) in content.iter_mut().enumerate() {
                 let at = address.saturating_add(index as u64);
                 *byte = if (FAKE_RIP..FAKE_RIP + CODE_AT_RIP.len() as u64).contains(&at) {
@@ -789,21 +833,41 @@ pub(crate) mod fake {
         overlay: BTreeMap<u64, u8>,
         maps: Vec<(u64, u64, u64, String)>,
         next_alloc: u64,
+        fixture: Option<Fixture>,
     }
 
     /// Full fake: attach binds nothing itself; on BDBB0001 it connects back to the
     /// requested callback address:755 and stores the stream so resume/step commands
     /// can push one stop event each.
     pub fn spawn_debuggable() -> FakeDebugger {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        serve_debuggable(TcpListener::bind("127.0.0.1:0").unwrap(), None)
+    }
+
+    /// Fixture-mode fake on an explicit listener (see [`Fixture`]).
+    pub fn spawn_fixture(listener: TcpListener, fixture: Fixture) -> FakeDebugger {
+        serve_debuggable(listener, Some(fixture))
+    }
+
+    fn serve_debuggable(listener: TcpListener, fixture: Option<Fixture>) -> FakeDebugger {
         let port = listener.local_addr().unwrap().port();
         let connections = Arc::new(AtomicUsize::new(0));
+        let rip = fixture.as_ref().map_or(FAKE_RIP, |fixture| fixture.rip);
+        let maps = match &fixture {
+            Some(fixture) => vec![
+                (fixture.base, fixture.base + ((fixture.image.len() as u64 + 0xfff) & !0xfff), 5, "fixture.elf".to_owned()),
+                (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
+            ],
+            None => vec![
+                (FAKE_RIP, FAKE_EXEC_END, 5, "eboot.bin".to_owned()),
+                (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
+            ],
+        };
         let shared = Arc::new(Mutex::new(Shared {
             events: None,
             registers: {
                 let mut regs = [0u8; 176];
                 regs[crate::expr::RIP_OFFSET..crate::expr::RIP_OFFSET + 8]
-                    .copy_from_slice(&FAKE_RIP.to_le_bytes());
+                    .copy_from_slice(&rip.to_le_bytes());
                 regs[80..88].copy_from_slice(&FAKE_STACK.to_le_bytes());
                 regs[160..168].copy_from_slice(&FAKE_STACK.to_le_bytes());
                 regs
@@ -812,11 +876,9 @@ pub(crate) mod fake {
             fsbase: 0x8001_0000,
             gsbase: 0,
             overlay: BTreeMap::new(),
-            maps: vec![
-                (FAKE_RIP, FAKE_EXEC_END, 5, "eboot.bin".to_owned()),
-                (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
-            ],
+            maps,
             next_alloc: 0x9000_0000,
+            fixture,
         }));
         let counter = connections.clone();
         let state = shared.clone();
@@ -847,10 +909,11 @@ pub(crate) mod fake {
                             }
                             0xbdaa0001 => {
                                 success(&mut stream);
+                                let pid = state.lock().unwrap().fixture.as_ref().map_or(77, |fixture| fixture.pid);
                                 let mut out = 1u32.to_le_bytes().to_vec();
                                 let mut entry = [0u8; 36];
                                 entry[..4].copy_from_slice(b"eboo");
-                                entry[32..36].copy_from_slice(&77u32.to_le_bytes());
+                                entry[32..36].copy_from_slice(&pid.to_le_bytes());
                                 out.extend(entry);
                                 let _ = stream.write_all(&out);
                             }
@@ -875,7 +938,7 @@ pub(crate) mod fake {
                                 let length = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
                                 success(&mut stream);
                                 let guard = state.lock().unwrap();
-                                let _ = stream.write_all(&fake_memory(address, length, &guard.overlay));
+                                let _ = stream.write_all(&fake_memory(address, length, &guard.overlay, guard.fixture.as_ref()));
                             }
                             0xbdaa0003 => {
                                 let address = u64::from_le_bytes(body[4..12].try_into().unwrap());
@@ -940,15 +1003,22 @@ pub(crate) mod fake {
                                 let interface = Ipv4Addr::new(body[4], body[5], body[6], body[7]);
                                 success(&mut stream);
                                 if let Ok(events) = TcpStream::connect((interface, 755)) {
-                                    state.lock().unwrap().events = Some(events);
+                                    let mut guard = state.lock().unwrap();
+                                    guard.events = Some(events);
+                                    // A real attach stops the process (PT_ATTACH -> SIGSTOP/SIGTRAP).
+                                    if let Some(fixture) = guard.fixture.clone() {
+                                        let event = fixture_event(&fixture, &guard.registers);
+                                        push_event(&mut guard, &event);
+                                    }
                                 }
                             }
                             0xbdbb0002 => success(&mut stream),
                             0xbdbb0003 | 0xbdbb0004 => success(&mut stream),
                             0xbdbb0005 => {
                                 success(&mut stream);
+                                let thread = state.lock().unwrap().fixture.as_ref().map_or(1, |fixture| fixture.thread_id);
                                 let mut out = 1u32.to_le_bytes().to_vec();
-                                out.extend(1u32.to_le_bytes());
+                                out.extend(thread.to_le_bytes());
                                 let _ = stream.write_all(&out);
                             }
                             0xbdbb0008 => {
@@ -1005,27 +1075,43 @@ pub(crate) mod fake {
                             0xbdbb0010 => {
                                 let resume = body.first().copied() == Some(0);
                                 success(&mut stream);
-                                if resume {
-                                    let event = event_bytes();
-                                    let mut guard = state.lock().unwrap();
-                                    if let Some(events) = guard.events.as_mut() {
-                                        let _ = events.write_all(&event);
+                                let mut guard = state.lock().unwrap();
+                                match guard.fixture.clone() {
+                                    // Fixture: halt reports a stop; resume runs until a stop it never reaches.
+                                    Some(fixture) if !resume => {
+                                        let event = fixture_event(&fixture, &guard.registers);
+                                        push_event(&mut guard, &event);
                                     }
+                                    Some(_) => {}
+                                    None if resume => push_event(&mut guard, &event_bytes()),
+                                    None => {}
                                 }
                             }
                             0xbdbb0011 => {
                                 success(&mut stream);
+                                let thread = state.lock().unwrap().fixture.as_ref().map_or(1, |fixture| fixture.thread_id);
                                 let mut data = vec![0u8; 40];
-                                data[..4].copy_from_slice(&1u32.to_le_bytes());
+                                data[..4].copy_from_slice(&thread.to_le_bytes());
                                 data[8..10].copy_from_slice(b"th");
                                 let _ = stream.write_all(&data);
                             }
                             0xbdbb0012 | 0xbdbb0013 => {
                                 success(&mut stream);
-                                let event = event_bytes();
                                 let mut guard = state.lock().unwrap();
-                                if let Some(events) = guard.events.as_mut() {
-                                    let _ = events.write_all(&event);
+                                match guard.fixture.clone() {
+                                    Some(fixture) => {
+                                        let rip = register_rip(&guard.registers);
+                                        let code = fake_memory(rip, 15, &guard.overlay, Some(&fixture));
+                                        let length = iced_x86::Decoder::with_ip(64, &code, rip, iced_x86::DecoderOptions::NONE)
+                                            .decode()
+                                            .len()
+                                            .max(1) as u64;
+                                        guard.registers[crate::expr::RIP_OFFSET..crate::expr::RIP_OFFSET + 8]
+                                            .copy_from_slice(&(rip + length).to_le_bytes());
+                                        let event = fixture_event(&fixture, &guard.registers);
+                                        push_event(&mut guard, &event);
+                                    }
+                                    None => push_event(&mut guard, &event_bytes()),
                                 }
                             }
                             _ => return,
@@ -1138,5 +1224,39 @@ mod tests {
         let error = debugger.processes().unwrap_err();
         assert!(format!("{error:#}").contains("attached to pid 5"), "{error:#}");
         assert!(debugger.attached_pid.is_none());
+    }
+
+    /// Python `test_async_packets_handle_fragmentation_and_source_offsets`.
+    #[test]
+    fn async_event_packets_reassemble_fragments_at_source_offsets() {
+        let (_directory, profile) = profile(1);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let receiver = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut sender, _) = listener.accept().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut debugger = Debugger::new(profile);
+        debugger.events = Some(receiver);
+        debugger.attached_pid = Some(71);
+        let mut event = vec![0u8; EVENT_SIZE];
+        event[..4].copy_from_slice(&72u32.to_le_bytes());
+        event[4..8].copy_from_slice(&5u32.to_le_bytes());
+        event[48 + 136..48 + 144].copy_from_slice(&0x1234u64.to_le_bytes());
+        sender.write_all(&event[..100]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(debugger.poll_events().unwrap(), json!([]));
+        sender.write_all(&event[100..]).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(3);
+        let events = loop {
+            let events = debugger.poll_events().unwrap();
+            if !events.as_array().unwrap().is_empty() || Instant::now() > deadline {
+                break events;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(events.as_array().unwrap().len(), 1);
+        assert_eq!(events[0]["thread_id"], 72);
+        assert_eq!(events[0]["status"], 5);
+        assert_eq!(events[0]["registers"]["rip"], "0x1234");
+        debugger.attached_pid = None;
     }
 }

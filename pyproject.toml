@@ -3,16 +3,16 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ps4-debugmcps"
-version = "0.2.0"
-description = "Firmware-aware PS4 research workbench and local stdio MCP server"
+name = "ps4-workbench-adapters"
+version = "0.3.0"
+description = "IDA / Ghidra / Binary Ninja / iaito analysis-agent adapters for the native ps4-workbench broker"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-only"
 dependencies = []
 
-[project.scripts]
-ps4-workbench = "ps4_workbench.cli:main"
+[project.optional-dependencies]
+iaito = ["r2pipe"]
 
 [tool.setuptools.packages.find]
 include = ["ps4_workbench*"]

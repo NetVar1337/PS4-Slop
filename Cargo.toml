@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 description = "Local-first PS4 reverse-engineering workbench and MCP server"
 license = "GPL-3.0-only"
+default-run = "ps4-workbench"
 
 [lib]
 name = "ps4_workbench_rs"

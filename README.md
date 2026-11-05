@@ -2,16 +2,20 @@
 
 A local PS4 research workbench, command-line interface, and **stdio MCP server**
 for the supplied **firmware 14.00 / Afterglow** setup. Version 0.3 is a native
-**Rust** rewrite (single static binary, official `rmcp` MCP SDK); only the thin
-IDA/Ghidra desktop adapters remain Python/Java. Runs on the development PC, not on the console.
+**Rust** implementation (single binary, official `rmcp` MCP SDK) and the **only**
+server: MCP, CLI, broker, GDB Remote bridge and console transports all live in
+`src/`. The Python package `ps4_workbench/` contains only the IDA / Ghidra /
+Binary Ninja / iaito analysis-agent adapters that run *inside* those applications
+and talk to the Rust broker. Runs on the development PC, not on the console.
 
 Version **0.2** adds a shared session broker, a GDB Remote bridge, IDA Pro 9.5
 integration and a Ghidra 12.2 Java agent. For the requested live workflow, start
 with [LIVE_WORKFLOW.md](docs/LIVE_WORKFLOW.md), not multiple independent debugger clients.
 
-Installed-app fixture checks now cover native IDA attachment, memory/registers,
+Installed-app fixture checks cover native IDA attachment, memory/registers,
 single-stepping, software breakpoints, static decompilation in both applications,
-and MCP-to-Ghidra Java-agent decompilation. **None of these is a PS4 hardware test.**
+and MCP-to-Ghidra Java-agent decompilation, all through the shipped Rust binaries
+against a loopback ps4debug-NG protocol fixture. **None of these is a PS4 hardware test.**
 
 **Hardware compatibility is NOT guaranteed.** This project does not install a
 jailbreak, HEN, debugger, SDK, or Ghidra. Default configuration is read-only
@@ -27,11 +31,12 @@ cargo build --release
 ./target/release/ps4-workbench validate
 ./target/release/ps4-workbench tools
 cargo test
+cargo build --locked; python -m unittest discover -q   # adapter tests against the real broker
 ```
 
 These commands do not contact the PS4. Tests use temporary files, fake sockets,
 loopback FTP/debug/log servers, and a local MCP subprocess.
-See [the validation record](docs/VALIDATION.md) for executed checks and untested boundaries.
+See [the current validation record](docs/VALIDATION_03.md) for executed checks and untested boundaries.
 
 Your profile is `profiles/ps4-1400.json`:
 
@@ -83,14 +88,19 @@ schemas; the server also exposes MCP **resources** (`ps4://workbench/...`) and w
 **prompts** (read-only triage, static analysis, dynamic analysis), and honors request
 cancellation before dispatch (a command already sent to the console cannot be undone).
 Stdout carries only JSON-RPC; diagnostics go to stderr. No HTTP listener is exposed
-by `serve`. Profile changes require a restart.
+by `serve`. Each inbound line is limited to 1 MiB: malformed or non-finite JSON gets a
+`-32700 Invalid JSON` reply, and an oversized line gets `-32700` and closes the
+transport. Profile changes require a restart. While an MCP client holds the
+server, Windows locks `target/release/ps4-workbench.exe`; stop the client (or rename
+the running exe aside) before `cargo build --release`.
 
 ## Tool groups
 
-There are **77 standalone tools**, **55 visible with the default read-only profile**.
+There are **76 standalone tools**, **54 visible with the default read-only profile**.
 Shared broker mode adds **10 static-analysis & synchronization tools** plus
-session-observer tools. Run `tools` for the complete, machine-readable schemas and
-current policy-filtered tool list.
+3 session-observer tools. Run `tools` for the complete, machine-readable schemas and
+current policy-filtered tool list. Every tool has exactly one implementation (Rust);
+integers above 2^53 in results are returned as hex strings.
 
 - **Console:** status, bounded streaming FTP listing/downloads, allowlisted FTP
   uploads, raw Klog capture, payload manifest inspection, single-attempt BIN
@@ -108,9 +118,11 @@ current policy-filtered tool list.
   memory reads, little-endian typed values, provenance-rich snapshots, local
   snapshot diffs, wildcard byte-pattern scans across page boundaries, stateful
   multi-pass Cheat-Engine-style value scanning (`memory_scan` over integer, float,
-  string, and wildcard byte targets), mapping/RVA correlation, bidirectional
-  runtime/static address rebasing (`address_rebase`), and sectionless in-memory
-  ELF64 reconstruction (`memory_elf_dump`). `memory_peek` avoids artifact creation
+  string, and wildcard byte targets), bidirectional runtime/static/module+offset
+  address translation (`address_rebase`, which also reports the containing process
+  map and falls back to a map-offset image-base estimate for addresses outside the
+  module list), and sectionless in-memory ELF64 reconstruction (`memory_elf_dump`).
+  `memory_peek` avoids artifact creation
   for live views; `memory_region_dump` chunks larger readable ranges and preserves
   incomplete captures explicitly.
 - **Debugger:** persistent process attach/detach, thread list, GP/FPU/XMM/YMM/debug
@@ -139,9 +151,11 @@ current policy-filtered tool list.
 - **Static analysis & Orbis OS (local, no console):** `artifact_info` parses ELF64
   structure (loads, sections, `.dynsym`/`.symtab`/`PT_DYNAMIC` symbols with automatic
   Orbis SHA-1 NID demangling, `DT_NEEDED` imports) or identifies SCE SELF/PKG
-  containers (without DRM decryption keys); `orbis_nid_resolve` resolves/encodes
+  containers (without DRM decryption keys); `nid_resolve` resolves/encodes
   Orbis NIDs with optional custom dictionaries; `artifact_disasm` disassembles an
-  artifact range; `artifact_strings` extracts bounded printable strings.
+  artifact range; `artifact_strings` extracts bounded printable strings;
+  `pattern_scan` searches a captured artifact (`memory_search` is the live
+  counterpart; both share one pattern engine).
 - **Development:** local SDK discovery, three SDK recipe/reference scaffolds,
   hash-allowlisted local builds with bounded logs/time and captured outputs.
 - **Shared analysis & GDB RSP:** IDA Pro, Ghidra, Binary Ninja, and iaito (radare2)
@@ -150,6 +164,18 @@ current policy-filtered tool list.
   label/comment synchronization (`analysis_sync_annotations`) through explicitly
   connected local agents, plus an x86-64 + SSE/XMM + SVR4 shared-library GDB Remote
   bridge (`gdb-server`, with opt-in `--allow-writes`).
+
+Annotation stores and which one is authoritative:
+
+| Store | Tools | Role |
+|---|---|---|
+| Host debugger labels | `debug_label*` | Runtime names for `debug_eval`/disassembly; session-local, saved explicitly |
+| Evidence annotations | `annotation_save` | Authoritative, hash-bound record (module SHA-256 + RVA + evidence artifact) |
+| Analyzer database | `analysis_rename`, `analysis_comment` | The open IDA/Ghidra/BN/iaito database |
+
+`analysis_sync_annotations` copies between labels and the analyzer database with
+ASLR rebasing; it never writes evidence annotations. When they disagree, the
+evidence annotation wins because it is bound to a module hash.
 
 Large results become local artifacts, not enormous MCP replies. Addresses/RVAs
 are strings (`"0x400000"`) to avoid JavaScript integer precision loss. Captures
@@ -206,13 +232,14 @@ runtime-tested here.
 ## Repository layout
 
 ```text
-src/                 Rust: MCP server, CLI, transports, broker, RSP/GDB bridge, analysis, SDK workflows
-ps4_workbench/       Python IDA/Ghidra adapter client only (legacy backend superseded by src/)
+src/                 Rust: the only server — MCP, CLI, transports, broker, RSP/GDB bridge, analysis, SDK workflows
+src/bin/             ps4debug-fixture: loopback protocol fixture for installed-app tests (`--features fixture`)
+ps4_workbench/       Python analysis-agent adapters (IDA/Ghidra/Binary Ninja/iaito) + broker client
 profiles/            Console profile; local qualification files are ignored
 examples/            MCP configs, manifest and evidence templates
 integrations/        IDA/Binary Ninja/iaito connection scripts; Ghidra Java/Python clients and annotations
 docs/                Compatibility, qualification, development, protocol notes
-tests/               Offline unit and loopback integration tests
+tests/               Python adapter tests against the real broker; tests/manual installed-app harnesses
 workspace/           Generated captures, logs, audit journal, projects (ignored)
 ```
 

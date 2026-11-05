@@ -9,7 +9,7 @@ or headless with Binary Ninja's bundled Python:
 
     import binaryninja
     bv = binaryninja.load(r"D:/dumps/eboot.bin")
-    exec(open(r".../integrations/binja/ps4_connect.py").read())
+    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/integrations/binja/ps4_connect.py").read())
 
 Environment:
     PS4_WORKBENCH_ROOT  repository root (default is this checkout)

@@ -135,6 +135,13 @@ impl Workbench {
             !paths.is_empty() && paths.len() <= 64,
             "Extract needs 1-64 explicit paths"
         );
+        let mut normalized = std::collections::BTreeSet::new();
+        for path in paths {
+            ensure!(
+                normalized.insert(transports::remote_path(path)?),
+                "Duplicate extract path: {path}"
+            );
+        }
         let mut files = Vec::new();
         let mut total = 0usize;
         let mut complete = true;
