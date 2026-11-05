@@ -749,7 +749,10 @@ mod tests {
         std::fs::write(&invalid, "ABC").unwrap();
         assert!(load_token(&invalid, false).is_err());
         assert!(load_token(&fixture.directory.path().join("absent.local"), false).is_err());
-        assert_eq!(token_file(&Profile::load(&fixture.profile_path).unwrap()), fixture.directory.path().join("broker-token.local"));
+        // Profile::load canonicalizes the profile path (Windows 8.3 short names
+        // like RUNNER~1 expand), so canonicalize the expected side too.
+        let expected_token = crate::config::resolve_lenient(&fixture.directory.path().join("broker-token.local")).unwrap();
+        assert_eq!(token_file(&Profile::load(&fixture.profile_path).unwrap()), expected_token);
     }
 
     #[test]
