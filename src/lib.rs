@@ -44,3 +44,7 @@ pub mod yara;
 pub mod cryptoscan;
 // trace area (run-loop tracing & coverage)
 pub mod tracekit;
+// Access/crash/pointer/struct/script feature area.
+pub mod pointerscan;
+pub mod structinfer;
+pub mod hostscript;
