@@ -1,0 +1,42 @@
+[package]
+name = "ps4-debugmcps"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Local-first PS4 reverse-engineering workbench and MCP server"
+license = "GPL-3.0-only"
+
+[lib]
+name = "ps4_workbench_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ps4-workbench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+jsonschema = { version = "0.46", default-features = false }
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+rmcp = { version = "3.8", features = ["server", "transport-io", "client", "transport-child-process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
+

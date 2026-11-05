@@ -18,8 +18,8 @@ Your installed applications were inspected and tested locally:
 From this repository:
 
 ```powershell
-python -m ps4_workbench call desktop_status
-python -m ps4_workbench broker
+ps4-workbench call desktop_status
+ps4-workbench broker
 ```
 
 Startup does not connect to the console. The broker binds only `127.0.0.1:8765`
@@ -40,10 +40,10 @@ cannot silently switch them to a different console configuration.
 Read-only commands through the already-running broker:
 
 ```powershell
-python -m ps4_workbench remote-call console_status
-python -m ps4_workbench remote-call process_list
-python -m ps4_workbench remote-call session_state
-python -m ps4_workbench remote-call analysis_status
+ps4-workbench remote-call console_status
+ps4-workbench remote-call process_list
+ps4-workbench remote-call session_state
+ps4-workbench remote-call analysis_status
 ```
 
 The actual console debugger still must be enabled and independently qualified
@@ -80,7 +80,7 @@ For native live debugging, first use your qualified profile and an observed PID:
 ```powershell
 $targetPid = [int](Read-Host 'Observed PS4 process PID')
 $callbackIp = Read-Host 'PC IPv4 reachable from the PS4'
-python -m ps4_workbench gdb-server --pid $targetPid --listen-address $callbackIp
+ps4-workbench gdb-server --pid $targetPid --listen-address $callbackIp
 ```
 
 The bridge listens only on PC loopback `127.0.0.1:1234`. It does not attach until

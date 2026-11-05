@@ -1,8 +1,9 @@
 # PS4-DebugMCPs
 
 A local PS4 research workbench, command-line interface, and **stdio MCP server**
-for the supplied **firmware 14.00 / Afterglow** setup. Python 3.11+; no runtime
-dependencies. Runs on the development PC, not on the console.
+for the supplied **firmware 14.00 / Afterglow** setup. Version 0.3 is a native
+**Rust** rewrite (single static binary, official `rmcp` MCP SDK); only the thin
+IDA/Ghidra desktop adapters remain Python/Java. Runs on the development PC, not on the console.
 
 Version **0.2** adds a shared session broker, a GDB Remote bridge, IDA Pro 9.5
 integration and a Ghidra 12.2 Java agent. For the requested live workflow, start
@@ -22,9 +23,10 @@ Even memory reads or debugger attachment can crash an unstable target.
 From this repository in PowerShell:
 
 ```powershell
-python -m ps4_workbench validate
-python -m ps4_workbench tools
-python -m unittest discover -v
+cargo build --release
+./target/release/ps4-workbench validate
+./target/release/ps4-workbench tools
+cargo test
 ```
 
 These commands do not contact the PS4. Tests use temporary files, fake sockets,
@@ -46,11 +48,11 @@ installed on your PS4**. Do not fill unknown values with the reference values.
 Explicit, read-only network actions (only when the corresponding service is enabled):
 
 ```powershell
-python -m ps4_workbench call console_status --arguments '{"probe":true}'
-python -m ps4_workbench call ftp_list --arguments '{"path":"/data"}'
-python -m ps4_workbench call debugger_info
-python -m ps4_workbench call process_list
-python -m ps4_workbench call klog_capture --arguments '{"seconds":5}'
+ps4-workbench call console_status --arguments '{"probe":true}'
+ps4-workbench call ftp_list --arguments '{"path":"/data"}'
+ps4-workbench call debugger_info
+ps4-workbench call process_list
+ps4-workbench call klog_capture --arguments '{"seconds":5}'
 ```
 
 `console_status` without `probe` is completely offline. With `probe`, it checks
@@ -61,7 +63,7 @@ the workbench does not enable it or reconnect automatically.
 On shells with JSON quoting problems, use a file:
 
 ```powershell
-python -m ps4_workbench call memory_read --arguments-file examples/read-memory.json
+ps4-workbench call memory_read --arguments-file examples/read-memory.json
 ```
 
 **Replace the example PID and address with an observed process and mapped range.**
@@ -70,23 +72,18 @@ The example values are not known to be valid on your console.
 ## MCP connection
 
 ```powershell
-python -m ps4_workbench --profile profiles/ps4-1400.json serve
+cargo build --release
+target/release/ps4-workbench --profile profiles/ps4-1400.json serve
 ```
 
 This is a stdio service; do not run it expecting an interactive prompt. Configure
-your MCP client using `examples/mcp-servers.json`. The example contains this
-checkout's absolute paths; adjust them if you move the repository. Clients that
-do not honor `cwd` should use an installed interpreter instead:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\python -m pip install -e .
-```
-
-Set the MCP command to the absolute `.venv/Scripts/python.exe` path and retain
-the absolute `--profile` path. Installation needs setuptools at build time, not
-at runtime. The server writes only JSON-RPC to stdout and diagnostics to stderr;
-it exposes no HTTP listener. Profile changes require restarting the server.
+your MCP client using `examples/mcp-servers.json` (absolute paths for this checkout;
+adjust if you move it). Tools return `structuredContent` (`{"data": ...}`) with output
+schemas; the server also exposes MCP **resources** (`ps4://workbench/...`) and workflow
+**prompts** (read-only triage, static analysis, dynamic analysis), and honors request
+cancellation before dispatch (a command already sent to the console cannot be undone).
+Stdout carries only JSON-RPC; diagnostics go to stderr. No HTTP listener is exposed
+by `serve`. Profile changes require a restart.
 
 ## Tool groups
 
@@ -170,7 +167,8 @@ runtime-tested here.
 ## Repository layout
 
 ```text
-ps4_workbench/       MCP, CLI, transports, debugger, analysis, SDK workflows
+src/                 Rust: MCP server, CLI, transports, broker, RSP/GDB bridge, analysis, SDK workflows
+ps4_workbench/       Python IDA/Ghidra adapter client only (legacy backend superseded by src/)
 profiles/            Console profile; local qualification files are ignored
 examples/            MCP configs, manifest and evidence templates
 integrations/        IDA connection script; Ghidra Java/Python clients and annotations

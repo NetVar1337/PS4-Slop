@@ -7,13 +7,10 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest, ubuntu-latest]
-        python: ['3.11', '3.13']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      - run: python -m unittest discover -v
-      - run: python -m compileall -q ps4_workbench
-      - run: python -m ps4_workbench validate
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo run --locked -- validate

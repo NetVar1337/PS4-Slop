@@ -1,9 +1,9 @@
 {
   "mcpServers": {
     "ps4-workbench": {
-      "command": "python",
+      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/target/release/ps4-workbench",
       "args": [
-        "-m", "ps4_workbench", "--profile",
+        "--profile",
         "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/profiles/ps4-1400.json",
         "serve"
       ],
