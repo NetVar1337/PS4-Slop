@@ -28,7 +28,7 @@ def desktop_status():
                        "installed": properties.is_file(), "supported_adapter": "Ghidra 12.2 / PyGhidra",
                        "native_debugger_requires": "GDB with Python and the Ghidra trace-agent dependencies"},
             "binja": {"directory": str(binja),
-                      "installed": any((binja / name).is_file() for name in ("binaryninza.exe", "binaryninja.exe")),
+                      "installed": (binja / "binaryninja.exe").is_file(),
                       "supported_adapter": "Binary Ninja Python (plugin context or headless binaryninja.load)"},
             "iaito": {"directory": str(iaito),
                       "installed": any((iaito / name).is_file() for name in ("iaito.exe", "r2.exe", "radare2.exe")),

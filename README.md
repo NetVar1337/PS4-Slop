@@ -87,54 +87,74 @@ by `serve`. Profile changes require a restart.
 
 ## Tool groups
 
-There are **61 standalone tools**, **45 visible with the default profile**. Shared
-mode adds static-analysis and session-observer tools. Run `tools` for
-the complete, machine-readable schemas and current policy-filtered tool list.
+There are **77 standalone tools**, **55 visible with the default read-only profile**.
+Shared broker mode adds **10 static-analysis & synchronization tools** plus
+session-observer tools. Run `tools` for the complete, machine-readable schemas and
+current policy-filtered tool list.
 
-- **Console:** status, bounded FTP listing/downloads, allowlisted FTP uploads,
-  raw Klog capture, payload manifest inspection, single-attempt BIN transfer.
-  Multi-file extraction preserves a cumulative budget and partial-failure manifest.
-  Link health is passive (no background probing): read-only debugger commands
-  reconnect once after a transient drop, FTP transfers re-establish the session
-  (NOOP-revalidated for batches) and retry idempotent reads a bounded number of
-  times, Klog captures reconnect instead of truncating, and payloads are
-  validated locally (container magic, size, fill, text heuristics, manifest hash,
-  allowlist) **before any byte is sent**, so an invalid payload never reaches the
-  loader and no service restart is needed. `link_status` reports per-service
-  health; mutations are never auto-retried.
-- **Processes:** process list and identity, memory maps, bounded memory reads,
-  little-endian typed values, provenance-rich snapshots, local snapshot diffs,
-  wildcard byte-pattern scans, mapping/RVA correlation.
-  `memory_peek` avoids artifact creation for live views; `memory_region_dump`
-  chunks larger readable ranges and preserves incomplete captures explicitly.
-- **Debugger:** persistent process attach/detach, thread list, GP/FPU/debug-register
-  reads, register writes with readback verification, asynchronous stop events,
-  halt/resume, step into/over/out, run-to-address and conditional run with
-  breakpoint hit counting, software breakpoints with conditions/log/stop-after,
-  aligned hardware watchpoints, live disassembly with masked breakpoint bytes,
-  module lists, expression evaluation on live registers/memory, call-stack
-  unwinding, live code xrefs (call/jump/lea targeting an address), live memory
-  pattern search, host-side labels, breakpoint/watchpoint export and re-apply,
-  and watchpoint listing. Stop handling re-reads live registers because the
-  pinned server steps past a breakpoint instruction before reporting the hit.
-- **Memory mutations:** compare expected bytes, preserve original/replacement
-  artifacts, write, independently read back, and persist an uncertainty journal.
-  Kernel access is separately gated and is not kernel breakpoint debugging.
+- **Console:** status, bounded streaming FTP listing/downloads, allowlisted FTP
+  uploads, raw Klog capture, payload manifest inspection, single-attempt BIN
+  transfer, and local TCP 755 callback bind preflight checks (`link_status` with
+  `probe: true`). Multi-file extraction preserves a cumulative budget and
+  partial-failure manifest. Link health is passive (no background probing):
+  read-only debugger commands reconnect once after a transient drop, FTP transfers
+  re-establish the session (NOOP-revalidated for batches) and retry idempotent reads
+  a bounded number of times, Klog captures reconnect instead of truncating, and
+  payloads are validated locally (container magic, size, fill, text heuristics,
+  manifest hash, allowlist) **before any byte is sent**, so an invalid payload never
+  reaches the loader and no service restart is needed. Mutations are never
+  auto-retried.
+- **Processes & Memory Scanning:** process list and identity, memory maps, bounded
+  memory reads, little-endian typed values, provenance-rich snapshots, local
+  snapshot diffs, wildcard byte-pattern scans across page boundaries, stateful
+  multi-pass Cheat-Engine-style value scanning (`memory_scan` over integer, float,
+  string, and wildcard byte targets), mapping/RVA correlation, bidirectional
+  runtime/static address rebasing (`address_rebase`), and sectionless in-memory
+  ELF64 reconstruction (`memory_elf_dump`). `memory_peek` avoids artifact creation
+  for live views; `memory_region_dump` chunks larger readable ranges and preserves
+  incomplete captures explicitly.
+- **Debugger:** persistent process attach/detach, thread list, GP/FPU/XMM/YMM/debug
+  register reads, Orbis TLS `fsbase`/`gsbase` reads and verified writes
+  (`debug_tls`, `debug_tls_set`), GP and FPU/XMM/YMM register writes with readback
+  verification (`debug_registers_set`, `debug_registers_fpu_set`), asynchronous stop
+  events, halt/resume, step into/over/out, run-to-address and conditional run with
+  per-breakpoint `condition`, `log` interpolation, and `stop_after` hit thresholds,
+  software breakpoints, aligned hardware watchpoints, live disassembly with masked
+  breakpoint bytes, host-side x86-64 Intel-syntax instruction assembly (`assemble`),
+  module lists, expression evaluation on live registers/memory/`fsbase`/`gsbase`,
+  DWARF `.eh_frame` CFI + frame-pointer call-stack unwinding, module/range-scoped
+  live code xrefs, live memory pattern search, persistent host-side labels
+  (`debug_label_save`, `debug_label_load`), and breakpoint/watchpoint export/import.
+  Stop handling re-reads live registers because the pinned server steps past a
+  breakpoint instruction before reporting the hit.
+- **Memory mutations & Patch Manager:** compare expected bytes, preserve prewrite
+  backup artifacts, write, independently read back, and persist an audit journal;
+  assemble & NOP-pad live code patches with tracked restore (`memory_patch`,
+  `patch_list`, `patch_restore`); allocate, free, and re-protect target virtual
+  memory (`memory_alloc`, `memory_free`, `memory_protect`) with readback
+  verification. Kernel access is separately gated and is not kernel breakpoint
+  debugging.
 - **Research artifacts:** hashes, metadata sidecars, bounded chunk reads,
   module/RVA annotations, Ghidra handoff bundles, experiment ZIPs.
-- **Static analysis (local, no console):** `artifact_info` parses ELF64 structure
-  (loads, sections, symbol counts, DT_NEEDED imports) or identifies SCE SELF/PKG
-  containers; `artifact_disasm` disassembles an artifact range at a chosen base
-  address; `artifact_strings` extracts bounded printable strings.
+- **Static analysis & Orbis OS (local, no console):** `artifact_info` parses ELF64
+  structure (loads, sections, `.dynsym`/`.symtab`/`PT_DYNAMIC` symbols with automatic
+  Orbis SHA-1 NID demangling, `DT_NEEDED` imports) or identifies SCE SELF/PKG
+  containers (without DRM decryption keys); `orbis_nid_resolve` resolves/encodes
+  Orbis NIDs with optional custom dictionaries; `artifact_disasm` disassembles an
+  artifact range; `artifact_strings` extracts bounded printable strings.
 - **Development:** local SDK discovery, three SDK recipe/reference scaffolds,
   hash-allowlisted local builds with bounded logs/time and captured outputs.
-- **Shared analysis:** IDA/Ghidra/Binary Ninja/iaito (radare2) functions,
-  decompilation and cross-references through explicitly connected local agents,
-  with one live-debug controller and independent event cursors for observers.
+- **Shared analysis & GDB RSP:** IDA Pro, Ghidra, Binary Ninja, and iaito (radare2)
+  functions, decompilation, directional cross-references, static disassembly,
+  strings, NID-enriched imports, symbol renames, comments, and bidirectional
+  label/comment synchronization (`analysis_sync_annotations`) through explicitly
+  connected local agents, plus an x86-64 + SSE/XMM + SVR4 shared-library GDB Remote
+  bridge (`gdb-server`, with opt-in `--allow-writes`).
 
 Large results become local artifacts, not enormous MCP replies. Addresses/RVAs
 are strings (`"0x400000"`) to avoid JavaScript integer precision loss. Captures
-are not atomic and do not reconstruct executable file formats.
+are not atomic; `memory_elf_dump` reconstructs only mapped PT_LOAD segments from
+in-memory ELF headers and never decrypts encrypted SELF/PKG containers.
 
 ## Compatibility and enabling advanced actions
 

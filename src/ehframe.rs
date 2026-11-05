@@ -433,7 +433,8 @@ pub fn unwind_at_pc(
 }
 
 /// Locate the `.eh_frame` range `(vaddr, byte_size)` from an in-memory ELF64 header
-/// + program headers (`PT_GNU_EH_FRAME` = `0x6474e550` -> `.eh_frame_hdr` -> `.eh_frame`).
+/// and program headers (`PT_GNU_EH_FRAME` = `0x6474e550` -> `.eh_frame_hdr` -> `.eh_frame`).
+///
 /// Returns `(eh_frame_vaddr, max_size_to_read)` when present.
 pub fn find_eh_frame_from_elf_header(
     header_page: &[u8],

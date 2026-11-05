@@ -221,7 +221,7 @@ fn parse_hex_pattern(raw: &str) -> Result<Vec<Option<u8>>> {
         }
     } else {
         let s = raw.trim().strip_prefix("0x").unwrap_or(raw.trim());
-        ensure!(s.len() % 2 == 0 && !s.is_empty(), "Hex byte string must have non-zero even length");
+        ensure!(s.len().is_multiple_of(2) && !s.is_empty(), "Hex byte string must have non-zero even length");
         for i in (0..s.len()).step_by(2) {
             let sub = &s[i..i + 2];
             if sub == "??" {
@@ -534,8 +534,10 @@ pub fn format_candidate_value(vtype: ScanValueType, bytes: &[u8]) -> Value {
         ScanValueType::Utf8 => json!(String::from_utf8_lossy(bytes).to_string()),
         ScanValueType::Utf16 => {
             let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_le_bytes(c))
                 .collect();
             json!(String::from_utf16_lossy(&units))
         }
@@ -930,7 +932,7 @@ mod tests {
 
     #[test]
     fn scans_across_chunk_boundaries_for_strings_and_wildcards() {
-        let mut mem = vec![0u8; 64];
+        let mut mem = [0u8; 64];
         mem[13..23].copy_from_slice(b"OrbisOS_14");
         let regions = vec![ScanRegion {
             start: 0x2000,

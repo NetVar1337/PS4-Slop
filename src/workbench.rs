@@ -1014,7 +1014,7 @@ pub fn desktop_status() -> Result<Value> {
     Ok(
         json!({"ida":{"directory":ida,"installed":ida.join("ida.exe").is_file(),"gdb_plugin_present":ida.join("plugins/gdb_user.dll").is_file(),"supported_adapter":"IDA Pro 9.5 / IDAPython"},
         "ghidra":{"directory":ghidra,"installed":properties.is_file(),"version":version,"supported_adapter":"Ghidra Java agent; optional PyGhidra","native_debugger_requires":"GDB with Python and Ghidra trace-agent dependencies"},
-        "binja":{"directory":binja,"installed":binja.join("binaryninza.exe").is_file() || binja.join("binaryninja.exe").is_file(),"supported_adapter":"Binary Ninja Python (plugin context or headless binaryninja.load)"},
+        "binja":{"directory":binja,"installed":binja.join("binaryninja.exe").is_file(),"supported_adapter":"Binary Ninja Python (plugin context or headless binaryninja.load)"},
         "iaito":{"directory":iaito,"installed":iaito.join("iaito.exe").is_file() || iaito.join("r2.exe").is_file() || iaito.join("radare2.exe").is_file(),"supported_adapter":"radare2/iaito via r2pipe (aflj/pdc/axtj); r2 must be on PATH"},
         "note":"Discovery only; no application launch, console connection or license inspection"}),
     )

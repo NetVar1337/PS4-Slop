@@ -98,8 +98,10 @@ pub struct Debugger {
     pub patches: std::collections::BTreeMap<u32, PatchRecord>,
     next_patch_id: u32,
     pub scans: crate::scanner::ScanBook,
-    eh_cache: std::collections::HashMap<(u32, u64), Option<(u64, Vec<u8>)>>,
+    eh_cache: EhFrameCache,
 }
+
+type EhFrameCache = std::collections::HashMap<(u32, u64), Option<(u64, Vec<u8>)>>;
 
 impl Debugger {
     pub fn new(profile: Profile) -> Self {

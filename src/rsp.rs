@@ -1154,11 +1154,32 @@ mod tests {
 
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                let mut buf = vec![0u8; 8192];
-                let Ok(n) = stream.read(&mut buf) else { continue };
-                let req = String::from_utf8_lossy(&buf[..n]);
-                let Some((_, body)) = req.split_once("\r\n\r\n") else { continue };
-                let Ok(val) = serde_json::from_str::<Value>(body) else { continue };
+                let mut data = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let body_offset = loop {
+                    let Ok(n) = stream.read(&mut chunk) else { break None };
+                    if n == 0 {
+                        break None;
+                    }
+                    data.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let hdr = String::from_utf8_lossy(&data[..pos]);
+                        let content_len = hdr
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim().eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= pos + 4 + content_len {
+                            break Some((pos + 4, pos + 4 + content_len));
+                        }
+                    }
+                };
+                let Some((start, end)) = body_offset else { continue };
+                let Ok(val) = serde_json::from_slice::<Value>(&data[start..end]) else { continue };
                 let op = val["operation"].as_str().unwrap_or("");
                 let result = match op {
                     "state" => json!({
@@ -1170,8 +1191,8 @@ mod tests {
                         "event_cursor": 1,
                     }),
                     "call" => {
-                        let tool = val["tool"].as_str().unwrap_or("").to_string();
-                        let args = val["arguments"].clone();
+                        let tool = val["arguments"]["name"].as_str().unwrap_or("").to_string();
+                        let args = val["arguments"]["arguments"].clone();
                         calls_srv.lock().unwrap().push((tool.clone(), args));
                         match tool.as_str() {
                             "debug_threads" => json!([72]),

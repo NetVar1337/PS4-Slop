@@ -1789,9 +1789,7 @@ impl Debugger {
             Some(s) => Some(ScanValueType::parse(s)?),
             None => None,
         };
-        let default_cmp = if action == "first" {
-            "exact"
-        } else if arguments.get("value").is_some_and(|v| !v.is_null()) {
+        let default_cmp = if action == "first" || arguments.get("value").is_some_and(|v| !v.is_null()) {
             "exact"
         } else {
             "changed"

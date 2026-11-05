@@ -86,6 +86,7 @@ def parser():
     gdb.add_argument("--pid", type=int, required=True)
     gdb.add_argument("--listen-address", required=True, help="PC IPv4 reachable from console callback on 755")
     gdb.add_argument("--observer", action="store_true", help="Observe an already attached session; deny controls")
+    gdb.add_argument("--allow-writes", action="store_true", help="Allow audited RSP memory/register writes (M/P/G)")
     commands.add_parser("tools", help="List tools allowed by the local profile; no network")
     commands.add_parser("validate", help="Validate local profile and show configured services; no network")
     call = commands.add_parser("call", help="Invoke a tool once; debug session auto-detaches at exit")
@@ -134,8 +135,9 @@ def main(argv=None):
                 from .rsp import RspServer
                 BrokerClient(arguments.broker, secret_path, expected_profile=profile.fingerprint)
                 with RspServer(arguments.broker, secret_path, arguments.pid, arguments.listen_address,
-                               arguments.port, arguments.observer, profile.fingerprint) as server:
-                    print(f"GDB Remote: 127.0.0.1:{server.server_address[1]}; PID {arguments.pid}; observer={arguments.observer}", file=sys.stderr)
+                               arguments.port, arguments.observer, profile.fingerprint,
+                               allow_writes=arguments.allow_writes) as server:
+                    print(f"GDB Remote: 127.0.0.1:{server.server_address[1]}; PID {arguments.pid}; observer={arguments.observer}; allow_writes={arguments.allow_writes}", file=sys.stderr)
                     server.serve_forever(poll_interval=0.1)
                 return 0
             client = BrokerClient(arguments.broker, secret_path, arguments.client_id, expected_profile=profile.fingerprint)

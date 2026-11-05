@@ -48,7 +48,7 @@ fn sha1(chunks: &[&[u8]]) -> [u8; 20] {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    for block in msg.as_chunks::<64>().0 {
         let mut w = [0u32; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let at = i * 4;
@@ -102,7 +102,7 @@ pub fn encode_nid(symbol: &str) -> String {
         digest[3], digest[2], digest[1], digest[0], 0u8,
     ];
     let mut out = Vec::with_capacity(12);
-    for group in raw.chunks_exact(3) {
+    for group in raw.as_chunks::<3>().0 {
         let triple = ((group[0] as u32) << 16) | ((group[1] as u32) << 8) | (group[2] as u32);
         out.push(NID_ALPHABET[((triple >> 18) & 0x3f) as usize]);
         out.push(NID_ALPHABET[((triple >> 12) & 0x3f) as usize]);

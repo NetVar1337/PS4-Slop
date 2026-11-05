@@ -404,12 +404,11 @@ fn parse_statements(source: &str) -> Result<Vec<Stmt>> {
             while let Some((label, rest)) = text.split_once(':') {
                 // Make sure ':' isn't inside `fs:[...]` or `gs:[...]`
                 let candidate = label.trim();
-                if candidate.to_ascii_lowercase().ends_with("fs")
-                    || candidate.to_ascii_lowercase().ends_with("gs")
+                if (candidate.to_ascii_lowercase().ends_with("fs")
+                    || candidate.to_ascii_lowercase().ends_with("gs"))
+                    && rest.trim_start().starts_with('[')
                 {
-                    if rest.trim_start().starts_with('[') {
-                        break;
-                    }
+                    break;
                 }
                 if is_ident(candidate) && !candidate.contains(' ') {
                     stmts.push(Stmt::Label(candidate.to_ascii_lowercase()));
@@ -792,9 +791,7 @@ fn build_one(
             (32, _) => Instruction::with2(Code::Mov_r32_imm32, *dst, *val as u32)?,
             (64, "movabs") => Instruction::with2(Code::Mov_r64_imm64, *dst, *val as u64)?,
             (64, _) => {
-                if *val >= 0 && *val <= u32::MAX as i128 {
-                    Instruction::with2(Code::Mov_rm64_imm32, *dst, *val as i32)?
-                } else if *val >= i32::MIN as i128 && *val < 0 {
+                if (i32::MIN as i128..=i32::MAX as i128).contains(val) {
                     Instruction::with2(Code::Mov_rm64_imm32, *dst, *val as i32)?
                 } else {
                     Instruction::with2(Code::Mov_r64_imm64, *dst, *val as u64)?

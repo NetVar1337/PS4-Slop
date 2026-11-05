@@ -104,6 +104,8 @@ enum Command {
         port: u16,
         #[arg(long)]
         observer: bool,
+        #[arg(long)]
+        allow_writes: bool,
     },
     Ingest {
         file: PathBuf,
@@ -218,14 +220,22 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             listen_address,
             port,
             observer,
+            allow_writes,
         } => {
             ensure!(
                 pid > 0 && pid <= i32::MAX as u32 && port > 0,
                 "Invalid PID or GDB port"
             );
             let client = remote_client(&profile, &remote)?;
-            eprintln!("GDB Remote: 127.0.0.1:{port}; PID {pid}; observer={observer}");
-            ps4_workbench_rs::rsp::serve(client, pid, &listen_address, port, observer)?;
+            eprintln!("GDB Remote: 127.0.0.1:{port}; PID {pid}; observer={observer}; allow_writes={allow_writes}");
+            ps4_workbench_rs::rsp::serve_with_options(
+                client,
+                pid,
+                &listen_address,
+                port,
+                observer,
+                allow_writes,
+            )?;
             Ok(None)
         }
         Command::Qualify {

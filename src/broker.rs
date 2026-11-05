@@ -827,6 +827,16 @@ impl SessionHub {
         let mut exported_renames = 0usize;
         let mut exported_comments = 0usize;
 
+        let pre_export_snapshot = if matches!(direction, "export_to_static" | "bidirectional") {
+            let reg = lock(&self.registry);
+            Some((
+                reg.workbench.debugger.label_list(),
+                reg.workbench.debugger.breakpoint_list(),
+            ))
+        } else {
+            None
+        };
+
         if matches!(direction, "import_from_static" | "bidirectional") {
             let mut offset = 0usize;
             let mut to_set = Vec::new();
@@ -892,14 +902,7 @@ impl SessionHub {
             }
         }
 
-        if matches!(direction, "export_to_static" | "bidirectional") {
-            let (labels, bps) = {
-                let reg = lock(&self.registry);
-                (
-                    reg.workbench.debugger.label_list(),
-                    reg.workbench.debugger.breakpoint_list(),
-                )
-            };
+        if let Some((labels, bps)) = pre_export_snapshot {
             if let Some(items) = labels.as_array() {
                 for item in items.iter().take(max_items) {
                     let (Some(lbl), Some(addr_str)) = (

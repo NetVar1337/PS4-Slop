@@ -1,6 +1,7 @@
 import socket
 import threading
 import xml.etree.ElementTree as ET
+from unittest.mock import Mock
 
 from ps4_workbench.client import BrokerClient
 from ps4_workbench.config import WorkbenchError
@@ -62,7 +63,22 @@ class SessionTests(BrokerCase):
             self.assertEqual(session.handle(b"m4000,4"), b"41414141")
             self.assertEqual(session.handle(b"p0"), b"3412000000000000")
             self.assertIn(b"memory-map", session.handle(b"qXfer:memory-map:read::0,1000"))
-            self.assertTrue(session.handle(b"qXfer:features:read:target.xml:0,1000").startswith(b"l<?xml"))
+            self.assertIn(b"library-list-svr4", session.handle(b"qXfer:libraries-svr4:read::0,1000"))
+            xml_reply = session.handle(b"qXfer:features:read:target.xml:0,1000")
+            self.assertTrue(xml_reply.startswith(b"l<?xml"))
+            self.assertIn(b'org.gnu.gdb.i386.sse', xml_reply)
+            session.cleanup()
+
+    def test_opt_in_allow_writes_enables_memory_and_register_writes(self):
+        from unittest.mock import Mock
+        self.workbench.memory_write = Mock(return_value={"verified": True})
+        with self.broker() as url:
+            session = RspSession(BrokerClient(url, self.secret_path, "gdb-rw"), 71, "127.0.0.1", allow_writes=True)
+            self.attach_and_stop(session)
+            self.assertEqual(session.handle(b"X4000,0:"), b"")
+            self.assertEqual(session.handle(b"M4000,4:90909090"), b"OK")
+            self.workbench.memory_write.assert_called_once_with(71, 0x4000, "90909090", "41414141")
+            self.assertEqual(session.handle(b"k"), b"E01")
             session.cleanup()
 
     def test_mutating_rsp_packets_not_supported_are_rejected(self):

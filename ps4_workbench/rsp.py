@@ -11,16 +11,39 @@ CORE_NAMES = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9"
 REGISTER_LAYOUT = [(name, 64 if index < 17 else 32) for index, name in enumerate(CORE_NAMES)]
 REGISTER_LAYOUT += [("st" + str(index), 80) for index in range(8)]
 REGISTER_LAYOUT += [(name, 32) for name in ("fctrl", "fstat", "ftag", "fiseg", "fioff", "foseg", "fooff", "fop")]
-TARGET_XML = ('<?xml version="1.0"?><!DOCTYPE target SYSTEM "gdb-target.dtd"><target>'
-              '<architecture>i386:x86-64</architecture><osabi>FreeBSD</osabi>'
-              '<feature name="org.gnu.gdb.i386.core">' + ''.join(
-                  f'<reg name="{name}" bitsize="{bits}" regnum="{index}" type="{"i387_ext" if bits == 80 else "int"}"/>'
-                  for index, (name, bits) in enumerate(REGISTER_LAYOUT)) + '</feature></target>').encode()
+REGISTER_LAYOUT += [("xmm" + str(index), 128) for index in range(16)]
+REGISTER_LAYOUT += [("mxcsr", 32)]
+TARGET_XML = (
+    '<?xml version="1.0"?><!DOCTYPE target SYSTEM "gdb-target.dtd"><target>'
+    '<architecture>i386:x86-64</architecture><osabi>FreeBSD</osabi>'
+    '<feature name="org.gnu.gdb.i386.core">'
+    + "".join(
+        f'<reg name="{name}" bitsize="{bits}" regnum="{index}" type="{"i387_ext" if bits == 80 else "int"}"/>'
+        for index, (name, bits) in enumerate(REGISTER_LAYOUT[:40])
+    )
+    + '</feature><feature name="org.gnu.gdb.i386.sse">'
+    + "".join(
+        f'<reg name="{name}" bitsize="{bits}" regnum="{40 + offset}" type="{"uint128" if bits == 128 else "int"}"/>'
+        for offset, (name, bits) in enumerate(REGISTER_LAYOUT[40:])
+    )
+    + '</feature></target>'
+).encode()
 MAX_PACKET = 16384
 
 
 def numeric(value):
     return int(value, 0) if isinstance(value, str) else value
+
+
+def _xml_escape(text):
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
 
 
 def memory_map_xml(mappings):
@@ -29,6 +52,21 @@ def memory_map_xml(mappings):
         if entry["protection"] & 1:
             regions.append(f'<memory type="ram" start="{hex(numeric(entry["start"]))}" length="{hex(numeric(entry["end"]) - numeric(entry["start"]))}"/>')
     return ('<?xml version="1.0"?><memory-map>' + ''.join(regions) + '</memory-map>').encode()
+
+
+def libraries_svr4_xml(modules):
+    libs = []
+    seen = set()
+    for entry in modules:
+        name = entry.get("name") if isinstance(entry, dict) else None
+        if not name or name in seen:
+            continue
+        addr_raw = entry.get("base", entry.get("start"))
+        if addr_raw is None:
+            continue
+        seen.add(name)
+        libs.append(f'<library name="{_xml_escape(name)}" lm="0x0" l_addr="{hex(numeric(addr_raw))}" l_ld="0x0"/>')
+    return ('<?xml version="1.0"?><library-list-svr4 version="1.0">' + "".join(libs) + "</library-list-svr4>").encode()
 
 
 def frame(payload):
@@ -41,6 +79,30 @@ def frame(payload):
     return b"$" + encoded + b"#" + f"{sum(encoded) & 255:02x}".encode()
 
 
+def merge_fpu_registers(target, fpu):
+    if not isinstance(fpu, dict):
+        return
+    for src, dst in (("fcw", "fctrl"), ("fsw", "fstat"), ("ftw", "ftag"), ("fop", "fop"), ("mxcsr", "mxcsr")):
+        if isinstance(fpu.get(src), str):
+            target[dst] = fpu[src]
+    for src, dst in (("fip", "fioff"), ("fdp", "fooff")):
+        if fpu.get(src) is not None:
+            try:
+                target[dst] = hex(numeric(fpu[src]) & 0xFFFFFFFF)
+            except (ValueError, TypeError):
+                pass
+    st = fpu.get("st")
+    if isinstance(st, list):
+        for i, s in enumerate(st[:8]):
+            if isinstance(s, str) and len(s) == 20:
+                target[f"st{i}"] = "le:" + s
+    xmm = fpu.get("xmm")
+    if isinstance(xmm, list):
+        for i, s in enumerate(xmm[:16]):
+            if isinstance(s, str) and len(s) == 32:
+                target[f"xmm{i}"] = "le:" + s
+
+
 def register_bytes(values):
     output = []
     for name, bits in REGISTER_LAYOUT:
@@ -48,6 +110,12 @@ def register_bytes(values):
         value = values.get(source)
         if value is None:
             output.append("xx" * (bits // 8))
+        elif isinstance(value, str) and value.startswith("le:"):
+            raw_le = value[3:]
+            if len(raw_le) != bits // 4:
+                raise WorkbenchError(f"Invalid little-endian register bytes for {source}")
+            bytes.fromhex(raw_le)
+            output.append(raw_le.lower())
         else:
             number = int(value, 16) & ((1 << bits) - 1)
             output.append(number.to_bytes(bits // 8, "little").hex())
@@ -106,12 +174,13 @@ class PacketDecoder:
 
 
 class RspSession:
-    def __init__(self, client, pid, listen_address, observer=False):
+    def __init__(self, client, pid, listen_address, observer=False, allow_writes=False):
         require_integer(pid, "pid", 1, 0x7FFFFFFF)
         self.client = client
         self.pid = pid
         self.listen_address = listen_address
         self.observer = observer
+        self.allow_writes = bool(allow_writes) and not observer
         self.thread_id = None
         self.continue_thread = None
         self.cursor = client.state()["event_cursor"]
@@ -123,6 +192,7 @@ class RspSession:
         self.no_ack = False
         self.session_id = None
         self.map_xml = None
+        self.libs_xml = None
 
     def ensure_attached(self):
         state = self.client.state()
@@ -193,6 +263,89 @@ class RspSession:
             raise WorkbenchError("Short broker memory capture")
         return content.hex().encode()
 
+    def write_memory(self, rest):
+        self.require_control()
+        if ":" not in rest:
+            raise WorkbenchError("Malformed memory write packet")
+        header, hex_body = rest.split(":", 1)
+        address_text, length_text = header.split(",")
+        address, length = int(address_text, 16), int(length_text, 16)
+        require_integer(length, "RSP memory write length", 0, MAX_PACKET // 2)
+        decoded = bytes.fromhex(hex_body)
+        if len(decoded) != length:
+            raise WorkbenchError("Memory write payload length mismatch")
+        if length == 0:
+            return b"OK"
+        peeked = self.client.call("memory_peek", pid=self.pid, address=hex(address), length=length)
+        self.client.call(
+            "memory_write",
+            pid=self.pid,
+            address=hex(address),
+            hex_data=decoded.hex(),
+            expected_hex=peeked["hex"],
+        )
+        return b"OK"
+
+    @staticmethod
+    def _decode_register_slot(index, le_hex):
+        if index < 0 or index >= len(REGISTER_LAYOUT):
+            raise WorkbenchError("Register index out of range")
+        name, bits = REGISTER_LAYOUT[index]
+        if len(le_hex) != bits // 4:
+            raise WorkbenchError(f"Register {name} expects {bits // 4} hex chars")
+        raw = bytes.fromhex(le_hex)
+        if index < 18:
+            reg_name = "rflags" if name == "eflags" else name
+            return ("gp", reg_name, hex(int.from_bytes(raw, "little")))
+        if 24 <= index < 32 or 40 <= index < 56:
+            return ("fpu", name, raw.hex())
+        scalar = {"fctrl": "fcw", "fstat": "fsw", "ftag": "ftw", "fop": "fop", "mxcsr": "mxcsr"}.get(name)
+        if scalar is not None:
+            return ("fpu", scalar, hex(int.from_bytes(raw, "little")))
+        raise WorkbenchError(f"Register {name} is read-only via RSP")
+
+    def write_single_register(self, rest):
+        self.require_control()
+        idx_text, le_hex = rest.split("=", 1)
+        index = int(idx_text, 16)
+        require_integer(index, "register index", 0, len(REGISTER_LAYOUT) - 1)
+        thread_id = self.current_thread()
+        group, key, val = self._decode_register_slot(index, le_hex)
+        tool = "debug_registers_set" if group == "gp" else "debug_registers_fpu_set"
+        self.client.call(tool, thread_id=thread_id, registers={key: val})
+        return b"OK"
+
+    def write_all_registers(self, all_hex):
+        self.require_control()
+        total_chars = sum(bits // 4 for _, bits in REGISTER_LAYOUT)
+        gp_chars = sum(bits // 4 for _, bits in REGISTER_LAYOUT[:18])
+        if len(all_hex) not in (total_chars, gp_chars):
+            raise WorkbenchError("Malformed G register block length")
+        thread_id = self.current_thread()
+        gp_regs, fpu_regs = {}, {}
+        offset = 0
+        for index, (_, bits) in enumerate(REGISTER_LAYOUT):
+            width = bits // 4
+            if offset + width > len(all_hex):
+                break
+            chunk = all_hex[offset:offset + width]
+            offset += width
+            if "x" in chunk.lower():
+                continue
+            try:
+                group, key, val = self._decode_register_slot(index, chunk)
+            except WorkbenchError:
+                continue
+            if group == "gp":
+                gp_regs[key] = val
+            else:
+                fpu_regs[key] = val
+        if gp_regs:
+            self.client.call("debug_registers_set", thread_id=thread_id, registers=gp_regs)
+        if fpu_regs:
+            self.client.call("debug_registers_fpu_set", thread_id=thread_id, registers=fpu_regs)
+        return b"OK"
+
     def set_breakpoint(self, command):
         self.require_control()
         kind_text, address_text, length_text = command[1:].split(",")
@@ -245,7 +398,7 @@ class RspSession:
     def handle(self, payload):
         command = payload.decode("ascii")
         if command.startswith("qSupported"):
-            return b"PacketSize=4000;qXfer:features:read+;qXfer:memory-map:read+;QStartNoAckMode+"
+            return b"PacketSize=4000;qXfer:features:read+;qXfer:memory-map:read+;qXfer:libraries-svr4:read+;QStartNoAckMode+"
         if command == "QStartNoAckMode":
             self.no_ack = True
             return b"OK"
@@ -267,6 +420,23 @@ class RspSession:
             if self.map_xml is None:
                 raise WorkbenchError("Begin a memory map transfer at offset zero")
             content = self.map_xml
+            return (b"l" if offset + length >= len(content) else b"m") + content[offset:offset + length]
+        if command.startswith("qXfer:libraries-svr4:read::"):
+            self.ensure_attached()
+            offset, length = (int(value, 16) for value in command.rsplit(":", 1)[1].split(","))
+            require_integer(offset, "libraries XML offset", 0, 0xFFFFFFFF)
+            require_integer(length, "libraries XML chunk", 1, MAX_PACKET - 1)
+            if offset == 0:
+                try:
+                    modules = self.client.call("module_list", pid=self.pid)
+                except WorkbenchError:
+                    modules = self.client.call("process_maps", pid=self.pid)
+                if not isinstance(modules, list):
+                    raise WorkbenchError("Large map list requires artifact inspection")
+                self.libs_xml = libraries_svr4_xml(modules)
+            if self.libs_xml is None:
+                raise WorkbenchError("Begin a libraries transfer at offset zero")
+            content = self.libs_xml
             return (b"l" if offset + length >= len(content) else b"m") + content[offset:offset + length]
         if command == "?":
             self.ensure_attached()
@@ -310,7 +480,13 @@ class RspSession:
         if command.startswith("T"):
             return b"OK" if int(command[1:], 16) in self.client.call("debug_threads") else b"E01"
         if command == "g" or command.startswith("p"):
-            values = self.client.call("debug_registers", thread_id=self.current_thread())
+            tid = self.current_thread()
+            values = dict(self.client.call("debug_registers", thread_id=tid))
+            try:
+                fpu = self.client.call("debug_registers_fpu", thread_id=tid)
+                merge_fpu_registers(values, fpu)
+            except WorkbenchError:
+                pass
             content = register_bytes(values)
             if command == "g":
                 return content
@@ -321,6 +497,15 @@ class RspSession:
         if command.startswith("m"):
             address, length = (int(value, 16) for value in command[1:].split(","))
             return self.read_memory(address, length)
+        if self.allow_writes:
+            if command.startswith("M"):
+                return self.write_memory(command[1:])
+            if command.startswith("P"):
+                return self.write_single_register(command[1:])
+            if command.startswith("G"):
+                return self.write_all_registers(command[1:])
+            if command.startswith("X"):
+                return b""
         if command.startswith(("Z", "z")):
             return self.set_breakpoint(command)
         if command == "vCont?":
@@ -357,13 +542,14 @@ class RspSession:
 class RspServer(socketserver.TCPServer):
     allow_reuse_address = False
 
-    def __init__(self, url, token_path, pid, listen_address, port=1234, observer=False, expected_profile=None):
+    def __init__(self, url, token_path, pid, listen_address, port=1234, observer=False, expected_profile=None, allow_writes=False):
         self.url = url
         self.token_path = token_path
         self.pid = pid
         self.listen_address = listen_address
         self.observer = observer
         self.expected_profile = expected_profile
+        self.allow_writes = allow_writes
         super().__init__(("127.0.0.1", port), RspHandler)
 
 
@@ -371,7 +557,8 @@ class RspHandler(socketserver.BaseRequestHandler):
     def handle(self):
         client = BrokerClient(self.server.url, self.server.token_path, "gdb-" + uuid.uuid4().hex,
                               expected_profile=self.server.expected_profile)
-        session = RspSession(client, self.server.pid, self.server.listen_address, self.server.observer)
+        session = RspSession(client, self.server.pid, self.server.listen_address, self.server.observer,
+                             allow_writes=self.server.allow_writes)
         decoder = PacketDecoder()
         last_frame = None
         last_request = None

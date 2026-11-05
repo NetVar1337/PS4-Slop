@@ -1097,7 +1097,7 @@ mod tests {
         d[62..64].copy_from_slice(&1u16.to_le_bytes());
 
         let shstr = b"\0.shstrtab\0.dynstr\0.dynsym\0";
-        let dynstr = b"\01jfXLRVzisc#libkernel#libkernel\0";
+        let dynstr = b"\x001jfXLRVzisc#libkernel#libkernel\0";
         let shstr_off = 128usize;
         let dynstr_off = shstr_off + shstr.len();
         let dynsym_off = (dynstr_off + dynstr.len() + 7) & !7;
