@@ -25,6 +25,7 @@ required-features = ["fixture"]
 fixture = []
 
 [dependencies]
+aho-corasick = "1"
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive"] }

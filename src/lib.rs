@@ -29,3 +29,11 @@ pub mod binstatic;
 pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// Engine & metadata recovery area (src/engines.rs).
+pub mod bytesource;
+pub mod il2cpp;
+pub mod unreal;
+pub mod rtti;
+pub mod yara;
+pub mod cryptoscan;
