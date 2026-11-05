@@ -56,7 +56,7 @@ class IaitoWorkbench(LiveAnalysis):
     def analyze(self, operation, arguments):
         import base64
         import re
-        from ..tools import parse_address
+        from ..config import parse_address
         expected = getattr(self, "expected_program_hash", None)
         digest = self.input_hash()
         if expected and digest != expected:

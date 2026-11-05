@@ -114,7 +114,7 @@ impl ToolRegistry {
         if let Some(permission) = tool["permission"].as_str() {
             self.workbench.profile.require(permission)?;
         }
-        let result = self.execute(name, &args)?;
+        let result = crate::config::json_safe(self.execute(name, &args)?);
         let content = serde_json::to_vec(&result)?;
         if content.len() > 24576 {
             let artifact =
@@ -547,6 +547,8 @@ impl ToolRegistry {
                     None
                 },
                 args["artifact"].as_str(),
+                args["module_sha256"].as_str(),
+                args["application_version"].as_str(),
             ),
             "artifact_info" => analysis::artifact_info(&self.workbench.read_artifact(
                 string(args, "artifact")?,
@@ -579,29 +581,6 @@ impl ToolRegistry {
                     &data,
                     args["min_length"].as_u64().unwrap_or(6) as usize,
                     args["max_results"].as_u64().unwrap_or(256) as usize,
-                )
-            }
-            "address_correlate" => {
-                let start = address(&args["address"])?;
-                let maps = self.workbench.debugger.maps(number(args, "pid")? as u32)?;
-                let selected = maps
-                    .as_array()
-                    .context("Expected maps")?
-                    .iter()
-                    .find(|entry| {
-                        entry["start"].as_u64().is_some_and(|base| base <= start)
-                            && entry["end"].as_u64().is_some_and(|end| start < end)
-                    })
-                    .context("Address not mapped")?;
-                let base = selected["start"]
-                    .as_u64()
-                    .context("Invalid start")?
-                    .checked_sub(selected["offset"].as_u64().context("Invalid offset")?)
-                    .context("Map offset exceeds start")?;
-                Ok(
-                    json!({"pid":args["pid"],"module_name":selected["name"],"module_sha256":args["module_sha256"],"application_version":args["application_version"],
-                    "absolute_address":format!("{start:#x}"),"mapping_base":format!("{:#x}",selected["start"].as_u64().unwrap()),
-                    "mapping_relative_offset":format!("{:#x}",start-selected["start"].as_u64().unwrap()),"estimated_image_base":format!("{base:#x}"),"estimated_rva":format!("{:#x}",start-base),"warning":"Estimated from map offset; verify ELF PT_LOAD layout"}),
                 )
             }
             "annotation_save" => analysis::annotate(
@@ -671,7 +650,11 @@ mod tests {
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
         let catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json")).unwrap();
-        assert_eq!(catalog.len(), 77);
+        let mut names: Vec<&str> = catalog.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        names.sort_unstable();
+        let total = names.len();
+        names.dedup();
+        assert_eq!(names.len(), total, "duplicate tool names in catalog");
         for expected in [
             "debug_step", "debug_run", "debug_stack", "debug_eval", "disassemble",
             "module_list", "debug_registers_set", "debug_registers_fpu",

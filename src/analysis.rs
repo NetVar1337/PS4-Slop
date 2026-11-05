@@ -213,16 +213,9 @@ fn map_field(entry: &Value, name: &str) -> Result<u64> {
         .ok_or_else(|| anyhow!("Memory map entry lacks integer {name}"))
 }
 
-/// Correlate a runtime address with debugger maps (`start`, `end`,
-/// `offset`, `name` entries) and estimate the image RVA.
-pub fn correlate_maps(
-    maps: &Value,
-    pid: u32,
-    address: u64,
-    module_sha256: &str,
-    application_version: &str,
-) -> Result<Value> {
-    require_hash(module_sha256, "module_sha256")?;
+/// Find the debugger map (`start`, `end`, `offset`, `name` entries) containing a
+/// runtime address and estimate the image base/RVA from the map file offset.
+pub fn correlate_maps(maps: &Value, address: u64) -> Result<Value> {
     let entries = maps
         .as_array()
         .ok_or_else(|| anyhow!("Memory maps must be a list"))?;
@@ -230,11 +223,11 @@ pub fn correlate_maps(
     for entry in entries {
         let (start, end) = (map_field(entry, "start")?, map_field(entry, "end")?);
         if start <= address && address < end {
-            selected = Some((entry, start));
+            selected = Some((entry, start, end));
             break;
         }
     }
-    let Some((entry, start)) = selected else {
+    let Some((entry, start, end)) = selected else {
         bail!("Address is not in the captured process maps");
     };
     let offset = map_field(entry, "offset")?;
@@ -247,16 +240,13 @@ pub fn correlate_maps(
         }
     };
     Ok(json!({
-        "pid": pid,
-        "module_name": entry.get("name").cloned().unwrap_or(Value::Null),
-        "module_sha256": module_sha256,
-        "application_version": application_version,
-        "absolute_address": format!("{address:#x}"),
-        "mapping_base": format!("{start:#x}"),
-        "mapping_relative_offset": format!("{:#x}", address - start),
+        "name": entry.get("name").cloned().unwrap_or(Value::Null),
+        "start": format!("{start:#x}"),
+        "end": format!("{end:#x}"),
+        "protection": entry.get("protection").cloned().unwrap_or(Value::Null),
+        "relative_offset": format!("{:#x}", address - start),
         "estimated_image_base": hex(base),
         "estimated_rva": hex(i128::from(address) - base),
-        "warning": "Image base is estimated from map offset; verify ELF PT_LOAD layout in Ghidra",
     }))
 }
 
@@ -920,12 +910,12 @@ mod tests {
             {"start": 0x1000, "end": 0x2000, "offset": 0, "protection": 5, "name": "a"},
             {"start": 0x4000, "end": 0x6000, "offset": 0x1000, "protection": 5, "name": "eboot.bin"},
         ]);
-        let result = correlate_maps(&maps, 71, 0x4010, &"a".repeat(64), "01.00").unwrap();
-        assert_eq!(result["module_name"], json!("eboot.bin"));
+        let result = correlate_maps(&maps, 0x4010).unwrap();
+        assert_eq!(result["name"], json!("eboot.bin"));
         assert_eq!(result["estimated_image_base"], json!("0x3000"));
         assert_eq!(result["estimated_rva"], json!("0x1010"));
-        assert_eq!(result["mapping_relative_offset"], json!("0x10"));
-        assert!(correlate_maps(&maps, 71, 0x3000, &"a".repeat(64), "01.00").is_err());
+        assert_eq!(result["relative_offset"], json!("0x10"));
+        assert!(correlate_maps(&maps, 0x3000).is_err());
 
         let (_directory, store) = store();
         let record = snapshot_record(

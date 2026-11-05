@@ -399,7 +399,6 @@ fn is_shared(name: &str) -> bool {
         || matches!(
             name,
             "debugger_info"
-                | "address_correlate"
                 | "address_rebase"
                 | "disassemble"
                 | "module_list"

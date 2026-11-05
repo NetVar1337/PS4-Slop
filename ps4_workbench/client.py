@@ -1,12 +1,25 @@
+"""HTTP client for the native ``ps4-workbench broker`` (Rust, ``src/broker.rs``).
+
+The broker owns the token file; this client only reads it.
+"""
 import json
 import re
 import uuid
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
-from .broker import load_token
 from .config import WorkbenchError
+
+MAX_RESPONSE = 8 * 1024 * 1024
+
+
+def load_token(path):
+    token = Path(path).resolve().read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", token):
+        raise WorkbenchError("Broker token file must contain exactly 64 lowercase hex characters")
+    return token
 
 
 class BrokerClient:
@@ -32,7 +45,7 @@ class BrokerClient:
                           "X-PS4-Client": self.client, "Content-Type": "application/json"}, method="POST")
         try:
             with self.opener.open(request, timeout=self.timeout) as response:
-                content = response.read(8388609)
+                content = response.read(MAX_RESPONSE + 1)
         except HTTPError as error:
             try:
                 message = json.loads(error.read(65536)).get("error", str(error))
@@ -43,7 +56,7 @@ class BrokerClient:
             raise WorkbenchError(message) from error
         except (URLError, OSError) as error:
             raise WorkbenchError("Broker connection failed; do not retry mutations automatically: " + str(error)) from error
-        if len(content) > 8388608:
+        if len(content) > MAX_RESPONSE:
             raise WorkbenchError("Broker response exceeds 8 MiB")
         return json.loads(content)["result"]
 
@@ -56,45 +69,5 @@ class BrokerClient:
     def events(self, cursor=0, limit=64):
         return self.request("events", cursor=cursor, limit=limit)
 
-    def close(self):
-        pass
-
-
-class RemoteTool:
-    def __init__(self, description):
-        self.description = description
-
-    def describe(self):
-        return self.description
-
-
-class RemoteRegistry:
-    def __init__(self, client):
-        self.client = client
-        self.workbench = client
-        self.cursor = 0
-        self.descriptions = client.request("tools")
-        self.descriptions.extend([
-            {"name": "session_state", "description": "Shared session controller, attached process and event health.",
-             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
-            {"name": "session_events", "description": "Replay shared events from this MCP client's cursor; never drains other clients' events.",
-             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}},
-            {"name": "session_release", "description": "Release this client's control lease only after detachment or a failed attach; does not recover the console.",
-             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}
-        ])
-
-    def available(self):
-        return [RemoteTool(description) for description in self.descriptions]
-
-    def call(self, name, arguments):
-        if name in ("session_state", "session_events", "session_release"):
-            if arguments != {}:
-                raise WorkbenchError("Session observer tools take no arguments")
-            if name == "session_state":
-                return self.client.state()
-            if name == "session_release":
-                return self.client.request("release")
-            result = self.client.events(self.cursor, limit=6)
-            self.cursor = result["cursor"]
-            return result
-        return self.client.call(name, **arguments)
+    def release(self):
+        return self.request("release")

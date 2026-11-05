@@ -63,7 +63,7 @@ class BinjaWorkbench(LiveAnalysis):
         raise WorkbenchError("Binary Ninja input SHA-256 is unavailable")
 
     def analyze(self, operation, arguments):
-        from ..tools import parse_address
+        from ..config import parse_address
         expected = getattr(self, "expected_program_hash", None)
         digest = self.input_hash()
         if expected and digest != expected:

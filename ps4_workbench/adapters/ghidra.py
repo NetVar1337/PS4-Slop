@@ -17,7 +17,7 @@ class GhidraWorkbench(LiveAnalysis):
 
     def analyze(self, operation, arguments):
         import itertools
-        from ..tools import parse_address
+        from ..config import parse_address
         manager = self.program.getFunctionManager()
         flt = (arguments.get("filter") or "").lower()
         if operation == "functions":

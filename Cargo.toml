@@ -14,6 +14,15 @@ path = "src/lib.rs"
 name = "ps4-workbench"
 path = "src/main.rs"
 
+# Loopback ps4debug-NG protocol fixture for installed-app (IDA/Ghidra) bridge tests.
+[[bin]]
+name = "ps4debug-fixture"
+path = "src/bin/ps4debug_fixture.rs"
+required-features = ["fixture"]
+
+[features]
+fixture = []
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"

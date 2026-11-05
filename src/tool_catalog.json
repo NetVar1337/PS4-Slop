@@ -1002,51 +1002,6 @@
   "permission": "debug_control"
  },
  {
-  "name": "address_correlate",
-  "description": "Correlate runtime address to mapping and estimated image RVA; manually verify ELF layout.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "pid": {
-     "type": "integer",
-     "minimum": 1,
-     "maximum": 2147483647
-    },
-    "address": {
-     "type": "string",
-     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-     "maxLength": 20,
-     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-    },
-    "module_sha256": {
-     "type": "string",
-     "description": "Lowercase SHA-256",
-     "maxLength": 64,
-     "pattern": "^[0-9a-f]{64}$"
-    },
-    "application_version": {
-     "type": "string",
-     "description": "",
-     "maxLength": 128
-    }
-   },
-   "required": [
-    "pid",
-    "address",
-    "module_sha256",
-    "application_version"
-   ],
-   "additionalProperties": false
-  },
-  "annotations": {
-   "readOnlyHint": true,
-   "destructiveHint": false,
-   "idempotentHint": false,
-   "openWorldHint": true
-  },
-  "permission": null
- },
- {
   "name": "annotation_save",
   "description": "Save local evidence-backed module/RVA comment or symbol for analysis handoff; does not mutate Ghidra.",
   "inputSchema": {
@@ -1395,7 +1350,7 @@
  },
  {
   "name": "debug_stack",
-  "description": "Best-effort call-stack unwind for a thread: frame-pointer chain plus a bounded stack scan for executable addresses, annotated with module+offset.",
+  "description": "Call-stack unwind for a thread: DWARF .eh_frame CFI first (handles -fomit-frame-pointer code), then the rbp frame-pointer chain, then a bounded stack scan for executable return addresses; each frame reports its method in `via` and is annotated with module+offset.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -2551,7 +2506,7 @@
   },
   {
    "name": "address_rebase",
-   "description": "Translate addresses bidirectionally between live ASLR runtime VA, static analyzer VA (0x0, 0x100000, 0x400000, or ELF image_base), and module+offset.",
+   "description": "Translate addresses bidirectionally between live ASLR runtime VA, static analyzer VA (0x0, 0x100000, 0x400000, or ELF image_base), and module+offset. A runtime_address is also correlated with its containing process map; addresses outside the module list fall back to a map-offset image-base estimate (basis: process_maps_estimate). Optional module_sha256/application_version are recorded as provenance.",
    "inputSchema": {
     "type": "object",
     "properties": {
@@ -2589,6 +2544,17 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 1024
+     },
+     "module_sha256": {
+      "type": "string",
+      "description": "Lowercase SHA-256 of the analyzed module, recorded as provenance",
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+     },
+     "application_version": {
+      "type": "string",
+      "description": "Application version, recorded as provenance",
+      "maxLength": 128
      }
     },
     "required": [],

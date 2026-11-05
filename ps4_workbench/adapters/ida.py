@@ -36,7 +36,7 @@ class IDAWorkbench(LiveAnalysis):
         mappings = self.client.call("process_maps", pid=pid)
         if not isinstance(mappings, list):
             raise WorkbenchError("Inspect the saved large map artifact before importing regions")
-        from ..rsp import numeric
+        from ..config import numeric
         regions = [{"start": numeric(entry["start"]), "end": numeric(entry["end"]),
                     "name": str(entry["name"])[:256], "protection": entry["protection"]}
                    for entry in mappings if numeric(entry["end"]) > numeric(entry["start"])]
@@ -74,7 +74,7 @@ class IDAWorkbench(LiveAnalysis):
             import ida_nalt
             import idautils
             import idc
-            from ..tools import parse_address
+            from ..config import parse_address
             expected = getattr(self, "expected_program_hash", None)
             digest = ida_nalt.retrieve_input_file_sha256()
             if expected and (not digest or bytes(digest).hex() != expected):

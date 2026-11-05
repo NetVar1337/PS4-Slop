@@ -576,6 +576,9 @@ impl Workbench {
 
     /// Translate addresses bidirectionally between live ASLR runtime VA, static
     /// analyzer VA (`0x0`, `0x400000`, or ELF `min_vaddr`), and `module+offset`.
+    /// A runtime address is also correlated with the process map that contains
+    /// it; when no module-list entry covers the address, the map file offset
+    /// supplies an estimated image base (`basis: process_maps_estimate`).
     #[allow(clippy::too_many_arguments)]
     pub fn address_rebase(
         &mut self,
@@ -586,7 +589,12 @@ impl Workbench {
         offset: Option<u64>,
         static_base: Option<u64>,
         artifact: Option<&str>,
+        module_sha256: Option<&str>,
+        application_version: Option<&str>,
     ) -> Result<Value> {
+        if let Some(hash) = module_sha256 {
+            crate::config::require_hash(hash, "module_sha256")?;
+        }
         let supplied = u8::from(runtime_address.is_some())
             + u8::from(static_address.is_some())
             + u8::from(offset.is_some());
@@ -665,6 +673,32 @@ impl Workbench {
             }
         }
 
+        let mut basis = runtime_base.map(|_| "module_list");
+        let mapping = match (target_pid, runtime_address) {
+            (Some(p), Some(rt)) => self
+                .debugger
+                .maps(p)
+                .ok()
+                .and_then(|maps| crate::analysis::correlate_maps(&maps, rt).ok()),
+            _ => None,
+        };
+        if runtime_base.is_none()
+            && let Some(map) = &mapping
+        {
+            let parse = |key: &str| {
+                map[key]
+                    .as_str()
+                    .and_then(|s| s.strip_prefix("0x"))
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+            };
+            if let Some(base) = parse("estimated_image_base") {
+                runtime_base = Some(base);
+                runtime_end = parse("end");
+                resolved_mod_name = resolved_mod_name.or_else(|| map["name"].as_str().map(str::to_owned));
+                basis = Some("process_maps_estimate");
+            }
+        }
+
         let rva = if let Some(off) = offset {
             off
         } else if let Some(st) = static_address {
@@ -676,7 +710,7 @@ impl Workbench {
         } else {
             let rt = runtime_address.unwrap();
             let rb = runtime_base.context(
-                "Cannot derive RVA from runtime_address without a live pid/attached session matching a module",
+                "Cannot derive RVA from runtime_address: no module or process map of the live pid/attached session contains it",
             )?;
             ensure!(
                 rt >= rb,
@@ -696,6 +730,10 @@ impl Workbench {
         Ok(json!({
             "pid": target_pid,
             "module": resolved_mod_name,
+            "module_sha256": module_sha256,
+            "application_version": application_version,
+            "basis": basis,
+            "mapping": mapping,
             "runtime_base": runtime_base.map(|v| format!("{v:#x}")),
             "runtime_end": runtime_end.map(|v| format!("{v:#x}")),
             "static_base": format!("{inferred_static_base:#x}"),
@@ -705,6 +743,7 @@ impl Workbench {
             "ghidra_pie_default_0x100000": format!("{:#x}", 0x10_0000u64.saturating_add(rva)),
             "ida_default_0x400000": format!("{:#x}", 0x40_0000u64.saturating_add(rva)),
             "expression": format!("{mod_label}+{rva:#x}"),
+            "warning": (basis == Some("process_maps_estimate")).then_some("Image base estimated from map file offset; verify ELF PT_LOAD layout"),
         }))
     }
 
@@ -1106,8 +1145,14 @@ mod tests {
                 None,
                 None,
                 Some(&art_path),
+                Some(&"a".repeat(64)),
+                Some("01.00"),
             )
             .unwrap();
+        assert_eq!(reb_rt["basis"], "module_list");
+        assert_eq!(reb_rt["mapping"]["name"], "eboot.bin");
+        assert_eq!(reb_rt["mapping"]["relative_offset"], "0x100");
+        assert_eq!(reb_rt["module_sha256"], "a".repeat(64));
         assert_eq!(reb_rt["module"], "eboot.bin");
         assert_eq!(reb_rt["offset"], "0x100");
         assert_eq!(reb_rt["static_address"], "0x100");
@@ -1122,9 +1167,27 @@ mod tests {
                 None,
                 Some(0x400000),
                 None,
+                None,
+                None,
             )
             .unwrap();
         assert_eq!(reb_st["runtime_address"], "0x1100");
+        assert!(reb_st["mapping"].is_null());
+
+        // Anonymous mapping (no module-list entry): former address_correlate path.
+        let reb_map = wb
+            .address_rebase(Some(77), None, Some(0x7fff_0020), None, None, None, None, None, None)
+            .unwrap();
+        assert_eq!(reb_map["basis"], "process_maps_estimate");
+        assert_eq!(reb_map["runtime_base"], "0x7fff0000");
+        assert_eq!(reb_map["offset"], "0x20");
+        assert!(reb_map["warning"].is_string());
+        assert!(wb
+            .address_rebase(Some(77), None, Some(0x10), None, None, None, None, None, None)
+            .is_err());
+        assert!(wb
+            .address_rebase(Some(77), None, Some(0x1100), None, None, None, None, Some("bad"), None)
+            .is_err());
 
         // 3. Label save & load round-trip via ArtifactStore.
         wb.debugger.label_set("entry_fn", 0x1100).unwrap();
