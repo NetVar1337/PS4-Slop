@@ -102,6 +102,11 @@ fn parse_pattern(pattern: &str) -> Result<Vec<Option<u8>>> {
         .collect()
 }
 
+/// Return the byte width of a validated `"48 8b ?? 05"` pattern.
+pub fn pattern_len(pattern: &str) -> Result<usize> {
+    Ok(parse_pattern(pattern)?.len())
+}
+
 /// Scan for a `"48 8b ?? 05"` style pattern; offsets are reported from 0.
 pub fn scan_pattern(data: &[u8], pattern: &str, max_matches: usize) -> Result<Value> {
     scan_pattern_at(data, pattern, 0, max_matches)
@@ -401,9 +406,44 @@ const MAX_DYNAMIC_ENTRIES: usize = 512;
 const MAX_NEEDED: usize = 64;
 const MAX_SECTION_LIST: usize = 256;
 
+const MAX_SYMBOL_LIST: usize = 512;
+
+fn sym_binding_name(bind: u8) -> &'static str {
+    match bind {
+        0 => "LOCAL",
+        1 => "GLOBAL",
+        2 => "WEAK",
+        _ => "OTHER",
+    }
+}
+
+fn sym_type_name(ty: u8) -> &'static str {
+    match ty {
+        0 => "NOTYPE",
+        1 => "OBJECT",
+        2 => "FUNC",
+        3 => "SECTION",
+        4 => "FILE",
+        6 => "TLS",
+        10 => "IFUNC",
+        _ => "OTHER",
+    }
+}
+
+fn read_cstr(data: &[u8], table_offset: u64, table_size: u64, name_offset: u32) -> String {
+    let cap = table_size.min(4 * 1024 * 1024) as usize;
+    let end = (table_offset as usize).saturating_add(cap).min(data.len());
+    let start = (table_offset as usize).saturating_add(name_offset as usize);
+    if start >= end {
+        return String::new();
+    }
+    let slice = &data[start..end];
+    String::from_utf8_lossy(slice.split(|byte| *byte == 0).next().unwrap_or_default()).into_owned()
+}
+
 /// Structural parse of a little-endian ELF64 image: header, program headers
-/// (loads + dynamic), section headers with names, symbol-table sizes and
-/// DT_NEEDED imports. Every offset is bounds-checked against the buffer.
+/// (loads + dynamic), section headers with names, symbol-table entries (with
+/// Orbis OS NID demangling), and DT_NEEDED imports. Every offset is bounds-checked.
 pub fn elf_info(data: &[u8]) -> Result<Value> {
     ensure!(data.len() >= 64, "Too small for an ELF64 header");
     ensure!(data[4] == 2, "Not a 64-bit ELF");
@@ -421,7 +461,9 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
     let shnum = le16(data, 60)?;
     let shstrndx = le16(data, 62)?;
     ensure!(phentsize >= 56, "Invalid program header entry size");
-    ensure!(shentsize >= 64, "Invalid section header entry size");
+    if shnum > 0 {
+        ensure!(shentsize >= 64, "Invalid section header entry size");
+    }
     ensure!(
         phnum <= MAX_PROGRAM_HEADERS && shnum <= MAX_SECTIONS,
         "Header counts exceed supported caps"
@@ -456,11 +498,21 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
         .filter_map(|load| parse_hex_string(load["vaddr"].as_str()?))
         .min();
 
+    let vaddr_to_file_offset = |vaddr: u64| -> Option<u64> {
+        loads.iter().find_map(|load| {
+            let v = parse_hex_string(load["vaddr"].as_str()?)?;
+            let filesz = load["filesz"].as_u64()?;
+            let off = parse_hex_string(load["offset"].as_str()?)?;
+            (v <= vaddr && vaddr < v.saturating_add(filesz)).then_some(off + (vaddr - v))
+        })
+    };
+
     // Section headers and names via the section-header string table.
     let mut sections = Vec::new();
     let mut sections_truncated = false;
     let mut symtab = 0u64;
     let mut dynsym = 0u64;
+    let mut section_spans: Vec<(u32, u64, u64, u32)> = Vec::new();
     if shnum > 0 && shoff > 0 {
         ensure!(
             shoff as u128 + shnum as u128 * shentsize as u128 <= data.len() as u128,
@@ -472,20 +524,6 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
         } else {
             None
         };
-        let name_at = |offset: u32| -> String {
-            let Some((table_offset, table_size)) = strtab else {
-                return String::new();
-            };
-            let start = table_offset as usize + offset as usize;
-            let table_size = table_size.min(1024 * 1024) as usize;
-            let end = (table_offset as usize + table_size).min(data.len());
-            if start >= end {
-                return String::new();
-            }
-            let slice = &data[start..end];
-            String::from_utf8_lossy(slice.split(|byte| *byte == 0).next().unwrap_or_default())
-                .into_owned()
-        };
         for index in 0..shnum as usize {
             let base = shoff as usize + index * shentsize as usize;
             let sh_name = le32(data, base)?;
@@ -494,27 +532,35 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
             let sh_addr = le64(data, base + 16)?;
             let sh_offset = le64(data, base + 24)?;
             let sh_size = le64(data, base + 32)?;
+            let sh_link = le32(data, base + 40)?;
+            section_spans.push((sh_type, sh_offset, sh_size, sh_link));
             if sh_type == 2 {
                 symtab = sh_size / 24;
             }
             if sh_type == 11 {
                 dynsym = sh_size / 24;
             }
-            if sections.len() == MAX_SECTION_LIST {
+            if sections.len() < MAX_SECTION_LIST {
+                let sec_name = strtab
+                    .map(|(off, sz)| read_cstr(data, off, sz, sh_name))
+                    .unwrap_or_default();
+                sections.push(json!({
+                    "name": sec_name, "type": sh_type,
+                    "flags": format!("{sh_flags:#x}"), "address": format!("{sh_addr:#x}"),
+                    "offset": format!("{sh_offset:#x}"), "size": sh_size,
+                }));
+            } else {
                 sections_truncated = true;
-                break;
             }
-            sections.push(json!({
-                "name": name_at(sh_name), "type": sh_type,
-                "flags": format!("{sh_flags:#x}"), "address": format!("{sh_addr:#x}"),
-                "offset": format!("{sh_offset:#x}"), "size": sh_size,
-            }));
         }
     }
 
-    // DT_NEEDED imports from the PT_DYNAMIC segment.
+    // DT_NEEDED imports & dynamic string/symbol tables from PT_DYNAMIC.
     let mut needed = Vec::new();
     let mut notes = Vec::new();
+    let mut dyn_str_span: Option<(u64, u64)> = None;
+    let mut dyn_sym_vaddr: Option<u64> = None;
+    let mut dyn_str_vaddr: Option<u64> = None;
     if let Some((offset, size)) = dynamic {
         let mut tags = Vec::new();
         let mut strtab_vaddr = None;
@@ -534,21 +580,15 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
             match tag {
                 1 => tags.push(value),
                 5 => strtab_vaddr = Some(value),
+                6 => dyn_sym_vaddr = Some(value),
                 10 => strtab_size = value,
                 _ => {}
             }
         }
+        dyn_str_vaddr = strtab_vaddr;
         if let Some(vaddr) = strtab_vaddr {
-            let file_offset = loads
-                .iter()
-                .filter_map(|load| {
-                    let v = parse_hex_string(load["vaddr"].as_str()?)?;
-                    let filesz = load["filesz"].as_u64()?;
-                    let off = parse_hex_string(load["offset"].as_str()?)?;
-                    (v <= vaddr && vaddr < v + filesz).then_some(off + (vaddr - v))
-                })
-                .next();
-            if let Some(start) = file_offset {
+            if let Some(start) = vaddr_to_file_offset(vaddr) {
+                dyn_str_span = Some((start, strtab_size));
                 let end = (start as u128 + strtab_size.min(65536) as u128).min(data.len() as u128);
                 for tag in tags.into_iter().take(MAX_NEEDED) {
                     let at = start as u128 + tag as u128;
@@ -574,6 +614,94 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
         notes.push("Section list truncated at the reporting cap");
     }
 
+    // Parse symbol entries from .dynsym / .symtab sections (or PT_DYNAMIC fallback)
+    // and demangle Orbis OS NIDs via the built-in NID dictionary.
+    let mut symbol_entries = Vec::new();
+    let mut symbols_truncated = false;
+    let mut nid_resolved = 0usize;
+
+    let mut parse_sym_region = |table_kind: &str,
+                                sym_off: u64,
+                                sym_size: u64,
+                                str_off: u64,
+                                str_size: u64| {
+        if sym_off < 64 || str_off < 64 || sym_size < 24 || str_size == 0 {
+            return;
+        }
+        let end_off = (sym_off as u128 + sym_size as u128).min(data.len() as u128) as usize;
+        if sym_off as usize >= end_off {
+            return;
+        }
+        let count = (end_off - sym_off as usize) / 24;
+        for idx in 1..count {
+            let at = sym_off as usize + idx * 24;
+            let Ok(st_name) = le32(data, at) else { break };
+            if st_name == 0 {
+                continue;
+            }
+            let st_info = data[at + 4];
+            let Ok(st_shndx) = le16(data, at + 6) else { break };
+            let Ok(st_value) = le64(data, at + 8) else { break };
+            let Ok(st_size) = le64(data, at + 16) else { break };
+            let raw_name = read_cstr(data, str_off, str_size, st_name);
+            if raw_name.is_empty() {
+                continue;
+            }
+            if symbol_entries.len() >= MAX_SYMBOL_LIST {
+                symbols_truncated = true;
+                break;
+            }
+            let orbis = crate::nid::split_orbis_symbol(&raw_name);
+            let resolved = crate::nid::lookup_nid(&raw_name, None);
+            if resolved.is_some() {
+                nid_resolved += 1;
+            }
+            symbol_entries.push(json!({
+                "table": table_kind,
+                "name": raw_name,
+                "nid": orbis.map(|(nid, _, _)| nid),
+                "library_tag": orbis.and_then(|(_, lib, _)| lib),
+                "module_tag": orbis.and_then(|(_, _, m)| m),
+                "resolved_name": resolved,
+                "value": format!("{st_value:#x}"),
+                "size": st_size,
+                "binding": sym_binding_name(st_info >> 4),
+                "type": sym_type_name(st_info & 0xf),
+                "defined": st_shndx != 0,
+            }));
+        }
+    };
+
+    for &(sh_type, sh_offset, sh_size, sh_link) in &section_spans {
+        if sh_type != 2 && sh_type != 11 {
+            continue;
+        }
+        let str_span = if sh_link > 0 && (sh_link as usize) < section_spans.len() {
+            let (link_ty, link_off, link_sz, _) = section_spans[sh_link as usize];
+            (link_ty == 3).then_some((link_off, link_sz))
+        } else if sh_type == 11 {
+            dyn_str_span
+        } else {
+            None
+        };
+        if let Some((str_off, str_sz)) = str_span {
+            let kind = if sh_type == 11 { "dynsym" } else { "symtab" };
+            parse_sym_region(kind, sh_offset, sh_size, str_off, str_sz);
+        }
+    }
+
+    // Sectionless ELF fallback (common in reconstructed in-memory PS4 dumps):
+    if section_spans.is_empty()
+        && let (Some(sym_vaddr), Some(str_vaddr), Some((str_off, str_sz))) =
+            (dyn_sym_vaddr, dyn_str_vaddr, dyn_str_span)
+        && sym_vaddr < str_vaddr
+        && let Some(sym_off) = vaddr_to_file_offset(sym_vaddr)
+    {
+        let est_bytes = (str_vaddr - sym_vaddr).min((MAX_SYMBOL_LIST as u64 + 1) * 24);
+        dynsym = (str_vaddr - sym_vaddr) / 24;
+        parse_sym_region("dynsym", sym_off, est_bytes, str_off, str_sz);
+    }
+
     Ok(json!({
         "kind": "elf64", "size": data.len(), "sha256": sha256_hex(data),
         "type": elf_type_name(e_type), "machine": elf_machine_name(e_machine),
@@ -582,7 +710,13 @@ pub fn elf_info(data: &[u8]) -> Result<Value> {
         "loads": loads,
         "section_count": shnum,
         "sections": sections,
-        "symbols": {"symtab_entries": symtab, "dynsym_entries": dynsym},
+        "symbols": {
+            "symtab_entries": symtab,
+            "dynsym_entries": dynsym,
+            "nid_resolved": nid_resolved,
+            "truncated": symbols_truncated,
+            "entries": symbol_entries,
+        },
         "dynamic_needed": needed,
         "notes": notes,
     }))
@@ -941,5 +1075,77 @@ mod tests {
             .collect();
         assert_eq!(texts, vec!["hi there", "longer string here"]);
         assert!(strings(data, 3, 10).is_err());
+    }
+
+    #[test]
+    fn elf_info_resolves_orbis_nid_symbols() {
+        // Build an ELF64 with a real .dynsym + .dynstr containing an Orbis NID symbol.
+        let mut d = vec![0u8; 64];
+        d[..4].copy_from_slice(b"\x7fELF");
+        d[4] = 2;
+        d[5] = 1;
+        d[6] = 1;
+        d[16..18].copy_from_slice(&3u16.to_le_bytes());
+        d[18..20].copy_from_slice(&0x3eu16.to_le_bytes());
+        d[20..24].copy_from_slice(&1u32.to_le_bytes());
+        d[32..40].copy_from_slice(&64u64.to_le_bytes());
+        d[52..54].copy_from_slice(&64u16.to_le_bytes());
+        d[54..56].copy_from_slice(&56u16.to_le_bytes());
+        d[56..58].copy_from_slice(&1u16.to_le_bytes());
+        d[58..60].copy_from_slice(&64u16.to_le_bytes());
+        d[60..62].copy_from_slice(&4u16.to_le_bytes());
+        d[62..64].copy_from_slice(&1u16.to_le_bytes());
+
+        let shstr = b"\0.shstrtab\0.dynstr\0.dynsym\0";
+        let dynstr = b"\01jfXLRVzisc#libkernel#libkernel\0";
+        let shstr_off = 128usize;
+        let dynstr_off = shstr_off + shstr.len();
+        let dynsym_off = (dynstr_off + dynstr.len() + 7) & !7;
+        let dynsym_sz = 48usize; // null + 1 symbol
+        let shoff = (dynsym_off + dynsym_sz + 7) & !7;
+        let total = shoff + 4 * 64;
+        d.resize(total, 0);
+        d[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+
+        // PT_LOAD covering file
+        let p = 64;
+        d[p..p + 4].copy_from_slice(&1u32.to_le_bytes());
+        d[p + 4..p + 8].copy_from_slice(&5u32.to_le_bytes());
+        d[p + 32..p + 40].copy_from_slice(&(total as u64).to_le_bytes());
+        d[p + 40..p + 48].copy_from_slice(&(total as u64).to_le_bytes());
+
+        d[shstr_off..shstr_off + shstr.len()].copy_from_slice(shstr);
+        d[dynstr_off..dynstr_off + dynstr.len()].copy_from_slice(dynstr);
+
+        // Symbol 1: st_name = 1, st_info = (STB_GLOBAL=1)<<4 | STT_FUNC=2 = 0x12, st_shndx = 0 (undef import)
+        let sym1 = dynsym_off + 24;
+        d[sym1..sym1 + 4].copy_from_slice(&1u32.to_le_bytes());
+        d[sym1 + 4] = 0x12;
+
+        let off = |name: &str| {
+            shstr
+                .windows(name.len() + 1)
+                .position(|w| w == format!("{name}\0").as_bytes())
+                .unwrap() as u32
+        };
+        let shdr = |d: &mut Vec<u8>, i: usize, name: u32, ty: u32, offset: usize, size: usize, link: u32| {
+            let b = shoff + i * 64;
+            d[b..b + 4].copy_from_slice(&name.to_le_bytes());
+            d[b + 4..b + 8].copy_from_slice(&ty.to_le_bytes());
+            d[b + 24..b + 32].copy_from_slice(&(offset as u64).to_le_bytes());
+            d[b + 32..b + 40].copy_from_slice(&(size as u64).to_le_bytes());
+            d[b + 40..b + 44].copy_from_slice(&link.to_le_bytes());
+        };
+        shdr(&mut d, 0, 0, 0, 0, 0, 0);
+        shdr(&mut d, 1, off(".shstrtab"), 3, shstr_off, shstr.len(), 0);
+        shdr(&mut d, 2, off(".dynstr"), 3, dynstr_off, dynstr.len(), 0);
+        shdr(&mut d, 3, off(".dynsym"), 11, dynsym_off, dynsym_sz, 2);
+
+        let info = elf_info(&d).unwrap();
+        assert_eq!(info["symbols"]["nid_resolved"], 1);
+        let entry = &info["symbols"]["entries"][0];
+        assert_eq!(entry["nid"], "1jfXLRVzisc");
+        assert_eq!(entry["resolved_name"], "sceKernelUsleep");
+        assert_eq!(entry["defined"], false);
     }
 }

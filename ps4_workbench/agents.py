@@ -70,14 +70,25 @@ class AnalysisAgents:
         return {"accepted": True}
 
     def submit(self, target, operation, arguments, timeout=20):
-        if target not in ("ida", "ghidra", "binja", "iaito") or operation not in ("decompile", "functions", "xrefs"):
+        import re
+        allowed_map = {
+            "functions": {"offset", "limit", "filter"},
+            "decompile": {"address"},
+            "xrefs": {"address", "limit", "direction"},
+            "disasm": {"address", "count"},
+            "strings": {"offset", "limit", "filter", "min_length"},
+            "imports": {"offset", "limit", "filter"},
+            "rename": {"address", "name"},
+            "comment": {"address", "text"},
+        }
+        if target not in ("ida", "ghidra", "binja", "iaito") or operation not in allowed_map:
             raise WorkbenchError("Unsupported static-analysis target or operation")
         if not isinstance(arguments, dict):
             raise WorkbenchError("Analysis arguments must be an object")
-        allowed = {"functions": {"offset", "limit"}, "decompile": {"address"}, "xrefs": {"address", "limit"}}[operation]
+        allowed = allowed_map[operation]
         if set(arguments) - allowed:
             raise WorkbenchError("Unknown static-analysis arguments")
-        if operation in ("decompile", "xrefs"):
+        if operation in ("decompile", "xrefs", "disasm", "rename", "comment"):
             from .tools import parse_address
             address = arguments.get("address")
             if not isinstance(address, str) or len(address) > 20:
@@ -87,6 +98,25 @@ class AnalysisAgents:
             require_integer(arguments["limit"], "limit", 1, 100)
         if "offset" in arguments:
             require_integer(arguments["offset"], "offset", 0, 1000000)
+        if "count" in arguments:
+            require_integer(arguments["count"], "count", 1, 256)
+        if "min_length" in arguments:
+            require_integer(arguments["min_length"], "min_length", 1, 256)
+        if "filter" in arguments:
+            flt = arguments["filter"]
+            if not isinstance(flt, str) or not (1 <= len(flt) <= 256):
+                raise WorkbenchError("filter must be a string of length 1..256")
+        if "direction" in arguments:
+            if arguments["direction"] not in ("to", "from", "both"):
+                raise WorkbenchError("direction must be one of to, from, both")
+        if operation == "rename":
+            name = arguments.get("name")
+            if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.$@?:+-]{1,256}", name):
+                raise WorkbenchError("Invalid symbol name for rename")
+        if operation == "comment":
+            text = arguments.get("text")
+            if not isinstance(text, str) or len(text) > 2048 or "\x00" in text:
+                raise WorkbenchError("Comment text out of bounds or contains NUL")
         with self.lock:
             state = self.agents.get(target)
             if not state or time.monotonic() - state["last_seen"] >= 30:

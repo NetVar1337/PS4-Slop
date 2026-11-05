@@ -62,21 +62,71 @@ class IDAWorkbench(LiveAnalysis):
         return self.on_ui(install, write=True)
 
     def analyze(self, operation, arguments):
+        write = operation in ("rename", "comment")
+
         def execute():
+            import itertools
+            import ida_bytes
             import ida_funcs
             import ida_hexrays
+            import ida_lines
+            import ida_name
             import ida_nalt
             import idautils
+            import idc
             from ..tools import parse_address
             expected = getattr(self, "expected_program_hash", None)
             digest = ida_nalt.retrieve_input_file_sha256()
             if expected and (not digest or bytes(digest).hex() != expected):
                 raise WorkbenchError("IDA database changed; stop and restart its analysis agent")
+            flt = (arguments.get("filter") or "").lower()
             if operation == "functions":
-                import itertools
                 offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
-                return [{"address": hex(address), "name": ida_funcs.get_func_name(address)[:256]}
-                        for address in itertools.islice(idautils.Functions(), offset, offset + limit)]
+                items = (
+                    {"address": hex(ea), "name": ida_funcs.get_func_name(ea)[:256]}
+                    for ea in idautils.Functions()
+                )
+                if flt:
+                    items = (item for item in items if flt in item["name"].lower())
+                return list(itertools.islice(items, offset, offset + limit))
+            if operation == "strings":
+                offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
+                min_len = arguments.get("min_length", 4)
+                out = []
+                skipped = 0
+                for s in idautils.Strings():
+                    val = str(s)
+                    if len(val) < min_len or (flt and flt not in val.lower()):
+                        continue
+                    if skipped < offset:
+                        skipped += 1
+                        continue
+                    out.append({"address": hex(int(s.ea)), "length": int(s.length), "value": val[:512]})
+                    if len(out) >= limit:
+                        break
+                return out
+            if operation == "imports":
+                offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
+                collected = []
+                qty = ida_nalt.get_import_module_qty()
+                for idx in range(qty):
+                    mod_name = ida_nalt.get_import_module_name(idx) or ""
+
+                    def _cb(ea, name, ordinal):
+                        sym_name = name or f"ord_{ordinal}"
+                        if not flt or flt in sym_name.lower() or flt in mod_name.lower():
+                            collected.append({
+                                "address": hex(int(ea)),
+                                "name": str(sym_name)[:256],
+                                "library": str(mod_name)[:128],
+                                "ordinal": int(ordinal or 0),
+                            })
+                        return len(collected) < offset + limit
+
+                    ida_nalt.enum_import_names(idx, _cb)
+                    if len(collected) >= offset + limit:
+                        break
+                return collected[offset:offset + limit]
             address = parse_address(arguments["address"])
             if operation == "decompile":
                 if not ida_hexrays.init_hexrays_plugin():
@@ -89,11 +139,43 @@ class IDAWorkbench(LiveAnalysis):
                     raise WorkbenchError("Hex-Rays did not produce a decompilation")
                 return {"address": hex(function.start_ea), **clipped(result)}
             if operation == "xrefs":
-                import itertools
-                return [{"from": hex(reference.frm), "to": hex(reference.to), "type": reference.type}
-                        for reference in itertools.islice(idautils.XrefsTo(address), arguments.get("limit", 100))]
+                limit = arguments.get("limit", 100)
+                direction = arguments.get("direction", "to")
+                refs = []
+                if direction in ("to", "both"):
+                    for ref in idautils.XrefsTo(address):
+                        refs.append({"from": hex(ref.frm), "to": hex(ref.to), "type": ref.type, "direction": "to"})
+                        if len(refs) >= limit:
+                            break
+                if direction in ("from", "both") and len(refs) < limit:
+                    for ref in idautils.XrefsFrom(address):
+                        refs.append({"from": hex(ref.frm), "to": hex(ref.to), "type": ref.type, "direction": "from"})
+                        if len(refs) >= limit:
+                            break
+                return refs
+            if operation == "disasm":
+                count = arguments.get("count", 32)
+                cur = address
+                insns = []
+                for _ in range(count):
+                    sz = ida_bytes.get_item_size(cur)
+                    if not sz or sz <= 0:
+                        break
+                    raw_line = idc.generate_disasm_line(cur, 0) or ""
+                    clean = ida_lines.tag_remove(raw_line) if hasattr(ida_lines, "tag_remove") else raw_line
+                    insns.append({"address": hex(cur), "size": int(sz), "text": clean[:256]})
+                    cur += sz
+                return {"address": hex(address), "instructions": insns}
+            if operation == "rename":
+                name = arguments["name"]
+                ok = ida_name.set_name(address, name, ida_name.SN_NOWARN | ida_name.SN_NOCHECK)
+                return {"address": hex(address), "name": name, "applied": bool(ok)}
+            if operation == "comment":
+                text = arguments["text"]
+                ok = ida_bytes.set_cmt(address, text, False)
+                return {"address": hex(address), "text": text, "applied": bool(ok)}
             raise WorkbenchError("Unsupported IDA analysis operation")
-        return self.on_ui(execute)
+        return self.on_ui(execute, write=write)
 
     def refresh_shadow(self, pid, rva, runtime_base, length, module_sha256, apply=False):
         import ida_bytes

@@ -11,11 +11,56 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, bail};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::Result;
-use crate::config::{
-    Profile, canonical_json, python_json, read_bounded_file, resolve_lenient, sha256_hex,
-};
+use crate::config::{Profile, canonical_json, python_json, read_bounded_file, resolve_lenient};
+#[cfg(test)]
+use crate::config::sha256_hex;
+
+/// Streaming writer that enforces a byte ceiling while hashing with SHA-256.
+pub struct BoundedShaWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+    written: usize,
+    maximum: usize,
+}
+
+impl<W: Write> BoundedShaWriter<W> {
+    pub fn new(inner: W, maximum: usize) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            written: 0,
+            maximum,
+        }
+    }
+
+    pub fn bytes_written(&self) -> usize {
+        self.written
+    }
+
+    pub fn finish(mut self) -> Result<(usize, String)> {
+        self.inner.flush()?;
+        Ok((self.written, hex::encode(self.hasher.finalize())))
+    }
+}
+
+impl<W: Write> Write for BoundedShaWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(buf.len()) > self.maximum {
+            return Err(std::io::Error::other("FTP transfer exceeds byte limit"));
+        }
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.written += n;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 /// Upper bound on directory entries examined by `inventory`.
 const MAX_SCANNED_ENTRIES: usize = 1_000_000;
@@ -210,6 +255,29 @@ impl ArtifactStore {
         metadata: Value,
         extension: &str,
     ) -> Result<Value> {
+        self.save_stream(
+            kind,
+            usize::MAX,
+            metadata,
+            extension,
+            |writer| Ok(writer.write_all(content)?),
+        )
+    }
+
+    /// Stream bytes directly into `<kind>-<uuid>.<extension>` bounded by `maximum`
+    /// while computing SHA-256 incrementally (no full-file heap buffer).
+    /// Removes the partial file if `produce` fails or exceeds `maximum`.
+    pub fn save_stream<F>(
+        &self,
+        kind: &str,
+        maximum: usize,
+        metadata: Value,
+        extension: &str,
+        produce: F,
+    ) -> Result<Value>
+    where
+        F: FnOnce(&mut BoundedShaWriter<std::io::BufWriter<fs::File>>) -> Result<()>,
+    {
         let simple = |text: &str, extra: &[char]| {
             !text.is_empty()
                 && text.len() <= 64
@@ -223,7 +291,20 @@ impl ArtifactStore {
         let identifier = format!("{kind}-{}", uuid::Uuid::new_v4().simple());
         let relative = format!("{identifier}.{extension}");
         self.ensure_root()?;
-        self.create_new(&relative, content)?;
+        let target = self.new_path(&relative)?;
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map_err(|error| anyhow!("Cannot create artifact {relative}: {error}"))?;
+        let mut writer = BoundedShaWriter::new(std::io::BufWriter::new(file), maximum);
+        let outcome = produce(&mut writer).and_then(|()| Ok(writer.flush()?));
+        if let Err(error) = outcome {
+            drop(writer);
+            let _ = fs::remove_file(&target);
+            return Err(error);
+        }
+        let (size, digest_hex) = writer.finish()?;
         let metadata = if metadata.is_null() {
             Value::Object(Map::new())
         } else {
@@ -233,8 +314,8 @@ impl ArtifactStore {
         let record = json!({
             "id": identifier,
             "path": relative,
-            "size": content.len(),
-            "sha256": sha256_hex(content),
+            "size": size,
+            "sha256": digest_hex,
             "created_at": utc_now(),
             "profile_sha256": self.profile.fingerprint(),
             "firmware": data.get("firmware").cloned().unwrap_or(Value::Null),
@@ -242,10 +323,13 @@ impl ArtifactStore {
             "debugger": data.get("debugger").cloned().unwrap_or(Value::Null),
             "metadata": metadata,
         });
-        self.create_new(
+        if let Err(error) = self.create_new(
             &format!("{relative}.json"),
             python_json(&record, Some(2), false).as_bytes(),
-        )?;
+        ) {
+            let _ = fs::remove_file(&target);
+            return Err(error);
+        }
         Ok(record)
     }
 

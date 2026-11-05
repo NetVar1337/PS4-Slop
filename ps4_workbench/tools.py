@@ -31,22 +31,30 @@ def parse_address(value):
 
 
 def validate(value, schema, location="arguments"):
+    import math
     import re
-    expected = schema["type"]
-    types = {"object": dict, "array": list, "string": str, "integer": int, "boolean": bool}
-    if type(value) is not types[expected]:
-        raise WorkbenchError(f"{location} must be {expected}")
+    expected = schema.get("type", "object")
+    if expected == "number":
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise WorkbenchError(f"{location} must be number")
+    else:
+        types = {"object": dict, "array": list, "string": str, "integer": int, "boolean": bool}
+        if type(value) is not types[expected]:
+            raise WorkbenchError(f"{location} must be {expected}")
     if "enum" in schema and value not in schema["enum"]:
         raise WorkbenchError(f"{location} must be one of {schema['enum']}")
     if expected == "object":
-        properties = schema["properties"]
-        if set(value) - set(properties):
+        has_props = "properties" in schema
+        closed = schema.get("additionalProperties") is False or has_props
+        properties = schema.get("properties", {})
+        if closed and (set(value) - set(properties)):
             raise WorkbenchError(f"Unknown {location} fields: {sorted(set(value) - set(properties))}")
-        for field in schema["required"]:
+        for field in schema.get("required", []):
             if field not in value:
                 raise WorkbenchError(f"Missing {location}.{field}")
         for field, supplied in value.items():
-            validate(supplied, properties[field], location + "." + field)
+            if field in properties:
+                validate(supplied, properties[field], location + "." + field)
     elif expected == "string":
         if not schema.get("minLength", 0) <= len(value) <= schema.get("maxLength", 4096):
             raise WorkbenchError(f"{location} length out of bounds")
@@ -55,11 +63,15 @@ def validate(value, schema, location="arguments"):
     elif expected == "integer":
         if not schema.get("minimum", 0) <= value <= schema.get("maximum", 2147483647):
             raise WorkbenchError(f"{location} out of bounds")
+    elif expected == "number":
+        if not schema.get("minimum", -math.inf) <= float(value) <= schema.get("maximum", math.inf):
+            raise WorkbenchError(f"{location} out of bounds")
     elif expected == "array":
         if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", 100):
             raise WorkbenchError(f"{location} item count out of bounds")
+        item_schema = schema.get("items", {})
         for item in value:
-            validate(item, schema["items"], location + "[]")
+            validate(item, item_schema, location + "[]")
 
 
 def json_safe(value):

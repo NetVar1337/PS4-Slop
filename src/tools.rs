@@ -43,18 +43,20 @@ impl ToolRegistry {
         for tool in &mut catalog {
             let properties = &mut tool["inputSchema"]["properties"];
             if properties.get("length").is_some() {
-                let limit = if tool["name"] == "memory_region_dump" {
-                    workbench.profile.limit("transfer_bytes")
-                } else if tool["name"] == "memory_peek" {
-                    workbench.profile.limit("memory_bytes").min(8192)
-                } else {
-                    workbench.profile.limit("memory_bytes")
-                };
-                if tool["name"]
-                    .as_str()
-                    .is_some_and(|name| name.starts_with("memory_") || name == "kernel_read")
-                {
-                    tool["inputSchema"]["properties"]["length"]["maximum"] = json!(limit);
+                match tool["name"].as_str() {
+                    Some("memory_region_dump") => {
+                        tool["inputSchema"]["properties"]["length"]["maximum"] =
+                            json!(workbench.profile.limit("transfer_bytes"));
+                    }
+                    Some("memory_peek") => {
+                        tool["inputSchema"]["properties"]["length"]["maximum"] =
+                            json!(workbench.profile.limit("memory_bytes").min(8192));
+                    }
+                    Some("memory_read" | "memory_snapshot" | "memory_search" | "kernel_read") => {
+                        tool["inputSchema"]["properties"]["length"]["maximum"] =
+                            json!(workbench.profile.limit("memory_bytes"));
+                    }
+                    _ => {}
                 }
             }
             if tool["name"] == "klog_capture" {
@@ -333,11 +335,25 @@ impl ToolRegistry {
                 .workbench
                 .debugger
                 .module_list(number(args, "pid")? as u32),
-            "code_xrefs" => self.workbench.debugger.code_xrefs(
-                number(args, "pid")? as u32,
-                address(&args["target_address"])?,
-                args["max_results"].as_u64().unwrap_or(256) as usize,
-            ),
+            "code_xrefs" => {
+                let range = if args["address"].is_string() || args["length"].is_u64() {
+                    let start = address(&args["address"])
+                        .context("code_xrefs range filter requires both address and length")?;
+                    let len = number(args, "length")
+                        .context("code_xrefs range filter requires both address and length")?
+                        as usize;
+                    Some((start, len))
+                } else {
+                    None
+                };
+                self.workbench.debugger.code_xrefs_filtered(
+                    number(args, "pid")? as u32,
+                    address(&args["target_address"])?,
+                    args["max_results"].as_u64().unwrap_or(256) as usize,
+                    args["module"].as_str(),
+                    range,
+                )
+            }
             "memory_search" => self.workbench.debugger.memory_search(
                 number(args, "pid")? as u32,
                 address(&args["address"])?,
@@ -408,6 +424,130 @@ impl ToolRegistry {
                 self.workbench.audit_result("debug_control", &result)?;
                 result
             }
+            "assemble" => {
+                let base = if args["base_address"].is_string() {
+                    address(&args["base_address"])?
+                } else {
+                    0
+                };
+                crate::asm::assemble_json(string(args, "assembly")?, base)
+            }
+            "memory_patch" => self.workbench.memory_patch(
+                number(args, "pid")? as u32,
+                address(&args["address"])?,
+                args["assembly"].as_str(),
+                args["data_hex"].as_str(),
+                args["nop_pad"].as_bool().unwrap_or(false),
+                args["comment"].as_str().map(str::to_owned),
+            ),
+            "patch_list" => Ok(self
+                .workbench
+                .debugger
+                .patch_list(args["pid"].as_u64().map(|p| p as u32))),
+            "patch_restore" => self.workbench.patch_restore(number(args, "id")? as u32),
+            "memory_scan" => self.workbench.debugger.memory_scan(args),
+            "memory_alloc" => self.workbench.memory_alloc(
+                number(args, "pid")? as u32,
+                number(args, "length")? as usize,
+                if args["address_hint"].is_string() {
+                    Some(address(&args["address_hint"])?)
+                } else {
+                    None
+                },
+            ),
+            "memory_free" => self.workbench.memory_free(
+                number(args, "pid")? as u32,
+                address(&args["address"])?,
+                number(args, "length")? as usize,
+            ),
+            "memory_protect" => self.workbench.memory_protect(
+                number(args, "pid")? as u32,
+                address(&args["address"])?,
+                number(args, "length")? as usize,
+                number(args, "protection")? as u32,
+            ),
+            "memory_elf_dump" => self.workbench.memory_elf_dump(
+                number(args, "pid")? as u32,
+                args["module"].as_str(),
+                if args["base_address"].is_string() {
+                    Some(address(&args["base_address"])?)
+                } else {
+                    None
+                },
+            ),
+            "debug_registers_fpu_set" => self
+                .workbench
+                .debug_registers_fpu_set(number(args, "thread_id")? as u32, &args["changes"]),
+            "debug_tls" => self
+                .workbench
+                .debugger
+                .tls_bases(number(args, "thread_id")? as u32),
+            "debug_tls_set" => self.workbench.debug_tls_set(
+                number(args, "thread_id")? as u32,
+                if args["fsbase"].is_string() {
+                    Some(address(&args["fsbase"])?)
+                } else {
+                    None
+                },
+                if args["gsbase"].is_string() {
+                    Some(address(&args["gsbase"])?)
+                } else {
+                    None
+                },
+            ),
+            "debug_label_save" => self.workbench.debug_label_save(),
+            "debug_label_load" => self.workbench.debug_label_load(
+                string(args, "artifact")?,
+                args["merge"].as_bool().unwrap_or(false),
+            ),
+            "nid_resolve" => {
+                let symbols = match args.get("symbols") {
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .map(|v| v.as_str().context("symbols[] must be string").map(str::to_owned))
+                        .collect::<Result<Vec<_>>>()?,
+                    _ => Vec::new(),
+                };
+                let nids = match args.get("nids") {
+                    Some(Value::Array(items)) => items
+                        .iter()
+                        .map(|v| v.as_str().context("nids[] must be string").map(str::to_owned))
+                        .collect::<Result<Vec<_>>>()?,
+                    _ => Vec::new(),
+                };
+                let custom = if let Some(dict_art) = args["dictionary_artifact"].as_str() {
+                    let raw = self.workbench.read_artifact(dict_art, 16 * 1024 * 1024)?;
+                    Some(crate::nid::parse_dictionary(&raw)?)
+                } else {
+                    None
+                };
+                crate::nid::resolve_batch(&symbols, &nids, custom.as_ref())
+            }
+            "address_rebase" => self.workbench.address_rebase(
+                args["pid"].as_u64().map(|p| p as u32),
+                args["module"].as_str(),
+                if args["runtime_address"].is_string() {
+                    Some(address(&args["runtime_address"])?)
+                } else {
+                    None
+                },
+                if args["static_address"].is_string() {
+                    Some(address(&args["static_address"])?)
+                } else {
+                    None
+                },
+                if args["offset"].is_string() {
+                    Some(address(&args["offset"])?)
+                } else {
+                    None
+                },
+                if args["static_base"].is_string() {
+                    Some(address(&args["static_base"])?)
+                } else {
+                    None
+                },
+                args["artifact"].as_str(),
+            ),
             "artifact_info" => analysis::artifact_info(&self.workbench.read_artifact(
                 string(args, "artifact")?,
                 self.workbench.profile.limit("transfer_bytes"),
@@ -519,6 +659,7 @@ impl ToolRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Profile;
 
     #[test]
     fn address_precision_and_overflow() {
@@ -530,14 +671,18 @@ mod tests {
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
         let catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json")).unwrap();
-        assert_eq!(catalog.len(), 61);
+        assert_eq!(catalog.len(), 77);
         for expected in [
             "debug_step", "debug_run", "debug_stack", "debug_eval", "disassemble",
             "module_list", "debug_registers_set", "debug_registers_fpu",
             "debug_registers_dr", "debug_breakpoint_list", "artifact_info",
             "artifact_disasm", "artifact_strings", "code_xrefs", "memory_search",
             "debug_label", "debug_breakpoint_save", "debug_breakpoint_load",
-            "debug_watchpoint_list",
+            "debug_watchpoint_list", "assemble", "memory_patch", "patch_list",
+            "patch_restore", "memory_scan", "memory_alloc", "memory_free",
+            "memory_protect", "memory_elf_dump", "debug_registers_fpu_set",
+            "debug_tls", "debug_tls_set", "debug_label_save", "debug_label_load",
+            "nid_resolve", "address_rebase",
         ] {
             assert!(catalog.iter().any(|tool| tool["name"] == expected), "{expected}");
         }
@@ -546,5 +691,61 @@ mod tests {
             assert!(!validator.is_valid(&json!({"unexpected":true})));
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
+    }
+
+    #[test]
+    fn offline_tools_dispatch_and_preserve_large_length_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        data["artifact_directory"] = json!("artifacts");
+        data["qualification_file"] = json!("qualification.json");
+        data["permissions"]["process_write"] = json!(true);
+        let profile_path = dir.path().join("profile.json");
+        std::fs::write(&profile_path, data.to_string()).unwrap();
+        let profile = Profile::load(&profile_path).unwrap();
+        let mut reg = ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap();
+
+        // memory_alloc length max should remain 64 MiB (not clamped to 1 MiB memory_bytes)
+        let alloc_schema = reg
+            .available()
+            .into_iter()
+            .find(|t| t["name"] == "memory_alloc")
+            .unwrap();
+        assert_eq!(
+            alloc_schema["inputSchema"]["properties"]["length"]["maximum"],
+            json!(67_108_864)
+        );
+
+        let asm = reg
+            .call(
+                "assemble",
+                json!({"assembly": "xor eax, eax; ret", "base_address": "0x401000"}),
+            )
+            .unwrap();
+        assert_eq!(asm["bytes"], "31c0c3");
+
+        let nid = reg
+            .call(
+                "nid_resolve",
+                json!({"symbols": ["sceKernelUsleep"], "nids": ["1jfXLRVzisc#libkernel#libkernel"]}),
+            )
+            .unwrap();
+        assert_eq!(nid["encoded"][0]["nid"], "1jfXLRVzisc");
+        assert_eq!(nid["decoded"][0]["symbol"], "sceKernelUsleep");
+
+        reg.call(
+            "debug_label",
+            json!({"action": "set", "name": "player_tick", "address": "0x401234"}),
+        )
+        .unwrap();
+        let saved = reg.call("debug_label_save", json!({})).unwrap();
+        assert_eq!(saved["count"], 1);
+        let loaded = reg
+            .call(
+                "debug_label_load",
+                json!({"artifact": saved["artifact"]["path"], "merge": false}),
+            )
+            .unwrap();
+        assert_eq!(loaded["loaded"], 1);
     }
 }

@@ -28,10 +28,25 @@ pub const MAX_CONNECTIONS: usize = 32;
 pub const MAX_INLINE_RESULT: usize = 24_576;
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 pub const PUMP_INTERVAL: Duration = Duration::from_millis(50);
-pub const CONTROL_TOOLS: [&str; 11] = [
-    "debug_attach", "debug_control", "debug_breakpoint", "debug_watchpoint", "memory_write",
-    "kernel_write", "debug_detach", "debug_step", "debug_run", "debug_registers_set",
+pub const CONTROL_TOOLS: [&str; 18] = [
+    "debug_attach",
+    "debug_control",
+    "debug_breakpoint",
+    "debug_watchpoint",
+    "memory_write",
+    "kernel_write",
+    "debug_detach",
+    "debug_step",
+    "debug_run",
+    "debug_registers_set",
+    "debug_registers_fpu_set",
+    "debug_tls_set",
     "debug_breakpoint_load",
+    "memory_patch",
+    "patch_restore",
+    "memory_alloc",
+    "memory_free",
+    "memory_protect",
 ];
 const MAX_TOKEN_FILE: u64 = 1024;
 const SAFE_INTEGER: i128 = 9_007_199_254_740_991;
@@ -81,6 +96,10 @@ fn text_schema(description: &str, maximum: usize) -> Value {
     json!({"type": "string", "description": description, "maxLength": maximum})
 }
 
+fn bounded_text_schema(description: &str, minimum: usize, maximum: usize) -> Value {
+    json!({"type": "string", "description": description, "minLength": minimum, "maxLength": maximum})
+}
+
 fn integer_schema(minimum: i64, maximum: i64) -> Value {
     json!({"type": "integer", "minimum": minimum, "maximum": maximum})
 }
@@ -93,21 +112,160 @@ fn address_schema() -> Value {
 pub fn analysis_tools() -> Vec<Value> {
     let mut target = text_schema("Live static-analysis application", 4096);
     target["enum"] = json!(["ida", "ghidra", "binja", "iaito"]);
+    let mut direction = text_schema("Reference direction", 32);
+    direction["enum"] = json!(["to", "from", "both"]);
+    let mut sync_dir = text_schema("Annotation sync direction", 64);
+    sync_dir["enum"] = json!(["import_from_static", "export_to_static", "bidirectional"]);
+    let pid_schema = integer_schema(1, 2_147_483_647);
+    let mod_schema = bounded_text_schema("Module name for runtime_address rebasing", 1, 256);
+    let filter_schema = bounded_text_schema("Case-insensitive substring filter", 1, 256);
+
     let operations = [
-        ("analysis_status", "Connected IDA/Ghidra/Binary Ninja/iaito (radare2) analysis agents; no application is launched automatically.",
-         json!({}), json!([])),
-        ("analysis_decompile", "Decompile a function in a connected IDA/Ghidra/Binary Ninja/iaito database. Address is STATIC, not a runtime VA.",
-         json!({"target": target, "address": address_schema()}), json!(["target", "address"])),
-        ("analysis_functions", "List a bounded page of functions from a connected static-analysis database.",
-         json!({"target": target, "offset": integer_schema(0, 1_000_000), "limit": integer_schema(1, 100)}), json!(["target"])),
-        ("analysis_xrefs", "List bounded references to a static database address.",
-         json!({"target": target, "address": address_schema(), "limit": integer_schema(1, 100)}), json!(["target", "address"])),
+        (
+            "analysis_status",
+            "Connected IDA/Ghidra/Binary Ninja/iaito (radare2) analysis agents; no application is launched automatically.",
+            json!({}),
+            json!([]),
+            true,
+        ),
+        (
+            "analysis_decompile",
+            "Decompile a function in a connected IDA/Ghidra/Binary Ninja/iaito database. Supply static address or runtime_address.",
+            json!({
+                "target": target,
+                "address": address_schema(),
+                "runtime_address": address_schema(),
+                "pid": pid_schema,
+                "module": mod_schema,
+                "static_base": address_schema(),
+            }),
+            json!(["target"]),
+            true,
+        ),
+        (
+            "analysis_functions",
+            "List a bounded page of functions from a connected static-analysis database.",
+            json!({
+                "target": target,
+                "offset": integer_schema(0, 1_000_000),
+                "limit": integer_schema(1, 100),
+                "filter": filter_schema,
+            }),
+            json!(["target"]),
+            true,
+        ),
+        (
+            "analysis_xrefs",
+            "List bounded references to/from a static database address.",
+            json!({
+                "target": target,
+                "address": address_schema(),
+                "runtime_address": address_schema(),
+                "pid": pid_schema,
+                "module": mod_schema,
+                "static_base": address_schema(),
+                "limit": integer_schema(1, 100),
+                "direction": direction,
+            }),
+            json!(["target"]),
+            true,
+        ),
+        (
+            "analysis_disasm",
+            "Disassemble instructions at a static database address in IDA/Ghidra/Binary Ninja/iaito.",
+            json!({
+                "target": target,
+                "address": address_schema(),
+                "runtime_address": address_schema(),
+                "pid": pid_schema,
+                "module": mod_schema,
+                "static_base": address_schema(),
+                "count": integer_schema(1, 256),
+            }),
+            json!(["target"]),
+            true,
+        ),
+        (
+            "analysis_strings",
+            "List strings in a connected static-analysis database.",
+            json!({
+                "target": target,
+                "offset": integer_schema(0, 1_000_000),
+                "limit": integer_schema(1, 100),
+                "filter": filter_schema,
+                "min_length": integer_schema(1, 256),
+            }),
+            json!(["target"]),
+            true,
+        ),
+        (
+            "analysis_imports",
+            "List imported symbols in a connected static-analysis database, automatically enriched with Orbis NID demangling.",
+            json!({
+                "target": target,
+                "offset": integer_schema(0, 1_000_000),
+                "limit": integer_schema(1, 100),
+                "filter": filter_schema,
+            }),
+            json!(["target"]),
+            true,
+        ),
+        (
+            "analysis_rename",
+            "Rename a function or label in a connected static-analysis database (local database only; never touches console).",
+            json!({
+                "target": target,
+                "address": address_schema(),
+                "runtime_address": address_schema(),
+                "pid": pid_schema,
+                "module": mod_schema,
+                "static_base": address_schema(),
+                "name": bounded_text_schema("New symbol identifier", 1, 256),
+            }),
+            json!(["target", "name"]),
+            false,
+        ),
+        (
+            "analysis_comment",
+            "Set or clear a comment at an address in a connected static-analysis database (local database only; never touches console).",
+            json!({
+                "target": target,
+                "address": address_schema(),
+                "runtime_address": address_schema(),
+                "pid": pid_schema,
+                "module": mod_schema,
+                "static_base": address_schema(),
+                "text": text_schema("Comment text", 2048),
+            }),
+            json!(["target", "text"]),
+            false,
+        ),
+        (
+            "analysis_sync_annotations",
+            "Synchronize host debugger labels/breakpoints and static-analysis function names/comments with automatic ASLR rebasing.",
+            json!({
+                "target": target,
+                "direction": sync_dir,
+                "pid": pid_schema,
+                "module": mod_schema,
+                "static_base": address_schema(),
+                "max_items": integer_schema(1, 500),
+            }),
+            json!(["target"]),
+            false,
+        ),
     ];
-    operations.into_iter().map(|(name, description, properties, required)| json!({
-        "name": name, "description": description,
-        "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": false},
-        "annotations": {"readOnlyHint": true, "destructiveHint": false, "openWorldHint": true}
-    })).collect()
+    operations
+        .into_iter()
+        .map(|(name, description, properties, required, read_only)| {
+            json!({
+                "name": name,
+                "description": description,
+                "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": false},
+                "annotations": {"readOnlyHint": read_only, "destructiveHint": false, "openWorldHint": true}
+            })
+        })
+        .collect()
 }
 
 fn python_list(items: &[String]) -> String {
@@ -121,6 +279,7 @@ pub fn validate(value: &Value, schema: &Value, location: &str) -> Result<()> {
         "array" => value.is_array(),
         "string" => value.is_string(),
         "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_f64() || value.is_i64() || value.is_u64(),
         "boolean" => value.is_boolean(),
         _ => false,
     };
@@ -128,16 +287,21 @@ pub fn validate(value: &Value, schema: &Value, location: &str) -> Result<()> {
         bail!("{location} must be {expected}");
     }
     if let Some(choices) = schema.get("enum").and_then(Value::as_array)
-        && !choices.contains(value) {
-            bail!("{location} must be one of {}", Value::Array(choices.clone()));
-        }
+        && !choices.contains(value)
+    {
+        bail!("{location} must be one of {}", Value::Array(choices.clone()));
+    }
     match value {
         Value::Object(fields) => {
+            let has_properties = schema.get("properties").and_then(Value::as_object).is_some();
+            let closed = schema.get("additionalProperties") == Some(&Value::Bool(false)) || has_properties;
             let properties = schema.get("properties").and_then(Value::as_object).cloned().unwrap_or_default();
-            let mut unknown: Vec<String> = fields.keys().filter(|key| !properties.contains_key(*key)).cloned().collect();
-            if !unknown.is_empty() {
-                unknown.sort();
-                bail!("Unknown {location} fields: {}", python_list(&unknown));
+            if closed {
+                let mut unknown: Vec<String> = fields.keys().filter(|key| !properties.contains_key(*key)).cloned().collect();
+                if !unknown.is_empty() {
+                    unknown.sort();
+                    bail!("Unknown {location} fields: {}", python_list(&unknown));
+                }
             }
             for field in schema.get("required").and_then(Value::as_array).into_iter().flatten() {
                 let field = field.as_str().unwrap_or_default();
@@ -146,7 +310,9 @@ pub fn validate(value: &Value, schema: &Value, location: &str) -> Result<()> {
                 }
             }
             for (field, supplied) in fields {
-                validate(supplied, &properties[field], &format!("{location}.{field}"))?;
+                if let Some(prop_schema) = properties.get(field) {
+                    validate(supplied, prop_schema, &format!("{location}.{field}"))?;
+                }
             }
         }
         Value::String(text) => {
@@ -163,10 +329,19 @@ pub fn validate(value: &Value, schema: &Value, location: &str) -> Result<()> {
                 }
             }
         }
-        Value::Number(_) => {
-            let minimum = schema.get("minimum").and_then(Value::as_i64).map_or(0, i128::from);
-            let maximum = schema.get("maximum").and_then(Value::as_i64).map_or(2_147_483_647, i128::from);
-            require_integer(value, location, minimum, maximum).map_err(|_| anyhow!("{location} out of bounds"))?;
+        Value::Number(num) => {
+            if expected == "number" {
+                let val = num.as_f64().ok_or_else(|| anyhow!("{location} must be finite"))?;
+                let minimum = schema.get("minimum").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY);
+                let maximum = schema.get("maximum").and_then(Value::as_f64).unwrap_or(f64::INFINITY);
+                if !val.is_finite() || val < minimum || val > maximum {
+                    bail!("{location} out of bounds");
+                }
+            } else {
+                let minimum = schema.get("minimum").and_then(Value::as_i64).map_or(0, i128::from);
+                let maximum = schema.get("maximum").and_then(Value::as_i64).map_or(2_147_483_647, i128::from);
+                require_integer(value, location, minimum, maximum).map_err(|_| anyhow!("{location} out of bounds"))?;
+            }
         }
         Value::Array(items) => {
             let length = items.len() as u64;
@@ -188,12 +363,21 @@ pub fn validate(value: &Value, schema: &Value, location: &str) -> Result<()> {
 fn fallback_permission(name: &str) -> Option<&'static str> {
     match name {
         "payload_execute" => Some("payload_execute"),
-        "memory_write" => Some("process_write"),
+        "memory_write" | "memory_patch" | "patch_restore" | "memory_alloc" | "memory_free" | "memory_protect" => {
+            Some("process_write")
+        }
         "kernel_read" | "kernel_base" => Some("kernel_read"),
         "kernel_write" => Some("kernel_write"),
-        "debug_attach" | "debug_control" | "debug_breakpoint" | "debug_watchpoint" | "debug_step" | "debug_run" | "debug_registers_set" | "debug_breakpoint_load" => {
-            Some("debug_control")
-        }
+        "debug_attach"
+        | "debug_control"
+        | "debug_breakpoint"
+        | "debug_watchpoint"
+        | "debug_step"
+        | "debug_run"
+        | "debug_registers_set"
+        | "debug_registers_fpu_set"
+        | "debug_tls_set"
+        | "debug_breakpoint_load" => Some("debug_control"),
         "ftp_upload" => Some("ftp_upload"),
         "sdk_build" => Some("build"),
         _ => None,
@@ -209,8 +393,19 @@ fn tool_permission(description: &Value, name: &str) -> Option<String> {
 }
 
 fn is_shared(name: &str) -> bool {
-    ["debug_", "process_", "memory_", "kernel_"].iter().any(|prefix| name.starts_with(prefix))
-        || matches!(name, "debugger_info" | "address_correlate" | "payload_execute")
+    ["debug_", "process_", "memory_", "kernel_", "patch_"]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        || matches!(
+            name,
+            "debugger_info"
+                | "address_correlate"
+                | "address_rebase"
+                | "disassemble"
+                | "module_list"
+                | "code_xrefs"
+                | "payload_execute"
+        )
 }
 
 struct SessionState {
@@ -221,6 +416,9 @@ struct SessionState {
     session_id: Option<String>,
     execution_state: &'static str,
     last_stop: Value,
+    cached_attached_pid: Option<u32>,
+    cached_profile_sha256: String,
+    cached_host: String,
 }
 
 impl SessionState {
@@ -236,6 +434,30 @@ impl SessionState {
             self.journal.pop_front();
         }
         self.journal.push_back(Value::Object(entry));
+    }
+
+    fn publish_stop_event(&mut self, pid: u32, event: Value) -> Result<()> {
+        let thread_id = event
+            .get("thread_id")
+            .cloned()
+            .ok_or_else(|| anyhow!("Stop event lacks thread_id"))?;
+        let status = event
+            .get("status")
+            .cloned()
+            .ok_or_else(|| anyhow!("Stop event lacks status"))?;
+        self.execution_state = "stopped";
+        let mut record = json!({"type": "stop", "pid": pid, "session_id": self.session_id});
+        if let (Some(fields), Value::Object(extra)) = (record.as_object_mut(), event) {
+            fields.extend(extra);
+        }
+        self.publish(record);
+        self.last_stop = json!({
+            "thread_id": thread_id,
+            "status": status,
+            "session_id": self.session_id,
+            "sequence": self.sequence,
+        });
+        Ok(())
     }
 }
 
@@ -253,10 +475,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl SessionHub {
     pub fn new(registry: Arc<Mutex<ToolRegistry>>) -> Self {
+        let (cached_attached_pid, cached_profile_sha256, cached_host) = {
+            let reg = lock(&registry);
+            (
+                reg.workbench.debugger.attached_pid,
+                reg.workbench.profile.fingerprint(),
+                reg.workbench.profile.host().to_owned(),
+            )
+        };
         Self {
             registry,
-            debug: Mutex::new(SessionState { controller: None, journal: VecDeque::new(), sequence: 0,
-                event_failure: false, session_id: None, execution_state: "detached", last_stop: Value::Null }),
+            debug: Mutex::new(SessionState {
+                controller: None,
+                journal: VecDeque::new(),
+                sequence: 0,
+                event_failure: false,
+                session_id: None,
+                execution_state: "detached",
+                last_stop: Value::Null,
+                cached_attached_pid,
+                cached_profile_sha256,
+                cached_host,
+            }),
             analysis: AnalysisAgents::new(),
             stopping: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -276,7 +516,10 @@ impl SessionHub {
     }
 
     pub fn profile_fingerprint(&self) -> String {
-        lock(&self.registry).workbench.profile.fingerprint()
+        if let Ok(registry) = self.registry.try_lock() {
+            return registry.workbench.profile.fingerprint();
+        }
+        lock(&self.debug).cached_profile_sha256.clone()
     }
 
     pub fn events_since(&self, cursor: &Value, limit: &Value) -> Result<Value> {
@@ -296,32 +539,35 @@ impl SessionHub {
     }
 
     pub fn pump(&self) {
-        let mut state = lock(&self.debug);
-        let mut registry = lock(&self.registry);
-        let Some(pid) = registry.workbench.debugger.attached_pid else {
-            return;
-        };
-        if state.event_failure {
+        if lock(&self.debug).event_failure {
             return;
         }
+        let Ok(mut registry) = self.registry.try_lock() else {
+            // A tool call is actively using the debugger; skip this tick without
+            // blocking state/events readers or stealing wait_stop packets.
+            return;
+        };
+        let Some(pid) = registry.workbench.debugger.attached_pid else {
+            drop(registry);
+            lock(&self.debug).cached_attached_pid = None;
+            return;
+        };
         let outcome = registry.workbench.debugger.poll_events().and_then(|events| match events {
             Value::Array(items) => Ok(items),
             _ => bail!("Debugger event poll did not return an array"),
         });
+        drop(registry);
+
+        let mut state = lock(&self.debug);
+        state.cached_attached_pid = Some(pid);
+        if state.event_failure {
+            return;
+        }
         let failure = match outcome {
-            Ok(events) => events.into_iter().try_for_each(|event| -> Result<()> {
-                let thread_id = event.get("thread_id").cloned().ok_or_else(|| anyhow!("Stop event lacks thread_id"))?;
-                let status = event.get("status").cloned().ok_or_else(|| anyhow!("Stop event lacks status"))?;
-                state.execution_state = "stopped";
-                let mut record = json!({"type": "stop", "pid": pid, "session_id": state.session_id});
-                if let (Some(fields), Value::Object(extra)) = (record.as_object_mut(), event) {
-                    fields.extend(extra);
-                }
-                state.publish(record);
-                state.last_stop = json!({"thread_id": thread_id, "status": status,
-                    "session_id": state.session_id, "sequence": state.sequence});
-                Ok(())
-            }).err(),
+            Ok(events) => events
+                .into_iter()
+                .try_for_each(|event| state.publish_stop_event(pid, event))
+                .err(),
             Err(error) => Some(error),
         };
         if let Some(error) = failure {
@@ -351,18 +597,39 @@ impl SessionHub {
         if let Some(handle) = lock(&self.worker).take() {
             let _ = handle.join();
         }
-        let _state = lock(&self.debug);
-        lock(&self.registry).workbench.close()
+        let closed = lock(&self.registry).workbench.close();
+        let mut state = lock(&self.debug);
+        state.cached_attached_pid = None;
+        state.execution_state = "detached";
+        closed
     }
 
     pub fn state(&self) -> Value {
-        let state = lock(&self.debug);
-        let registry = lock(&self.registry);
-        json!({"controller": state.controller, "attached_pid": registry.workbench.debugger.attached_pid,
-            "profile_sha256": registry.workbench.profile.fingerprint(), "host": registry.workbench.profile.host(),
-            "event_cursor": state.sequence, "event_channel_failed": state.event_failure,
-            "session_id": state.session_id, "execution_state": state.execution_state,
-            "last_stop": state.last_stop, "hardware_compatibility_guaranteed": false})
+        let live_snapshot = self.registry.try_lock().ok().map(|reg| {
+            (
+                reg.workbench.debugger.attached_pid,
+                reg.workbench.profile.fingerprint(),
+                reg.workbench.profile.host().to_owned(),
+            )
+        });
+        let mut state = lock(&self.debug);
+        if let Some((pid, fp, host)) = live_snapshot {
+            state.cached_attached_pid = pid;
+            state.cached_profile_sha256 = fp;
+            state.cached_host = host;
+        }
+        json!({
+            "controller": state.controller,
+            "attached_pid": state.cached_attached_pid,
+            "profile_sha256": state.cached_profile_sha256,
+            "host": state.cached_host,
+            "event_cursor": state.sequence,
+            "event_channel_failed": state.event_failure,
+            "session_id": state.session_id,
+            "execution_state": state.execution_state,
+            "last_stop": state.last_stop,
+            "hardware_compatibility_guaranteed": false,
+        })
     }
 
     pub fn call(&self, client: &str, name: &str, arguments: Value) -> Result<Value> {
@@ -378,43 +645,82 @@ impl SessionHub {
         if !is_shared(name) {
             return lock(&self.registry).call(name, arguments);
         }
-        let mut state = lock(&self.debug);
+
+        // Acquire `registry` first, then `debug` ONLY for fast in-memory lease/state
+        // updates so `state()` and `events_since()` remain non-blocking during console I/O.
         let mut registry = lock(&self.registry);
         if name == "payload_execute" && registry.workbench.debugger.attached_pid.is_some() {
             bail!("Detach the active debug session before sending a payload");
         }
-        let description = registry.available().into_iter()
+        let description = registry
+            .available()
+            .into_iter()
             .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
             .ok_or_else(|| anyhow!("Unknown or locally disabled tool: {name}"))?;
-        validate(&arguments, description.get("inputSchema").unwrap_or(&json!({"type": "object"})), "arguments")?;
+        validate(
+            &arguments,
+            description.get("inputSchema").unwrap_or(&json!({"type": "object"})),
+            "arguments",
+        )?;
         if let Some(permission) = tool_permission(&description, name) {
             registry.workbench.profile.require(&permission)?;
         }
         let control = CONTROL_TOOLS.contains(&name);
-        if control && state.controller.as_deref().is_some_and(|owner| owner != client) {
-            bail!("Another client owns debug control; observers may still read memory and events");
-        }
-        let claimed = name == "debug_attach" && state.controller.is_none();
-        if claimed {
-            state.controller = Some(client.to_string());
-            state.session_id = Some(uuid::Uuid::new_v4().simple().to_string());
-            state.execution_state = "attaching";
-            state.last_stop = Value::Null;
-        }
+        let claimed = {
+            let mut state = lock(&self.debug);
+            state.cached_attached_pid = registry.workbench.debugger.attached_pid;
+            state.cached_profile_sha256 = registry.workbench.profile.fingerprint();
+            state.cached_host = registry.workbench.profile.host().to_owned();
+            if control && state.controller.as_deref().is_some_and(|owner| owner != client) {
+                bail!("Another client owns debug control; observers may still read memory and events");
+            }
+            let claiming = name == "debug_attach" && state.controller.is_none();
+            if claiming {
+                state.controller = Some(client.to_string());
+                state.session_id = Some(uuid::Uuid::new_v4().simple().to_string());
+                state.execution_state = "attaching";
+                state.last_stop = Value::Null;
+            } else if name == "debug_run"
+                || (matches!(name, "debug_control" | "debug_step")
+                    && matches!(
+                        arguments.get("action").and_then(Value::as_str),
+                        Some("resume" | "step" | "step_thread" | "into" | "over" | "out")
+                    ))
+            {
+                state.execution_state = "running";
+            }
+            claiming
+        };
+
         let action = arguments.get("action").and_then(Value::as_str).map(str::to_string);
-        let result = match registry.call(name, arguments) {
+        let outcome = registry.call(name, arguments);
+        let now_attached = registry.workbench.debugger.attached_pid;
+        let now_fp = registry.workbench.profile.fingerprint();
+        let now_host = registry.workbench.profile.host().to_owned();
+        drop(registry);
+
+        let mut state = lock(&self.debug);
+        state.cached_attached_pid = now_attached;
+        state.cached_profile_sha256 = now_fp;
+        state.cached_host = now_host;
+
+        let result = match outcome {
             Ok(result) => result,
             Err(error) => {
-                if control || (registry.workbench.debugger.attached_pid.is_none() && state.controller.is_some()) {
+                if control || (now_attached.is_none() && state.controller.is_some()) {
                     state.execution_state = "uncertain";
                 }
                 if claimed {
-                    state.publish(json!({"type": "session_error", "error": "Attach failed; inspect console before retrying",
-                        "console_state": "uncertain"}));
+                    state.publish(json!({
+                        "type": "session_error",
+                        "error": "Attach failed; inspect console before retrying",
+                        "console_state": "uncertain",
+                    }));
                 }
                 return Err(error);
             }
         };
+
         if matches!(name, "debug_attach" | "debug_detach") {
             state.event_failure = false;
         }
@@ -424,22 +730,254 @@ impl SessionHub {
             state.session_id = None;
             state.execution_state = "detached";
             state.last_stop = Value::Null;
+        } else if name == "debug_step" {
+            if let (Some(pid), Some(ev)) = (now_attached, result.get("event").cloned())
+                && ev.is_object()
+            {
+                let _ = state.publish_stop_event(pid, ev);
+            }
         } else if name == "debug_run" {
-            state.execution_state = "running";
-        } else if matches!(name, "debug_control" | "debug_step") {
+            if let (Some(pid), Some(stops)) = (now_attached, result.get("stops").and_then(Value::as_array)) {
+                for stop in stops {
+                    if let Some(ev) = stop.get("event").cloned()
+                        && ev.is_object()
+                    {
+                        let _ = state.publish_stop_event(pid, ev);
+                    }
+                }
+            }
+        } else if name == "debug_control" {
             match action.as_deref() {
                 Some("halt") => state.execution_state = "halting",
-                Some("resume" | "step" | "step_thread" | "into" | "over" | "out") => {
-                    state.execution_state = "running";
-                }
+                Some("resume" | "step" | "step_thread") => state.execution_state = "running",
                 _ => {}
             }
         }
         Ok(result)
     }
 
+    fn resolve_runtime_module(
+        &self,
+        pid: Option<u32>,
+        module: Option<&str>,
+        runtime_addr: Option<u64>,
+    ) -> Result<(Option<u64>, Option<u64>, Option<String>)> {
+        let mut reg = lock(&self.registry);
+        let Some(target_pid) = pid.or(reg.workbench.debugger.attached_pid) else {
+            return Ok((None, None, module.map(str::to_owned)));
+        };
+        let listing = reg.workbench.debugger.module_list(target_pid)?;
+        let Some(mods) = listing.as_array() else {
+            return Ok((None, None, module.map(str::to_owned)));
+        };
+        let parse_bounds = |m: &Value| -> Option<(u64, u64)> {
+            let b = m["base"]
+                .as_str()
+                .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())?;
+            let sz = m["size"].as_u64().unwrap_or(0);
+            Some((b, b.saturating_add(sz)))
+        };
+        let chosen = if let Some(want) = module {
+            let needle = want.to_ascii_lowercase();
+            mods.iter()
+                .find(|m| m["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(want)))
+                .or_else(|| {
+                    mods.iter()
+                        .find(|m| m["name"].as_str().is_some_and(|n| n.to_ascii_lowercase().contains(&needle)))
+                })
+        } else if let Some(rt) = runtime_addr {
+            mods.iter()
+                .find(|m| matches!(parse_bounds(m), Some((start, stop)) if start <= rt && rt < stop))
+        } else {
+            mods.iter()
+                .find(|m| m["name"].as_str() == Some("eboot.bin"))
+                .or_else(|| mods.first())
+        };
+        if let Some(m) = chosen
+            && let Some((b, e)) = parse_bounds(m)
+        {
+            return Ok((Some(b), Some(e), m["name"].as_str().map(str::to_owned)));
+        }
+        Ok((None, None, module.map(str::to_owned)))
+    }
+
+    fn sync_annotations(&self, arguments: &Map<String, Value>) -> Result<Value> {
+        let target = arguments
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("Missing target"))?;
+        let direction = arguments
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("bidirectional");
+        let pid = arguments.get("pid").and_then(Value::as_u64).map(|p| p as u32);
+        let module = arguments.get("module").and_then(Value::as_str);
+        let static_base = match arguments.get("static_base").and_then(Value::as_str) {
+            Some(s) => crate::agents::parse_address(s)?,
+            None => 0,
+        };
+        let max_items = arguments
+            .get("max_items")
+            .and_then(Value::as_u64)
+            .unwrap_or(100) as usize;
+
+        let (rt_base, rt_end, resolved_mod) = self.resolve_runtime_module(pid, module, None)?;
+        let effective_rt = rt_base.unwrap_or(static_base);
+        let mut imported_labels = 0usize;
+        let mut exported_renames = 0usize;
+        let mut exported_comments = 0usize;
+
+        if matches!(direction, "import_from_static" | "bidirectional") {
+            let mut offset = 0usize;
+            let mut to_set = Vec::new();
+            while offset < max_items {
+                let page_len = (max_items - offset).min(100);
+                let page = self.analysis.submit(
+                    target,
+                    "functions",
+                    json!({"offset": offset, "limit": page_len}),
+                    JOB_TIMEOUT,
+                )?;
+                let Some(items) = page.as_array() else {
+                    break;
+                };
+                if items.is_empty() {
+                    break;
+                }
+                for item in items {
+                    let Some(fn_name) = item.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if fn_name.is_empty()
+                        || fn_name.starts_with("sub_")
+                        || fn_name.starts_with("FUN_")
+                        || fn_name.starts_with("fcn.")
+                        || fn_name.starts_with("loc_")
+                    {
+                        continue;
+                    }
+                    let Some(addr_str) = item.get("address").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if let Ok(st_addr) = crate::agents::parse_address(addr_str)
+                        && st_addr >= static_base
+                    {
+                        let rt_addr = effective_rt.saturating_add(st_addr - static_base);
+                        to_set.push((fn_name.to_owned(), rt_addr));
+                    }
+                }
+                if items.len() < page_len {
+                    break;
+                }
+                offset += items.len();
+            }
+            if !to_set.is_empty() {
+                let mut reg = lock(&self.registry);
+                for (lbl, rt_addr) in to_set {
+                    let clean: String = lbl
+                        .chars()
+                        .map(|c| {
+                            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.') {
+                                c
+                            } else {
+                                '_'
+                            }
+                        })
+                        .take(128)
+                        .collect();
+                    if !clean.is_empty() && reg.workbench.debugger.label_set(&clean, rt_addr).is_ok() {
+                        imported_labels += 1;
+                    }
+                }
+            }
+        }
+
+        if matches!(direction, "export_to_static" | "bidirectional") {
+            let (labels, bps) = {
+                let reg = lock(&self.registry);
+                (
+                    reg.workbench.debugger.label_list(),
+                    reg.workbench.debugger.breakpoint_list(),
+                )
+            };
+            if let Some(items) = labels.as_array() {
+                for item in items.iter().take(max_items) {
+                    let (Some(lbl), Some(addr_str)) = (
+                        item.get("name").and_then(Value::as_str),
+                        item.get("address").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    let Ok(rt_addr) = crate::agents::parse_address(addr_str) else {
+                        continue;
+                    };
+                    if rt_addr < effective_rt || rt_end.is_some_and(|end| rt_addr >= end) {
+                        continue;
+                    }
+                    let st_addr = static_base.saturating_add(rt_addr - effective_rt);
+                    if self
+                        .analysis
+                        .submit(
+                            target,
+                            "rename",
+                            json!({"address": format!("{st_addr:#x}"), "name": lbl}),
+                            JOB_TIMEOUT,
+                        )
+                        .is_ok()
+                    {
+                        exported_renames += 1;
+                    }
+                }
+            }
+            if let Some(bp_items) = bps.as_array() {
+                for bp in bp_items.iter().take(max_items) {
+                    let Some(addr_str) = bp.get("address").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let Ok(rt_addr) = crate::agents::parse_address(addr_str) else {
+                        continue;
+                    };
+                    if rt_addr < effective_rt || rt_end.is_some_and(|end| rt_addr >= end) {
+                        continue;
+                    }
+                    let cond = bp.get("condition").and_then(Value::as_str).unwrap_or("");
+                    let log = bp.get("log").and_then(Value::as_str).unwrap_or("");
+                    if cond.is_empty() && log.is_empty() {
+                        continue;
+                    }
+                    let st_addr = static_base.saturating_add(rt_addr - effective_rt);
+                    let note = format!("PS4 BP cond={cond} log={log}");
+                    if self
+                        .analysis
+                        .submit(
+                            target,
+                            "comment",
+                            json!({"address": format!("{st_addr:#x}"), "text": note}),
+                            JOB_TIMEOUT,
+                        )
+                        .is_ok()
+                    {
+                        exported_comments += 1;
+                    }
+                }
+            }
+        }
+
+        Ok(json!({
+            "target": target,
+            "direction": direction,
+            "module": resolved_mod,
+            "runtime_base": format!("{effective_rt:#x}"),
+            "static_base": format!("{static_base:#x}"),
+            "imported_labels": imported_labels,
+            "exported_renames": exported_renames,
+            "exported_comments": exported_comments,
+        }))
+    }
+
     fn analysis_call(&self, name: &str, arguments: Value) -> Result<Value> {
-        let description = analysis_tools().into_iter()
+        let description = analysis_tools()
+            .into_iter()
             .find(|tool| tool["name"] == name)
             .ok_or_else(|| anyhow!("Unknown static-analysis tool"))?;
         validate(&arguments, &description["inputSchema"], "arguments")?;
@@ -447,9 +985,72 @@ impl SessionHub {
             return Ok(self.analysis.status());
         }
         let mut fields = arguments.as_object().cloned().unwrap_or_default();
-        let target = fields.remove("target").and_then(|value| value.as_str().map(str::to_string)).unwrap_or_default();
+        if name == "analysis_sync_annotations" {
+            return self.sync_annotations(&fields);
+        }
+        let target = fields
+            .remove("target")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let rt_arg = fields.remove("runtime_address");
+        let pid_arg = fields.remove("pid").and_then(|v| v.as_u64().map(|p| p as u32));
+        let mod_arg = fields.remove("module").and_then(|v| v.as_str().map(str::to_owned));
+        let sb_arg = fields.remove("static_base");
+
+        if !fields.contains_key("address")
+            && let Some(Value::String(rt_str)) = rt_arg
+        {
+            let rt_addr = crate::agents::parse_address(&rt_str)?;
+            let st_base = match sb_arg.as_ref().and_then(Value::as_str) {
+                Some(s) => crate::agents::parse_address(s)?,
+                None => 0,
+            };
+            let (Some(rt_base), _, _) =
+                self.resolve_runtime_module(pid_arg, mod_arg.as_deref(), Some(rt_addr))?
+            else {
+                bail!("Cannot rebase runtime_address without a matching live process module");
+            };
+            if rt_addr < rt_base {
+                bail!("runtime_address {rt_addr:#x} precedes module base {rt_base:#x}");
+            }
+            fields.insert(
+                "address".into(),
+                json!(format!("{:#x}", st_base.saturating_add(rt_addr - rt_base))),
+            );
+        }
+
         let operation = name.trim_start_matches("analysis_");
-        let result = self.analysis.submit(&target, operation, Value::Object(fields), JOB_TIMEOUT)?;
+        let mut result = self
+            .analysis
+            .submit(&target, operation, Value::Object(fields), JOB_TIMEOUT)?;
+
+        // Enrich Orbis NID imports automatically when returned by static analyzers.
+        if name == "analysis_imports"
+            && let Some(items) = result.as_array_mut()
+        {
+            for item in items {
+                let raw_name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_default();
+                if let Some((nid, lib_tag, mod_tag)) = crate::nid::split_orbis_symbol(&raw_name)
+                    && let Some(obj) = item.as_object_mut()
+                {
+                    obj.insert("nid".into(), json!(nid));
+                    if let Some(lt) = lib_tag {
+                        obj.insert("library_tag".into(), json!(lt));
+                    }
+                    if let Some(mt) = mod_tag {
+                        obj.insert("module_tag".into(), json!(mt));
+                    }
+                    if let Some(demangled) = crate::nid::lookup_nid(&raw_name, None) {
+                        obj.insert("resolved_symbol".into(), json!(demangled));
+                    }
+                }
+            }
+        }
+
         let encoded = python_json(&result, None, false);
         if encoded.len() > MAX_INLINE_RESULT {
             let store = lock(&self.registry).workbench.store.clone();
@@ -497,12 +1098,14 @@ impl SessionHub {
                 arguments.get("result").cloned().unwrap_or(Value::Null),
                 arguments.get("error").cloned().unwrap_or(Value::Null)),
             "release" => {
+                let attached = lock(&self.registry).workbench.debugger.attached_pid;
                 {
                     let mut state = lock(&self.debug);
+                    state.cached_attached_pid = attached;
                     if state.controller.as_deref() != Some(client) {
                         bail!("Only the controlling client can release its lease");
                     }
-                    if lock(&self.registry).workbench.debugger.attached_pid.is_some() {
+                    if attached.is_some() {
                         bail!("Detach before releasing debug control");
                     }
                     state.controller = None;
@@ -872,5 +1475,99 @@ mod tests {
         assert!(validate(&json!({"pid": 1, "address": "0xZZ"}), &schema, "arguments").is_err());
         assert!(validate(&json!({"pid": 1, "other": 1}), &schema, "arguments").unwrap_err().to_string().contains("Unknown"));
         assert!(validate(&json!([]), &schema, "arguments").is_err());
+
+        let num_schema = json!({"type": "object", "properties": {
+            "tolerance": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "registers": {"type": "object"}
+        }, "additionalProperties": false});
+        assert!(validate(&json!({"tolerance": 0.25, "registers": {"xmm0": "00"}}), &num_schema, "arguments").is_ok());
+        assert!(validate(&json!({"tolerance": 1, "registers": {}}), &num_schema, "arguments").is_ok());
+        assert!(validate(&json!({"tolerance": 1.5}), &num_schema, "arguments").is_err());
+        assert!(validate(&json!({"tolerance": true}), &num_schema, "arguments").is_err());
+        assert!(validate(&json!({"registers": [1, 2]}), &num_schema, "arguments").is_err());
+    }
+
+    #[test]
+    fn imports_nid_demangling_and_bidirectional_annotation_sync() {
+        let fixture = fixture();
+        let running = run(fixture.hub.clone(), fixture.token.clone());
+        let agent = BrokerClient::new(&running.url, &fixture.token_path, "ida-agent-1", None).unwrap();
+        agent.request("agent_register", json!({"target": "ida", "program": "b".repeat(64)})).unwrap();
+        let caller = BrokerClient::new(&running.url, &fixture.token_path, "mcp-sync", None).unwrap();
+
+        // Seed a runtime label in the debugger so bidirectional sync exports it to IDA.
+        caller.call("debug_label", json!({"action": "set", "name": "player_tick", "address": "0x402000"})).unwrap();
+
+        // 1. Test analysis_imports Orbis NID demangling (`sceKernelUsleep` -> `Q3xaNI1RVdc`).
+        let caller_imp = caller.clone();
+        let imp_handle = std::thread::spawn(move || {
+            caller_imp.call("analysis_imports", json!({"target": "ida", "limit": 10}))
+        });
+        let job = loop {
+            let j = agent.request("agent_poll", json!({"target": "ida"})).unwrap();
+            if !j.is_null() {
+                break j;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(job["operation"], "imports");
+        let nid = crate::nid::encode_nid("sceKernelUsleep");
+        agent.request("agent_result", json!({
+            "identifier": job["id"],
+            "result": [{"address": "0x1080", "name": format!("{nid}#A#B"), "library": "libkernel"}]
+        })).unwrap();
+        let enriched = imp_handle.join().unwrap().unwrap();
+        assert_eq!(enriched[0]["nid"], nid);
+        assert_eq!(enriched[0]["resolved_symbol"], "sceKernelUsleep");
+
+        // 2. Test analysis_sync_annotations bidirectional sync with static_base rebasing.
+        let caller_sync = caller.clone();
+        let sync_handle = std::thread::spawn(move || {
+            caller_sync.call("analysis_sync_annotations", json!({
+                "target": "ida",
+                "direction": "bidirectional",
+                "static_base": "0x400000",
+                "max_items": 10
+            }))
+        });
+
+        // Agent serves `functions` first, then `rename` for `player_tick`.
+        let mut saw_rename = false;
+        for _ in 0..2 {
+            let j = loop {
+                let polled = agent.request("agent_poll", json!({"target": "ida"})).unwrap();
+                if !polled.is_null() {
+                    break polled;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            match j["operation"].as_str().unwrap() {
+                "functions" => {
+                    agent.request("agent_result", json!({
+                        "identifier": j["id"],
+                        "result": [
+                            {"address": "0x401000", "name": "sub_401000"},
+                            {"address": "0x401500", "name": "orbis_main"}
+                        ]
+                    })).unwrap();
+                }
+                "rename" => {
+                    assert_eq!(j["arguments"]["name"], "player_tick");
+                    assert_eq!(j["arguments"]["address"], "0x402000");
+                    saw_rename = true;
+                    agent.request("agent_result", json!({
+                        "identifier": j["id"],
+                        "result": {"address": "0x402000", "name": "player_tick"}
+                    })).unwrap();
+                }
+                other => panic!("Unexpected sync operation: {other}"),
+            }
+        }
+        let summary = sync_handle.join().unwrap().unwrap();
+        assert!(saw_rename);
+        assert_eq!(summary["imported_labels"], 1);
+        assert_eq!(summary["exported_renames"], 1);
+        let labels = caller.call("debug_label", json!({"action": "list"})).unwrap();
+        assert!(labels.as_array().unwrap().iter().any(|l| l["name"] == "orbis_main" && l["address"] == "0x401500"));
     }
 }

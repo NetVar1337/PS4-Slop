@@ -15,8 +15,13 @@ from .config import WorkbenchError, require_integer
 
 
 MAX_BODY = 1048576
-CONTROL_TOOLS = {"debug_attach", "debug_control", "debug_breakpoint", "debug_watchpoint",
-                 "memory_write", "kernel_write", "debug_detach"}
+CONTROL_TOOLS = {
+    "debug_attach", "debug_control", "debug_breakpoint", "debug_watchpoint",
+    "memory_write", "kernel_write", "debug_detach", "debug_step", "debug_run",
+    "debug_registers_set", "debug_registers_fpu_set", "debug_tls_set",
+    "debug_breakpoint_load", "memory_patch", "patch_restore", "memory_alloc",
+    "memory_free", "memory_protect",
+}
 
 
 def token_file(profile):
@@ -107,26 +112,110 @@ class SessionHub:
                     "last_stop": self.last_stop,
                     "hardware_compatibility_guaranteed": False}
 
+    def _resolve_runtime_base(self, pid=None, module=None, runtime_addr=None):
+        debugger = self.registry.workbench.debugger
+        target_pid = pid if pid is not None else debugger.attached_pid
+        if target_pid is None:
+            return None, module
+        mappings = debugger.maps(target_pid)
+        if not isinstance(mappings, list) or not mappings:
+            return None, module
+        from .rsp import numeric
+        by_mod = {}
+        for entry in mappings:
+            name = str(entry.get("name") or "anonymous")
+            start, end = numeric(entry["start"]), numeric(entry["end"])
+            if name not in by_mod:
+                by_mod[name] = [start, end]
+            else:
+                by_mod[name][0] = min(by_mod[name][0], start)
+                by_mod[name][1] = max(by_mod[name][1], end)
+        if module:
+            needle = module.lower()
+            for name, (start, _) in by_mod.items():
+                if name.lower() == needle or needle in name.lower():
+                    return start, name
+        if runtime_addr is not None:
+            for name, (start, end) in by_mod.items():
+                if start <= runtime_addr < end:
+                    return start, name
+        if "eboot.bin" in by_mod:
+            return by_mod["eboot.bin"][0], "eboot.bin"
+        first_name = next(iter(by_mod))
+        return by_mod[first_name][0], first_name
+
+    def _analysis_call(self, name, arguments):
+        from .tools import parse_address, validate
+        description = next((tool for tool in analysis_tools() if tool["name"] == name), None)
+        if description is None:
+            raise WorkbenchError("Unknown static-analysis tool")
+        validate(arguments, description["inputSchema"])
+        if name == "analysis_status":
+            return self.analysis.status()
+        if name == "analysis_sync_annotations":
+            target = arguments["target"]
+            direction = arguments.get("direction", "bidirectional")
+            static_base = parse_address(arguments.get("static_base", "0x0"))
+            max_items = arguments.get("max_items", 100)
+            rt_base, mod_name = self._resolve_runtime_base(arguments.get("pid"), arguments.get("module"))
+            effective_rt = rt_base if rt_base is not None else static_base
+            debugger = self.registry.workbench.debugger
+            labels = getattr(debugger, "labels", None)
+            if labels is None:
+                labels = {}
+                debugger.labels = labels
+            imported = 0
+            exported_renames = 0
+            if direction in ("import_from_static", "bidirectional"):
+                funcs = self.analysis.submit(target, "functions", {"offset": 0, "limit": min(max_items, 100)}) or []
+                for fn in funcs[:max_items]:
+                    fn_name = str(fn.get("name", ""))
+                    if not fn_name or fn_name.startswith(("sub_", "FUN_", "fcn.", "loc_")):
+                        continue
+                    st_addr = parse_address(str(fn["address"]))
+                    if st_addr >= static_base:
+                        labels[fn_name] = effective_rt + (st_addr - static_base)
+                        imported += 1
+            if direction in ("export_to_static", "bidirectional"):
+                for lbl_name, rt_addr in list(labels.items())[:max_items]:
+                    if rt_addr >= effective_rt:
+                        st_addr = static_base + (rt_addr - effective_rt)
+                        self.analysis.submit(target, "rename", {"address": hex(st_addr), "name": lbl_name})
+                        exported_renames += 1
+            return {
+                "target": target,
+                "direction": direction,
+                "module": mod_name,
+                "runtime_base": hex(effective_rt),
+                "static_base": hex(static_base),
+                "imported_labels": imported,
+                "exported_renames": exported_renames,
+            }
+        fields = {k: v for k, v in arguments.items() if k not in ("target", "runtime_address", "pid", "module", "static_base")}
+        if "address" not in fields and "runtime_address" in arguments:
+            rt_addr = parse_address(arguments["runtime_address"])
+            st_base = parse_address(arguments.get("static_base", "0x0"))
+            rt_base, _ = self._resolve_runtime_base(arguments.get("pid"), arguments.get("module"), rt_addr)
+            if rt_base is None or rt_addr < rt_base:
+                raise WorkbenchError("Cannot rebase runtime_address without a matching live process module")
+            fields["address"] = hex(st_base + (rt_addr - rt_base))
+        result = self.analysis.submit(arguments["target"], name.removeprefix("analysis_"), fields)
+        encoded = json.dumps(result, ensure_ascii=True, allow_nan=False).encode()
+        if len(encoded) > 24576:
+            return {"result_saved": self.registry.workbench.store.save("static-analysis", encoded, {"tool": name}, "json")}
+        return result
+
     def call(self, client, name, arguments):
         if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,96}", client):
             raise WorkbenchError("Use a simple unique broker client identifier")
         if name == "debug_events":
             raise WorkbenchError("Shared events use events_since(cursor); draining the callback is broker-owned")
         if name.startswith("analysis_"):
-            from .tools import validate
-            description = next((tool for tool in analysis_tools() if tool["name"] == name), None)
-            if description is None:
-                raise WorkbenchError("Unknown static-analysis tool")
-            validate(arguments, description["inputSchema"])
-            if name == "analysis_status":
-                return self.analysis.status()
-            result = self.analysis.submit(arguments["target"], name.removeprefix("analysis_"),
-                                          {key: value for key, value in arguments.items() if key != "target"})
-            encoded = json.dumps(result, ensure_ascii=True, allow_nan=False).encode()
-            if len(encoded) > 24576:
-                return {"result_saved": self.registry.workbench.store.save("static-analysis", encoded, {"tool": name}, "json")}
-            return result
-        shared = name.startswith(("debug_", "process_", "memory_", "kernel_")) or name in ("debugger_info", "address_correlate", "payload_execute")
+            return self._analysis_call(name, arguments)
+        shared = (
+            name.startswith(("debug_", "process_", "memory_", "kernel_", "patch_"))
+            or name in ("debugger_info", "address_correlate", "address_rebase", "disassemble", "module_list", "code_xrefs", "payload_execute")
+        )
         if not shared:
             return self.registry.call(name, arguments)
         with self.debug_lock:
@@ -200,21 +289,43 @@ class SessionHub:
 
 
 def analysis_tools():
-    from .tools import ADDRESS, integer, text
+    from .tools import ADDRESS, PID, integer, text
     target = text("Live static-analysis application", enum=["ida", "ghidra", "binja", "iaito"])
+    rebase_fields = {
+        "runtime_address": ADDRESS,
+        "pid": PID,
+        "module": text("Module name for runtime_address rebasing", 256, minLength=1),
+        "static_base": ADDRESS,
+    }
     operations = [
-        ("analysis_status", "Connected IDA/Ghidra analysis agents; no application is launched automatically.", {}, []),
-        ("analysis_decompile", "Decompile a function in a connected IDA/Ghidra database. Address is STATIC, not a runtime VA.",
-         {"target": target, "address": ADDRESS}, ["target", "address"]),
+        ("analysis_status", "Connected IDA/Ghidra/Binary Ninja/iaito analysis agents; no application is launched automatically.", {}, [], True),
+        ("analysis_decompile", "Decompile a function in a connected IDA/Ghidra/Binary Ninja/iaito database (supply static address or runtime_address).",
+         {"target": target, "address": ADDRESS, **rebase_fields}, ["target"], True),
         ("analysis_functions", "List a bounded page of functions from a connected static-analysis database.",
-         {"target": target, "offset": integer(0, 1000000), "limit": integer(1, 100)}, ["target"]),
-        ("analysis_xrefs", "List bounded references to a static database address.",
-         {"target": target, "address": ADDRESS, "limit": integer(1, 100)}, ["target", "address"])
+         {"target": target, "offset": integer(0, 1000000), "limit": integer(1, 100), "filter": text("Substring filter", 256, minLength=1)}, ["target"], True),
+        ("analysis_xrefs", "List bounded references to/from a static database address.",
+         {"target": target, "address": ADDRESS, **rebase_fields, "limit": integer(1, 100),
+          "direction": text("Reference direction", enum=["to", "from", "both"])}, ["target"], True),
+        ("analysis_disasm", "Disassemble instructions at a static database address.",
+         {"target": target, "address": ADDRESS, **rebase_fields, "count": integer(1, 256)}, ["target"], True),
+        ("analysis_strings", "List strings in a connected static-analysis database.",
+         {"target": target, "offset": integer(0, 1000000), "limit": integer(1, 100),
+          "filter": text("Substring filter", 256, minLength=1), "min_length": integer(1, 256)}, ["target"], True),
+        ("analysis_imports", "List imported symbols in a connected static-analysis database (with Orbis NID demangling when available).",
+         {"target": target, "offset": integer(0, 1000000), "limit": integer(1, 100),
+          "filter": text("Substring filter", 256, minLength=1)}, ["target"], True),
+        ("analysis_rename", "Rename a function or label in a connected static-analysis database (does not touch console).",
+         {"target": target, "address": ADDRESS, **rebase_fields, "name": text("New symbol name", 256, minLength=1)}, ["target", "name"], False),
+        ("analysis_comment", "Set or clear an address comment in a connected static-analysis database (does not touch console).",
+         {"target": target, "address": ADDRESS, **rebase_fields, "text": text("Comment text", 2048)}, ["target", "text"], False),
+        ("analysis_sync_annotations", "Synchronize debugger labels/breakpoints and static-analysis function names/comments with automatic ASLR rebasing.",
+         {"target": target, "direction": text("Sync direction", enum=["import_from_static", "export_to_static", "bidirectional"]),
+          "pid": PID, "module": text("Module name", 256, minLength=1), "static_base": ADDRESS, "max_items": integer(1, 500)}, ["target"], False),
     ]
     return [{"name": name, "description": description,
              "inputSchema": {"type": "object", "properties": properties, "required": required, "additionalProperties": False},
-             "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": True}}
-            for name, description, properties, required in operations]
+             "annotations": {"readOnlyHint": read_only, "destructiveHint": False, "openWorldHint": True}}
+            for name, description, properties, required, read_only in operations]
 
 
 class BrokerServer(ThreadingHTTPServer):

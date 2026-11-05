@@ -54,16 +54,55 @@ class IaitoWorkbench(LiveAnalysis):
         return _sha256_file(self.path)
 
     def analyze(self, operation, arguments):
+        import base64
+        import re
         from ..tools import parse_address
         expected = getattr(self, "expected_program_hash", None)
         digest = self.input_hash()
         if expected and digest != expected:
             raise WorkbenchError("iaito input file changed; stop and restart its analysis agent")
+        flt = (arguments.get("filter") or "").lower()
         if operation == "functions":
             offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
             functions = self.r2.cmdj("aflj") or []
-            return [{"address": hex(int(entry.get("offset", 0))), "name": str(entry.get("name", ""))[:256]}
-                    for entry in functions[offset:offset + limit]]
+            items = [
+                {"address": hex(int(entry.get("offset", 0))), "name": str(entry.get("name", ""))[:256]}
+                for entry in functions
+                if not flt or flt in str(entry.get("name", "")).lower()
+            ]
+            return items[offset:offset + limit]
+        if operation == "strings":
+            offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
+            min_len = arguments.get("min_length", 4)
+            entries = self.r2.cmdj("izj") or []
+            items = []
+            for entry in entries:
+                val = str(entry.get("string", ""))
+                length = int(entry.get("length", len(val)))
+                if length < min_len or (flt and flt not in val.lower()):
+                    continue
+                items.append({
+                    "address": hex(int(entry.get("vaddr", entry.get("paddr", 0)))),
+                    "length": length,
+                    "value": val[:512],
+                })
+            return items[offset:offset + limit]
+        if operation == "imports":
+            offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
+            entries = self.r2.cmdj("iij") or []
+            items = []
+            for entry in entries:
+                sym_name = str(entry.get("name", ""))
+                lib_name = str(entry.get("libname", ""))
+                if flt and flt not in sym_name.lower() and flt not in lib_name.lower():
+                    continue
+                items.append({
+                    "address": hex(int(entry.get("plt", 0))),
+                    "name": sym_name[:256],
+                    "library": lib_name[:128],
+                    "ordinal": int(entry.get("ordinal", 0)),
+                })
+            return items[offset:offset + limit]
         address = parse_address(arguments["address"])
         where = hex(address)
         if operation == "decompile":
@@ -75,7 +114,43 @@ class IaitoWorkbench(LiveAnalysis):
             return {"address": where, **clipped(text)}
         if operation == "xrefs":
             limit = arguments.get("limit", 100)
-            refs = self.r2.cmdj(f"axtj @ {where}") or []
-            return [{"from": hex(int(ref.get("from", 0))), "to": hex(int(ref.get("to", address))),
-                     "type": str(ref.get("type", ""))} for ref in refs[:limit]]
+            direction = arguments.get("direction", "to")
+            out = []
+            if direction in ("to", "both"):
+                refs = self.r2.cmdj(f"axtj @ {where}") or []
+                for ref in refs[:limit]:
+                    out.append({"from": hex(int(ref.get("from", 0))), "to": hex(int(ref.get("to", address))),
+                                "type": str(ref.get("type", "")), "direction": "to"})
+            if direction in ("from", "both") and len(out) < limit:
+                refs = self.r2.cmdj(f"axfj @ {where}") or []
+                for ref in refs[:limit - len(out)]:
+                    out.append({"from": hex(int(ref.get("from", address))), "to": hex(int(ref.get("to", 0))),
+                                "type": str(ref.get("type", "")), "direction": "from"})
+            return out
+        if operation == "disasm":
+            count = int(arguments.get("count", 32))
+            entries = self.r2.cmdj(f"pdj {count} @ {where}") or []
+            insns = [
+                {
+                    "address": hex(int(entry.get("offset", 0))),
+                    "size": int(entry.get("size", 0)),
+                    "text": str(entry.get("disasm", entry.get("opcode", "")))[:256],
+                }
+                for entry in entries
+            ]
+            return {"address": where, "instructions": insns}
+        if operation == "rename":
+            name = arguments["name"]
+            if not re.fullmatch(r"[A-Za-z0-9_.$@?:+-]{1,256}", name):
+                raise WorkbenchError("Invalid r2 identifier")
+            self.r2.cmd(f"afn {name} @ {where}")
+            return {"address": where, "name": name, "applied": True}
+        if operation == "comment":
+            text = arguments["text"]
+            if text:
+                encoded = base64.b64encode(text.encode("utf-8")).decode("ascii")
+                self.r2.cmd(f"CCu base64:{encoded} @ {where}")
+            else:
+                self.r2.cmd(f"CC- @ {where}")
+            return {"address": where, "text": text, "applied": True}
         raise WorkbenchError("Unsupported iaito analysis operation")

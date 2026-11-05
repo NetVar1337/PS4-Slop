@@ -1778,169 +1778,828 @@
      "maxLength": 20,
      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
     },
-    "max_results": {
-     "type": "integer",
-     "minimum": 1,
-     "maximum": 1024
-    }
+     "max_results": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1024
+     },
+     "module": {
+      "type": "string",
+      "description": "Optional module name filter (e.g. eboot.bin)",
+      "minLength": 1,
+      "maxLength": 256
+     },
+     "address": {
+      "type": "string",
+      "description": "Optional scan start address to restrict search range",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 67108864
+     }
+    },
+    "required": [
+     "pid",
+     "target_address"
+    ],
+    "additionalProperties": false
    },
-   "required": [
-    "pid",
-    "target_address"
-   ],
-   "additionalProperties": false
-  },
-  "annotations": {
-   "readOnlyHint": true,
-   "destructiveHint": false,
-   "idempotentHint": false,
-   "openWorldHint": true
-  },
-  "permission": null
- },
- {
-  "name": "memory_search",
-  "description": "Live pattern search (hex bytes with ?? wildcards) over a bounded readable range; the scan runs locally on chunked reads.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "pid": {
-     "type": "integer",
-     "minimum": 1,
-     "maximum": 2147483647
-    },
-    "address": {
-     "type": "string",
-     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-     "maxLength": 20,
-     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-    },
-    "length": {
-     "type": "integer",
-     "minimum": 1,
-     "maximum": 1048576
-    },
-    "pattern": {
-     "type": "string",
-     "minLength": 1,
-     "maxLength": 1024
-    },
-    "max_results": {
-     "type": "integer",
-     "minimum": 1,
-     "maximum": 4096
-    }
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
    },
-   "required": [
-    "pid",
-    "address",
-    "length",
-    "pattern"
-   ],
-   "additionalProperties": false
+   "permission": null
   },
-  "annotations": {
-   "readOnlyHint": true,
-   "destructiveHint": false,
-   "idempotentHint": false,
-   "openWorldHint": true
-  },
-  "permission": null
- },
- {
-  "name": "debug_label",
-  "description": "Set/remove/list host-side labels used by debug_eval and disassembly annotations (e.g. a function name at an address). Local only; no console mutation.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "action": {
-     "type": "string",
-     "enum": [
-      "set",
-      "remove",
-      "list"
-     ]
+  {
+   "name": "memory_search",
+   "description": "Live pattern search (hex bytes with ?? wildcards) over a bounded readable range; the scan runs locally on chunked reads.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "address": {
+      "type": "string",
+      "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1048576
+     },
+     "pattern": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+     },
+     "max_results": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+     }
     },
-    "name": {
-     "type": "string",
-     "minLength": 1,
-     "maxLength": 128
+    "required": [
+     "pid",
+     "address",
+     "length",
+     "pattern"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
+  },
+  {
+   "name": "debug_label",
+   "description": "Set/remove/list host-side labels used by debug_eval and disassembly annotations (e.g. a function name at an address). Local only; no console mutation.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "action": {
+      "type": "string",
+      "enum": [
+       "set",
+       "remove",
+       "list"
+      ]
+     },
+     "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+     },
+     "address": {
+      "type": "string",
+      "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
     },
-    "address": {
-     "type": "string",
-     "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
-     "maxLength": 20,
-     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
-    }
+    "required": [
+     "action"
+    ],
+    "additionalProperties": false
    },
-   "required": [
-    "action"
-   ],
-   "additionalProperties": false
-  },
-  "annotations": {
-   "readOnlyHint": false,
-   "destructiveHint": false,
-   "idempotentHint": false,
-   "openWorldHint": true
-  },
-  "permission": null
- },
- {
-  "name": "debug_breakpoint_save",
-  "description": "Export tracked breakpoints (with condition/log/stop_after/hits) and watchpoints as a versioned JSON document.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {},
-   "required": [],
-   "additionalProperties": false
-  },
-  "annotations": {
-   "readOnlyHint": true,
-   "destructiveHint": false,
-   "idempotentHint": false,
-   "openWorldHint": true
-  },
-  "permission": null
- },
- {
-  "name": "debug_breakpoint_load",
-  "description": "Re-apply a document from debug_breakpoint_save; sets/clears console breakpoint and watchpoint slots.",
-  "inputSchema": {
-   "type": "object",
-   "properties": {
-    "document": {
-     "type": "object"
-    }
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
    },
-   "required": [
-    "document"
-   ],
-   "additionalProperties": false
+   "permission": null
   },
-  "annotations": {
-   "readOnlyHint": false,
-   "destructiveHint": true,
-   "idempotentHint": false,
-   "openWorldHint": true
+  {
+   "name": "debug_breakpoint_save",
+   "description": "Export tracked breakpoints (with condition/log/stop_after/hits) and watchpoints as a versioned JSON document.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
   },
-  "permission": "debug_control"
- },
- {
-  "name": "debug_watchpoint_list",
-  "description": "List tracked hardware watchpoints (slot, address, length, access).",
-  "inputSchema": {
-   "type": "object",
-   "properties": {},
-   "required": [],
-   "additionalProperties": false
+  {
+   "name": "debug_breakpoint_load",
+   "description": "Re-apply a document from debug_breakpoint_save; sets/clears console breakpoint and watchpoint slots.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "document": {
+      "type": "object"
+     }
+    },
+    "required": [
+     "document"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "debug_control"
   },
-  "annotations": {
-   "readOnlyHint": true,
-   "destructiveHint": false,
-   "idempotentHint": false,
-   "openWorldHint": true
+  {
+   "name": "debug_watchpoint_list",
+   "description": "List tracked hardware watchpoints (slot, address, length, access).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
   },
-  "permission": null
- }
+  {
+   "name": "assemble",
+   "description": "Host-side x86-64 Intel-syntax assembler with labels, RIP-relative addressing, FS/GS segment prefixes, SSE, and db/dw/dd/dq directives. Purely local; never touches the console.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "assembly": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384
+     },
+     "base_address": {
+      "type": "string",
+      "description": "Target virtual address for relative branches and RIP-relative displacements (default 0x0)",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
+    },
+    "required": [
+     "assembly"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+   },
+   "permission": null
+  },
+  {
+   "name": "memory_patch",
+   "description": "Assemble x86-64 instructions or decode hex bytes at a live process address, optionally NOP-pad to the overwritten instruction boundary, save a prewrite backup, write, and verify readback.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "address": {
+      "type": "string",
+      "description": "Unsigned address, e.g. 0x401000",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "assembly": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 16384
+     },
+     "data_hex": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 8192
+     },
+     "nop_pad": {
+      "type": "boolean"
+     },
+     "comment": {
+      "type": "string",
+      "maxLength": 512
+     }
+    },
+    "required": [
+     "pid",
+     "address"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "process_write"
+  },
+  {
+   "name": "patch_list",
+   "description": "List all recorded memory patches in this session (id, pid, address, original_hex, patched_hex, active, comment).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     }
+    },
+    "required": [],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+   },
+   "permission": null
+  },
+  {
+   "name": "patch_restore",
+   "description": "Restore the original bytes of a recorded session patch by id and verify via readback.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     }
+    },
+    "required": [
+     "id"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "process_write"
+  },
+  {
+   "name": "memory_scan",
+   "description": "Stateful multi-pass live memory value scanner (first, next, get, list, reset) supporting integers, floats, strings, and byte patterns across readable/writable mappings.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "action": {
+      "type": "string",
+      "enum": [
+       "first",
+       "next",
+       "get",
+       "list",
+       "reset"
+      ]
+     },
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "session_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+     },
+     "value_type": {
+      "type": "string",
+      "enum": [
+       "u8",
+       "i8",
+       "u16",
+       "i16",
+       "u32",
+       "i32",
+       "u64",
+       "i64",
+       "f32",
+       "f64",
+       "utf8",
+       "utf16",
+       "bytes"
+      ]
+     },
+     "comparison": {
+      "type": "string",
+      "enum": [
+       "exact",
+       "bigger",
+       "smaller",
+       "between",
+       "changed",
+       "unchanged",
+       "increased",
+       "decreased",
+       "unknown_initial"
+      ]
+     },
+     "value": {
+      "type": "string",
+      "maxLength": 1024
+     },
+     "value_max": {
+      "type": "string",
+      "maxLength": 1024
+     },
+     "module": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+     },
+     "address": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 268435456
+     },
+     "writable_only": {
+      "type": "boolean"
+     },
+     "case_insensitive": {
+      "type": "boolean"
+     },
+     "alignment": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 64
+     },
+     "float_epsilon": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1000000
+     },
+     "max_candidates": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000000
+     },
+     "refresh": {
+      "type": "boolean"
+     },
+     "offset": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000000
+     },
+     "limit": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 1000
+     }
+    },
+    "required": [
+     "action"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
+  },
+  {
+   "name": "memory_alloc",
+   "description": "Allocate RWX virtual memory in a target process via CMD_PROC_ALLOC (0xBDAA000B) or hinted allocation (0xBDAA000E) for code caves and trampolines.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 67108864
+     },
+     "address_hint": {
+      "type": "string",
+      "description": "Optional page-aligned target address hint (uses 0xBDAA000E)",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
+    },
+    "required": [
+     "pid",
+     "length"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "process_write"
+  },
+  {
+   "name": "memory_free",
+   "description": "Free virtual memory in a target process via CMD_PROC_FREE (0xBDAA000C).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "address": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 67108864
+     }
+    },
+    "required": [
+     "pid",
+     "address",
+     "length"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "process_write"
+  },
+  {
+   "name": "memory_protect",
+   "description": "Change page protection (VM_PROT_READ=1, WRITE=2, EXECUTE=4, 0..=7) via CMD_PROC_PROTECT (0xBDAA0008) with maps readback verification.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "address": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 268435456
+     },
+     "protection": {
+      "type": "integer",
+      "description": "Bitmask of VM_PROT_READ(1) | VM_PROT_WRITE(2) | VM_PROT_EXECUTE(4)",
+      "minimum": 0,
+      "maximum": 7
+     }
+    },
+    "required": [
+     "pid",
+     "address",
+     "length",
+     "protection"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "process_write"
+  },
+  {
+   "name": "memory_elf_dump",
+   "description": "Reconstruct an offline-analyzable ELF64 binary from a live decrypted PS4 module (eboot.bin or .sprx) by dumping its in-memory PT_LOAD segments into the artifact store.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "module": {
+      "type": "string",
+      "description": "Module name (e.g. eboot.bin or libScePad.sprx); defaults to eboot.bin",
+      "minLength": 1,
+      "maxLength": 256
+     },
+     "base_address": {
+      "type": "string",
+      "description": "Explicit ELF header base address override",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
+    },
+    "required": [
+     "pid"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
+  },
+  {
+   "name": "debug_registers_fpu_set",
+   "description": "Modify x87/XMM0-15/YMM_HIGH0-15/MXCSR registers via 832-byte savefpu_ymm read-modify-write (0xBDBB000B) with readback verification.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "thread_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "changes": {
+      "type": "object",
+      "description": "Map of register names (xmm0..xmm15, ymm0_high..ymm15_high, st0..st7, mxcsr, fcw, fsw) to hex strings, scalar floats, or {\"f32\":[...]} / {\"f64\":[...]}"
+     }
+    },
+    "required": [
+     "thread_id",
+     "changes"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "debug_control"
+  },
+  {
+   "name": "debug_tls",
+   "description": "Read FSBASE (Orbis pthread TLS) and GSBASE for a thread via CMD_DEBUG_GETTLS (0xBDBB000E).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "thread_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     }
+    },
+    "required": [
+     "thread_id"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+   },
+   "permission": null
+  },
+  {
+   "name": "debug_tls_set",
+   "description": "Write FSBASE and/or GSBASE for a thread via CMD_DEBUG_SETTLS (0xBDBB000F) with readback verification.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "thread_id": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "fsbase": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "gsbase": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
+    },
+    "required": [
+     "thread_id"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": "debug_control"
+  },
+  {
+   "name": "debug_label_save",
+   "description": "Save all host-side debugger labels to a contained JSON artifact in the artifact store.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {},
+    "required": [],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": false
+   },
+   "permission": null
+  },
+  {
+   "name": "debug_label_load",
+   "description": "Load host-side debugger labels from a saved JSON artifact (replaces existing labels unless merge=true).",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "artifact": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+     },
+     "merge": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "artifact"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": false,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": false
+   },
+   "permission": null
+  },
+  {
+   "name": "nid_resolve",
+   "description": "Compute Orbis OS 11-char SHA-1 NIDs from symbol names and/or demangle NIDs (bare or NID#lib#mod) using the built-in PS4 SDK corpus and optional custom dictionary artifact.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "symbols": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 512
+      }
+     },
+     "nids": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+       "type": "string",
+       "minLength": 1,
+       "maxLength": 512
+      }
+     },
+     "dictionary_artifact": {
+      "type": "string",
+      "description": "Optional relative artifact path to a JSON or line-delimited NID dictionary",
+      "minLength": 1,
+      "maxLength": 1024
+     }
+    },
+    "required": [],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": false
+   },
+   "permission": null
+  },
+  {
+   "name": "address_rebase",
+   "description": "Translate addresses bidirectionally between live ASLR runtime VA, static analyzer VA (0x0, 0x100000, 0x400000, or ELF image_base), and module+offset.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "module": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+     },
+     "runtime_address": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "static_address": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "offset": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "static_base": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     },
+     "artifact": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024
+     }
+    },
+    "required": [],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
+    "openWorldHint": true
+   },
+   "permission": null
+  }
 ]

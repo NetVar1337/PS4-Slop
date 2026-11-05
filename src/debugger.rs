@@ -8,7 +8,7 @@ use std::{
 };
 
 mod ops;
-pub use ops::BreakpointRecord;
+pub use ops::{BreakpointRecord, PatchRecord, parse_protection_spec};
 
 #[derive(Debug, Clone)]
 pub struct WatchpointRecord {
@@ -21,6 +21,7 @@ pub struct WatchpointRecord {
 
 pub const MAGIC: u32 = 0xffaabbcc;
 pub const SUCCESS: u32 = 0x80000000;
+pub const CMD_DATA_NULL: u32 = 0xf0000003;
 pub const EVENT_SIZE: usize = 1184;
 
 pub fn address_range(address: u64, length: usize, maximum: usize) -> Result<()> {
@@ -94,6 +95,10 @@ pub struct Debugger {
     pub watchpoints: std::collections::BTreeMap<u32, WatchpointRecord>,
     stash: Vec<Value>,
     pub labels: std::collections::BTreeMap<String, u64>,
+    pub patches: std::collections::BTreeMap<u32, PatchRecord>,
+    next_patch_id: u32,
+    pub scans: crate::scanner::ScanBook,
+    eh_cache: std::collections::HashMap<(u32, u64), Option<(u64, Vec<u8>)>>,
 }
 
 impl Debugger {
@@ -110,6 +115,10 @@ impl Debugger {
             watchpoints: Default::default(),
             stash: Vec::new(),
             labels: Default::default(),
+            patches: Default::default(),
+            next_patch_id: 1,
+            scans: Default::default(),
+            eh_cache: Default::default(),
         }
     }
 
@@ -121,6 +130,7 @@ impl Debugger {
         self.breakpoints.clear();
         self.watchpoints.clear();
         self.event_buffer.clear();
+        self.eh_cache.clear();
     }
 
     fn socket(&self) -> Result<&TcpStream> {
@@ -173,6 +183,36 @@ impl Debugger {
             "Debugger rejected command: {status:#010x}"
         );
         Ok(())
+    }
+
+    /// Upstream `ps4debug-NG@8be828fe` `proc_protect_handle` (`proc.c:830-848`) omits
+    /// `return 0;` after sending `CMD_SUCCESS`, falling through to emit a trailing
+    /// 4-byte `CMD_DATA_NULL (0xF0000003)` on the persistent command socket. Drain it
+    /// with a short timeout so both unpatched `8be828fe` and patched builds stay in sync.
+    fn drain_optional_trailing_status(&self) -> Result<Option<u32>> {
+        let connection = self.connection.as_ref().context("No debugger connection")?;
+        connection.set_read_timeout(Some(std::time::Duration::from_millis(60)))?;
+        let mut buf = [0u8; 4];
+        let mut offset = 0usize;
+        while offset < 4 {
+            match (&*connection).read(&mut buf[offset..]) {
+                Ok(0) => bail!("Debugger disconnected after status"),
+                Ok(n) => offset += n,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if offset == 0 {
+                        return Ok(None);
+                    }
+                    bail!("Partial trailing status ({offset}/4 bytes) left socket uncertain");
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        Ok(Some(u32::from_le_bytes(buf)))
     }
 
     fn text(&self) -> Result<String> {
@@ -335,7 +375,7 @@ impl Debugger {
 
     pub fn process_info(&mut self, pid: u32) -> Result<Value> {
         Self::pid(pid)?;
-        self.exchange(|debugger| {
+        self.exchange_read(|debugger| {
             debugger.packet(0xbdaa000a,&pid.to_le_bytes())?; debugger.status()?;
             let data=debugger.read(188)?;
             Ok(json!({"pid":word(&data,0),"name":cstring(&data[4..44]),"path":cstring(&data[44..108]),"title_id":cstring(&data[108..124]),"content_id":cstring(&data[124..188])}))
@@ -510,7 +550,7 @@ impl Debugger {
     pub fn get_registers(&mut self, thread_id: u32) -> Result<Value> {
         self.session()?;
         Self::pid(thread_id)?;
-        self.exchange(|debugger| {
+        self.exchange_read(|debugger| {
             debugger.packet(0xbdbb0008, &thread_id.to_le_bytes())?;
             debugger.status()?;
             registers(&debugger.read(176)?)
@@ -655,6 +695,7 @@ pub(crate) mod fake {
     //! additionally implements attach, the event callback, registers, memory, maps,
     //! breakpoints and execution control so the higher-level ops can be tested.
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -703,11 +744,12 @@ pub(crate) mod fake {
         entry[..8].copy_from_slice(&start.to_le_bytes());
         entry[8..16].copy_from_slice(&end.to_le_bytes());
         entry[24..32].copy_from_slice(&protection.to_le_bytes());
-        entry[32..32 + name.len()].copy_from_slice(name.as_bytes());
+        let cap = name.len().min(31);
+        entry[32..32 + cap].copy_from_slice(&name.as_bytes()[..cap]);
         entry
     }
 
-    fn fake_memory(address: u64, length: usize) -> Vec<u8> {
+    fn fake_memory(address: u64, length: usize, overlay: &BTreeMap<u64, u8>) -> Vec<u8> {
         let mut content = vec![0u8; length];
         let end = address.saturating_add(length as u64);
         if address < FAKE_EXEC_END && end > FAKE_RIP {
@@ -730,12 +772,21 @@ pub(crate) mod fake {
                 *byte = (value >> (8 * (offset % 8))) as u8;
             }
         }
+        for (&at, &val) in overlay.range(address..end) {
+            content[(at - address) as usize] = val;
+        }
         content
     }
 
     struct Shared {
         events: Option<TcpStream>,
         registers: [u8; 176],
+        fpregs: [u8; 832],
+        fsbase: u64,
+        gsbase: u64,
+        overlay: BTreeMap<u64, u8>,
+        maps: Vec<(u64, u64, u64, String)>,
+        next_alloc: u64,
     }
 
     /// Full fake: attach binds nothing itself; on BDBB0001 it connects back to the
@@ -755,6 +806,15 @@ pub(crate) mod fake {
                 regs[160..168].copy_from_slice(&FAKE_STACK.to_le_bytes());
                 regs
             },
+            fpregs: [0u8; 832],
+            fsbase: 0x8001_0000,
+            gsbase: 0,
+            overlay: BTreeMap::new(),
+            maps: vec![
+                (FAKE_RIP, FAKE_EXEC_END, 5, "eboot.bin".to_owned()),
+                (FAKE_STACK, FAKE_STACK + 0x10000, 3, String::new()),
+            ],
+            next_alloc: 0x9000_0000,
         }));
         let counter = connections.clone();
         let state = shared.clone();
@@ -794,9 +854,11 @@ pub(crate) mod fake {
                             }
                             0xbdaa0004 => {
                                 success(&mut stream);
-                                let mut out = 2u32.to_le_bytes().to_vec();
-                                out.extend(map_entry(FAKE_RIP, FAKE_EXEC_END, 5, "eboot.bin"));
-                                out.extend(map_entry(FAKE_STACK, FAKE_STACK + 0x10000, 3, ""));
+                                let guard = state.lock().unwrap();
+                                let mut out = (guard.maps.len() as u32).to_le_bytes().to_vec();
+                                for (s, e, p, n) in &guard.maps {
+                                    out.extend(map_entry(*s, *e, *p, n));
+                                }
                                 let _ = stream.write_all(&out);
                             }
                             0xbdaa000a => {
@@ -810,7 +872,67 @@ pub(crate) mod fake {
                                 let address = u64::from_le_bytes(body[4..12].try_into().unwrap());
                                 let length = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
                                 success(&mut stream);
-                                let _ = stream.write_all(&fake_memory(address, length));
+                                let guard = state.lock().unwrap();
+                                let _ = stream.write_all(&fake_memory(address, length, &guard.overlay));
+                            }
+                            0xbdaa0003 => {
+                                let address = u64::from_le_bytes(body[4..12].try_into().unwrap());
+                                let length = u32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let mut data = vec![0u8; length];
+                                if stream.read_exact(&mut data).is_err() {
+                                    return;
+                                }
+                                let mut guard = state.lock().unwrap();
+                                for (i, b) in data.into_iter().enumerate() {
+                                    guard.overlay.insert(address + i as u64, b);
+                                }
+                                success(&mut stream);
+                            }
+                            0xbdaa0008 => {
+                                // Reproduce ps4debug-NG@8be828fe proc_protect_handle missing `return 0;`:
+                                // sends CMD_SUCCESS followed immediately by CMD_DATA_NULL (0xF0000003)!
+                                let address = u64::from_le_bytes(body[4..12].try_into().unwrap());
+                                let length = u32::from_le_bytes(body[12..16].try_into().unwrap()) as u64;
+                                let prot = u32::from_le_bytes(body[16..20].try_into().unwrap()) as u64;
+                                {
+                                    let mut guard = state.lock().unwrap();
+                                    for (s, e, p, _) in &mut guard.maps {
+                                        if *s <= address && address < *e && address + length <= *e {
+                                            *p = prot;
+                                        }
+                                    }
+                                }
+                                success(&mut stream);
+                                let _ = stream.write_all(&CMD_DATA_NULL.to_le_bytes());
+                            }
+                            0xbdaa000b => {
+                                let length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as u64;
+                                let aligned = ((length.max(1) + 0x3fff) & !0x3fff).max(0x4000);
+                                let mut guard = state.lock().unwrap();
+                                let addr = guard.next_alloc;
+                                guard.next_alloc += aligned;
+                                guard.maps.push((addr, addr + aligned, 7, "alloc".to_owned()));
+                                success(&mut stream);
+                                let _ = stream.write_all(&addr.to_le_bytes());
+                            }
+                            0xbdaa000e => {
+                                let hint = u64::from_le_bytes(body[4..12].try_into().unwrap());
+                                let length = u32::from_le_bytes(body[12..16].try_into().unwrap()) as u64;
+                                let aligned = ((length.max(1) + 0x3fff) & !0x3fff).max(0x4000);
+                                let mut guard = state.lock().unwrap();
+                                let addr = if hint != 0 { hint & !0x3fff } else { guard.next_alloc };
+                                if hint == 0 {
+                                    guard.next_alloc += aligned;
+                                }
+                                guard.maps.push((addr, addr + aligned, 7, "alloc_hint".to_owned()));
+                                success(&mut stream);
+                                let _ = stream.write_all(&addr.to_le_bytes());
+                            }
+                            0xbdaa000c => {
+                                let address = u64::from_le_bytes(body[4..12].try_into().unwrap());
+                                state.lock().unwrap().maps.retain(|(s, _, _, _)| *s != address);
+                                success(&mut stream);
                             }
                             0xbdbb0001 => {
                                 let interface = Ipv4Addr::new(body[4], body[5], body[6], body[7]);
@@ -843,11 +965,40 @@ pub(crate) mod fake {
                             }
                             0xbdbb000a => {
                                 success(&mut stream);
-                                let _ = stream.write_all(&[0u8; 832]);
+                                let fpregs = state.lock().unwrap().fpregs;
+                                let _ = stream.write_all(&fpregs);
+                            }
+                            0xbdbb000b => {
+                                success(&mut stream);
+                                let mut fpregs = [0u8; 832];
+                                if stream.read_exact(&mut fpregs).is_err() {
+                                    return;
+                                }
+                                state.lock().unwrap().fpregs = fpregs;
+                                success(&mut stream);
                             }
                             0xbdbb000c => {
                                 success(&mut stream);
                                 let _ = stream.write_all(&[0u8; 128]);
+                            }
+                            0xbdbb000e => {
+                                success(&mut stream);
+                                let guard = state.lock().unwrap();
+                                let mut out = Vec::with_capacity(16);
+                                out.extend(guard.fsbase.to_le_bytes());
+                                out.extend(guard.gsbase.to_le_bytes());
+                                let _ = stream.write_all(&out);
+                            }
+                            0xbdbb000f => {
+                                success(&mut stream);
+                                let mut buf = [0u8; 16];
+                                if stream.read_exact(&mut buf).is_err() {
+                                    return;
+                                }
+                                let mut guard = state.lock().unwrap();
+                                guard.fsbase = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                                guard.gsbase = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                                success(&mut stream);
                             }
                             0xbdbb0010 => {
                                 let resume = body.first().copied() == Some(0);

@@ -169,22 +169,41 @@ impl AnalysisAgents {
     }
 
     pub fn submit(&self, target: &str, operation: &str, arguments: Value, timeout: Duration) -> Result<Value> {
-        if !AGENT_TARGETS.contains(&target) || !["decompile", "functions", "xrefs"].contains(&operation) {
+        const OPS: &[&str] = &[
+            "decompile",
+            "functions",
+            "xrefs",
+            "disasm",
+            "strings",
+            "imports",
+            "rename",
+            "comment",
+        ];
+        if !AGENT_TARGETS.contains(&target) || !OPS.contains(&operation) {
             bail!("Unsupported static-analysis target or operation");
         }
         let Some(fields) = arguments.as_object() else {
             bail!("Analysis arguments must be an object");
         };
         let allowed: &[&str] = match operation {
-            "functions" => &["offset", "limit"],
+            "functions" => &["offset", "limit", "filter"],
             "decompile" => &["address"],
-            _ => &["address", "limit"],
+            "xrefs" => &["address", "limit", "direction"],
+            "disasm" => &["address", "count"],
+            "strings" => &["offset", "limit", "filter", "min_length"],
+            "imports" => &["offset", "limit", "filter"],
+            "rename" => &["address", "name"],
+            "comment" => &["address", "text"],
+            _ => &[],
         };
         if fields.keys().any(|key| !allowed.contains(&key.as_str())) {
             bail!("Unknown static-analysis arguments");
         }
-        if operation != "functions" {
-            let address = fields.get("address").and_then(Value::as_str).filter(|text| text.chars().count() <= 20);
+        if matches!(operation, "decompile" | "xrefs" | "disasm" | "rename" | "comment") {
+            let address = fields
+                .get("address")
+                .and_then(Value::as_str)
+                .filter(|text| text.chars().count() <= 20);
             let Some(address) = address else {
                 bail!("Supply a static database address string");
             };
@@ -195,6 +214,51 @@ impl AnalysisAgents {
         }
         if let Some(offset) = fields.get("offset") {
             require_integer(offset, "offset", 0, 1_000_000)?;
+        }
+        if let Some(count) = fields.get("count") {
+            require_integer(count, "count", 1, 256)?;
+        }
+        if let Some(min_length) = fields.get("min_length") {
+            require_integer(min_length, "min_length", 1, 256)?;
+        }
+        if let Some(filter) = fields.get("filter") {
+            let Some(text) = filter.as_str() else {
+                bail!("filter must be a string");
+            };
+            let len = text.chars().count();
+            if !(1..=256).contains(&len) {
+                bail!("filter length must be 1..=256");
+            }
+        }
+        if let Some(direction) = fields.get("direction") {
+            let Some(dir) = direction.as_str() else {
+                bail!("direction must be a string");
+            };
+            if !matches!(dir, "to" | "from" | "both") {
+                bail!("direction must be one of to, from, both");
+            }
+        }
+        if operation == "rename" {
+            let Some(name) = fields.get("name").and_then(Value::as_str) else {
+                bail!("Supply a valid symbol name string");
+            };
+            let len = name.chars().count();
+            let valid = (1..=256).contains(&len)
+                && name.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'_' | b'.' | b'$' | b'@' | b'?' | b':' | b'+' | b'-')
+                });
+            if !valid {
+                bail!("Invalid symbol name for rename");
+            }
+        }
+        if operation == "comment" {
+            let Some(text) = fields.get("text").and_then(Value::as_str) else {
+                bail!("Supply a comment text string");
+            };
+            if text.chars().count() > 2048 || text.contains('\0') {
+                bail!("Comment text out of bounds or contains NUL");
+            }
         }
         let identifier = uuid::Uuid::new_v4().simple().to_string();
         let mut state = self.lock();

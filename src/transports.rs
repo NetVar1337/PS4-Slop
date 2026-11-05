@@ -244,9 +244,14 @@ impl<'a> Ftp<'a> {
         Ok(stream)
     }
 
-    fn download(&mut self, command: &str, maximum: usize) -> Result<Vec<u8>> {
+    fn download_to<W: Write>(
+        &mut self,
+        command: &str,
+        writer: &mut W,
+        maximum: usize,
+    ) -> Result<usize> {
         let mut stream = self.data(command)?;
-        let mut content = Vec::new();
+        let mut total = 0usize;
         let mut buffer = [0; 65536];
         loop {
             stream.set_read_timeout(Some(self.remaining()?))?;
@@ -255,13 +260,20 @@ impl<'a> Ftp<'a> {
                 break;
             }
             ensure!(
-                content.len() + count <= maximum,
+                total + count <= maximum,
                 "FTP transfer exceeds byte limit"
             );
-            content.extend(&buffer[..count]);
+            writer.write_all(&buffer[..count])?;
+            total += count;
         }
         drop(stream);
         self.expect(&[226, 250])?;
+        Ok(total)
+    }
+
+    fn download(&mut self, command: &str, maximum: usize) -> Result<Vec<u8>> {
+        let mut content = Vec::new();
+        self.download_to(command, &mut content, maximum)?;
         Ok(content)
     }
 }
@@ -326,6 +338,53 @@ impl<'a> FtpBatch<'a> {
             }
         }
     }
+
+    /// Stream a remote file directly into `store` bounded by `remaining_budget`,
+    /// avoiding holding multi-hundred-MiB binaries in RAM.
+    pub fn download_to_store(
+        &mut self,
+        store: &crate::artifacts::ArtifactStore,
+        raw_path: &str,
+        remaining_budget: usize,
+    ) -> Result<(Value, usize)> {
+        let canonical = remote_path(raw_path)?;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let mut transferred = 0usize;
+            let result = self.ready().and_then(|ftp| {
+                store.save_stream(
+                    "ftp",
+                    remaining_budget,
+                    json!({"remote_path": raw_path}),
+                    "bin",
+                    |out| {
+                        transferred = ftp.download_to(
+                            &format!("RETR {canonical}"),
+                            out,
+                            remaining_budget,
+                        )?;
+                        Ok(())
+                    },
+                )
+            });
+            match result {
+                Ok(artifact) => {
+                    link::record_ok("ftp");
+                    return Ok((artifact, transferred));
+                }
+                Err(error) => {
+                    self.session = None;
+                    link::record_err("ftp", &error);
+                    if attempt >= 2 || !link::is_transient(&error) {
+                        return Err(error);
+                    }
+                    link::record_retry("ftp");
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        }
+    }
 }
 
 pub fn ftp_list(profile: &Profile, path: &str) -> Result<Value> {
@@ -348,6 +407,22 @@ pub fn ftp_download(profile: &Profile, path: &str) -> Result<Vec<u8>> {
     let path = remote_path(path)?;
     link::retry("ftp", 3, || {
         Ftp::open(profile)?.download(&format!("RETR {path}"), profile.limit("transfer_bytes"))
+    })
+}
+
+/// Stream an FTP download directly to `store` without holding the entire file in memory.
+pub fn ftp_download_to_store(
+    profile: &Profile,
+    store: &crate::artifacts::ArtifactStore,
+    raw_path: &str,
+) -> Result<Value> {
+    let canonical = remote_path(raw_path)?;
+    let limit = profile.limit("transfer_bytes");
+    link::retry("ftp", 3, || {
+        store.save_stream("ftp", limit, json!({"remote_path": raw_path}), "bin", |out| {
+            Ftp::open(profile)?.download_to(&format!("RETR {canonical}"), out, limit)?;
+            Ok(())
+        })
     })
 }
 

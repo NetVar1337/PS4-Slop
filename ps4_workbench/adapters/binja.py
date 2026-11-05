@@ -68,11 +68,45 @@ class BinjaWorkbench(LiveAnalysis):
         digest = self.input_hash()
         if expected and digest != expected:
             raise WorkbenchError("Binary Ninja database changed; stop and restart its analysis agent")
+        flt = (arguments.get("filter") or "").lower()
         if operation == "functions":
             offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
-            functions = list(self.bv.functions)
-            return [{"address": hex(function.start), "name": str(function.name)[:256]}
-                    for function in functions[offset:offset + limit]]
+            functions = [
+                {"address": hex(function.start), "name": str(function.name)[:256]}
+                for function in self.bv.functions
+                if not flt or flt in str(function.name).lower()
+            ]
+            return functions[offset:offset + limit]
+        if operation == "strings":
+            offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
+            min_len = arguments.get("min_length", 4)
+            matched = [
+                {"address": hex(int(s.start)), "length": int(s.length), "value": str(s.value)[:512]}
+                for s in getattr(self.bv, "strings", [])
+                if int(s.length) >= min_len and (not flt or flt in str(s.value).lower())
+            ]
+            return matched[offset:offset + limit]
+        if operation == "imports":
+            offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
+            collected = []
+            raw_syms = getattr(self.bv, "symbols", {})
+            sym_lists = raw_syms.values() if isinstance(raw_syms, dict) else []
+            for entry in sym_lists:
+                items = entry if isinstance(entry, list) else [entry]
+                for sym in items:
+                    kind = str(getattr(sym, "type", ""))
+                    if "Import" not in kind and "External" not in kind:
+                        continue
+                    sym_name = str(getattr(sym, "full_name", None) or getattr(sym, "name", ""))
+                    ns = str(getattr(sym, "namespace", "") or "")
+                    if flt and flt not in sym_name.lower() and flt not in ns.lower():
+                        continue
+                    collected.append({
+                        "address": hex(int(getattr(sym, "address", 0))),
+                        "name": sym_name[:256],
+                        "library": ns[:128],
+                    })
+            return collected[offset:offset + limit]
         address = parse_address(arguments["address"])
         if operation == "decompile":
             function = self.bv.get_function_at(address)
@@ -93,10 +127,43 @@ class BinjaWorkbench(LiveAnalysis):
             return {"address": hex(function.start), **clipped(text)}
         if operation == "xrefs":
             limit = arguments.get("limit", 100)
-            refs = self.bv.get_code_refs_to(address)
+            direction = arguments.get("direction", "to")
             result = []
-            for reference in refs[:limit]:
-                kind = getattr(reference, "ref_type", None) or getattr(reference, "type", "")
-                result.append({"from": hex(reference.address), "to": hex(address), "type": str(kind)})
+            if direction in ("to", "both"):
+                for reference in list(self.bv.get_code_refs(address))[:limit] if hasattr(self.bv, "get_code_refs") and not hasattr(self.bv, "get_code_refs_to") else list(self.bv.get_code_refs_to(address))[:limit]:
+                    kind = getattr(reference, "ref_type", None) or getattr(reference, "type", "")
+                    result.append({"from": hex(reference.address), "to": hex(address), "type": str(kind), "direction": "to"})
+            if direction in ("from", "both") and len(result) < limit and hasattr(self.bv, "get_code_refs_from"):
+                for dst in list(self.bv.get_code_refs_from(address))[:limit - len(result)]:
+                    target_addr = dst if isinstance(dst, int) else getattr(dst, "address", 0)
+                    result.append({"from": hex(address), "to": hex(int(target_addr)), "type": "code", "direction": "from"})
             return result
+        if operation == "disasm":
+            count = arguments.get("count", 32)
+            cur = address
+            insns = []
+            for _ in range(count):
+                sz = self.bv.get_instruction_length(cur)
+                if not sz or sz <= 0:
+                    break
+                line = self.bv.get_disassembly(cur) or ""
+                insns.append({"address": hex(cur), "size": int(sz), "text": str(line)[:256]})
+                cur += sz
+            return {"address": hex(address), "instructions": insns}
+        if operation == "rename":
+            name = arguments["name"]
+            fn = self.bv.get_function_at(address)
+            if fn is not None:
+                fn.name = name
+            else:
+                import binaryninja
+                self.bv.define_user_symbol(binaryninja.Symbol(binaryninja.SymbolType.DataSymbol, address, name))
+            return {"address": hex(address), "name": name, "applied": True}
+        if operation == "comment":
+            text = arguments["text"]
+            if hasattr(self.bv, "set_comment_at"):
+                self.bv.set_comment_at(address, text)
+            elif (fn := self.bv.get_function_containing(address)) is not None:
+                fn.set_comment_at(address, text)
+            return {"address": hex(address), "text": text, "applied": True}
         raise WorkbenchError("Unsupported Binary Ninja analysis operation")
