@@ -1,13 +1,116 @@
-from .base import LiveAnalysis, clipped
+from .base import APPLY_OPERATIONS, LiveAnalysis, Unsupported, clipped
 from ..config import WorkbenchError
+
+
+def _sized_data_type(kind, size):
+    """Best-effort Ghidra built-in data type for a struct field."""
+    from ghidra.program.model.data import (ArrayDataType, ByteDataType, DoubleDataType, DWordDataType, FloatDataType,
+                                           PointerDataType, QWordDataType, WordDataType)
+    text = (kind or "").replace(" ", "").lower()
+    if "*" in text and size == 8:
+        return PointerDataType()
+    if text == "float" and size == 4:
+        return FloatDataType()
+    if text == "double" and size == 8:
+        return DoubleDataType()
+    sized = {1: ByteDataType, 2: WordDataType, 4: DWordDataType, 8: QWordDataType}
+    if size in sized:
+        return sized[size]()
+    return ArrayDataType(ByteDataType(), size, 1)
 
 
 class GhidraWorkbench(LiveAnalysis):
     target = "ghidra"
 
-    def __init__(self, program, url, token_path):
+    def __init__(self, program, url, token_path, tool=None):
+        """``tool`` (the PluginTool, e.g. ``state.getTool()``) enables block colouring via ColorizingService."""
         self.program = program
+        self.tool = tool
         super().__init__(url, token_path)
+
+    # Apply primitives (run inside a program transaction from analyze()) -----------------------------
+    def _address(self, value):
+        return self.program.getAddressFactory().getDefaultAddressSpace().getAddress(hex(value))
+
+    def image_base(self):
+        return int(self.program.getImageBase().getOffset())
+
+    def find_function(self, name):
+        manager = self.program.getFunctionManager()
+        for symbol in self.program.getSymbolTable().getSymbols(name):
+            candidate = symbol.getObject()
+            if candidate is not None and hasattr(candidate, "getSignatureSource"):
+                return candidate
+            function = manager.getFunctionAt(symbol.getAddress())
+            if function is not None:
+                return function
+        return None
+
+    def has_user_type(self, handle):
+        return str(handle.getSignatureSource()) == "USER_DEFINED"
+
+    def set_prototype(self, handle, declaration):
+        from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+        from ghidra.app.util.parser import FunctionSignatureParser
+        from ghidra.program.model.symbol import SourceType
+        from ghidra.util.task import TaskMonitor
+        parser = FunctionSignatureParser(self.program.getDataTypeManager(), None)
+        signature = parser.parse(handle.getSignature(), declaration)
+        command = ApplyFunctionSignatureCmd(handle.getEntryPoint(), signature, SourceType.USER_DEFINED)
+        return bool(command.applyTo(self.program, TaskMonitor.DUMMY))
+
+    def name_at(self, address):
+        symbol = self.program.getSymbolTable().getPrimarySymbol(self._address(address))
+        if symbol is None or str(symbol.getSource()) == "DEFAULT":
+            return ""
+        return str(symbol.getName())
+
+    def set_name(self, address, name):
+        from ghidra.program.model.symbol import SourceType
+        location = self._address(address)
+        function = self.program.getFunctionManager().getFunctionAt(location)
+        if function is not None:
+            function.setName(name, SourceType.USER_DEFINED)
+        else:
+            self.program.getSymbolTable().createLabel(location, name, SourceType.USER_DEFINED)
+        return True
+
+    def comment_at(self, address):
+        from ghidra.program.model.listing import CodeUnit
+        return self.program.getListing().getComment(CodeUnit.EOL_COMMENT, self._address(address))
+
+    def set_comment(self, address, text):
+        from ghidra.program.model.listing import CodeUnit
+        self.program.getListing().setComment(self._address(address), CodeUnit.EOL_COMMENT, text or None)
+        return True
+
+    def type_exists(self, name):
+        return self.program.getDataTypeManager().getDataType("/" + name) is not None
+
+    def define_struct(self, struct, declaration):
+        from ghidra.program.model.data import DataTypeConflictHandler, StructureDataType
+        definition = StructureDataType(struct["name"], int(struct["size"]))
+        for field in struct["fields"]:
+            size = int(field["size"])
+            definition.replaceAtOffset(int(field["offset"]), _sized_data_type(field.get("type"), size), size,
+                                       field["name"], field.get("comment"))
+        manager = self.program.getDataTypeManager()
+        return manager.addDataType(definition, DataTypeConflictHandler.REPLACE_HANDLER) is not None
+
+    def color_block(self, address, size, rgb):
+        if self.tool is None:
+            raise Unsupported("color", "pass tool=state.getTool() to GhidraWorkbench (unavailable headless)")
+        from ghidra.app.plugin.core.colorizer import ColorizingService
+        from java.awt import Color
+        service = self.tool.getService(ColorizingService)
+        if service is None:
+            raise Unsupported("color", "ColorizingService is not available in this tool")
+        start, end = self._address(address), self._address(address + max(size, 1) - 1)
+        if rgb is None:
+            service.clearBackgroundColor(start, end)
+        else:
+            service.setBackgroundColor(start, end, Color((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF))
+        return True
 
     def input_hash(self):
         digest = self.program.getExecutableSHA256()
@@ -18,6 +121,15 @@ class GhidraWorkbench(LiveAnalysis):
     def analyze(self, operation, arguments):
         import itertools
         from ..config import parse_address
+        if operation in APPLY_OPERATIONS:
+            transaction = self.program.startTransaction("PS4 " + operation)
+            committed = False
+            try:
+                result = self.apply(operation, arguments)
+                committed = True
+                return result
+            finally:
+                self.program.endTransaction(transaction, committed)
         manager = self.program.getFunctionManager()
         flt = (arguments.get("filter") or "").lower()
         if operation == "functions":

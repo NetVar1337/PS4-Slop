@@ -1,4 +1,4 @@
-from .base import LiveAnalysis, clipped
+from .base import APPLY_OPERATIONS, LiveAnalysis, clipped, struct_c_declaration
 from ..config import WorkbenchError
 
 
@@ -62,7 +62,7 @@ class IDAWorkbench(LiveAnalysis):
         return self.on_ui(install, write=True)
 
     def analyze(self, operation, arguments):
-        write = operation in ("rename", "comment")
+        write = operation in ("rename", "comment") or operation in APPLY_OPERATIONS
 
         def execute():
             import itertools
@@ -79,6 +79,8 @@ class IDAWorkbench(LiveAnalysis):
             digest = ida_nalt.retrieve_input_file_sha256()
             if expected and (not digest or bytes(digest).hex() != expected):
                 raise WorkbenchError("IDA database changed; stop and restart its analysis agent")
+            if operation in APPLY_OPERATIONS:
+                return self.apply(operation, arguments)
             flt = (arguments.get("filter") or "").lower()
             if operation == "functions":
                 offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
@@ -176,6 +178,65 @@ class IDAWorkbench(LiveAnalysis):
                 return {"address": hex(address), "text": text, "applied": bool(ok)}
             raise WorkbenchError("Unsupported IDA analysis operation")
         return self.on_ui(execute, write=write)
+
+    # Apply primitives (called on the IDA main thread from analyze()) --------------------------------
+    def image_base(self):
+        import ida_nalt
+        return int(ida_nalt.get_imagebase())
+
+    def find_function(self, name):
+        import ida_idaapi
+        import ida_name
+        address = ida_name.get_name_ea(ida_idaapi.BADADDR, name)
+        return None if address == ida_idaapi.BADADDR else int(address)
+
+    def has_user_type(self, handle):
+        import ida_nalt
+        import ida_typeinf
+        return bool(ida_nalt.get_tinfo(ida_typeinf.tinfo_t(), handle))
+
+    def set_prototype(self, handle, declaration):
+        import idc
+        return bool(idc.SetType(handle, declaration.rstrip(";") + ";"))
+
+    def name_at(self, address):
+        import ida_name
+        return ida_name.get_name(address) or ""
+
+    def set_name(self, address, name):
+        import ida_name
+        return bool(ida_name.set_name(address, name, ida_name.SN_NOWARN | ida_name.SN_NOCHECK))
+
+    def comment_at(self, address):
+        import ida_bytes
+        return ida_bytes.get_cmt(address, False)
+
+    def set_comment(self, address, text):
+        import ida_bytes
+        return bool(ida_bytes.set_cmt(address, text, False))
+
+    def type_exists(self, name):
+        import ida_idaapi
+        import ida_typeinf
+        return ida_typeinf.get_named_type_tid(name) != ida_idaapi.BADADDR
+
+    def define_struct(self, struct, declaration):
+        import idc
+        candidates = [declaration] if declaration else []
+        candidates += [struct_c_declaration(struct, typed=True), struct_c_declaration(struct, typed=False)]
+        for text in candidates:
+            if idc.parse_decls(text, idc.PT_SILENT) == 0:
+                return True
+        return False
+
+    def color_block(self, address, size, rgb):
+        import idautils
+        import idc
+        bgr = idc.DEFCOLOR if rgb is None else ((rgb & 0xFF) << 16) | (rgb & 0xFF00) | ((rgb >> 16) & 0xFF)
+        heads = list(idautils.Heads(address, address + size)) or [address]
+        for head in heads[:4096]:
+            idc.set_color(head, idc.CIC_ITEM, bgr)
+        return True
 
     def refresh_shadow(self, pid, rva, runtime_base, length, module_sha256, apply=False):
         import ida_bytes

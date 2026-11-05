@@ -1,0 +1,126 @@
+[
+ {
+  "name": "debug_find_accesses",
+  "description": "Cheat-Engine style 'find out what writes/accesses this address': arms hardware watchpoints on free slots (length 1-32 split into aligned 1/2/4/8 slots, or struct mode: struct_span bytes from address watched by rotating the slots over rounds), resumes until timeout_seconds/max_hits, and collects unique accessing instructions (recovered by back-decoding to the post-access rip; confidence exact|ambiguous|plausible|unknown) with hit counts, disassembly, module+offset, offset/size/kind, sample registers and old/new values. Disarms its watchpoints on every exit path and leaves the target halted. Saves a ps4wb-access-v1 artifact (input for struct_infer).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Watched address (struct mode: object base)"},
+    "length": {"type": "integer", "minimum": 1, "maximum": 32, "description": "Watched byte count (default 4); ignored in struct mode"},
+    "access": {"type": "string", "enum": ["write", "read_write"], "description": "write = what writes; read_write = what accesses (default write)"},
+    "struct_span": {"type": "integer", "minimum": 8, "maximum": 1024, "description": "Struct mode: watch [address, address+struct_span) in 32-byte rounds; time is split evenly across rounds"},
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Total wall-clock bound (default 30)"},
+    "max_hits": {"type": "integer", "minimum": 1, "maximum": 10000, "description": "Stop after this many in-range hits (default 256)"},
+    "samples_per_instruction": {"type": "integer", "minimum": 0, "maximum": 16, "description": "Register/value samples kept per unique access (default 4)"}
+   },
+   "required": ["address"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+  "permission": "debug_control"
+ },
+ {
+  "name": "struct_infer",
+  "description": "Offline structure inference (read-only) from one or more ps4wb-access-v1 access logs, optional memory_snapshot artifacts of the object and optional read-only live sampling (pid + address). Infers fields (offset, size from operand size, type: pointer/vtable-like/code pointer via maps, float/double from SSE scalar instructions, bool/int widths, arrays from strided accesses) and emits a ps4wb-struct-v1 artifact with a C declaration.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "access_artifacts": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"type": "string", "maxLength": 1024}, "description": "ps4wb-access-v1 artifact paths"},
+    "snapshot_artifacts": {"type": "array", "maxItems": 16, "items": {"type": "string", "maxLength": 1024}, "description": "memory_snapshot artifacts covering the object (aligned via their address metadata)"},
+    "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Object base (default: base of the first access log)"},
+    "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647, "description": "Optional: read the object live (read-only) as an extra value sample"},
+    "size": {"type": "integer", "minimum": 1, "maximum": 65536, "description": "Struct size override"},
+    "name": {"type": "string", "maxLength": 64, "pattern": "^[A-Za-z_][A-Za-z0-9_]*$", "description": "C struct name (default InferredStruct)"}
+   },
+   "required": ["access_artifacts"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+  "permission": null
+ },
+ {
+  "name": "debug_crash_triage",
+  "description": "Crash triage: analyze the current stop (wait=false) or resume and wait up to timeout_seconds for a fault stop (non-SIGTRAP FreeBSD wait status; SIGTRAP stops are skipped up to max_events). Collects signal, trapno/error code, live registers, faulting instruction with evaluated memory operands and their mapping/protection, stack trace, memory around rsp and operands, module+offset, and ranked classifications (null deref, wild read/write, write to read-only, execute non-exec/unmapped/outside modules, stack overflow, int3/ud2/abort, divide error). Never resumes after the fault; on timeout the target is halted. Saves a crash-report artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "wait": {"type": "boolean", "description": "Resume and wait for a fault (default false: analyze the current stop)"},
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Wait bound (default 30)"},
+    "thread_id": {"type": "integer", "minimum": 1, "maximum": 2147483647, "description": "Thread to analyze (default: the stopping thread)"},
+    "max_events": {"type": "integer", "minimum": 1, "maximum": 256, "description": "SIGTRAP stops to skip while waiting (default 64)"},
+    "capture_bytes": {"type": "integer", "minimum": 0, "maximum": 4096, "description": "Memory capture budget around rsp/operands (default 256)"}
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+  "permission": "debug_control"
+ },
+ {
+  "name": "memory_pointer_scan",
+  "description": "Read-only multi-level pointer scan: snapshots writable non-executable data maps (module data first, heaps if include_heap) within budget_bytes, indexes 8-byte aligned values that point into readable memory, and searches backward from target_address (max_depth <= 6, max_offset <= 0x4000) for paths rooted at static module locations ([module+off] -> +o1 -> +o2 ...). Saves a ps4wb-pointers-v1 artifact for memory_pointer_rescan.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "target_address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
+    "max_depth": {"type": "integer", "minimum": 1, "maximum": 6, "description": "Dereference levels (default 4)"},
+    "max_offset": {"type": "integer", "minimum": 0, "maximum": 16384, "description": "Largest positive offset per level (default 4096)"},
+    "max_results": {"type": "integer", "minimum": 1, "maximum": 10000, "description": "Default 1000"},
+    "budget_bytes": {"type": "integer", "minimum": 4096, "maximum": 268435456, "description": "Snapshot byte budget (default profile transfer_bytes)"},
+    "include_heap": {"type": "boolean", "description": "Also index anonymous/heap data maps (default true)"}
+   },
+   "required": ["pid", "target_address"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
+  "permission": null
+ },
+ {
+  "name": "memory_pointer_rescan",
+  "description": "Read-only rescan of a ps4wb-pointers-v1 artifact: re-resolves every saved path against current module bases and live memory (page-cached, bounded) and keeps those that still reach target_address (e.g. the new address after a game restart; default: the artifact's target). Saves the filtered paths as a new artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {"type": "string", "maxLength": 1024},
+    "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "target_address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
+    "budget_bytes": {"type": "integer", "minimum": 4096, "maximum": 268435456, "description": "Live read budget (default profile transfer_bytes)"}
+   },
+   "required": ["artifact", "pid"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true},
+  "permission": null
+ },
+ {
+  "name": "debug_run_script",
+  "description": "Host-side scripted breakpoints (Rhai, sandboxed): sets internal breakpoints, resumes, and on each hit calls the script's fn on_stop(ctx) which returns \"continue\"/\"stop\" (or true = stop / false = continue). ctx is read-only: ctx.reg(name), ctx.read_u8/u16/u32/i32/u64/f32/f64(addr), ctx.read_bytes(addr,n<=4096), ctx.read_cstring(addr,max<=4096), ctx.bp_name, ctx.bp_address, ctx.hits, ctx.total_hits, ctx.thread_id, ctx.rip, ctx.location, persistent ctx.state map (ctx.state.x = ..., ctx.get/ctx.set), log(msg)/print. No filesystem, network, process, import, eval or memory/register writes; operations, call depth, sizes, per-hit time and reads are bounded. Script errors stop the run. Breakpoints are cleared on every exit path and the target is left halted. Saves a script-log artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "script": {"type": "string", "minLength": 1, "maxLength": 16384},
+    "breakpoints": {
+     "type": "array", "minItems": 1, "maxItems": 16,
+     "items": {
+      "type": "object",
+      "properties": {
+       "address": {"type": "string", "maxLength": 128, "description": "Address, label or expression (e.g. eboot.bin + 0x1234)"},
+       "name": {"type": "string", "maxLength": 64}
+      },
+      "required": ["address"],
+      "additionalProperties": false
+     }
+    },
+    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300, "description": "Default 30"},
+    "max_stops": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Default 100"},
+    "per_hit_ms": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "Script wall-time budget per hit (default 250)"},
+    "max_operations": {"type": "integer", "minimum": 1000, "maximum": 10000000, "description": "Rhai operation limit per hit (default 1000000)"}
+   },
+   "required": ["script", "breakpoints"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+  "permission": "debug_control"
+ }
+]

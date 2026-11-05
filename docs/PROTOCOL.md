@@ -49,6 +49,10 @@ value scanning (`memory_scan`), x86-64 Intel-syntax instruction assembly (`assem
 `memory_patch`), DWARF `.eh_frame` CFI stack unwinding, Orbis SHA-1 NID symbol
 demangling (`orbis_nid_resolve`), and sectionless in-memory ELF64 header/segment
 reconstruction (`memory_elf_dump`) run entirely on the host PC over bounded reads.
+The same holds for the reverse-engineering suite in `docs/features/`: tracing, coverage,
+access finding and scripted breakpoints are composed from the commands listed above
+(breakpoints, watchpoints, resume/halt, register and memory reads); no new wire commands
+are used.
 Debugger capabilities outside the implemented subset are not inferred from an open
 port or successful handshake.
 

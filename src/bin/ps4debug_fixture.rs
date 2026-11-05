@@ -41,7 +41,14 @@ fn main() -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", arguments.port))?;
     let fake = spawn_fixture(
         listener,
-        Fixture { pid: arguments.pid, thread_id: arguments.thread, base: arguments.base, image, rip: arguments.rip },
+        Fixture {
+            pid: arguments.pid,
+            thread_id: arguments.thread,
+            base: arguments.base,
+            image,
+            rip: arguments.rip,
+            ..Default::default()
+        },
     );
     println!("{}", fake.port);
     loop {

@@ -179,13 +179,15 @@ impl AnalysisAgents {
             "rename",
             "comment",
         ];
-        if !AGENT_TARGETS.contains(&target) || !OPS.contains(&operation) {
+        let apply = crate::analysis_apply::AGENT_OPERATIONS.iter().find(|(name, _)| *name == operation);
+        if !AGENT_TARGETS.contains(&target) || (!OPS.contains(&operation) && apply.is_none()) {
             bail!("Unsupported static-analysis target or operation");
         }
         let Some(fields) = arguments.as_object() else {
             bail!("Analysis arguments must be an object");
         };
         let allowed: &[&str] = match operation {
+            _ if apply.is_some() => apply.map_or(&[], |(_, keys)| *keys),
             "functions" => &["offset", "limit", "filter"],
             "decompile" => &["address"],
             "xrefs" => &["address", "limit", "direction"],
@@ -208,6 +210,11 @@ impl AnalysisAgents {
                 bail!("Supply a static database address string");
             };
             parse_address(address)?;
+        }
+        if apply.is_some()
+            && fields.values().any(|value| value.as_array().is_some_and(|items| items.len() > crate::analysis_apply::MAX_BATCH_ITEMS))
+        {
+            bail!("Analysis apply batch is too large");
         }
         if let Some(limit) = fields.get("limit") {
             require_integer(limit, "limit", 1, 100)?;

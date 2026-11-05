@@ -38,7 +38,7 @@ pub fn number(args: &Value, key: &str) -> Result<u64> {
 
 impl ToolRegistry {
     pub fn new(workbench: Workbench) -> Result<Self> {
-        let mut catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json"))?;
+        let mut catalog: Vec<Value> = crate::extensions::full_catalog()?;
         let mut validators = std::collections::HashMap::new();
         for tool in &mut catalog {
             let properties = &mut tool["inputSchema"]["properties"];
@@ -115,6 +115,11 @@ impl ToolRegistry {
             self.workbench.profile.require(permission)?;
         }
         let result = crate::config::json_safe(self.execute(name, &args)?);
+        // Best-effort provenance: never fail a completed tool call because the
+        // project index could not be updated.
+        if let Err(error) = crate::project::auto_record(&self.workbench.store, name, &args, &result) {
+            eprintln!("project auto-record skipped for {name}: {error:#}");
+        }
         let content = serde_json::to_vec(&result)?;
         if content.len() > 24576 {
             let artifact =
@@ -630,7 +635,10 @@ impl ToolRegistry {
             "sdk_build" => self
                 .development
                 .build(string(args, "recipe")?, string(args, "sha256")?),
-            _ => bail!("No implementation for tool: {name}"),
+            _ => match crate::extensions::dispatch(self, name, args) {
+                Some(result) => result,
+                None => bail!("No implementation for tool: {name}"),
+            },
         }
     }
 }
@@ -649,7 +657,7 @@ mod tests {
 
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
-        let catalog: Vec<Value> = serde_json::from_str(include_str!("tool_catalog.json")).unwrap();
+        let catalog: Vec<Value> = crate::extensions::full_catalog().unwrap();
         let mut names: Vec<&str> = catalog.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
         names.sort_unstable();
         let total = names.len();

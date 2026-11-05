@@ -20,5 +20,40 @@ pub mod broker;
 pub mod client;
 pub mod rsp;
 pub mod mcp;
+pub mod extensions;
+pub mod dumping;
+pub mod engines;
+pub mod dyntrace;
+pub mod dynaccess;
+pub mod binstatic;
+pub mod project;
 
 pub type Result<T> = anyhow::Result<T>;
+
+// Dumping area (process/module dumps, ELF rebuild, core files, snapshots).
+pub mod orbisdyn;
+pub mod elfrebuild;
+pub mod coredump;
+pub mod snapstore;
+// Engine & metadata recovery area (src/engines.rs).
+pub mod bytesource;
+pub mod il2cpp;
+pub mod unreal;
+pub mod rtti;
+pub mod yara;
+pub mod cryptoscan;
+// trace area (run-loop tracing & coverage)
+pub mod tracekit;
+// Access/crash/pointer/struct/script feature area.
+pub mod pointerscan;
+pub mod structinfer;
+pub mod hostscript;
+// Native static analysis (binstatic area).
+pub mod binimage;
+pub mod cfg;
+pub mod sigmaker;
+pub mod bindiff;
+pub mod prototypes;
+// Project area modules.
+pub mod recipes;
+pub mod analysis_apply;

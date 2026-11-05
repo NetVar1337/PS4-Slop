@@ -20,7 +20,7 @@ The agent answers analysis_decompile / analysis_functions / analysis_xrefs
 jobs from the shared broker. Addresses are STATIC database addresses.
 """
 
-from .base import LiveAnalysis, clipped
+from .base import APPLY_OPERATIONS, LiveAnalysis, clipped, struct_c_declaration
 from ..config import WorkbenchError
 
 
@@ -68,6 +68,8 @@ class BinjaWorkbench(LiveAnalysis):
         digest = self.input_hash()
         if expected and digest != expected:
             raise WorkbenchError("Binary Ninja database changed; stop and restart its analysis agent")
+        if operation in APPLY_OPERATIONS:
+            return self.apply(operation, arguments)
         flt = (arguments.get("filter") or "").lower()
         if operation == "functions":
             offset, limit = arguments.get("offset", 0), arguments.get("limit", 100)
@@ -167,3 +169,84 @@ class BinjaWorkbench(LiveAnalysis):
                 fn.set_comment_at(address, text)
             return {"address": hex(address), "text": text, "applied": True}
         raise WorkbenchError("Unsupported Binary Ninja analysis operation")
+
+    # Apply primitives ----------------------------------------------------------------------------------
+    def image_base(self):
+        return int(getattr(self.bv, "image_base", None) or self.bv.start)
+
+    def find_function(self, name):
+        functions = self.bv.get_functions_by_name(name) if hasattr(self.bv, "get_functions_by_name") else []
+        if functions:
+            return functions[0]
+        symbol = self.bv.get_symbol_by_raw_name(name) if hasattr(self.bv, "get_symbol_by_raw_name") else None
+        if symbol is not None:
+            return self.bv.get_function_at(symbol.address)
+        return None
+
+    def has_user_type(self, handle):
+        return bool(getattr(handle, "has_user_type", False))
+
+    def set_prototype(self, handle, declaration):
+        parsed, _ = self.bv.parse_type_string(declaration.rstrip(";"))
+        if hasattr(handle, "set_user_type"):
+            handle.set_user_type(parsed)
+        else:
+            handle.type = parsed
+        return True
+
+    def name_at(self, address):
+        function = self.bv.get_function_at(address)
+        if function is not None:
+            return str(function.name)
+        symbol = self.bv.get_symbol_at(address)
+        return str(symbol.name) if symbol is not None else ""
+
+    def set_name(self, address, name):
+        function = self.bv.get_function_at(address)
+        if function is not None:
+            function.name = name
+        else:
+            import binaryninja
+            self.bv.define_user_symbol(binaryninja.Symbol(binaryninja.SymbolType.DataSymbol, address, name))
+        return True
+
+    def comment_at(self, address):
+        return self.bv.get_comment_at(address) if hasattr(self.bv, "get_comment_at") else None
+
+    def set_comment(self, address, text):
+        self.bv.set_comment_at(address, text)
+        return True
+
+    def type_exists(self, name):
+        return self.bv.get_type_by_name(name) is not None
+
+    def define_struct(self, struct, declaration):
+        candidates = [declaration] if declaration else []
+        candidates += [struct_c_declaration(struct, typed=True), struct_c_declaration(struct, typed=False)]
+        for text in candidates:
+            try:
+                parsed = self.bv.parse_types_from_string(text)
+            except Exception:  # noqa: BLE001 - try the next, more conservative declaration
+                continue
+            for type_name, type_object in parsed.types.items():
+                if str(type_name) == struct["name"]:
+                    self.bv.define_user_type(struct["name"], type_object)
+                    return True
+        return False
+
+    def color_block(self, address, size, rgb):
+        import binaryninja
+        if rgb is None:
+            color = binaryninja.HighlightStandardColor.NoHighlightColor
+        else:
+            color = binaryninja.HighlightColor(red=(rgb >> 16) & 0xFF, green=(rgb >> 8) & 0xFF, blue=rgb & 0xFF)
+        blocks = list(self.bv.get_basic_blocks_starting_at(address))
+        for block in blocks:
+            block.set_user_highlight(color)
+        if blocks:
+            return True
+        coloured = False
+        for function in self.bv.get_functions_containing(address):
+            function.set_user_instr_highlight(address, color)
+            coloured = True
+        return coloured

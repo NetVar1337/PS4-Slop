@@ -1,0 +1,401 @@
+[
+ {
+  "name": "debug_trace_imports",
+  "description": "ltrace-like API trace for one module (default eboot.bin) of the attached process: resolves PLT imports (Orbis PT_SCE_DYNLIBDATA / standard PT_DYNAMIC JMPREL -> GOT -> NID-demangled symbol; from elf_artifact or the in-memory ELF, else unnamed lazy PLT stubs), breakpoints the PLT stubs (or bound targets) of the filtered imports, resumes, and records symbol, caller, SysV args (+ optional strings), thread and time per call. Bounded by timeout, max_events and the breakpoint budget; always halts and clears its breakpoints. Saves a JSONL trace artifact. All-stop: every hit pauses all threads.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 64,
+     "description": "Module name (exact or substring); default eboot.bin"
+    },
+    "filter": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256,
+     "description": "Case-insensitive regex over symbol / raw NID / library; needed when imports exceed the breakpoint budget"
+    },
+    "elf_artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Artifact path of a decrypted ELF of this module (gives names when PT_SCE_DYNLIBDATA is not mapped in memory)"
+    },
+    "probe_at": {
+     "type": "string",
+     "enum": [
+      "plt",
+      "target"
+     ],
+     "description": "plt (default): this module's PLT stub, catches only its calls; target: the GOT-bound function entry, catches every caller"
+    },
+    "dry_run": {
+     "type": "boolean",
+     "description": "Only resolve and list the probes; never arms breakpoints or resumes"
+    },
+    "scan_limit_bytes": {
+     "type": "integer",
+     "minimum": 4096,
+     "maximum": 268435456,
+     "description": "Bytes of executable memory the planning scan may read (default 64 MiB)"
+    },
+    "timeout_seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 300,
+     "description": "Wall-clock bound (default 30). On timeout the target is halted and every internal breakpoint cleared"
+    },
+    "max_events": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 10000,
+     "description": "Stop (target left halted) after this many recorded hits (default 1000)"
+    },
+    "max_breakpoints": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 28,
+     "description": "Internal breakpoint budget (default 28; also bounded by free slots - user breakpoints are never touched)"
+    },
+    "capture_returns": {
+     "type": "boolean",
+     "description": "Arm a temporary breakpoint at each call's return address to record rax and host-observed duration (uses budget slots)"
+    },
+    "arg_count": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 6,
+     "description": "SysV argument registers to record (default 6)"
+    },
+    "string_bytes": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 256,
+     "description": "Dereference pointer arguments inside readable maps as printable C strings up to this many bytes (0 = off)"
+    },
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Record hits from this thread only (others are resumed and counted as filtered)"
+    },
+    "backtrace_frames": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 32,
+     "description": "Per-hit stack unwind depth (0 = off; costly: several reads per hit)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_trace_syscalls",
+  "description": "Trace syscalls made through libkernel*.sprx wrappers (mov rax,N; [mov r10,rcx;] syscall): scans the executable segments, derives numbers statically, names them (FreeBSD 9 natives, public Orbis dynlib_* additions, optional user dictionary; unknown -> sys_<n>), breakpoints the filtered wrappers and records number, name, args (rdi,rsi,rdx,r10,r8,r9), caller and thread. Bounded by timeout, max_events and the breakpoint budget; always halts and clears its breakpoints; JSONL artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "numbers": {
+     "type": "array",
+     "maxItems": 64,
+     "items": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4095
+     },
+     "description": "Syscall numbers to trace"
+    },
+    "names": {
+     "type": "array",
+     "maxItems": 64,
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+     },
+     "description": "Case-insensitive name substrings to trace"
+    },
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 64,
+     "description": "Module substring to scan instead of libkernel"
+    },
+    "dictionary_artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Artifact path of a JSON object {\"<number>\": \"name\"} overriding names"
+    },
+    "include_unrecognized": {
+     "type": "boolean",
+     "description": "Also list/trace bare 0F 05 sites with no recognised wrapper (number from the event snapshot; may be false positives). Only applies without numbers/names filters"
+    },
+    "dry_run": {
+     "type": "boolean",
+     "description": "Only resolve and list the probes; never arms breakpoints or resumes"
+    },
+    "scan_limit_bytes": {
+     "type": "integer",
+     "minimum": 4096,
+     "maximum": 268435456,
+     "description": "Bytes of executable memory the planning scan may read (default 64 MiB)"
+    },
+    "timeout_seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 300,
+     "description": "Wall-clock bound (default 30). On timeout the target is halted and every internal breakpoint cleared"
+    },
+    "max_events": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 10000,
+     "description": "Stop (target left halted) after this many recorded hits (default 1000)"
+    },
+    "max_breakpoints": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 28,
+     "description": "Internal breakpoint budget (default 28; also bounded by free slots - user breakpoints are never touched)"
+    },
+    "capture_returns": {
+     "type": "boolean",
+     "description": "Arm a temporary breakpoint at each call's return address to record rax and host-observed duration (uses budget slots)"
+    },
+    "arg_count": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 6,
+     "description": "SysV argument registers to record (default 6)"
+    },
+    "string_bytes": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 256,
+     "description": "Dereference pointer arguments inside readable maps as printable C strings up to this many bytes (0 = off)"
+    },
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Record hits from this thread only (others are resumed and counted as filtered)"
+    },
+    "backtrace_frames": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 32,
+     "description": "Per-hit stack unwind depth (0 = off; costly: several reads per hit)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_trace_function",
+  "description": "Trace calls to one or more functions (0x addresses, module+0xoffset, or debug_label names): entry args, caller (return address), stack usage, optional backtrace, hit counts, and with capture_returns the return value and host-observed duration. Bounded by timeout, max_events and the breakpoint budget; always halts and clears its breakpoints; JSONL artifact.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "targets": {
+     "type": "array",
+     "minItems": 1,
+     "maxItems": 28,
+     "items": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+     },
+     "description": "Function entries: 0x address, module+0xoffset, or label"
+    },
+    "timeout_seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 300,
+     "description": "Wall-clock bound (default 30). On timeout the target is halted and every internal breakpoint cleared"
+    },
+    "max_events": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 10000,
+     "description": "Stop (target left halted) after this many recorded hits (default 1000)"
+    },
+    "max_breakpoints": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 28,
+     "description": "Internal breakpoint budget (default 28; also bounded by free slots - user breakpoints are never touched)"
+    },
+    "capture_returns": {
+     "type": "boolean",
+     "description": "Arm a temporary breakpoint at each call's return address to record rax and host-observed duration (uses budget slots)"
+    },
+    "arg_count": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 6,
+     "description": "SysV argument registers to record (default 6)"
+    },
+    "string_bytes": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 256,
+     "description": "Dereference pointer arguments inside readable maps as printable C strings up to this many bytes (0 = off)"
+    },
+    "thread_id": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647,
+     "description": "Record hits from this thread only (others are resumed and counted as filtered)"
+    },
+    "backtrace_frames": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 32,
+     "description": "Per-hit stack unwind depth (0 = off; costly: several reads per hit)"
+    }
+   },
+   "required": [
+    "targets"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "debug_coverage",
+  "description": "Code coverage with one-shot breakpoints armed in rotating batches (at most max_breakpoints at once; each hit disarms its slot and arms the next block). Blocks come from a ps4wb-blocks-v1 artifact (RVAs rebased to the live module) or are derived live as function entries (.eh_frame FDEs, else push rbp; mov rbp,rsp prologues). Saves a ps4wb-coverage-v1 JSON artifact and a drcov v2 artifact for Lighthouse/Cartographer; reports covered/total. Always halts and clears its breakpoints.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "module": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 64,
+     "description": "Module (default: the blocks artifact's module, else eboot.bin)"
+    },
+    "blocks_artifact": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Artifact path of a ps4wb-blocks-v1 document"
+    },
+    "source": {
+     "type": "string",
+     "enum": [
+      "auto",
+      "eh_frame",
+      "prologue"
+     ],
+     "description": "Live block derivation when no blocks_artifact (default auto)"
+    },
+    "max_blocks": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Upper bound on blocks (default 50000)"
+    },
+    "timeout_seconds": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 300,
+     "description": "Wall-clock bound (default 30). On timeout the target is halted and every internal breakpoint cleared"
+    },
+    "max_events": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 200000,
+     "description": "Stop after this many block hits (default: all blocks)"
+    },
+    "max_breakpoints": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 28,
+     "description": "Internal breakpoint budget (default 28; also bounded by free slots - user breakpoints are never touched)"
+    },
+    "dry_run": {
+     "type": "boolean",
+     "description": "Only resolve and list the probes; never arms breakpoints or resumes"
+    },
+    "scan_limit_bytes": {
+     "type": "integer",
+     "minimum": 4096,
+     "maximum": 268435456,
+     "description": "Bytes of executable memory the planning scan may read (default 64 MiB)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "debug_control"
+ },
+ {
+  "name": "coverage_diff",
+  "description": "Offline: compare two ps4wb-coverage-v1 artifacts by RVA and list covered blocks only in A, only in B, and in both (e.g. what ran when a button was pressed).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "a": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Coverage artifact A"
+    },
+    "b": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024,
+     "description": "Coverage artifact B"
+    },
+    "max_list": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100000,
+     "description": "Cap per list (default 2000)"
+    }
+   },
+   "required": [
+    "a",
+    "b"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ }
+]

@@ -983,7 +983,7 @@ impl Debugger {
 
     /// Temporary breakpoint in a free slot, tracked as internal so it never
     /// shows up in `breakpoint_list` and is always cleared by the caller.
-    fn set_internal_breakpoint(&mut self, address: u64) -> Result<u32> {
+    pub(super) fn set_internal_breakpoint(&mut self, address: u64) -> Result<u32> {
         let slot = self.free_slot()?;
         self.breakpoint_ex(slot, address, true, None, None, 0)?;
         if let Some(record) = self.breakpoints.get_mut(&slot) {
@@ -992,7 +992,7 @@ impl Debugger {
         Ok(slot)
     }
 
-    fn clear_internal_breakpoint(&mut self, slot: u32) -> Result<()> {
+    pub(super) fn clear_internal_breakpoint(&mut self, slot: u32) -> Result<()> {
         let result = self.breakpoint(slot, 0, false).map(|_| ());
         self.breakpoints.remove(&slot);
         result
@@ -2080,33 +2080,12 @@ impl Context for Live<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ATTESTATION, Profile};
+    use crate::config::Profile;
     use crate::debugger::fake;
     use std::path::Path;
 
     fn qualified_profile(directory: &Path, port: u16) -> Profile {
-        let mut data: Value =
-            serde_json::from_str(include_str!("../../profiles/ps4-1400.json")).unwrap();
-        data["host"] = json!("127.0.0.1");
-        data["artifact_directory"] = json!("artifacts");
-        data["qualification_file"] = json!("qualification.json");
-        data["ports"]["debug"] = json!(port);
-        data["permissions"]["debug_control"] = json!(true);
-        data["permissions"]["process_write"] = json!(true);
-        data["jailbreak"]["installed_commit"] = json!("a".repeat(40));
-        data["jailbreak"]["hen_build"] = json!("test-hen");
-        data["debugger"]["expected_brand"] = json!("ps4debug-NG by Pharaoh2k v1.3.4");
-        data["debugger"]["payload_sha256"] = json!("b".repeat(64));
-        let path = directory.join("profile.json");
-        std::fs::write(&path, data.to_string()).unwrap();
-        let profile = Profile::load(path).unwrap();
-        let record = json!({
-            "profile_sha256": profile.fingerprint(), "attestation": ATTESTATION,
-            "approved_permissions": ["debug_control", "process_write"], "debugger_payload_sha256": "b".repeat(64),
-            "payload_sha256_allowlist": [], "build_recipe_sha256_allowlist": [],
-        });
-        std::fs::write(profile.qualification_path(), record.to_string()).unwrap();
-        profile
+        fake::qualified_profile(directory, port)
     }
 
     #[test]
@@ -2114,10 +2093,9 @@ mod tests {
         // The pinned protocol fixes the debug callback port at 755. Hosts with
         // an unprivileged-port floor above 755 (some CI runners) cannot bind it;
         // skip there instead of failing — other runners cover the full path.
-        if std::net::TcpListener::bind(("127.0.0.1", 755)).is_err() {
-            eprintln!("skipping: cannot bind the fixed callback port 755 on this host");
+        let Some(_port) = fake::callback_port_guard() else {
             return;
-        }
+        };
         let fake = fake::spawn_debuggable();
         let directory = tempfile::tempdir().unwrap();
         let profile = qualified_profile(directory.path(), fake.port);
@@ -2314,5 +2292,50 @@ mod tests {
             .unwrap();
         assert_eq!(found["count"], 2);
         assert_eq!(found["matches"], json!(["0x200ffe", "0x201040"]));
+    }
+
+    /// The scripted fixture program drives real breakpoint, watchpoint and fault
+    /// stops through the unmodified run loop.
+    #[test]
+    fn fixture_program_reports_breakpoint_watchpoint_and_fault_stops() {
+        let Some(_port) = fake::callback_port_guard() else {
+            return;
+        };
+        let base = 0x40_0000u64;
+        // nop; nop; mov [rax], ecx (2 bytes: 89 08); nop; ...
+        let mut image = vec![0x90u8; 0x100];
+        image[0x10] = 0x89;
+        image[0x11] = 0x08;
+        let step = |rip: u64| fake::FixtureStep { rip, ..Default::default() };
+        let program = vec![
+            step(base),
+            fake::FixtureStep { registers: vec![("rdi".into(), 0x1234)], ..step(base + 1) },
+            fake::FixtureStep { access: Some((0x9000_0010, 4, true)), ..step(base + 0x10) },
+            fake::FixtureStep { signal: Some(11), ..step(base + 0x20) },
+        ];
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fake = fake::spawn_fixture(
+            listener,
+            fake::Fixture { pid: 71, thread_id: 72, base, image, rip: base, program, ..Default::default() },
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let mut debugger = Debugger::new(qualified_profile(directory.path(), fake.port));
+        debugger.attach(71, "127.0.0.1").unwrap();
+        debugger.wait_stop(Duration::from_secs(2)).unwrap().expect("attach stop");
+        debugger.breakpoint_ex(0, base + 1, true, None, None, 0).unwrap();
+        debugger.watchpoint(0, 0x9000_0010, 4, "write", true).unwrap();
+
+        let run = debugger.run(None, None, 1, Duration::from_secs(3)).unwrap();
+        assert_eq!(run["stops"][0]["hit_breakpoint"], 0);
+        assert_eq!(run["stops"][0]["state"]["registers"]["rdi"], "0x1234");
+        assert_eq!(run["stops"][0]["state"]["rip"], format!("{:#x}", base + 2));
+
+        let run = debugger.run(None, None, 1, Duration::from_secs(3)).unwrap();
+        assert_eq!(run["stops"][0]["state"]["rip"], format!("{:#x}", base + 0x12));
+        assert_eq!(debugger.hardware_debug_registers(72).unwrap()["dr6"], "0x1");
+
+        let run = debugger.run(None, None, 1, Duration::from_secs(3)).unwrap();
+        assert_eq!(run["stops"][0]["event"]["status"], (11 << 8) | 0x7f);
+        debugger.detach().unwrap();
     }
 }
