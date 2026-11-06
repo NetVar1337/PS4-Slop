@@ -1,0 +1,80 @@
+[
+  {
+    "name": "afterglow_verify",
+    "description": "Read-only local verification of an Afterglow checkout: git HEAD, patched 14.00 hen.bin MD5/SHA-256, goldhen.bin and patchset-1400.bin hashes, and cache.appcache freshness. Never contacts the console. Refuses the known upstream hen.bin that freezes app launches on 14.00.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "directory": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Afterglow checkout (default: profile jailbreak.local_directory or PS4_AFTERGLOW_DIR)"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "permission": null
+  },
+  {
+    "name": "debugger_payload_verify",
+    "description": "Read-only local SHA-256 verification of the ps4debug-NG BIN before loading it. Compares the file with the profile debugger.payload_sha256 (default: the pinned 1.3.4 release) and reports the expected brand. Never contacts the console.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "ps4debug-NG BIN (default: profile debugger.payload_path or PS4DEBUG_NG_PAYLOAD)"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    },
+    "permission": null
+  },
+  {
+    "name": "preflight",
+    "description": "Read-only 14.00 preflight: profile, qualification freshness, Afterglow hen.bin/goldhen/patchset hashes and cache manifest, ps4debug-NG payload SHA-256, then optional FTP/Klog TCP checks and ps4debug-NG identity handshake. The payload port is never probed. Does not attach, write, or send anything.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "afterglow_directory": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Afterglow checkout (default: profile jailbreak.local_directory or PS4_AFTERGLOW_DIR)"
+        },
+        "debugger_payload": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "ps4debug-NG BIN (default: profile debugger.payload_path or PS4DEBUG_NG_PAYLOAD)"
+        },
+        "probe": {
+          "type": "boolean",
+          "description": "Explicitly probe FTP/Klog/debug TCP ports; the payload port is never probed"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true
+    },
+    "permission": null
+  }
+]

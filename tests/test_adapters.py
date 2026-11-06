@@ -11,15 +11,62 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from ps4_workbench.adapters.base import APPLY_OPERATIONS, ApplyMixin, LiveAnalysis, Unsupported, struct_c_declaration
 from ps4_workbench.agents import AnalysisWorker
 from ps4_workbench.client import BrokerClient, load_token
 from ps4_workbench.config import WorkbenchError, numeric, parse_address
+from ps4_workbench.adapters.binja import BinjaWorkbench
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ".exe" if os.name == "nt" else ""
+
+
+class BinaryNinjaAdapterTests(unittest.TestCase):
+    def adapter(self, bv):
+        adapter = object.__new__(BinjaWorkbench)
+        adapter.bv = bv
+        adapter.expected_program_hash = None
+        return adapter
+
+    def test_hash_uses_original_input_not_bndb_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / "eboot.bin"
+            database = Path(directory) / "eboot.bndb"
+            original.write_bytes(b"original module")
+            database.write_bytes(b"analysis database contents")
+            adapter = self.adapter(SimpleNamespace(file=SimpleNamespace(
+                filename=str(database), original_filename=str(original)
+            )))
+            import hashlib
+            self.assertEqual(adapter.input_hash(), hashlib.sha256(b"original module").hexdigest())
+
+            adapter.bv.file.original_filename = str(database)
+            with self.assertRaisesRegex(WorkbenchError, "cannot identify the original module"):
+                adapter.input_hash()
+
+    def test_decompile_resolves_function_containing_address_with_bn6_api(self):
+        function = SimpleNamespace(start=0x1000, hlil="return 42;", mlil=None, llil=None)
+
+        class FakeBinaryView:
+            file = SimpleNamespace(original_filename=None)
+
+            def get_function_at(self, address):
+                return None
+
+            def get_functions_containing(self, address):
+                self.queried = address
+                return [function]
+
+        bv = FakeBinaryView()
+        adapter = self.adapter(bv)
+        adapter.input_hash = lambda: "a" * 64
+        result = adapter.analyze("decompile", {"address": "0x1010"})
+        self.assertEqual(bv.queried, 0x1010)
+        self.assertEqual(result["address"], "0x1000")
+        self.assertEqual(result["text"], "return 42;")
 
 
 def workbench_binary():
@@ -32,7 +79,7 @@ def workbench_binary():
 
 
 class RustBroker:
-    def __init__(self):
+    def __init__(self, toolset="read-only"):
         self.temporary = tempfile.TemporaryDirectory(prefix="ps4-adapter-test-")
         directory = Path(self.temporary.name)
         settings = json.loads((ROOT / "profiles/ps4-1400.json").read_text(encoding="utf-8"))
@@ -43,7 +90,8 @@ class RustBroker:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        self.process = subprocess.Popen([str(workbench_binary()), "--profile", str(profile), "broker", "--port", str(port),
+        self.process = subprocess.Popen([str(workbench_binary()), "--profile", str(profile), "--toolset", toolset,
+                                         "broker", "--port", str(port),
                                          "--token-file", str(self.token)],
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.url = f"http://127.0.0.1:{port}"
@@ -418,7 +466,7 @@ class ApplyThroughBrokerTests(unittest.TestCase):
 class ProjectAndRecipeThroughBrokerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.broker = RustBroker()
+        cls.broker = RustBroker(toolset="full")
 
     @classmethod
     def tearDownClass(cls):

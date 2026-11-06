@@ -88,7 +88,7 @@ pub fn registers(bytes: &[u8]) -> Result<Value> {
 }
 
 pub struct Debugger {
-    profile: Profile,
+    pub profile: Profile,
     connection: Option<TcpStream>,
     events: Option<TcpStream>,
     event_buffer: Vec<u8>,
@@ -386,6 +386,72 @@ impl Debugger {
             debugger.packet(0xbdaa000a,&pid.to_le_bytes())?; debugger.status()?;
             let data=debugger.read(188)?;
             Ok(json!({"pid":word(&data,0),"name":cstring(&data[4..44]),"path":cstring(&data[44..108]),"title_id":cstring(&data[108..124]),"content_id":cstring(&data[124..188])}))
+        })
+    }
+
+    /// Install one reusable RPC trampoline in the target. Callers cache the
+    /// result: upstream allocates a new mapping and thread on every invocation.
+    pub fn install_rpc(&mut self, pid: u32) -> Result<u64> {
+        self.require_qualified_debugger("process_inject")?;
+        Self::pid(pid)?;
+        ensure!(self.attached_pid.is_none(), "RPC installation is blocked during debugger attachment");
+        self.exchange(|debugger| {
+            debugger.packet(0xbdaa0005, &pid.to_le_bytes())?;
+            debugger.status()?;
+            let stub = qword(&debugger.read(8)?, 0);
+            ensure!(stub != 0, "ps4debug-NG returned a null RPC stub");
+            Ok(stub)
+        })
+    }
+
+    /// Call a function through a previously installed RPC stub. The server
+    /// waits for the function to return, so payload entry points must be short.
+    pub fn call_rpc(
+        &mut self,
+        pid: u32,
+        stub: u64,
+        entry: u64,
+        arguments: [u64; 6],
+    ) -> Result<u64> {
+        self.require_qualified_debugger("process_inject")?;
+        Self::pid(pid)?;
+        ensure!(stub != 0 && entry != 0, "RPC stub and entry must be nonzero");
+        ensure!(self.attached_pid.is_none(), "RPC calls are blocked during debugger attachment");
+        let mut body = Vec::with_capacity(68);
+        body.extend(pid.to_le_bytes());
+        body.extend(stub.to_le_bytes());
+        body.extend(entry.to_le_bytes());
+        for argument in arguments {
+            body.extend(argument.to_le_bytes());
+        }
+        self.exchange(|debugger| {
+            debugger.packet(0xbdaa0006, &body)?;
+            debugger.status()?;
+            let response = debugger.read(12)?;
+            ensure!(word(&response, 0) == pid, "RPC response PID does not match the request");
+            Ok(qword(&response, 4))
+        })
+    }
+
+    /// Stage an ELF through CMD_PROC_ELF_RPC. Upstream starts the image entry
+    /// thread before returning it; never invoke that raw entry a second time.
+    pub fn load_elf_rpc(&mut self, pid: u32, elf: &[u8]) -> Result<u64> {
+        self.require_qualified_debugger("process_inject")?;
+        Self::pid(pid)?;
+        ensure!(self.attached_pid.is_none(), "ELF staging is blocked during debugger attachment");
+        ensure!(!elf.is_empty() && elf.len() <= u32::MAX as usize, "Invalid ELF size");
+        ensure!(elf.len() <= self.profile.limit("transfer_bytes"), "ELF exceeds configured transfer limit");
+        let mut body = Vec::with_capacity(8);
+        body.extend(pid.to_le_bytes());
+        body.extend((elf.len() as u32).to_le_bytes());
+        self.exchange(|debugger| {
+            debugger.packet(0xbdaa0010, &body)?;
+            debugger.status()?;
+            debugger.write(elf)?;
+            debugger.status()?;
+            let entry = qword(&debugger.read(8)?, 0);
+            ensure!(entry != 0, "ps4debug-NG returned a null ELF entry");
+            Ok(entry)
         })
     }
 

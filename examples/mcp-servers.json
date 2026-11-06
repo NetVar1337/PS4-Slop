@@ -4,7 +4,9 @@
       "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/target/release/ps4-workbench",
       "args": [
         "--profile",
-        "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/profiles/ps4-1400.json",
+        "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/profiles/ps4-1400.local.json",
+        "--toolset",
+        "read-only",
         "serve"
       ],
       "cwd": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs"

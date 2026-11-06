@@ -22,9 +22,10 @@ use crate::Result;
 const MAX_POLICY_FILE_BYTES: u64 = 1024 * 1024;
 
 const SERVICES: [&str; 4] = ["payload", "ftp", "klog", "debug"];
-const PERMISSIONS: [&str; 7] = [
+const PERMISSIONS: [&str; 8] = [
     "ftp_upload",
     "payload_execute",
+    "process_inject",
     "process_write",
     "debug_control",
     "kernel_read",
@@ -585,6 +586,29 @@ impl Profile {
                 Some(_) => bail!("Invalid jailbreak {name}"),
             }
         }
+        match jailbreak.get("expected_hen_md5") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(digest)) if is_lower_hex(digest, 32) => {}
+            Some(_) => bail!("jailbreak.expected_hen_md5 must be a lowercase MD5 digest"),
+        }
+        for name in [
+            "expected_hen_sha256",
+            "expected_goldhen_sha256",
+            "expected_patchset_1400_sha256",
+        ] {
+            match jailbreak.get(name) {
+                None | Some(Value::Null) => {}
+                Some(Value::String(digest)) => {
+                    require_hash(digest, name)?;
+                }
+                Some(_) => bail!("Invalid jailbreak {name}"),
+            }
+        }
+        match jailbreak.get("local_directory") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) if !value.trim().is_empty() => {}
+            Some(_) => bail!("Invalid jailbreak local_directory"),
+        }
         match debugger.get("payload_sha256") {
             None | Some(Value::Null) => {}
             Some(Value::String(digest)) => {
@@ -598,6 +622,11 @@ impl Profile {
                 if brand.starts_with("ps4debug-NG by Pharaoh2k v")
                     && brand.chars().count() <= 256 => {}
             Some(_) => bail!("Invalid expected debugger branding"),
+        }
+        match debugger.get("payload_path") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(value)) if !value.trim().is_empty() => {}
+            Some(_) => bail!("Invalid debugger payload_path"),
         }
         match object.get("ftp_upload_roots") {
             Some(Value::Array(roots)) if roots.iter().all(Value::is_string) => {}
@@ -780,14 +809,32 @@ mod tests {
         let profile = write_profile(directory.path(), &settings()).unwrap();
         assert_eq!(
             profile.fingerprint(),
-            "5441c8eb4d6a73e2f1ff3bf1659ac4e7935acc2288cd5ebe87397667dfb1a524"
+            "87cb5ee9a6c198c482ef64c14af4ac5c7c32118fc7bdf24920bdd9d1d680d920"
         );
         let mut data = settings();
         data["timeout_seconds"] = json!(2.5);
         let profile = write_profile(directory.path(), &data).unwrap();
         assert_eq!(
             profile.fingerprint(),
-            "1053673d70d798783a57aeb027205213a3227caeb0d0e5fa24410e07e603fa8e"
+            "09ea2768658e27ad622d89421b8cb8b35857ef8398a91b7e3844e1beb78d01a2"
+        );
+    }
+
+    #[test]
+    fn reference_profile_stays_read_only_and_unidentified() {
+        let data: Value = serde_json::from_str(REFERENCE_PROFILE).unwrap();
+        for permission in PERMISSIONS {
+            assert_eq!(
+                data["permissions"][permission],
+                Value::Bool(false),
+                "tracked profile must keep {permission} disabled"
+            );
+        }
+        assert!(data["jailbreak"]["installed_commit"].is_null());
+        assert!(data["jailbreak"]["hen_build"].is_null());
+        assert_eq!(
+            data["jailbreak"]["expected_hen_md5"],
+            json!("6417a84a72f9c7988f0e33b3ae190542")
         );
     }
 

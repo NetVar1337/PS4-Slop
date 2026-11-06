@@ -25,7 +25,7 @@ Python server.
 - `debug_stack`'s description now names its DWARF `.eh_frame` → frame pointer →
   stack scan order.
 
-## Automated checks executed
+## Historical automated checks executed at validation time
 
 - `cargo test --locked`: 101 unit tests and 85 contract tests passed.
 - `cargo clippy --all-targets --locked -- -D warnings`: clean.
@@ -56,7 +56,7 @@ executes no code.
 ## Live read-only console checks
 
 - `ftp_list /data` against `192.168.86.25:2121` returned a listing.
-- `pi mcp list` reports `ps4-workbench` connected with 66 tools: the 54 default
+- `pi mcp list` reported `ps4-workbench` connected with 66 tools: the 54 default
   tools, minus the broker-owned `debug_events`, plus 13 analysis/session tools.
 - Memory-map decoding fixed to the upstream packed 58-byte `proc_vm_map_entry`
   (name[32], start, end, offset, u16 prot); the old 64-byte decoder failed with
@@ -69,7 +69,17 @@ executes no code.
 
 - No payload was sent to `9090`.
 - No debugger session on real hardware.
-- No qualification record exists for the console.
-- Binary Ninja and iaito adapters have not been run inside those applications; the
-  apps are not installed.
+- A local qualification file now exists, but the current profile has changed and
+  the record is stale; it does not authorize advanced operations. Re-qualify only
+  after recording the real Afterglow commit/HEN and completing the required tests.
+- Binary Ninja is installed, but its PS4 analysis-agent adapter has not been run
+  inside the application. The iaito adapter has not been run inside iaito.
 - The GitHub Actions jobs have not been observed running.
+
+## Current local verification scope
+
+The Afterglow verifier hashes the local HEN, GoldHEN, 14.00 patchset and cached
+manifest, and reports git HEAD/worktree status. This does not prove which bytes
+were served to or loaded by the PS4. The ps4debug-NG verifier checks the local
+payload file; only explicit `preflight --probe` performs the debugger identity
+handshake. Neither check sends a payload or attaches to a process.

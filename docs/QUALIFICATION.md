@@ -19,6 +19,13 @@ Record, without guessing:
   payload's branding and `debugger.payload_sha256` from the actual local binary.
 - SDK/compiler revisions and application title/version/module hashes in evidence.
 
+Before opening apps or enabling debugger actions, run the local checks in
+`COMPATIBILITY.md`: `afterglow-verify`, `debugger-payload-verify`, then
+`preflight`. The 14.00 patched `hen.bin` hash is a safety gate because the known
+upstream unpatched build freezes app launches. The manifest check also catches
+stale browser-cache entries. These checks verify local files only; still confirm
+the served version and loaded debugger manually.
+
 The HEN build string is a manually recorded identity; the workbench does not
 remotely attest it. Identical branding cannot prove identical debugger binaries.
 
@@ -59,8 +66,15 @@ qualification. The command does not contact the console or perform tests:
 ps4-workbench --profile profiles/ps4-1400.local.json qualify `
   --evidence C:/research/my-completed-hardware-tests.md `
   --attest I_TESTED_THIS_EXACT_CONFIGURATION `
-  --approve ftp_upload
+  --approve ftp_upload `
+  --afterglow-directory C:/research/afterglow-web
 ```
+
+Advanced approvals (`payload_execute`, `process_write`, `debug_control`, kernel
+access, or `build`) hash and record the verified Afterglow checkout (patched HEN,
+GoldHEN, 14.00 patchset and cache manifest). Debugger permissions additionally require
+`debugger-payload-verify` to pass; pass `--debugger-payload` or set
+`PS4DEBUG_NG_PAYLOAD` when qualifying.
 
 For payload execution, additionally supply `--approve payload_execute` and one
 or more `--payload-sha256 ACTUAL_TESTED_BIN_HASH` options. For builds, supply
@@ -76,6 +90,11 @@ Changing any profile field makes the record stale. Re-test as appropriate,
 re-run with `--replace`, and include the **complete** desired approval/allowlist
 set; replacement does not implicitly preserve old approvals. Restart your MCP
 server after changing profile or qualification configuration.
+
+Toolsets (`static`, `read-only`, `debug`, `full`) are an additional exposure
+filter, not an authorization bypass. Even `full` still requires the profile
+permission and a matching qualification record for each mutating action. Use
+`read-only` unless you specifically need the capabilities of another set.
 
 ## 4. Payload manifests and transport separation
 

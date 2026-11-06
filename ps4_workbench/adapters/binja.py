@@ -54,13 +54,26 @@ class BinjaWorkbench(LiveAnalysis):
 
     def input_hash(self):
         metadata = getattr(self.bv, "file", None)
-        digest = getattr(metadata, "hash", None)
-        if digest:
-            return str(digest).lower()
-        filename = getattr(metadata, "filename", None)
-        if filename:
-            return _sha256_file(filename)
-        raise WorkbenchError("Binary Ninja input SHA-256 is unavailable")
+        # BN 6 FileMetadata has no content-hash property. Hashing filename can
+        # silently bind analysis to the .bndb database instead of the input.
+        original = getattr(metadata, "original_filename", None)
+        if original:
+            from pathlib import Path
+
+            path = Path(str(original))
+            if path.suffix.lower() == ".bndb":
+                raise WorkbenchError(
+                    "Binary Ninja original_filename points at a .bndb; cannot identify the original module"
+                )
+            if path.is_file():
+                return _sha256_file(str(path))
+        raise WorkbenchError(
+            "Binary Ninja original input SHA-256 is unavailable; refusing to hash the analysis database"
+        )
+
+    def _function_containing(self, address):
+        functions = self.bv.get_functions_containing(address)
+        return functions[0] if functions else None
 
     def analyze(self, operation, arguments):
         from ..config import parse_address
@@ -113,7 +126,7 @@ class BinjaWorkbench(LiveAnalysis):
         if operation == "decompile":
             function = self.bv.get_function_at(address)
             if function is None:
-                containing = self.bv.get_function_containing(address)
+                containing = self._function_containing(address)
                 if containing is None:
                     raise WorkbenchError("No function at static address")
                 function = containing
@@ -165,7 +178,7 @@ class BinjaWorkbench(LiveAnalysis):
             text = arguments["text"]
             if hasattr(self.bv, "set_comment_at"):
                 self.bv.set_comment_at(address, text)
-            elif (fn := self.bv.get_function_containing(address)) is not None:
+            elif (fn := self._function_containing(address)) is not None:
                 fn.set_comment_at(address, text)
             return {"address": hex(address), "text": text, "applied": True}
         raise WorkbenchError("Unsupported Binary Ninja analysis operation")

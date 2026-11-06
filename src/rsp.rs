@@ -726,6 +726,20 @@ impl RspSession {
             self.no_ack = true;
             return reply("OK");
         }
+        // Extended mode (radare2 requires it before vAttach). Restart/run/kill stay refused below.
+        if command == "!" {
+            return reply("OK");
+        }
+        // LLDB (also Binary Ninja's debugger) identifies host/process from these; x86-64 FreeBSD (Orbis).
+        if command == "qHostInfo" {
+            return reply("cputype:16777223;cpusubtype:3;ostype:freebsd;vendor:unknown;endian:little;ptrsize:8;");
+        }
+        if command == "qProcessInfo" {
+            return reply(&format!(
+                "pid:{:x};cputype:1000007;cpusubtype:3;ostype:freebsd;vendor:unknown;endian:little;ptrsize:8;",
+                self.pid
+            ));
+        }
         if command.starts_with("qXfer:features:read:target.xml:") {
             let (offset, length) = transfer_range(command, "XML")?;
             return Ok(Some(chunk(&TARGET_XML, offset, length)));
@@ -1120,6 +1134,13 @@ mod tests {
         for packet in [&b"M4000,1:ff"[..], b"P0=00", b"G00", b"k", b"vKill;47", b"qRcmd,00", b"X4000,0:"] {
             assert_eq!(session.handle(packet).unwrap(), Some(b"E01".to_vec()));
         }
+        // radare2 requires extended mode; enabling it must not unlock restart/run/kill.
+        assert_eq!(session.handle(b"!").unwrap(), Some(b"OK".to_vec()));
+        for packet in [&b"R00"[..], b"vRun;00", b"k", b"vKill;47"] {
+            assert_eq!(session.handle(packet).unwrap(), Some(b"E01".to_vec()));
+        }
+        let process = String::from_utf8(session.handle(b"qProcessInfo").unwrap().unwrap()).unwrap();
+        assert!(process.starts_with("pid:47;"), "{process}");
         let supported = String::from_utf8(session.handle(b"qSupported:xmlRegisters=i386").unwrap().unwrap()).unwrap();
         assert!(supported.starts_with("PacketSize=4000"));
         assert!(supported.contains("qXfer:libraries-svr4:read+"));

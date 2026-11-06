@@ -1,12 +1,16 @@
 {
   "name": "ps4-afterglow-1400",
-  "host": "192.168.86.25",
+  "host": "127.0.0.1",
   "firmware": "14.00",
   "jailbreak": {
     "repository": "https://github.com/well0nez/afterglow-web",
-    "reference_commit": "7eb2663a721bf73278680b82c79f14affeeff0db",
+    "reference_commit": "688fd1565f36c54aa9aaaa2e9d0ad121968db775",
     "installed_commit": null,
-    "hen_build": null
+    "hen_build": null,
+    "expected_hen_md5": "6417a84a72f9c7988f0e33b3ae190542",
+    "expected_hen_sha256": "364e5f6fd59e8a7afc207c70e27b840699f8173f3ae0241b63bc6dec6b394bfe",
+    "expected_goldhen_sha256": "39452f5e1c305ac9efcb4745eef7958b4db8c6d85299529f08700970b009ea4d",
+    "expected_patchset_1400_sha256": "615f275b96831cc04173757db39e93f0d27b52888976af2a6444604aa8ac5dbf"
   },
   "ports": {"payload": 9090, "ftp": 2121, "klog": 3232, "debug": 744},
   "debugger": {
@@ -27,6 +31,7 @@
   "permissions": {
     "ftp_upload": false,
     "payload_execute": false,
+    "process_inject": false,
     "process_write": false,
     "debug_control": false,
     "kernel_read": false,

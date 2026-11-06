@@ -18,8 +18,29 @@ Environment:
 
 import os
 import sys
+from pathlib import Path
 
-repository = os.environ.get("PS4_WORKBENCH_ROOT", "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs")
+
+def _repository_root():
+    configured = os.environ.get("PS4_WORKBENCH_ROOT")
+    if configured:
+        root = Path(configured).expanduser().resolve()
+        if (root / "ps4_workbench" / "adapters" / "binja.py").is_file():
+            return root
+        raise RuntimeError("PS4_WORKBENCH_ROOT does not point at a PS4-DebugMCPs checkout")
+    candidates = [Path.cwd()]
+    script = globals().get("__file__")
+    if script:
+        candidates.append(Path(script).resolve().parent)
+    for candidate in candidates:
+        for root in (candidate, *candidate.parents):
+            if (root / "ps4_workbench" / "adapters" / "binja.py").is_file():
+                return root
+    raise RuntimeError(
+        "Cannot locate PS4-DebugMCPs; set PS4_WORKBENCH_ROOT to the repository root"
+    )
+
+repository = str(_repository_root())
 if repository not in sys.path:
     sys.path.insert(0, repository)
 

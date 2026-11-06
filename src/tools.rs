@@ -8,11 +8,53 @@ use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom};
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+pub enum Toolset {
+    /// Offline, read-only tools only (no console or network access).
+    Static,
+    /// Read-only tools, including live inspection; mutating tools stay hidden.
+    ReadOnly,
+    /// Read-only tools plus process writes and debugger control.
+    Debug,
+    /// Every tool allowed by the profile permissions.
+    Full,
+}
+
+impl Toolset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::ReadOnly => "read-only",
+            Self::Debug => "debug",
+            Self::Full => "full",
+        }
+    }
+
+    pub fn allows(self, tool: &Value) -> bool {
+        let permission = tool["permission"].as_str();
+        let read_only = tool["annotations"]["readOnlyHint"].as_bool() == Some(true);
+        let offline = tool["annotations"]["openWorldHint"].as_bool() == Some(false);
+        match self {
+            Self::Full => true,
+            Self::ReadOnly => permission.is_none() && read_only,
+            Self::Static => permission.is_none() && read_only && offline,
+            Self::Debug => {
+                (permission.is_none() && read_only)
+                    || matches!(
+                        permission,
+                        Some("debug_control" | "process_write" | "kernel_read")
+                    )
+            }
+        }
+    }
+}
+
 pub struct ToolRegistry {
     pub workbench: Workbench,
     catalog: Vec<Value>,
     validators: std::collections::HashMap<String, jsonschema::Validator>,
     development: Development,
+    toolset: Toolset,
 }
 
 pub fn address(value: &Value) -> Result<u64> {
@@ -38,6 +80,10 @@ pub fn number(args: &Value, key: &str) -> Result<u64> {
 
 impl ToolRegistry {
     pub fn new(workbench: Workbench) -> Result<Self> {
+        Self::with_toolset(workbench, Toolset::ReadOnly)
+    }
+
+    pub fn with_toolset(workbench: Workbench, toolset: Toolset) -> Result<Self> {
         let mut catalog: Vec<Value> = crate::extensions::full_catalog()?;
         let mut validators = std::collections::HashMap::new();
         for tool in &mut catalog {
@@ -75,16 +121,22 @@ impl ToolRegistry {
             catalog,
             validators,
             development,
+            toolset,
         })
+    }
+
+    pub fn toolset(&self) -> Toolset {
+        self.toolset
     }
 
     pub fn available(&self) -> Vec<Value> {
         self.catalog
             .iter()
             .filter(|tool| {
-                tool["permission"].as_str().is_none_or(|permission| {
-                    self.workbench.profile.data["permissions"][permission] == true
-                })
+                self.toolset.allows(tool)
+                    && tool["permission"].as_str().is_none_or(|permission| {
+                        self.workbench.profile.data["permissions"][permission] == true
+                    })
             })
             .map(|tool| {
                 let mut tool = tool.clone();
@@ -106,6 +158,11 @@ impl ToolRegistry {
                 "Locally disabled tool: {name}"
             );
         }
+        ensure!(
+            self.toolset.allows(tool),
+            "Tool {name} is excluded by the '{}' toolset",
+            self.toolset.label()
+        );
         self.validators
             .get(name)
             .context("Missing schema")?
@@ -117,7 +174,8 @@ impl ToolRegistry {
         let result = crate::config::json_safe(self.execute(name, &args)?);
         // Best-effort provenance: never fail a completed tool call because the
         // project index could not be updated.
-        if let Err(error) = crate::project::auto_record(&self.workbench.store, name, &args, &result) {
+        if let Err(error) = crate::project::auto_record(&self.workbench.store, name, &args, &result)
+        {
             eprintln!("project auto-record skipped for {name}: {error:#}");
         }
         let content = serde_json::to_vec(&result)?;
@@ -317,10 +375,11 @@ impl ToolRegistry {
                 .workbench
                 .debugger
                 .fpu_registers(number(args, "thread_id")? as u32),
-            "debug_registers_dr" => self
-                .workbench
-                .debugger
-                .hardware_debug_registers(number(args, "thread_id")? as u32),
+            "debug_registers_dr" => {
+                self.workbench
+                    .debugger
+                    .hardware_debug_registers(number(args, "thread_id")? as u32)
+            }
             "debug_breakpoint_list" => Ok(self.workbench.debugger.breakpoint_list()),
             "debug_stack" => self.workbench.debugger.stack_trace(
                 number(args, "thread_id")? as u32,
@@ -382,7 +441,10 @@ impl ToolRegistry {
                     "debug_control_intent",
                     json!({"method":name,"arguments":args}),
                 )?;
-                let result = self.workbench.debugger.breakpoints_import(&args["document"]);
+                let result = self
+                    .workbench
+                    .debugger
+                    .breakpoints_import(&args["document"]);
                 self.workbench.audit_result("debug_control", &result)?;
                 result
             }
@@ -391,8 +453,9 @@ impl ToolRegistry {
                     "debug_control_intent",
                     json!({"method":name,"arguments":args}),
                 )?;
-                let timeout =
-                    Duration::from_secs(args["timeout_seconds"].as_u64().unwrap_or(10).clamp(1, 60));
+                let timeout = Duration::from_secs(
+                    args["timeout_seconds"].as_u64().unwrap_or(10).clamp(1, 60),
+                );
                 let result = match name {
                     "debug_step" => self.workbench.debugger.step(
                         string(args, "action")?,
@@ -509,14 +572,22 @@ impl ToolRegistry {
                 let symbols = match args.get("symbols") {
                     Some(Value::Array(items)) => items
                         .iter()
-                        .map(|v| v.as_str().context("symbols[] must be string").map(str::to_owned))
+                        .map(|v| {
+                            v.as_str()
+                                .context("symbols[] must be string")
+                                .map(str::to_owned)
+                        })
                         .collect::<Result<Vec<_>>>()?,
                     _ => Vec::new(),
                 };
                 let nids = match args.get("nids") {
                     Some(Value::Array(items)) => items
                         .iter()
-                        .map(|v| v.as_str().context("nids[] must be string").map(str::to_owned))
+                        .map(|v| {
+                            v.as_str()
+                                .context("nids[] must be string")
+                                .map(str::to_owned)
+                        })
                         .collect::<Result<Vec<_>>>()?,
                     _ => Vec::new(),
                 };
@@ -658,24 +729,55 @@ mod tests {
     #[test]
     fn catalog_covers_existing_tools_and_policy() {
         let catalog: Vec<Value> = crate::extensions::full_catalog().unwrap();
-        let mut names: Vec<&str> = catalog.iter().map(|tool| tool["name"].as_str().unwrap()).collect();
+        let mut names: Vec<&str> = catalog
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
         names.sort_unstable();
         let total = names.len();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate tool names in catalog");
         for expected in [
-            "debug_step", "debug_run", "debug_stack", "debug_eval", "disassemble",
-            "module_list", "debug_registers_set", "debug_registers_fpu",
-            "debug_registers_dr", "debug_breakpoint_list", "artifact_info",
-            "artifact_disasm", "artifact_strings", "code_xrefs", "memory_search",
-            "debug_label", "debug_breakpoint_save", "debug_breakpoint_load",
-            "debug_watchpoint_list", "assemble", "memory_patch", "patch_list",
-            "patch_restore", "memory_scan", "memory_alloc", "memory_free",
-            "memory_protect", "memory_elf_dump", "debug_registers_fpu_set",
-            "debug_tls", "debug_tls_set", "debug_label_save", "debug_label_load",
-            "nid_resolve", "address_rebase",
+            "debug_step",
+            "debug_run",
+            "debug_stack",
+            "debug_eval",
+            "disassemble",
+            "module_list",
+            "debug_registers_set",
+            "debug_registers_fpu",
+            "debug_registers_dr",
+            "debug_breakpoint_list",
+            "artifact_info",
+            "artifact_disasm",
+            "artifact_strings",
+            "code_xrefs",
+            "memory_search",
+            "debug_label",
+            "debug_breakpoint_save",
+            "debug_breakpoint_load",
+            "debug_watchpoint_list",
+            "assemble",
+            "memory_patch",
+            "patch_list",
+            "patch_restore",
+            "memory_scan",
+            "memory_alloc",
+            "memory_free",
+            "memory_protect",
+            "memory_elf_dump",
+            "debug_registers_fpu_set",
+            "debug_tls",
+            "debug_tls_set",
+            "debug_label_save",
+            "debug_label_load",
+            "nid_resolve",
+            "address_rebase",
         ] {
-            assert!(catalog.iter().any(|tool| tool["name"] == expected), "{expected}");
+            assert!(
+                catalog.iter().any(|tool| tool["name"] == expected),
+                "{expected}"
+            );
         }
         for tool in catalog {
             let validator = jsonschema::validator_for(&tool["inputSchema"]).unwrap();
@@ -687,14 +789,16 @@ mod tests {
     #[test]
     fn offline_tools_dispatch_and_preserve_large_length_caps() {
         let dir = tempfile::tempdir().unwrap();
-        let mut data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let mut data: Value =
+            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");
         data["permissions"]["process_write"] = json!(true);
         let profile_path = dir.path().join("profile.json");
         std::fs::write(&profile_path, data.to_string()).unwrap();
         let profile = Profile::load(&profile_path).unwrap();
-        let mut reg = ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap();
+        let mut reg =
+            ToolRegistry::with_toolset(Workbench::new(profile).unwrap(), Toolset::Full).unwrap();
 
         // memory_alloc length max should remain 64 MiB (not clamped to 1 MiB memory_bytes)
         let alloc_schema = reg
@@ -738,5 +842,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(loaded["loaded"], 1);
+    }
+
+    #[test]
+    fn toolsets_are_an_additional_policy_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut data: Value =
+            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        data["artifact_directory"] = json!("artifacts");
+        data["qualification_file"] = json!("qualification.json");
+        data["permissions"]["debug_control"] = json!(true);
+        data["permissions"]["process_write"] = json!(true);
+        data["permissions"]["payload_execute"] = json!(true);
+        let profile_path = dir.path().join("profile.json");
+        std::fs::write(&profile_path, data.to_string()).unwrap();
+        let profile = Profile::load(&profile_path).unwrap();
+
+        let mut readonly =
+            ToolRegistry::with_toolset(Workbench::new(profile.clone()).unwrap(), Toolset::ReadOnly)
+                .unwrap();
+        let readonly_names: Vec<_> = readonly
+            .available()
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(readonly_names.iter().any(|name| name == "artifact_info"));
+        assert!(!readonly_names.iter().any(|name| name == "debug_attach"));
+        assert!(!readonly_names.iter().any(|name| name == "memory_write"));
+        assert!(
+            readonly
+                .call("debug_attach", json!({"pid": 7}))
+                .unwrap_err()
+                .to_string()
+                .contains("toolset")
+        );
+
+        let debug =
+            ToolRegistry::with_toolset(Workbench::new(profile.clone()).unwrap(), Toolset::Debug)
+                .unwrap();
+        let debug_names: Vec<_> = debug
+            .available()
+            .into_iter()
+            .map(|tool| tool["name"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(debug_names.iter().any(|name| name == "debug_attach"));
+        assert!(debug_names.iter().any(|name| name == "memory_write"));
+        assert!(!debug_names.iter().any(|name| name == "payload_execute"));
+
+        let full =
+            ToolRegistry::with_toolset(Workbench::new(profile).unwrap(), Toolset::Full).unwrap();
+        assert!(
+            full.available()
+                .iter()
+                .any(|tool| tool["name"] == "payload_execute")
+        );
     }
 }

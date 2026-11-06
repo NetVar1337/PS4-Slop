@@ -573,7 +573,8 @@ mod tests {
 
     fn registry(dir: &std::path::Path, profile: Option<Profile>) -> ToolRegistry {
         let profile = profile.unwrap_or_else(|| crate::artifacts::tests::test_profile(dir));
-        ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap()
+        ToolRegistry::with_toolset(Workbench::new(profile).unwrap(), crate::tools::Toolset::Full)
+            .unwrap()
     }
 
     fn save(reg: &ToolRegistry, bytes: &[u8], ext: &str) -> String {

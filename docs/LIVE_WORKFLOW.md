@@ -145,27 +145,66 @@ the agent; job timeout is not represented as successful analysis.
 Do not run it in Jython/Python 2. The Java script is the tested, dependency-free
 route for this installation.
 
-### Optional native Ghidra Debugger UI
+### Native Ghidra Debugger UI
 
-Install/configure a local GDB with x86-64 ELF support and embedded Python, plus
-the dependencies required by Ghidra 12.2's shipped GDB trace agent. These are
-not installed by this project; `desktop_status` currently reports GDB missing.
+Requires a GDB with x86-64/FreeBSD support and embedded Python, plus `protobuf`
+and `psutil` for Ghidra's trace agent. Tested setup (MSYS2):
 
-In Ghidra's Debugger tool use the shipped **gdb remote** launcher, target type
-`remote`, host `127.0.0.1`, port `1234`, and the real local module image. This
-talks to this project's GDB Remote bridge, not to the PS4 directly on port 744.
-Verify static/dynamic module mappings in Ghidra before applying labels or relying
-on static addresses. Generic memory-map XML is not proof of an ELF load bias.
+```powershell
+winget install MSYS2.MSYS2
+C:\msys64\usr\bin\env.exe MSYSTEM=MINGW64 /usr/bin/bash -lc "pacman -S --needed --noconfirm mingw-w64-x86_64-gdb-multiarch mingw-w64-x86_64-python-pip mingw-w64-x86_64-python-psutil"
+# protobuf from Ghidra's bundled wheel:
+C:\msys64\mingw64\bin\python.exe -m pip install --break-system-packages --no-deps `
+  <Ghidra>\Ghidra\Debug\Debugger-rmi-trace\pypkg\dist\protobuf-*.whl
+```
 
-For simultaneous native windows, keep one controlling bridge on 1234 and start
-a second observer bridge on 1235 with identical PID/profile/callback arguments
-plus `--observer`. Attach/stop the controller first, then connect the observer.
-Observer controls are refused; it never resumes or detaches the controller.
-Observer refresh is explicit, not a full Ghidra trace/timeline synchronization
-plugin. Native Ghidra/GDB UI integration has not been exercised here because
-the local GDB dependency is absent.
+Use `gdb-multiarch`, not plain `gdb`: MSYS2's default GDB lacks the FreeBSD OS ABI
+and rejects the bridge's target description. `desktop_status` reports `gdb_path`.
 
-## 3b. Connect Binary Ninja or iaito as static-analysis agents
+In Ghidra's Debugger tool use the shipped **gdb remote** launcher: gdb command
+`C:\msys64\mingw64\bin\gdb-multiarch.exe`, target type `remote`, host `127.0.0.1`,
+port `1234`, and the real local module image. This talks to this project's GDB
+Remote bridge, not to the PS4 directly on port 744. Verify static/dynamic module
+mappings in Ghidra before applying labels or relying on static addresses. Generic
+memory-map XML is not proof of an ELF load bias.
+
+## 3a. Several native debuggers at once: `integrations/live/start-live.ps1`
+
+```powershell
+.\integrations\live\start-live.ps1 -TargetPid <observed pid> -Observers 3
+.\integrations\live\start-live.ps1 -Stop
+```
+
+Starts the broker (if not already on 8765), a **controller** bridge on 1234 and
+observer bridges on 1235.. for the same PID, picks the PC address that routes to
+the profile's console as the callback, and (run once as administrator) adds a
+firewall rule allowing TCP 755 **from the console's address only**. It does not
+contact the console; the first debugger connecting to 1234 attaches. `-Stop` ends
+only the processes the script started. Logs: `workspace/live-logs`.
+
+Attach the controller first; observers read registers, memory and maps while the
+controller has the target stopped. Observer control requests are refused and the
+observer bridge closes that connection (LLDB reports it as "process exited"); the
+controller is unaffected.
+
+| Debugger | Connect to the bridge |
+|---|---|
+| IDA Pro | Remote GDB debugger, host `127.0.0.1`, port; attach to the PID (section 2) |
+| Ghidra | Debugger tool, **gdb remote** launcher with `gdb-multiarch` (above) |
+| Binary Ninja | Debugger > Connect to Remote Process, adapter **LLDB**, `127.0.0.1`, port; remote stub type `gdb-remote` (default) |
+| iaito | File > Open with **Debug** enabled: `gdb://127.0.0.1:<port>/<pid>` |
+
+Verified against the loopback `ps4debug-fixture` (not hardware): `gdb-multiarch`
+18.1 on the controller (attach, registers, memory, breakpoints, `stepi`, interrupt,
+detach) together with radare2 6.2.2 (iaito's engine) and Binary Ninja's bundled
+LLDB as observers. The fixture does not execute code, so continue-to-breakpoint
+was exercised only as continue + interrupt.
+
+Bridge notes: extended mode (`!`, required by radare2) is accepted, but restart,
+run and kill (`R`, `vRun`, `k`, `vKill`) stay refused. `qProcessInfo`/`qHostInfo`
+identify the configured PID as x86-64 FreeBSD for LLDB.
+
+## 3b. Binary Ninja or iaito as static-analysis agents
 
 With the broker running (`ps4-workbench broker`), register an agent so the
 shared MCP's `analysis_*` tools can reach it:
@@ -272,7 +311,9 @@ structure / SELF-PKG identification), `artifact_disasm`, `artifact_strings`,
 
 ## Verification boundary
 
-See `VALIDATION.md`. The exact installed IDA native debugger and Ghidra Java
-static agent have been exercised against generated/local fixtures. **The PS4 at
-192.168.86.25 has not been contacted.** Actual 14.00/Afterglow/HEN/debugger
-qualification remains mandatory and is not a 100%-compatibility certification.
+See `VALIDATION_03.md` for the tested/not-tested matrix. Earlier validation
+records include limited FTP and read-only debugger inspection at the address
+then configured; that is not a current connection claim. Use the host in your
+local profile. No payload send or live debugger-control session is claimed here.
+Actual 14.00/Afterglow/HEN/debugger qualification remains mandatory and is not
+a 100%-compatibility certification.

@@ -38,13 +38,21 @@ These commands do not contact the PS4. Tests use temporary files, fake sockets,
 loopback FTP/debug/log servers, and a local MCP subprocess.
 See [the current validation record](docs/VALIDATION_03.md) for executed checks and untested boundaries.
 
-Your profile is `profiles/ps4-1400.json`:
+The tracked `profiles/ps4-1400.json` is a safe, read-only template. Copy it to
+`profiles/ps4-1400.local.json` before setting your console address or enabling
+permissions:
 
-- Console: `192.168.86.25`, firmware claim `14.00`.
+```powershell
+Copy-Item profiles/ps4-1400.json profiles/ps4-1400.local.json
+```
+
+Point all commands at that ignored local copy. The tracked template records:
+
+- Console address: `127.0.0.1` loopback placeholder; set the actual value in your local profile. Firmware claim: `14.00`.
 - GoldHEN BinLoader: `9090`; FTP: `2121`.
 - Optional Klog: `3232`; optional ps4debug-NG: `744`.
 - Actual installed Afterglow commit, HEN build and debugger binary identity:
-  **unset**, because these have not been verified on your hardware.
+  **unset** in the tracked template; record only what you verified on your hardware.
 - Artifacts: `workspace/`; local qualification: `profiles/qualification.local.json`.
 
 The reference source commits are research references, **not claims about what is
@@ -78,12 +86,14 @@ The example values are not known to be valid on your console.
 
 ```powershell
 cargo build --release
-target/release/ps4-workbench --profile profiles/ps4-1400.json serve
+target/release/ps4-workbench --profile profiles/ps4-1400.local.json --toolset read-only serve
 ```
 
 This is a stdio service; do not run it expecting an interactive prompt. Configure
-your MCP client using `examples/mcp-servers.json` (absolute paths for this checkout;
-adjust if you move it). Tools return `structuredContent` (`{"data": ...}`) with output
+your MCP client using `examples/mcp-servers.json`, or OpenCode using
+`examples/opencode.json` (replace its placeholder paths). For Binary Ninja 6 on
+Windows, enable `ui.mcp.enabled`, restart BN, then start **Plugins → MCP → Start
+Server**; OpenCode connects to `http://127.0.0.1:24642/mcp`. Tools return `structuredContent` (`{"data": ...}`) with output
 schemas; the server also exposes MCP **resources** (`ps4://workbench/...`) and workflow
 **prompts** (read-only triage, static analysis, dynamic analysis), and honors request
 cancellation before dispatch (a command already sent to the console cannot be undone).
@@ -96,7 +106,10 @@ the running exe aside) before `cargo build --release`.
 
 ## Tool groups
 
-There are **112 standalone tools**, **83 visible with the default read-only profile**.
+There are **115 standalone tools**. The default `read-only` toolset keeps mutating
+tools hidden even if the profile enables them; use an explicit toolset to expose
+additional tools. Profile permissions and exact-profile qualification remain
+required regardless of toolset.
 Shared broker mode adds **15 static-analysis, synchronization & application tools** plus
 3 session-observer tools. Run `tools` for the complete, machine-readable schemas and
 current policy-filtered tool list. Every tool has exactly one implementation (Rust);
@@ -114,6 +127,18 @@ integers above 2^53 in results are returned as hex strings.
   manifest hash, allowlist) **before any byte is sent**, so an invalid payload never
   reaches the loader and no service restart is needed. Mutations are never
   auto-retried.
+- **Toolsets:** `static` exposes offline/read-only analysis; `read-only` (default)
+  adds read-only live inspection; `debug` adds profile-enabled debugger control
+  and process writes; `full` exposes every profile-enabled tool. For example,
+  use `--toolset debug` only after explicitly reviewing the local profile and
+  hardware qualification.
+- **14.00 preflight:** `preflight` verifies the local patched `hen.bin`,
+  `goldhen.bin`, 14.00 patchset and cache manifest, and optionally hashes the
+  ps4debug-NG payload. `probe: true` is explicit, probes FTP/Klog and performs
+  the debugger identity handshake; it never probes the payload port or sends a
+  payload. CLI equivalents: `afterglow-verify`, `debugger-payload-verify`, and
+  `preflight --probe`. Set `PS4_AFTERGLOW_DIR` and `PS4DEBUG_NG_PAYLOAD` or pass
+  paths explicitly.
 - **Processes & Memory Scanning:** process list and identity, memory maps, bounded
   memory reads, little-endian typed values, provenance-rich snapshots, local
   snapshot diffs, wildcard byte-pattern scans across page boundaries, stateful
@@ -223,6 +248,13 @@ in-memory ELF headers and never decrypts encrypted SELF/PKG containers.
 
 Read [the compatibility contract](docs/COMPATIBILITY.md) **before loading any
 debugger or payload**, then follow [the hardware qualification checklist](docs/QUALIFICATION.md).
+
+Before loading Afterglow, run `ps4-workbench --profile profiles/ps4-1400.local.json
+afterglow-verify --directory C:/path/to/afterglow-web`. The known-good patched
+14.00 `hen.bin` is pinned by both MD5 and SHA-256; the known upstream unpatched
+MD5 is rejected. Afterglow is a web exploit/HEN path, not a ps4debug-NG loader:
+verify the debugger BIN separately, load it manually through an appropriate
+loader, then use `preflight --probe` for the read-only identity handshake.
 
 Mutating tools are hidden unless their profile permission is explicitly enabled.
 Enabling the flag alone is insufficient: execution also requires a matching,

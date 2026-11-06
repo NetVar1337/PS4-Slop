@@ -420,7 +420,7 @@ impl Image {
     }
 }
 
-#[cfg(test)]
+#[doc(hidden)]
 pub mod testelf {
     //! Synthetic ELF builder shared by the static-analysis tests.
 

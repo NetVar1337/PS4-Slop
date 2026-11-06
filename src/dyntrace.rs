@@ -285,7 +285,11 @@ mod tests {
         );
         let directory = tempfile::tempdir().unwrap();
         let profile = fake::qualified_profile(directory.path(), fake.port);
-        let mut registry = ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap();
+        let mut registry = ToolRegistry::with_toolset(
+            Workbench::new(profile).unwrap(),
+            crate::tools::Toolset::Full,
+        )
+        .unwrap();
         registry.call("debug_attach", json!({"pid": 71, "listen_address": "127.0.0.1"})).unwrap();
         registry.workbench.debugger.wait_stop(Duration::from_secs(2)).unwrap().expect("attach stop");
         let blocks = json!({"format": tracekit::BLOCKS_FORMAT, "module": "fixture.elf", "module_sha256": null,

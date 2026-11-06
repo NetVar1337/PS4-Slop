@@ -727,7 +727,11 @@ mod tests {
     }
 
     fn registry(port: u16, directory: &std::path::Path) -> ToolRegistry {
-        ToolRegistry::new(Workbench::new(fake::qualified_profile(directory, port)).unwrap()).unwrap()
+        ToolRegistry::with_toolset(
+            Workbench::new(fake::qualified_profile(directory, port)).unwrap(),
+            crate::tools::Toolset::Full,
+        )
+        .unwrap()
     }
 
     #[test]

@@ -452,6 +452,9 @@ pub fn validate(value: &Value, schema: &Value, location: &str) -> Result<()> {
 fn fallback_permission(name: &str) -> Option<&'static str> {
     match name {
         "payload_execute" => Some("payload_execute"),
+        "payload_stage" | "payload_recover" | "payload_status" | "payload_rpc" | "payload_shutdown" => {
+            Some("process_inject")
+        }
         "memory_write" | "memory_patch" | "patch_restore" | "memory_alloc" | "memory_free" | "memory_protect" => {
             Some("process_write")
         }
@@ -482,7 +485,7 @@ fn tool_permission(description: &Value, name: &str) -> Option<String> {
 }
 
 fn is_shared(name: &str) -> bool {
-    ["debug_", "process_", "memory_", "kernel_", "patch_"]
+    ["debug_", "process_", "memory_", "kernel_", "patch_", "payload_"]
         .iter()
         .any(|prefix| name.starts_with(prefix))
         || matches!(
@@ -1470,7 +1473,11 @@ pub(crate) mod testing {
         let profile_path = directory.path().join("profile.json");
         std::fs::write(&profile_path, serde_json::to_vec(&profile_document()).unwrap()).unwrap();
         let profile = Profile::load(&profile_path).unwrap();
-        let registry = ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap();
+        let registry = ToolRegistry::with_toolset(
+            Workbench::new(profile).unwrap(),
+            crate::tools::Toolset::Full,
+        )
+        .unwrap();
         let token_path = directory.path().join("broker-token.local");
         let token = load_token(&token_path, true).unwrap();
         Fixture { directory, profile_path, token_path, token, hub: Arc::new(SessionHub::from_registry(registry)) }

@@ -8,7 +8,8 @@ use tokio::sync::Semaphore;
 
 /// Largest accepted JSON-RPC line; a longer line is answered once and the transport closed.
 pub const MAX_MESSAGE: usize = 1_048_576;
-const PARSE_ERROR: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON"}}"#;
+const PARSE_ERROR: &str =
+    r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Invalid JSON"}}"#;
 const OVERSIZE_ERROR: &str = r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Message exceeds 1 MiB; closing transport"}}"#;
 
 enum Frame {
@@ -19,12 +20,19 @@ enum Frame {
 
 /// Read one newline-delimited message into `line` (newline excluded) without
 /// ever buffering more than `MAX_MESSAGE` bytes.
-async fn next_frame<R: AsyncBufRead + Unpin>(reader: &mut R, line: &mut Vec<u8>) -> std::io::Result<Frame> {
+async fn next_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+) -> std::io::Result<Frame> {
     line.clear();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
-            return Ok(if line.is_empty() { Frame::Eof } else { Frame::Line });
+            return Ok(if line.is_empty() {
+                Frame::Eof
+            } else {
+                Frame::Line
+            });
         }
         let (take, complete) = match available.iter().position(|byte| *byte == b'\n') {
             Some(position) => (position, true),
@@ -41,7 +49,10 @@ async fn next_frame<R: AsyncBufRead + Unpin>(reader: &mut R, line: &mut Vec<u8>)
     }
 }
 
-async fn write_line<W: AsyncWrite + Unpin>(output: &tokio::sync::Mutex<W>, line: &[u8]) -> std::io::Result<()> {
+async fn write_line<W: AsyncWrite + Unpin>(
+    output: &tokio::sync::Mutex<W>,
+    line: &[u8],
+) -> std::io::Result<()> {
     let mut output = output.lock().await;
     output.write_all(line).await?;
     if !line.ends_with(b"\n") {
@@ -53,7 +64,11 @@ async fn write_line<W: AsyncWrite + Unpin>(output: &tokio::sync::Mutex<W>, line:
 /// Forward well-formed, bounded JSON lines to the MCP service. Malformed or
 /// non-finite JSON is answered with -32700; an oversized line is answered and
 /// ends the input so the transport closes.
-async fn filter_input<R, F, W>(input: R, mut feed: F, output: Arc<tokio::sync::Mutex<W>>) -> std::io::Result<()>
+async fn filter_input<R, F, W>(
+    input: R,
+    mut feed: F,
+    output: Arc<tokio::sync::Mutex<W>>,
+) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     F: AsyncWrite + Unpin,
@@ -125,24 +140,26 @@ pub struct McpServer {
     backend: Backend,
     client: String,
     tools: Arc<Vec<Tool>>,
+    instructions: String,
     cursor: Arc<Mutex<u64>>,
     permits: Arc<Semaphore>,
 }
 
 impl McpServer {
     pub fn local(registry: ToolRegistry, client: &str) -> Result<Self> {
+        let toolset = registry.toolset().label();
         let hub = Arc::new(SessionHub::from_registry(registry));
-        let server = Self::new(Backend::Local(hub.clone()), client)?;
+        let server = Self::new(Backend::Local(hub.clone()), client, toolset)?;
         hub.start()?;
         Ok(server)
     }
 
     pub fn remote(client: BrokerClient) -> Result<Self> {
         let identifier = client.client_id().to_owned();
-        Self::new(Backend::Remote(Arc::new(client)), &identifier)
+        Self::new(Backend::Remote(Arc::new(client)), &identifier, "read-only")
     }
 
-    fn new(backend: Backend, client: &str) -> Result<Self> {
+    fn new(backend: Backend, client: &str, toolset: &str) -> Result<Self> {
         ensure!(
             crate::broker::valid_client_identity(client),
             "Invalid client identity"
@@ -166,6 +183,9 @@ impl McpServer {
                 false,
             ),
         ] {
+            if name == "session_release" && !matches!(toolset, "debug" | "full") {
+                continue;
+            }
             descriptions.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":{},"additionalProperties":false},
                 "annotations":{"readOnlyHint":read_only,"destructiveHint":false,"idempotentHint":false,"openWorldHint":true}}));
         }
@@ -178,12 +198,19 @@ impl McpServer {
             backend,
             client: client.to_owned(),
             tools: Arc::new(tools),
+            instructions: format!(
+                "{INSTRUCTIONS} Active toolset: {toolset}. Toolset visibility is an additional policy gate; profile permissions and exact-profile qualification remain authoritative."
+            ),
             cursor: Arc::new(Mutex::new(0)),
             permits: Arc::new(Semaphore::new(4)),
         })
     }
 
     fn execute(&self, name: &str, arguments: Value) -> Result<Value> {
+        ensure!(
+            self.tools.iter().any(|tool| tool.name == name),
+            "Tool {name} is not exposed by this MCP server"
+        );
         if name.starts_with("session_") {
             ensure!(
                 arguments
@@ -256,7 +283,7 @@ impl McpServer {
             "ps4://workbench/session" => self.execute("session_state", json!({})),
             "ps4://workbench/artifacts" => self.execute("artifact_list", json!({})),
             "ps4://workbench/safety" => Ok(
-                json!({"instructions":INSTRUCTIONS,"mutation_retries":false,"hardware_compatibility_guaranteed":false}),
+                json!({"instructions":self.instructions,"mutation_retries":false,"hardware_compatibility_guaranteed":false}),
             ),
             _ => bail!("Unknown resource URI; arbitrary filesystem access is not supported"),
         }
@@ -280,7 +307,7 @@ impl ServerHandler for McpServer {
             "ps4-debugmcps",
             env!("CARGO_PKG_VERSION"),
         ))
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(&self.instructions)
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {

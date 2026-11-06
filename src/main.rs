@@ -8,8 +8,9 @@ use ps4_workbench_rs::{
     broker,
     client::BrokerClient,
     config::{ATTESTATION, Profile, require_hash},
+    jailbreak,
     mcp::McpServer,
-    tools::ToolRegistry,
+    tools::{ToolRegistry, Toolset},
     workbench::{Workbench, digest, read_bounded},
 };
 use serde_json::{Value, json};
@@ -27,6 +28,8 @@ use std::{
 struct Cli {
     #[arg(long, global = true, default_value = "profiles/ps4-1400.json")]
     profile: PathBuf,
+    #[arg(long, global = true, value_enum, default_value = "read-only")]
+    toolset: Toolset,
     #[command(subcommand)]
     command: Command,
 }
@@ -67,6 +70,25 @@ struct Remote {
 enum Command {
     Validate,
     Tools,
+    AfterglowVerify {
+        #[arg(long)]
+        directory: Option<PathBuf>,
+    },
+    DebuggerPayloadVerify {
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+    Preflight {
+        #[arg(long)]
+        afterglow_directory: Option<PathBuf>,
+        #[arg(long)]
+        debugger_payload: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Explicitly probe FTP/Klog and perform debugger identity handshake; never probe payload port"
+        )]
+        probe: bool,
+    },
     Call {
         tool: String,
         #[command(flatten)]
@@ -124,6 +146,10 @@ enum Command {
         payload_sha256: Vec<String>,
         #[arg(long)]
         build_recipe_sha256: Vec<String>,
+        #[arg(long, help = "Afterglow checkout to hash and bind into qualification evidence")]
+        afterglow_directory: Option<PathBuf>,
+        #[arg(long, help = "Exact ps4debug-NG BIN to hash for debugger approvals")]
+        debugger_payload: Option<PathBuf>,
         #[arg(long)]
         replace: bool,
     },
@@ -161,6 +187,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 
 fn run(cli: Cli) -> Result<Option<Value>> {
     let profile = Profile::load(cli.profile)?;
+    let toolset = cli.toolset;
     match cli.command {
         Command::Hash { file } => {
             let mut file = std::fs::File::open(file)?;
@@ -176,6 +203,24 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             }
             Ok(Some(json!({"sha256":hex::encode(hash.finalize())})))
         }
+        Command::AfterglowVerify { directory } => Ok(Some(jailbreak::afterglow_verify(
+            &profile,
+            directory.as_deref(),
+        )?)),
+        Command::DebuggerPayloadVerify { path } => Ok(Some(jailbreak::debugger_payload_verify(
+            &profile,
+            path.as_deref(),
+        )?)),
+        Command::Preflight {
+            afterglow_directory,
+            debugger_payload,
+            probe,
+        } => Ok(Some(jailbreak::preflight(
+            &profile,
+            afterglow_directory.as_deref(),
+            debugger_payload.as_deref(),
+            probe,
+        )?)),
         Command::Serve {
             broker,
             token_file,
@@ -191,7 +236,10 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                     Some(profile.fingerprint()),
                 )?)?
             } else {
-                McpServer::local(ToolRegistry::new(Workbench::new(profile)?)?, &client_id)?
+                McpServer::local(
+                    ToolRegistry::with_toolset(Workbench::new(profile)?, toolset)?,
+                    &client_id,
+                )?
             };
             runtime()?.block_on(server.serve())?;
             Ok(None)
@@ -199,7 +247,7 @@ fn run(cli: Cli) -> Result<Option<Value>> {
         Command::Broker { port, token_file } => {
             ensure!(port > 0, "Broker port must be nonzero");
             let token = token_path(&profile, token_file.as_deref())?;
-            let registry = ToolRegistry::new(Workbench::new(profile)?)?;
+            let registry = ToolRegistry::with_toolset(Workbench::new(profile)?, toolset)?;
             let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
             eprintln!("Broker: http://{address}; token file: {}", token.display());
             runtime()?.block_on(broker::serve(registry, address, token))?;
@@ -227,7 +275,9 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                 "Invalid PID or GDB port"
             );
             let client = remote_client(&profile, &remote)?;
-            eprintln!("GDB Remote: 127.0.0.1:{port}; PID {pid}; observer={observer}; allow_writes={allow_writes}");
+            eprintln!(
+                "GDB Remote: 127.0.0.1:{port}; PID {pid}; observer={observer}; allow_writes={allow_writes}"
+            );
             ps4_workbench_rs::rsp::serve_with_options(
                 client,
                 pid,
@@ -244,6 +294,8 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             mut approve,
             mut payload_sha256,
             mut build_recipe_sha256,
+            afterglow_directory,
+            debugger_payload,
             replace,
         } => {
             ensure!(
@@ -264,8 +316,50 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                         .all(|permission| profile.permission_enabled(permission)),
                 "Approve only permissions explicitly enabled in the local profile"
             );
+            let needs_afterglow = approve.iter().any(|permission| {
+                [
+                    "payload_execute",
+                    "process_inject",
+                    "process_write",
+                    "debug_control",
+                    "kernel_read",
+                    "kernel_write",
+                    "build",
+                ]
+                .contains(&permission.as_str())
+            });
+            let afterglow = if needs_afterglow {
+                let verification = jailbreak::afterglow_verify(
+                    &profile,
+                    afterglow_directory.as_deref(),
+                )?;
+                ensure!(
+                    verification["ok"] == true,
+                    "Afterglow verification failed; refusing advanced qualification"
+                );
+                Some(verification)
+            } else {
+                None
+            };
+            let debugger_verification = if approve.iter().any(|permission| {
+                ["process_inject", "process_write", "debug_control", "kernel_read", "kernel_write"]
+                    .contains(&permission.as_str())
+            }) {
+                let verification = jailbreak::debugger_payload_verify(
+                    &profile,
+                    debugger_payload.as_deref(),
+                )?;
+                ensure!(
+                    verification["ok"] == true,
+                    "ps4debug-NG payload verification failed; refusing debugger qualification"
+                );
+                Some(verification)
+            } else {
+                None
+            };
             if approve.iter().any(|permission| {
                 [
+                    "process_inject",
                     "process_write",
                     "debug_control",
                     "kernel_read",
@@ -285,9 +379,9 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             ensure!(
                 !approve
                     .iter()
-                    .any(|permission| permission == "payload_execute")
+                    .any(|permission| matches!(permission.as_str(), "payload_execute" | "process_inject"))
                     || !payload_sha256.is_empty(),
-                "Payload permission needs tested hash allowlist"
+                "Payload and injection permissions need a tested hash allowlist"
             );
             ensure!(
                 !approve.iter().any(|permission| permission == "build")
@@ -316,7 +410,9 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             build_recipe_sha256.dedup();
             let record = json!({"recorded_at":utc_now(),"profile_sha256":profile.fingerprint(),"attestation":attest,"approved_permissions":approve,
                 "evidence":artifact,"debugger_payload_sha256":profile.data["debugger"]["payload_sha256"],"payload_sha256_allowlist":payload_sha256,
-                "build_recipe_sha256_allowlist":build_recipe_sha256,"hardware_compatibility_guaranteed":false});
+                "build_recipe_sha256_allowlist":build_recipe_sha256,
+                "afterglow_verification":afterglow,"debugger_payload_verification":debugger_verification,
+                "hardware_compatibility_guaranteed":false});
             std::fs::create_dir_all(target.parent().context("Qualification path needs parent")?)?;
             let temporary =
                 target.with_file_name(format!("qualification-{}.tmp", uuid::Uuid::new_v4()));
@@ -343,10 +439,14 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             Ok(Some(record))
         }
         command => {
-            let mut registry = ToolRegistry::new(Workbench::new(profile.clone())?)?;
+            let mut registry =
+                ToolRegistry::with_toolset(Workbench::new(profile.clone())?, toolset)?;
             let result = match command {
                 Command::Validate => registry.workbench.status(false)?,
                 Command::Tools => json!(registry.available()),
+                Command::AfterglowVerify { .. }
+                | Command::DebuggerPayloadVerify { .. }
+                | Command::Preflight { .. } => unreachable!(),
                 Command::Call { tool, input } => registry.call(&tool, input.value()?)?,
                 Command::Ingest { file } => {
                     let content = read_bounded(&file, profile.limit("transfer_bytes"))?;

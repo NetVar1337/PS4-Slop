@@ -87,7 +87,7 @@ impl Env {
     }
 
     fn registry(&self) -> ToolRegistry {
-        ToolRegistry::new(self.workbench()).unwrap()
+        ToolRegistry::with_toolset(self.workbench(), ps4_workbench_rs::tools::Toolset::Full).unwrap()
     }
 
     /// Python `WorkbenchCase.qualify`.
@@ -232,6 +232,12 @@ type CommandLog = Mutex<Vec<(u32, Vec<u8>)>>;
 struct ConsoleState {
     overlay: BTreeMap<u64, u8>,
     maps: Vec<(u64, u64, u64, &'static str)>,
+    process_name: &'static str,
+    process_path: &'static str,
+    title_id: &'static str,
+    content_id: &'static str,
+    rpc_installs: usize,
+    elf_uploads: usize,
     apply_writes: bool,
     /// Memory reads served before every further read drops the connection.
     read_budget: Option<usize>,
@@ -253,7 +259,13 @@ impl FakeConsole {
         let log = Arc::new(Mutex::new(Vec::new()));
         let state = Arc::new(Mutex::new(ConsoleState {
             overlay: BTreeMap::new(),
-            maps: vec![(0x4000, 0x8000, 5, "sample")],
+            maps: vec![(0x4000, 0x8000, 5, "eboot.bin")],
+            process_name: "eboot.bin",
+            process_path: "/app0/eboot.bin",
+            title_id: "CUSA12552",
+            content_id: "UP0000-CUSA12552_00-TEST000000000000",
+            rpc_installs: 0,
+            elf_uploads: 0,
             apply_writes: true,
             read_budget: None,
             reads: 0,
@@ -275,6 +287,14 @@ impl FakeConsole {
 
     fn bodies(&self, command: u32) -> Vec<Vec<u8>> {
         lock(&self.log).iter().filter(|(seen, _)| *seen == command).map(|(_, body)| body.clone()).collect()
+    }
+
+    fn rpc_installs(&self) -> usize {
+        lock(&self.state).rpc_installs
+    }
+
+    fn elf_uploads(&self) -> usize {
+        lock(&self.state).elf_uploads
     }
 
     /// Deliver one real stop event on the debug callback channel.
@@ -328,10 +348,46 @@ fn serve_console(mut stream: TcpStream, log: &CommandLog, state: &Mutex<ConsoleS
             }
             0xbdaa_000a => {
                 reply.extend(OK);
+                let state = lock(state);
                 let mut info = vec![0u8; 188];
                 info[..4].copy_from_slice(&71u32.to_le_bytes());
-                info[4..10].copy_from_slice(b"sample");
+                for (offset, capacity, text) in [
+                    (4, 40, state.process_name),
+                    (44, 64, state.process_path),
+                    (108, 16, state.title_id),
+                    (124, 64, state.content_id),
+                ] {
+                    let bytes = text.as_bytes();
+                    let length = bytes.len().min(capacity - 1);
+                    info[offset..offset + length].copy_from_slice(&bytes[..length]);
+                }
                 reply.extend(info);
+            }
+            0xbdaa_0005 => {
+                lock(state).rpc_installs += 1;
+                reply.extend(OK);
+                reply.extend(0x9000u64.to_le_bytes());
+            }
+            0xbdaa_0006 => {
+                let command = u64::from_le_bytes(body[20..28].try_into().unwrap());
+                let lifecycle = if command == 2 { 4u64 } else { 2u64 };
+                let status = (0x4158_4553u64 << 32) | lifecycle;
+                reply.extend(OK);
+                reply.extend(71u32.to_le_bytes());
+                reply.extend(status.to_le_bytes());
+            }
+            0xbdaa_0010 => {
+                let length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                if stream.write_all(&OK).is_err() {
+                    return;
+                }
+                let mut elf = vec![0u8; length];
+                if stream.read_exact(&mut elf).is_err() {
+                    return;
+                }
+                lock(state).elf_uploads += 1;
+                reply.extend(OK);
+                reply.extend(0x5000u64.to_le_bytes());
             }
             0xbdaa_0002 => {
                 let mut state = lock(state);
@@ -638,7 +694,10 @@ impl Broker {
         let mut env = Env::new();
         env.port("debug", console.port);
         let profile = env.qualify(&["debug_control", "process_write"], &[]);
-        let hub = Arc::new(SessionHub::from_registry(ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap()));
+    let hub = Arc::new(SessionHub::from_registry(ToolRegistry::with_toolset(
+        Workbench::new(profile).unwrap(),
+        ps4_workbench_rs::tools::Toolset::Full,
+    ).unwrap()));
         let token_path = env.dir.path().join("broker-token.local");
         let token = load_token(&token_path, true).unwrap();
         Self { env, console, hub, token_path, token }
@@ -737,6 +796,16 @@ impl Mcp {
 
     fn local(env: &Env) -> Self {
         Self::spawn(&["--profile", env.path().to_str().unwrap(), "serve"])
+    }
+
+    fn local_with_toolset(env: &Env, toolset: &str) -> Self {
+        Self::spawn(&[
+            "--profile",
+            env.path().to_str().unwrap(),
+            "--toolset",
+            toolset,
+            "serve",
+        ])
     }
 
     fn send(&mut self, line: &str) {
@@ -897,7 +966,10 @@ fn attach_failure_retains_lease_until_explicit_release() {
     let mut env = Env::new();
     env.port("debug", closed_port());
     let profile = env.qualify(&["debug_control"], &[]);
-    let hub = SessionHub::from_registry(ToolRegistry::new(Workbench::new(profile).unwrap()).unwrap());
+    let hub = SessionHub::from_registry(ToolRegistry::with_toolset(
+        Workbench::new(profile).unwrap(),
+        ps4_workbench_rs::tools::Toolset::Full,
+    ).unwrap());
     assert!(hub.call("ida", "debug_attach", json!({"pid": 71, "listen_address": "127.0.0.1"})).is_err());
     assert_eq!(hub.state()["controller"], "ida");
     assert!(hub.dispatch("ghidra", &json!("release"), &Map::new()).is_err());
@@ -1542,7 +1614,7 @@ fn large_results_saved_not_inline() {
 #[test]
 fn no_policy_or_qualification_tool() {
     let mut env = Env::new();
-    for permission in ["ftp_upload", "payload_execute", "process_write", "debug_control", "kernel_read", "kernel_write", "build"] {
+    for permission in ["ftp_upload", "payload_execute", "process_inject", "process_write", "debug_control", "kernel_read", "kernel_write", "build"] {
         env.settings["permissions"][permission] = json!(true);
     }
     let registry = env.registry();
@@ -1743,6 +1815,141 @@ fn memory_read_body_has_no_native_padding() {
     expected.extend(0x1122_3344_5566_7788u64.to_le_bytes());
     expected.extend(4u32.to_le_bytes());
     assert!(scripted.wait_sent(76).ends_with(&expected));
+}
+
+#[test]
+fn rpc_install_uses_exact_packed_request_and_rejects_null_stub() {
+    let mut env = Env::new();
+    let mut response = good_identity();
+    response.extend(OK);
+    response.extend(0x9000_1234u64.to_le_bytes());
+    let (scripted, mut debugger) = qualified_scripted(&mut env, "process_inject", response);
+    assert_eq!(debugger.install_rpc(71).unwrap(), 0x9000_1234);
+    let mut expected = header(0xbdaa_0005, 4);
+    expected.extend(71u32.to_le_bytes());
+    assert!(scripted.wait_sent(64).ends_with(&expected));
+
+    let mut response = good_identity();
+    response.extend(OK);
+    response.extend(0u64.to_le_bytes());
+    let (scripted, mut debugger) = qualified_scripted(&mut env, "process_inject", response);
+    assert!(debugger.install_rpc(71).unwrap_err().to_string().contains("null RPC stub"));
+    assert!(scripted.wait_closed());
+}
+
+#[test]
+fn rpc_call_uses_68_byte_body_and_checks_response_pid() {
+    let mut env = Env::new();
+    let mut response = good_identity();
+    response.extend(OK);
+    response.extend(71u32.to_le_bytes());
+    response.extend(0x1122_3344_5566_7788u64.to_le_bytes());
+    let (scripted, mut debugger) = qualified_scripted(&mut env, "process_inject", response);
+    let arguments = [1, 2, 3, 4, 5, 6];
+    assert_eq!(
+        debugger.call_rpc(71, 0x9000, 0x5000, arguments).unwrap(),
+        0x1122_3344_5566_7788
+    );
+    let mut expected = header(0xbdaa_0006, 68);
+    expected.extend(71u32.to_le_bytes());
+    expected.extend(0x9000u64.to_le_bytes());
+    expected.extend(0x5000u64.to_le_bytes());
+    for argument in arguments {
+        expected.extend(argument.to_le_bytes());
+    }
+    assert_eq!(expected.len(), 80);
+    assert!(scripted.wait_sent(48 + 80).ends_with(&expected));
+}
+
+#[test]
+fn elf_rpc_consumes_ready_upload_final_status_and_entry() {
+    let mut env = Env::new();
+    let mut response = good_identity();
+    response.extend(OK);
+    response.extend(OK);
+    response.extend(0x8000_5000u64.to_le_bytes());
+    let (scripted, mut debugger) = qualified_scripted(&mut env, "process_inject", response);
+    let elf = b"\x7fELF-test-payload";
+    assert_eq!(debugger.load_elf_rpc(71, elf).unwrap(), 0x8000_5000);
+    let mut expected = header(0xbdaa_0010, 8);
+    expected.extend(71u32.to_le_bytes());
+    expected.extend((elf.len() as u32).to_le_bytes());
+    expected.extend(elf);
+    assert!(scripted.wait_sent(48 + 20 + elf.len()).ends_with(&expected));
+}
+
+fn internals_artifacts(workbench: &Workbench) -> (String, String, String, Vec<u8>) {
+    let mut builder = ps4_workbench_rs::binimage::testelf::Builder::new(0);
+    builder.text = (0u8..64).collect();
+    builder.symbols.push(("payload_rpc_entry".into(), builder.text_va(), 64));
+    let elf = builder.build();
+    let payload_sha256 = digest(&elf);
+    let signature = builder.text[..16].to_vec();
+    let target = json!({
+        "format":"ps4wb-internals-target-v1","name":"Apex fixture","title_id":"CUSA12552",
+        "process_name":"eboot.bin","process_path":"/app0/eboot.bin","application_version":"01.00",
+        "executable_text_sha256":digest(&vec![0x41; 0x4000]),"status_magic":"0x41584553",
+        "fingerprints":[{"address":"0x4000","hex":"41414141414141414141414141414141"}],
+        "pointers":[{"address":"0x4008","expected":"0x4141414141414141"}]
+    });
+    let target_path = workbench.store.save("internals-target", &serde_json::to_vec(&target).unwrap(), json!({}), "json").unwrap()["path"].as_str().unwrap().to_owned();
+    let payload_path = workbench.store.save("internals-payload", &elf, json!({}), "elf").unwrap()["path"].as_str().unwrap().to_owned();
+    (target_path, payload_path, payload_sha256, signature)
+}
+
+#[test]
+fn resident_payload_stages_controls_and_reuses_one_rpc_stub() {
+    let console = FakeConsole::spawn();
+    let mut env = Env::new();
+    env.port("debug", console.port);
+    let workbench = Workbench::new(env.profile()).unwrap();
+    let (target, payload, sha256, signature) = internals_artifacts(&workbench);
+    console.configure(|state| {
+        for (index, byte) in signature.iter().enumerate() {
+            state.overlay.insert(0x5000 + index as u64, *byte);
+        }
+    });
+    let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
+    let workbench = Workbench::new(profile).unwrap();
+    let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let staged = registry.call("payload_stage", json!({"pid":71,"target":target,"payload":payload,"sha256":sha256})).unwrap();
+    assert_eq!(staged["status"]["lifecycle_name"], "ready");
+    assert_eq!(staged["raw_entry_called"], false);
+    let status = registry.call("payload_status", json!({"pid":71})).unwrap();
+    assert_eq!(status["lifecycle"], 2);
+    let rpc = registry.call("payload_rpc", json!({"pid":71,"command":4,"argument":"0x2","argument2":"0x3"})).unwrap();
+    assert_eq!(rpc["command"], 4);
+    let shutdown = registry.call("payload_shutdown", json!({"pid":71})).unwrap();
+    assert_eq!(shutdown["status"]["lifecycle_name"], "disabled");
+    assert_eq!(console.rpc_installs(), 1);
+    assert_eq!(console.elf_uploads(), 1);
+}
+
+#[test]
+fn resident_signature_recovers_and_duplicate_stage_never_uploads() {
+    let console = FakeConsole::spawn();
+    let mut env = Env::new();
+    env.port("debug", console.port);
+    let workbench = Workbench::new(env.profile()).unwrap();
+    let (target, payload, sha256, signature) = internals_artifacts(&workbench);
+    let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
+    let workbench = Workbench::new(profile).unwrap();
+    console.configure(|state| {
+        state.maps.push((0x9000, 0xa000, 5, ""));
+        for (index, byte) in signature.iter().enumerate() {
+            state.overlay.insert(0x9000 + index as u64, *byte);
+        }
+    });
+    let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let error = registry.call("payload_stage", json!({"pid":71,"target":target,"payload":payload,"sha256":sha256})).unwrap_err();
+    assert!(error.to_string().contains("already resident"), "{error:#}");
+    assert_eq!(console.rpc_installs(), 0);
+    assert_eq!(console.elf_uploads(), 0);
+    let recovered = registry.call("payload_recover", json!({"pid":71,"target":target,"payload":payload,"sha256":sha256})).unwrap();
+    assert_eq!(recovered["rpc_entry"], "0x9000");
+    assert_eq!(recovered["status"]["lifecycle_name"], "ready");
+    assert_eq!(console.rpc_installs(), 1);
+    assert_eq!(console.elf_uploads(), 0);
 }
 
 /// `test_memory_bounds_before_connect`
@@ -2096,7 +2303,7 @@ fn mcp_eof_always_cleans_up_session() {
     let mut env = Env::new();
     env.port("debug", console.port);
     env.qualify(&["debug_control"], &[]);
-    let mut mcp = Mcp::local(&env);
+    let mut mcp = Mcp::local_with_toolset(&env, "debug");
     mcp.initialize();
     let attached = mcp.call(2, "debug_attach", json!({"pid": 71, "listen_address": "127.0.0.1"}));
     assert_eq!(attached["result"]["isError"], false, "{attached}");

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub mod config;
+pub mod jailbreak;
+pub mod internals;
 pub mod artifacts;
 pub mod analysis;
 pub mod development;

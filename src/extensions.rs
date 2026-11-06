@@ -11,6 +11,8 @@ pub const CATALOGS: &[(&str, &str)] = &[
     ("access", include_str!("catalog/access.json")),
     ("binstatic", include_str!("catalog/binstatic.json")),
     ("project", include_str!("catalog/project.json")),
+    ("jailbreak", include_str!("catalog/jailbreak.json")),
+    ("internals", include_str!("catalog/internals.json")),
 ];
 
 /// Every tool schema: the base catalog followed by all extension catalogs.
@@ -31,4 +33,6 @@ pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option
         .or_else(|| crate::dynaccess::dispatch(registry, name, args))
         .or_else(|| crate::binstatic::dispatch(registry, name, args))
         .or_else(|| crate::project::dispatch(registry, name, args))
+        .or_else(|| crate::jailbreak::dispatch(registry, name, args))
+        .or_else(|| crate::internals::dispatch(registry, name, args))
 }

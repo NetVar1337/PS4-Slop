@@ -19,6 +19,7 @@ use std::{
 pub struct Workbench {
     pub profile: Profile,
     pub debugger: Debugger,
+    pub internals: crate::internals::Internals,
     pub store: Arc<ArtifactStore>,
 }
 
@@ -43,6 +44,7 @@ impl Workbench {
         let store = Arc::new(ArtifactStore::new(&profile)?);
         Ok(Self {
             debugger: Debugger::new(profile.clone()),
+            internals: Default::default(),
             profile,
             store,
         })
@@ -93,7 +95,7 @@ impl Workbench {
         Ok(json!({"health":crate::link::snapshot(),"probe":probed,
             "callback_port_755": callback_755,
             "policy":{"idempotent_retry":"reads, listings and connection setup: up to 3 attempts with 150/450 ms backoff",
-                "never_retried":["payload_execute","ftp_upload","memory_write","memory_patch","memory_alloc","memory_free","memory_protect","kernel_write","debug_control"],
+                "never_retried":["payload_execute","payload_stage","payload_recover","payload_rpc","payload_shutdown","ftp_upload","memory_write","memory_patch","memory_alloc","memory_free","memory_protect","kernel_write","debug_control"],
                 "ftp":"each session sends QUIT on close; downloads stream directly to disk; ftp_extract reuses one session with NOOP revalidation",
                 "payload":"validated before send, serialized, cooldown enforced, graceful close; loader cannot be restarted from the PC",
                 "background_probing":false},
@@ -1039,13 +1041,15 @@ pub fn desktop_status() -> Result<Value> {
         std::env::var("PS4_GHIDRA_DIRECTORY")
             .unwrap_or_else(|_| "C:/Users/Admin/Desktop/Ghidra".into()),
     );
-    let binja = PathBuf::from(
-        std::env::var("PS4_BINJA_DIRECTORY")
-            .unwrap_or_else(|_| "C:/Program Files/Vector 35/Binary Ninja".into()),
+    let binja = install_directory(
+        "PS4_BINJA_DIRECTORY",
+        &["C:/Program Files/Vector35/BinaryNinja", "C:/Program Files/Vector 35/Binary Ninja", "%LOCALAPPDATA%/Vector35/BinaryNinja"],
+        "binaryninja.exe",
     );
-    let iaito = PathBuf::from(
-        std::env::var("PS4_IAITO_DIRECTORY")
-            .unwrap_or_else(|_| "C:/Program Files/radare2".into()),
+    let iaito = install_directory(
+        "PS4_IAITO_DIRECTORY",
+        &["%LOCALAPPDATA%/Programs/iaito", "C:/Program Files/iaito", "C:/Program Files/radare2"],
+        "iaito.exe",
     );
     let properties = ghidra.join("Ghidra/application.properties");
     let version = if properties.is_file() {
@@ -1057,13 +1061,39 @@ pub fn desktop_status() -> Result<Value> {
     } else {
         None
     };
+    let gdb = install_directory(
+        "PS4_GDB_DIRECTORY",
+        &["C:/msys64/mingw64/bin", "C:/msys64/ucrt64/bin"],
+        "gdb-multiarch.exe",
+    )
+    .join("gdb-multiarch.exe");
     Ok(
-        json!({"ida":{"directory":ida,"installed":ida.join("ida.exe").is_file(),"gdb_plugin_present":ida.join("plugins/gdb_user.dll").is_file(),"supported_adapter":"IDA Pro 9.5 / IDAPython"},
-        "ghidra":{"directory":ghidra,"installed":properties.is_file(),"version":version,"supported_adapter":"Ghidra Java agent; optional PyGhidra","native_debugger_requires":"GDB with Python and Ghidra trace-agent dependencies"},
-        "binja":{"directory":binja,"installed":binja.join("binaryninja.exe").is_file(),"supported_adapter":"Binary Ninja Python (plugin context or headless binaryninja.load)"},
-        "iaito":{"directory":iaito,"installed":iaito.join("iaito.exe").is_file() || iaito.join("r2.exe").is_file() || iaito.join("radare2.exe").is_file(),"supported_adapter":"radare2/iaito via r2pipe (aflj/pdc/axtj); r2 must be on PATH"},
+        json!({"ida":{"directory":ida,"installed":ida.join("ida.exe").is_file(),"gdb_plugin_present":ida.join("plugins/gdb_user.dll").is_file(),"supported_adapter":"IDA Pro 9.5 / IDAPython",
+            "live_debugger":"Debugger > Remote GDB debugger -> gdb-server 127.0.0.1:1234"},
+        "ghidra":{"directory":ghidra,"installed":properties.is_file(),"version":version,"supported_adapter":"Ghidra Java agent; optional PyGhidra",
+            "live_debugger":"Debugger tool, 'gdb remote' launcher: gdb command = gdb_path, target remote 127.0.0.1:1234",
+            "gdb_path":gdb,"gdb_present":gdb.is_file(),"native_debugger_requires":"GDB with Python plus protobuf/psutil and Ghidra's ghidragdb/ghidratrace"},
+        "binja":{"directory":binja,"installed":binja.join("binaryninja.exe").is_file(),"supported_adapter":"Binary Ninja Python (plugin context or headless binaryninja.load)",
+            "live_debugger":"Debugger > Connect to Remote Process, adapter LLDB, stub gdb-remote, 127.0.0.1:1234",
+            "lldb_present":binja.join("plugins/liblldb.dll").is_file()},
+        "iaito":{"directory":iaito,"installed":iaito.join("iaito.exe").is_file() || iaito.join("r2.exe").is_file() || iaito.join("radare2.exe").is_file(),"supported_adapter":"radare2/iaito via r2pipe (aflj/pdc/axtj); r2 must be on PATH",
+            "live_debugger":"open gdb://127.0.0.1:1234/<pid> with debug mode (radare2 gdb io plugin)",
+            "r_debug_present":iaito.join("r_debug.dll").is_file()},
         "note":"Discovery only; no application launch, console connection or license inspection"}),
     )
+}
+
+/// Environment override, else the first standard location containing `marker`, else the first candidate.
+fn install_directory(variable: &str, candidates: &[&str], marker: &str) -> PathBuf {
+    if let Ok(directory) = std::env::var(variable) {
+        return PathBuf::from(directory);
+    }
+    let local = std::env::var("LOCALAPPDATA").unwrap_or_default();
+    let expanded: Vec<PathBuf> = candidates
+        .iter()
+        .map(|candidate| PathBuf::from(candidate.replace("%LOCALAPPDATA%", &local)))
+        .collect();
+    expanded.iter().find(|directory| directory.join(marker).is_file()).unwrap_or(&expanded[0]).clone()
 }
 
 #[cfg(test)]

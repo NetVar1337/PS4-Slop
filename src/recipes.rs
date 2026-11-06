@@ -462,7 +462,11 @@ mod tests {
         data["qualification_file"] = json!("qualification.json");
         let path = directory.join("profile.json");
         std::fs::write(&path, data.to_string()).unwrap();
-        ToolRegistry::new(Workbench::new(Profile::load(path).unwrap()).unwrap()).unwrap()
+        ToolRegistry::with_toolset(
+            Workbench::new(Profile::load(path).unwrap()).unwrap(),
+            crate::tools::Toolset::Full,
+        )
+        .unwrap()
     }
 
     #[test]
