@@ -452,10 +452,8 @@ fn serve_console(mut stream: TcpStream, log: &CommandLog, state: &Mutex<ConsoleS
                         let mut at = *start;
                         while at + element as u64 <= *end {
                             let matches = (0..element).all(|i| *state.overlay.get(&(at + i as u64)).unwrap_or(&0x41) == data[i]);
-                            if matches {
-                                if stream.write_all(&at.to_le_bytes()).is_err() {
-                                    return;
-                                }
+                            if matches && stream.write_all(&at.to_le_bytes()).is_err() {
+                                return;
                             }
                             at += element as u64;
                         }
@@ -1988,7 +1986,7 @@ fn resident_payload_stages_controls_and_reuses_one_rpc_stub() {
             state.overlay.insert(0x9000 + index as u64, *byte);
         }
     });
-    let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
+    let profile = env.qualify(&["process_inject"], std::slice::from_ref(&sha256));
     let workbench = Workbench::new(profile).unwrap();
     let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
     let staged = registry.call("payload_stage", json!({"pid":71,"target":target,"payload":payload,"sha256":sha256})).unwrap();
@@ -2011,7 +2009,7 @@ fn resident_signature_recovers_and_duplicate_stage_never_uploads() {
     env.port("debug", console.port);
     let workbench = Workbench::new(env.profile()).unwrap();
     let (target, payload, sha256, signature) = internals_artifacts(&workbench);
-    let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
+    let profile = env.qualify(&["process_inject"], std::slice::from_ref(&sha256));
     let workbench = Workbench::new(profile).unwrap();
     console.configure(|state| {
         state.maps.push((0x9000, 0xa000, 5, ""));
@@ -2176,7 +2174,7 @@ fn payload_run_process_call_server_scan_and_process_find() {
     env.port("debug", console.port);
     let workbench = Workbench::new(env.profile()).unwrap();
     let (target, payload, sha256, _signature) = internals_artifacts(&workbench);
-    let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
+    let profile = env.qualify(&["process_inject"], std::slice::from_ref(&sha256));
     let workbench = Workbench::new(profile).unwrap();
     let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
 
