@@ -1430,10 +1430,16 @@ fn probe_never_touches_payload_port() {
     let mut env = Env::new();
     let counters = counted_services(&mut env);
     env.workbench().status(true).unwrap();
-    assert_eq!(counters["payload"].connections(), 0);
+    // The debug handshake's TCP accept on the counter side is asynchronous;
+    // allow it to land before asserting (CI scheduling varies).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     for service in ["ftp", "klog", "debug"] {
+        while counters[service].connections() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(counters[service].connections() >= 1, "{service}");
     }
+    assert_eq!(counters["payload"].connections(), 0);
 }
 
 /// `test_malformed_qualification_is_unverified_not_crash`
