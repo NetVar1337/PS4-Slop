@@ -1104,7 +1104,7 @@ mod tests {
 
     fn test_profile(directory: &std::path::Path, port: u16) -> Profile {
         let mut data: Value =
-            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["host"] = json!("127.0.0.1");
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");

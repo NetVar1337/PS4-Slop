@@ -65,7 +65,7 @@ class RustStack:
         fixture = self.spawn([str(FIXTURE), "--image", str(self.image), "--base", "0x400000", "--rip", "0x400100",
                               "--pid", str(PID), "--thread", str(THREAD)], stdout=subprocess.PIPE, text=True)
         debug_port = int(fixture.stdout.readline())
-        settings = json.loads((ROOT / "profiles/ps4-1400.json").read_text(encoding="utf-8"))
+        settings = json.loads((ROOT / "tests/fixtures/profile.json").read_text(encoding="utf-8"))
         settings.update(host="127.0.0.1", artifact_directory="artifacts", qualification_file="qualification.local.json")
         settings["ports"]["debug"] = debug_port
         if self.debug_control:

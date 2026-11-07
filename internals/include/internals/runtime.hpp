@@ -9,6 +9,8 @@ inline constexpr std::uint32_t kDefaultStatusMagic = 0x5053494E; // "PSIN"
 inline constexpr std::uint32_t kMaxConfigWords = 32;
 inline constexpr std::uint32_t kMaxTelemetryWords = 16;
 inline constexpr std::uint64_t kInvalidRpcResult = ~0ull;
+// RPC 7 is read-only negotiation: PSWB, version 1, supported commands 0..7.
+inline constexpr std::uint64_t kProtocolDescriptor = 0x50535742000100ffULL;
 
 // Command ABI shared by the generic runtime and existing game runtimes.
 struct RpcCallbacks {
@@ -83,6 +85,7 @@ private:
     std::atomic<std::uint32_t> pending_config_mask_{0};
     std::atomic<std::uint64_t> pending_config_values_[kMaxConfigWords]{};
     std::atomic<std::uint64_t> config_mirror_[kMaxConfigWords]{};
+    std::atomic<std::uint64_t> telemetry_mirror_[kMaxTelemetryWords]{};
 };
 
 int PayloadMain(Runtime& runtime) noexcept;

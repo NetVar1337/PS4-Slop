@@ -119,6 +119,7 @@ impl<'a> Source<'a> {
             let mut source = match mode {
                 Mode::File => Self::from_file(artifact, bytes),
                 Mode::Mapped if bytes.starts_with(b"\x7fELF") => Self::from_elf(artifact, bytes)?,
+                Mode::Mapped if bytes.starts_with(b"{") && serde_json::from_slice::<Value>(&bytes).ok().is_some_and(|v| v["format"] == "ps4wb-memory-image-v1") => Self::from_sparse(workbench, artifact, &bytes)?,
                 Mode::Mapped => Self::from_raw(artifact, bytes, spec.base),
             };
             source.budget = budget;
@@ -223,6 +224,41 @@ impl<'a> Source<'a> {
             exhausted: false,
             read_failures: 0,
         }
+    }
+
+    /// Replay discontiguous captured module/heap regions without a console.
+    /// Missing pages remain holes, and every referenced capture is hash-checked.
+    fn from_sparse(workbench: &Workbench, label: &str, bytes: &[u8]) -> Result<Self> {
+        ensure!(bytes.len() <= 8 << 20, "Memory image manifest exceeds 8 MiB");
+        let document: Value = serde_json::from_slice(bytes)?;
+        let mut source = Self::empty("artifact-sparse", label);
+        source.image_base = crate::tools::address(&document["image_base"])?;
+        let regions = document["regions"].as_array().context("Missing memory image regions")?;
+        ensure!(regions.len() <= 16384, "Too many memory image regions");
+        let mut pairs = Vec::new(); let mut total = 0usize;
+        for item in regions {
+            let path = item["artifact"]["path"].as_str().context("Missing region artifact")?;
+            let data = workbench.read_artifact(path, ARTIFACT_MAX)?;
+            total = total.checked_add(data.len()).context("Memory image size overflow")?;
+            ensure!(total <= ARTIFACT_MAX && !data.is_empty(), "Memory image exceeds budget or contains an empty region");
+            ensure!(crate::config::sha256_hex(&data) == item["artifact"]["sha256"], "Memory image region changed: {path}");
+            let start = crate::tools::address(&item["address"])?;
+            let end = start.checked_add(data.len() as u64).context("Region address overflow")?;
+            let protection = item["protection"].as_u64().context("Missing region protection")?;
+            ensure!(protection & 1 != 0 && protection <= 7, "Invalid region protection");
+            let region = Region {start,end,prot:protection as u8,name:item["name"].as_str().unwrap_or("").to_owned()};
+            pairs.push((region,data,item["selected"].as_bool().unwrap_or(true)));
+        }
+        pairs.sort_by_key(|p| p.0.start);
+        let mut previous = 0;
+        for (region,data,selected) in pairs {
+            ensure!(region.start >= previous, "Overlapping memory image captures");previous=region.end;
+            if selected { source.selection.push((region.start,region.end)); }
+            source.regions.push(region);source.data.push(data);
+        }
+        source.file_size=total as u64;
+        if document["missing"].as_array().is_some_and(|r| !r.is_empty()) { source.notes.push("Capture has missing regions; absent bytes are never synthesized".into()); }
+        Ok(source)
     }
 
     /// In-memory bytes addressed by file offset.

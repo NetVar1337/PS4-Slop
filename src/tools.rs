@@ -824,7 +824,7 @@ mod tests {
     fn offline_tools_dispatch_and_preserve_large_length_caps() {
         let dir = tempfile::tempdir().unwrap();
         let mut data: Value =
-            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");
         data["permissions"]["process_write"] = json!(true);
@@ -882,7 +882,7 @@ mod tests {
     fn toolsets_are_an_additional_policy_gate() {
         let dir = tempfile::tempdir().unwrap();
         let mut data: Value =
-            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");
         data["permissions"]["debug_control"] = json!(true);

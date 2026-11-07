@@ -1,0 +1,45 @@
+[
+ {
+  "name": "hook_plan",
+  "description": "Plan an offline x86-64 detour with instruction-boundary decoding, RIP/branch relocation, expected-byte ownership and a return trampoline. Never writes console memory.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "artifact": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "base": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "address": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "detour": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "trampoline": {
+     "type": "string",
+     "maxLength": 1024
+    }
+   },
+   "required": [
+    "artifact",
+    "address",
+    "detour",
+    "trampoline"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ }
+]

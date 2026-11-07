@@ -124,8 +124,18 @@ def build_parser():
     p.add_argument("--payload-repo", default=None, help="payload repo for the build (default per game)")
     p.add_argument("--payload", default=None, help="payload ELF path relative to the repo")
     p.add_argument("--build-cmd", default="make", help="payload build command (default make)")
+    p.add_argument("--build-argv", default=None, help="JSON argv array; executes without a shell")
+    p.add_argument("--app-version", default=None, help="observed application version when opening a new project")
+    p.add_argument("--session-id", default=None, help="resume an existing durable research session")
     p.add_argument("--no-build", action="store_true")
     p.add_argument("--dry-run", action="store_true", help="print the plan without any console calls")
+    p = sub.add_parser("session", help="create, advance, inspect, cancel or retry a durable recipe session")
+    p.add_argument("action", choices=["create", "advance", "status", "cancel", "retry", "revise"])
+    p.add_argument("--session", default=None)
+    p.add_argument("--recipe", default=None)
+    p.add_argument("--inputs", default="{}")
+    p.add_argument("--step", type=int, default=None)
+    p.add_argument("--recovery-evidence", default=None)
     return parser
 
 
@@ -179,6 +189,15 @@ def run(argv, client_factory=BrokerClient):
                        argument2="0x0")
     elif args.command == "watch":
         result = _watch(client, args)
+    elif args.command == "session":
+        arguments = {"action": args.action}
+        for key in ("session", "recipe", "step", "recovery_evidence"):
+            value = getattr(args, key)
+            if value is not None:
+                arguments[key] = value
+        if args.action in ("create", "revise"):
+            arguments["inputs"] = json.loads(args.inputs)
+        result = _call(client, "recipe_session", **arguments)
     elif args.command == "update":
         result = _update(client, args)
     elif args.command == "export-offsets":
@@ -200,70 +219,105 @@ def run(argv, client_factory=BrokerClient):
 
 GAMES = {
     "fortnite": {"recipe": "unreal_pipeline", "repo": "../Fortnite-PS4", "payload": "payload.elf"},
-    "apex": {"recipe": "source_pipeline", "repo": "../Apex-PS4", "payload": "payload/payload.elf"},
+    "apex": {"recipe": "source_pipeline", "repo": "../Apex-PS4", "payload": "build/apex_payload.elf", "status_magic": "0x41584553"},
 }
 
 
+def _artifact_bytes(client, path, expected_sha=None):
+    import hashlib
+    content = bytearray()
+    while len(content) <= 16 * 1024 * 1024:
+        part = _call(client, "artifact_read", artifact=path, offset=len(content), length=4096)
+        block = bytes.fromhex(part["hex"])
+        content.extend(block)
+        if len(block) < 4096:
+            if expected_sha and hashlib.sha256(content).hexdigest() != expected_sha:
+                raise WorkbenchError(f"Artifact changed: {path}")
+            return bytes(content)
+    raise WorkbenchError("Artifact exceeds 16 MiB")
+
+
+def _expanded(client, value):
+    if "result_saved" in value:
+        ref = value["result_saved"]
+        return json.loads(_artifact_bytes(client, ref["path"], ref["sha256"]))
+    return value
+
+
 def _update(client, args):
-    """Full update pipeline with a deliberate human qualification checkpoint."""
-    game = GAMES[args.game]
-    repo = args.payload_repo or game["repo"]
-    inputs = {"pid": args.pid}
-    for key, value in (("module", args.module), ("module_sha256", args.module_sha256),
-                       ("namespace", args.namespace), ("image_base", args.image_base),
-                       ("signature_sites", args.signature_sites)):
-        if value is not None:
-            inputs[key] = value
-
-    plan = {"game": args.game, "pipeline_recipe": game["recipe"], "inputs": inputs,
-            "payload_repo": repo, "build_cmd": None if args.no_build else args.build_cmd}
-    if args.old_artifact and args.annotations:
-        plan["update_recipe"] = "offset_refresh"
-        plan["update_inputs"] = {"pid": args.pid, "module": args.module,
-                                 "old_artifact": args.old_artifact, "annotations": args.annotations,
-                                 "module_sha256": args.module_sha256, "namespace": args.namespace}
-    if args.dry_run:
-        plan["dry_run"] = True
-        return plan
-
-    # 1. Fresh dump + engine SDK + offsets/target, or update-port from an older build.
-    if args.old_artifact and args.annotations:
-        update = _call(client, "recipe_run", recipe="offset_refresh", inputs=plan["update_inputs"])
-    else:
-        update = _call(client, "recipe_run", recipe=game["recipe"], inputs=inputs)
-
-    # 2. Build the payload locally; never through the console.
-    build = None
-    if not args.no_build:
-        import subprocess
-        proc = subprocess.run(args.build_cmd, cwd=repo, shell=True,
-                              capture_output=True, text=True, timeout=600)
-        build = {"command": args.build_cmd, "cwd": repo, "exit_code": proc.returncode,
-                 "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:]}
-        if proc.returncode != 0:
-            raise WorkbenchError(f"payload build failed in {repo}: {proc.stderr[-500:]}")
-
-    # 3. Hash the payload and print the human-checkpoint next steps.
+    """Research, install generated inputs, build fresh ELF, preserve evidence."""
     import hashlib
     from pathlib import Path
-    payload_file = Path(repo) / (args.payload or game["payload"])
-    if not payload_file.is_file():
-        raise WorkbenchError(f"payload not found: {payload_file}")
-    sha = hashlib.sha256(payload_file.read_bytes()).hexdigest()
-    next_steps = [
-        f"ps4-workbench --profile profiles/ps4-1400.local.json ingest {payload_file}",
-        "ps4-workbench --profile profiles/ps4-1400.local.json qualify --replace "
-        f"--evidence <your-tests.md> --attest I_TESTED_THIS_EXACT_CONFIGURATION "
-        f"--approve process_inject --payload-sha256 {sha}",
-        "python -m ps4_workbench.ctl ... call recipe_run "
-        + json.dumps({"recipe": "stage_and_verify",
-                      "inputs": {"pid": args.pid, "target": "<target artifact from update>",
-                                 "payload": "<ingested payload artifact>", "sha256": sha}}),
-    ]
-    return {"update": update, "build": build,
-            "payload": {"path": str(payload_file), "sha256": sha},
-            "next": next_steps,
-            "note": "Qualification is a human checkpoint: test on hardware, then run these yourself."}
+    import shlex
+    import subprocess
+    import os
+    from .build import build
+
+    game = GAMES[args.game]
+    repo = Path(args.payload_repo or game["repo"]).resolve()
+    inputs = {"pid": args.pid, "namespace": args.namespace or "game",
+              "status_magic": game.get("status_magic", "0x5053494e")}
+    for key in ("module", "module_sha256", "image_base", "signature_sites"):
+        value = getattr(args, key)
+        if value is not None:
+            inputs[key] = value
+    if bool(args.old_artifact) != bool(args.annotations):
+        raise WorkbenchError("Pass --old-artifact and --annotations together")
+    recipe = game["recipe"]
+    plan = {"game": args.game, "pipeline_recipe": recipe, "inputs": inputs,
+            "payload_repo": str(repo), "build_cmd": None if args.no_build else args.build_cmd}
+    if args.old_artifact:
+        inputs.update(old_artifact=args.old_artifact, annotations=args.annotations)
+        recipe = ("unreal" if args.game == "fortnite" else "source") + "_update"
+        plan["update_recipe"] = "offset_refresh"
+        plan["update_inputs"] = dict(inputs)
+    if args.dry_run:
+        return dict(plan, dry_run=True)
+
+    # A new project needs the real application version; never invent one.
+    active = _call(client, "project_open")
+    if not active.get("active"):
+        if not args.app_version:
+            raise WorkbenchError("Open a project with the observed title/app version, or pass --app-version")
+        info = _call(client, "process_info", pid=args.pid)
+        _call(client, "project_open", title_id=info["title_id"], app_version=args.app_version, name=args.game)
+    if args.session_id:
+        update = _call(client, "recipe_session", action="status", session=args.session_id)
+    else:
+        update = _call(client, "recipe_session", action="create", recipe=recipe, inputs=inputs)
+    session_id = update["id"]
+    while update["state"] in ("pending", "running"):
+        update = _expanded(client, _call(client, "recipe_session", action="advance", session=session_id))
+        print(json.dumps({"session": session_id, "state": update["state"], "completed": update["completed"], "total": update["total"]}), file=sys.stderr, flush=True)
+    if update["state"] != "completed":
+        raise WorkbenchError(f"Research session {session_id} is {update['state']}; inspect it before explicitly retrying")
+    outputs = update["outputs"]
+    target_ref = outputs["project_export_target"]["target"]
+    target = json.loads(_artifact_bytes(client, target_ref["path"], target_ref["sha256"]))
+    prior = _call(client, "project_manifest").get("manifest") or {}
+    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
+    if commit.returncode:
+        raise WorkbenchError("Payload repository must have a pinned source commit")
+    manifest = dict(prior, format="ps4wb-project-v1", title_id=target["title_id"],
+                    app_version=target["application_version"], module_sha256=target["module_sha256"],
+                    engine="unreal" if args.game == "fortnite" else "source", sdk="openorbis" if args.game == "fortnite" else "payload",
+                    source_commit=commit.stdout.strip(), repository=str(repo), staging="immediate", rpc_version=1)
+    _call(client, "project_manifest", manifest=manifest)
+    installed = _call(client, "project_install", target=target_ref["path"],
+                      offsets=outputs["project_export_offsets"]["header"]["path"],
+                      engine=outputs["engine_sdk_export"]["artifact"]["path"])
+    if args.no_build:
+        return {"session": session_id, "update": update, "installed": installed, "build": None, "deployed": False}
+    argv = json.loads(args.build_argv) if args.build_argv else shlex.split(args.build_cmd, posix=os.name != "nt")
+    argv = [a[1:-1] if len(a) > 1 and a[0] == a[-1] == '"' else a for a in argv]
+    evidence = build(repo, argv, args.payload or game["payload"])
+    collected = _call(client, "project_collect_build")
+    payload_file = Path(evidence["payload"]["path"])
+    sha = evidence["payload"]["sha256"]
+    return {"session": session_id, "update": update, "installed": installed, "build": evidence,
+            "payload": {"path": str(payload_file), "sha256": sha}, "collected": collected, "deployed": False,
+            "next": {"ingest": ["ps4-workbench", "ingest", str(payload_file)], "target": target_ref["path"],
+                     "payload_sha256": sha, "action": "qualify the exact tested output before staging"}}
 
 
 def _watch(client, args):

@@ -1,5 +1,8 @@
 # Development and analysis integrations
 
+The connected development workflow, buildable payload scaffolds, evidence-bound
+SDKs, and resumable update CLI are documented in [PROJECT_PIPELINE.md](PROJECT_PIPELINE.md).
+
 These SDKs and third-party MCP projects are optional. This repository does not
 automatically install them or declare their console output hardware-qualified.
 The already-installed IDA and Ghidra applications are used by the local tests.

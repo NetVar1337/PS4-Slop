@@ -1,0 +1,56 @@
+"""Build diagnostics with explicit argv; no injection or console connections."""
+import argparse
+import os
+from pathlib import Path
+import shutil
+import subprocess
+
+
+def compiler(name, fallback):
+    configured = os.environ.get(name)
+    if configured:
+        return configured
+    found = shutil.which(fallback)
+    if found:
+        return found
+    windows = Path(r"C:\Program Files\LLVM\bin") / (fallback + ".exe")
+    if windows.is_file():
+        return str(windows)
+    raise SystemExit(f"Missing {fallback}; set {name}")
+
+
+def run(argv):
+    subprocess.run([str(value) for value in argv], check=True, timeout=300)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host-test", action="store_true")
+    parser.add_argument("--sdk", default=os.environ.get("OO_PS4_TOOLCHAIN"))
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parent
+    build = root / "build"
+    build.mkdir(exist_ok=True)
+    cxx = compiler("CXX", "clang++")
+    common = ["-std=c++17", "-O2", "-Wall", "-Wextra", "-I" + str(root / "include"), "-I" + str(root / "src")]
+    sources = [root / "src/payload.cpp", root / "runtime.cpp"]
+    if args.host_test:
+        output = build / ("host-smoke.exe" if os.name == "nt" else "host-smoke")
+        run([cxx, *common, "-DPS4WB_HOST_TEST", *sources, root / "tests/host_smoke.cpp", "-o", output])
+        run([output])
+        return
+    sdk = Path(args.sdk or Path.home() / ".local/openorbis-ps4-toolchain").resolve()
+    for needed in ("link.x", "lib/crt1.o", "include"):
+        if not (sdk / needed).exists():
+            raise SystemExit(f"Incomplete OpenOrbis SDK: {sdk / needed}")
+    flags = ["--target=x86_64-pc-freebsd12-elf", "-fPIC", "-funwind-tables", "-fno-exceptions", "-fno-rtti", "-D__PS4__", "-D_BSD_SOURCE", "-isysroot", sdk, "-isystem", sdk / "include", "-isystem", sdk / "include/c++/v1"]
+    objects = []
+    for source in sources:
+        output = build / (source.stem + ".o")
+        run([cxx, *common, *flags, "-c", source, "-o", output])
+        objects.append(output)
+    run([compiler("LLD", "ld.lld"), "-m", "elf_x86_64", "-pie", "--script", sdk / "link.x", "--eh-frame-hdr", "-o", build / "payload.elf", *objects, "-L" + str(sdk / "lib"), "-lkernel", "-lc", sdk / "lib/crt1.o"])
+
+
+if __name__ == "__main__":
+    main()

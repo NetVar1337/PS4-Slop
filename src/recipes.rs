@@ -23,130 +23,7 @@ pub const FORMAT: &str = "ps4wb-recipe-v1";
 /// delete at merge once they are all in `full_catalog()`.
 pub const PLANNED_TOOLS: &[&str] = &[];
 
-pub const BUILTIN_RECIPES: &str = r#"[
- {"format": "ps4wb-recipe-v1", "name": "dump_and_rebuild",
-  "description": "Dump a loaded module from memory, rebuild a loadable ELF and enumerate its functions.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
-             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"}},
-  "steps": [
-   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
-   {"tool": "artifact_functions", "arguments": {"artifact": "${steps.1.artifact.path}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "static_triage",
-  "description": "Offline triage of a module artifact: functions, RTTI classes, crypto constants and Orbis import prototypes.",
-  "inputs": {"artifact": {"type": "string", "required": true, "description": "ELF/SELF-decrypted module artifact path"}},
-  "steps": [
-   {"tool": "artifact_functions", "arguments": {"artifact": "${artifact}"}},
-   {"tool": "rtti_recover", "arguments": {"artifact": "${artifact}"}},
-   {"tool": "crypto_scan", "arguments": {"artifact": "${artifact}"}},
-   {"tool": "orbis_prototypes", "arguments": {"action": "imports", "artifact": "${artifact}", "use_sdk": true}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "update_port",
-  "description": "Diff two builds of a module and port annotations from the old build to the new one.",
-  "inputs": {"old_artifact": {"type": "string", "required": true, "description": "Previously annotated build"},
-             "new_artifact": {"type": "string", "required": true, "description": "Updated build"},
-             "annotations": {"type": "string", "required": true, "description": "Annotation artifact (annotation_save evidence, ported set or {rva: name} JSON) for the old build"}},
-  "steps": [
-   {"tool": "binary_diff", "arguments": {"artifact_a": "${old_artifact}", "artifact_b": "${new_artifact}"}},
-   {"tool": "annotation_port", "arguments": {"diff": "${steps.0.artifact}", "sources": ["${annotations}"], "artifact_a": "${old_artifact}", "artifact_b": "${new_artifact}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "crash_capture",
-  "description": "Run the attached process until it faults, triage the crash, then save a core dump.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Attached target process id"}},
-  "steps": [
-   {"tool": "debug_crash_triage", "arguments": {"wait": true}},
-   {"tool": "process_core_dump", "arguments": {"pid": "${pid}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "coverage_compare",
-  "description": "Record block coverage for the attached process and diff it against a baseline coverage artifact.",
-  "inputs": {"module": {"type": "string", "description": "Module to cover in the attached process; defaults to eboot.bin"},
-             "baseline": {"type": "string", "required": true, "description": "Baseline coverage artifact"}},
-  "steps": [
-   {"tool": "debug_coverage", "arguments": {"module": "${module}"}},
-   {"tool": "coverage_diff", "arguments": {"a": "${baseline}", "b": "${steps.0.coverage_artifact.path}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "offset_refresh",
-  "description": "After a game update: dump the new build, rebuild its ELF, diff against the previous annotated build, port annotations, and regenerate the offsets header/manifest.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
-             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"},
-             "old_artifact": {"type": "string", "required": true, "description": "Previously annotated build artifact"},
-             "annotations": {"type": "string", "required": true, "description": "Annotation artifact for the old build"},
-             "module_sha256": {"type": "string", "description": "Restrict the offsets export to one module hash"},
-             "namespace": {"type": "string", "description": "C++ namespace for the generated header"}},
-  "steps": [
-   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
-   {"tool": "binary_diff", "arguments": {"artifact_a": "${old_artifact}", "artifact_b": "${steps.1.artifact.path}"}},
-   {"tool": "annotation_port", "arguments": {"diff": "${steps.2.artifact}", "sources": ["${annotations}"], "artifact_a": "${old_artifact}", "artifact_b": "${steps.1.artifact.path}"}},
-   {"tool": "project_export_offsets", "arguments": {"module_sha256": "${module_sha256}", "namespace": "${namespace}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "stage_and_verify",
-  "description": "Stage a hash-qualified resident payload, read its lifecycle status, then set the feature bitmask.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
-             "target": {"type": "string", "required": true, "description": "ps4wb-internals-target-v1 artifact (project_export_target)"},
-             "payload": {"type": "string", "required": true, "description": "Resident payload ELF artifact"},
-             "sha256": {"type": "string", "required": true, "description": "Expected payload SHA-256"},
-             "features": {"type": "string", "default": "0x0", "description": "Feature bitmask for RPC command 1"}},
-  "steps": [
-   {"tool": "payload_stage", "arguments": {"pid": "${pid}", "target": "${target}", "payload": "${payload}", "sha256": "${sha256}"}},
-   {"tool": "payload_status", "arguments": {"pid": "${pid}"}},
-   {"tool": "payload_rpc", "arguments": {"pid": "${pid}", "command": 1, "argument": "${features}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "payload_crash_bundle",
-  "description": "Triage a fault of the attached process, capture Klog, and archive both into one experiment bundle for payload_recover analysis.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Attached target process id"},
-             "seconds": {"type": "integer", "default": 5, "description": "Klog capture duration"},
-             "notes": {"type": "string", "description": "Notes stored in the bundle"}},
-  "steps": [
-   {"tool": "debug_crash_triage", "arguments": {"wait": true}},
-   {"tool": "klog_capture", "arguments": {"seconds": "${seconds}"}},
-   {"tool": "experiment_bundle", "arguments": {"paths": ["${steps.0.@artifact}", "${steps.1.@artifact}"], "notes": "${notes}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "deep_dump",
-  "description": "Full module RE dump: in-memory ELF dump, rebuilt ELF with sections/NID names, function discovery, RTTI classes and Orbis import prototypes in one pass.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
-             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"}},
-  "steps": [
-   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
-   {"tool": "artifact_functions", "arguments": {"artifact": "${steps.1.artifact.path}"}},
-   {"tool": "rtti_recover", "arguments": {"artifact": "${steps.1.artifact.path}"}},
-   {"tool": "orbis_prototypes", "arguments": {"action": "imports", "artifact": "${steps.1.artifact.path}", "use_sdk": true}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "unreal_pipeline",
-  "description": "UE4 game (e.g. Fortnite): dump the loaded module, rebuild the ELF, recover GNames/GObjects, export the ue4::Offsets SDK header, then regenerate offsets and a stage-ready target manifest.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
-             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"},
-             "module_sha256": {"type": "string", "description": "Restrict exports to one module hash"},
-             "namespace": {"type": "string", "description": "C++ namespace for generated headers"},
-             "image_base": {"type": "string", "description": "Runtime module base for the target manifest"},
-             "signature_sites": {"type": "array", "description": "Optional RVAs verified unique by signature_make"}},
-  "steps": [
-   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
-   {"tool": "unreal_dump", "arguments": {"artifact": "${steps.1.artifact.path}", "sdk": true}},
-   {"tool": "engine_sdk_export", "arguments": {"unreal": "${steps.2.json.path}", "namespace": "${namespace}"}},
-   {"tool": "project_export_offsets", "arguments": {"module_sha256": "${module_sha256}", "namespace": "${namespace}"}},
-   {"tool": "project_export_target", "arguments": {"module_sha256": "${module_sha256}", "image_base": "${image_base}", "signature_sites": "${signature_sites}"}}
-  ]},
- {"format": "ps4wb-recipe-v1", "name": "source_pipeline",
-  "description": "Source/Respawn game (e.g. Apex Legends): dump the loaded module, rebuild the ELF, recover netvars/datamaps, export the netvar SDK header, then regenerate offsets and a stage-ready target manifest.",
-  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
-             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"},
-             "module_sha256": {"type": "string", "description": "Restrict exports to one module hash"},
-             "namespace": {"type": "string", "description": "C++ namespace for generated headers"},
-             "image_base": {"type": "string", "description": "Runtime module base for the target manifest"},
-             "signature_sites": {"type": "array", "description": "Optional RVAs verified unique by signature_make"}},
-  "steps": [
-   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
-   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
-   {"tool": "source_dump", "arguments": {"artifact": "${steps.1.artifact.path}"}},
-   {"tool": "engine_sdk_export", "arguments": {"source": "${steps.2.artifact.path}", "namespace": "${namespace}"}},
-   {"tool": "project_export_offsets", "arguments": {"module_sha256": "${module_sha256}", "namespace": "${namespace}"}},
-   {"tool": "project_export_target", "arguments": {"module_sha256": "${module_sha256}", "image_base": "${image_base}", "signature_sites": "${signature_sites}"}}
-  ]}
-]"#;
+pub const BUILTIN_RECIPES: &str = include_str!("recipes/builtin.json");
 
 pub fn builtins() -> Result<Vec<Value>> {
     Ok(serde_json::from_str(BUILTIN_RECIPES)?)
@@ -271,7 +148,7 @@ pub fn list(registry: &ToolRegistry) -> Result<Value> {
         "note": "recipe_run also accepts recipe_artifact (JSON artifact path) or an inline definition; every step is policy-checked like a direct call"}))
 }
 
-fn first_artifact(value: &Value, depth: usize) -> Option<&str> {
+pub(crate) fn first_artifact(value: &Value, depth: usize) -> Option<&str> {
     if depth > 6 {
         return None;
     }
@@ -334,7 +211,7 @@ fn lookup(reference: &str, inputs: &Map<String, Value>, results: &[Value]) -> Re
     }
 }
 
-fn substitute(value: &Value, inputs: &Map<String, Value>, results: &[Value]) -> Result<Option<Value>> {
+pub(crate) fn substitute(value: &Value, inputs: &Map<String, Value>, results: &[Value]) -> Result<Option<Value>> {
     Ok(Some(match value {
         Value::String(text) => {
             if let Some(inner) = text.strip_prefix("${").and_then(|t| t.strip_suffix('}'))
@@ -383,7 +260,7 @@ fn substitute(value: &Value, inputs: &Map<String, Value>, results: &[Value]) -> 
     }))
 }
 
-fn bind_inputs(recipe: &Value, supplied: &Value) -> Result<Map<String, Value>> {
+pub(crate) fn bind_inputs(recipe: &Value, supplied: &Value) -> Result<Map<String, Value>> {
     let supplied = match supplied {
         Value::Null => Map::new(),
         Value::Object(fields) => fields.clone(),
@@ -469,6 +346,7 @@ pub fn run(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
     let mut artifacts = Vec::new();
     let mut failure = Value::Null;
     for (index, step) in steps.iter().enumerate() {
+        ensure_not_cancelled()?;
         let tool = step["tool"].as_str().unwrap_or_default().to_owned();
         let template = step.get("arguments").cloned().unwrap_or_else(|| json!({}));
         let arguments = match substitute(&template, &inputs, &results) {
@@ -517,6 +395,13 @@ pub fn run(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "artifacts": artifacts,
         "failure": failure,
     });
+    let mut outputs = Map::new();
+    for (step, result) in steps.iter().zip(&results) {
+        if let Some(tool) = step["tool"].as_str() && ["project_bind_module", "engine_sdk_export", "project_export_offsets", "project_export_target", "project_install", "sdk_build"].contains(&tool) {
+            outputs.insert(tool.into(), result.clone());
+        }
+    }
+    outcome["outputs"] = Value::Object(outputs);
     if !dry_run && !results.is_empty() {
         let log = json!({"recipe": recipe, "inputs": inputs, "time": utc_now(), "steps": outcome["steps"], "results": results});
         let encoded = serde_json::to_vec(&log)?;
@@ -529,6 +414,11 @@ pub fn run(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
     Ok(outcome)
 }
 
+fn ensure_not_cancelled() -> Result<()> {
+    anyhow::ensure!(!crate::sessions::cancelled(), "Recipe cancelled between steps; completed mutations were not undone");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,7 +426,7 @@ mod tests {
     use crate::workbench::Workbench;
 
     fn registry(directory: &std::path::Path) -> ToolRegistry {
-        let mut data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let mut data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["host"] = json!("127.0.0.1");
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");

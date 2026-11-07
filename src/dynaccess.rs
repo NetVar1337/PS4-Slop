@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn catalog_entries_validate_and_offline_struct_infer_dispatches() {
         let directory = tempfile::tempdir().unwrap();
-        let mut data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let mut data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");
         let profile_path = directory.path().join("profile.json");

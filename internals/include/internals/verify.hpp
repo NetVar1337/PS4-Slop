@@ -14,6 +14,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <internals/memory.hpp>
 
 namespace internals {
 
@@ -25,16 +26,24 @@ struct VerifyCheck {
     std::uint8_t bytes[kMaxVerifyBytes];   // expected bytes at base + offset
 };
 
+inline bool verify_module(MemoryReader reader, std::uintptr_t base, const VerifyCheck* checks, std::size_t count) noexcept {
+    if (!base || !checks || !count || count > 64) return false;
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& check = checks[i];
+        std::uint8_t actual[kMaxVerifyBytes]{};
+        if (!check.length || check.length > kMaxVerifyBytes || base > UINTPTR_MAX - check.offset ||
+            !reader.Read(base + check.offset, actual, check.length)) return false;
+        for (std::size_t j = 0; j < check.length; ++j) if (actual[j] != check.bytes[j]) return false;
+    }
+    return true;
+}
+
 // Compare every check against the mapped module at `base`.
 // Returns false on the first mismatch, on any malformed check, or when a
-// non-empty check list is given without a base. An empty list with a nonzero
-// base verifies trivially (nothing was pinned); callers decide whether that
-// is acceptable for their target.
+// non-empty check list is given without a base. Empty verification is never
+// evidence that a target matches: an unconfigured payload stays unavailable.
 inline bool verify_module(std::uintptr_t base, const VerifyCheck* checks, std::size_t count) noexcept {
-    if (checks == nullptr) {
-        return count == 0 && base != 0;
-    }
-    if (base == 0) {
+    if (checks == nullptr || count == 0 || base == 0 || count > 64) {
         return false;
     }
     for (std::size_t i = 0; i < count; ++i) {

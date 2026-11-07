@@ -1,0 +1,447 @@
+[
+ {
+  "name": "project_manifest",
+  "description": "Read or register the exact-build project contract; never changes console permissions.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "manifest": {
+     "type": "object",
+     "properties": {
+      "format": {
+       "const": "ps4wb-project-v1",
+       "type": "string"
+      },
+      "title_id": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "app_version": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "module_sha256": {
+       "type": "string",
+       "pattern": "^[a-f0-9]{64}$"
+      },
+      "engine": {
+       "enum": [
+        "generic",
+        "unreal",
+        "source"
+       ],
+       "type": "string"
+      },
+      "sdk": {
+       "enum": [
+        "openorbis",
+        "payload"
+       ],
+       "type": "string"
+      },
+      "source_commit": {
+       "type": "string",
+       "pattern": "^[a-f0-9]{40}$"
+      },
+      "repository": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "staging": {
+       "enum": [
+        "immediate",
+        "elf_rpc"
+       ],
+       "type": "string"
+      },
+      "rpc_version": {
+       "const": 1,
+       "type": "integer"
+      },
+      "features": {
+       "type": "object",
+       "maxProperties": 32,
+       "additionalProperties": {
+        "type": "object",
+        "properties": {
+         "bit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483648
+         },
+         "requires": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+           "type": "string",
+           "maxLength": 4096
+          }
+         },
+         "dependencies": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+           "type": "string",
+           "maxLength": 4096
+          }
+         }
+        },
+        "required": [
+         "bit"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "bindings": {
+       "type": "object",
+       "maxProperties": 32,
+       "additionalProperties": {
+        "type": "string",
+        "maxLength": 96
+       }
+      }
+     },
+     "required": [
+      "format",
+      "title_id",
+      "app_version",
+      "module_sha256",
+      "engine",
+      "sdk",
+      "source_commit",
+      "repository",
+      "staging",
+      "rpc_version"
+     ],
+     "additionalProperties": false
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_finding",
+  "description": "Record or query a typed, build-bound finding with hash-checked evidence; hardware evidence is user-attested.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "finding": {
+     "type": "object",
+     "properties": {
+      "id": {
+       "type": "string",
+       "pattern": "^[A-Za-z0-9_]{1,96}$"
+      },
+      "module_sha256": {
+       "type": "string",
+       "pattern": "^[a-f0-9]{64}$"
+      },
+      "kind": {
+       "enum": [
+        "module_rva",
+        "object_member",
+        "vtable_slot",
+        "pointer_chain",
+        "function_abi",
+        "enum",
+        "constant"
+       ],
+       "type": "string"
+      },
+      "state": {
+       "enum": [
+        "hypothesis",
+        "static_supported",
+        "live_validated",
+        "rejected"
+       ],
+       "type": "string"
+      },
+      "value": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "owner": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "data_type": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "size": {
+       "type": "integer",
+       "minimum": 0,
+       "maximum": 1048576
+      },
+      "indirection": {
+       "type": "array",
+       "maxItems": 16,
+       "items": {
+        "type": "string",
+        "maxLength": 4096
+       }
+      },
+      "abi": {
+       "type": "object",
+       "properties": {
+        "calling_convention": {
+         "const": "sysv_amd64",
+         "type": "string"
+        },
+        "returns": {
+         "type": "string",
+         "maxLength": 4096
+        },
+        "arguments": {
+         "type": "array",
+         "maxItems": 16,
+         "items": {
+          "type": "string",
+          "maxLength": 4096
+         }
+        },
+        "thread": {
+         "type": "string",
+         "maxLength": 4096
+        },
+        "lifetime": {
+         "type": "string",
+         "maxLength": 4096
+        },
+        "is_method": {
+         "type": "boolean"
+        }
+       },
+       "required": [
+        "calling_convention",
+        "returns",
+        "arguments",
+        "thread",
+        "lifetime"
+       ],
+       "additionalProperties": false
+      },
+      "evidence": {
+       "type": "array",
+       "minItems": 1,
+       "maxItems": 64,
+       "items": {
+        "type": "object",
+        "properties": {
+         "artifact": {
+          "type": "string",
+          "maxLength": 4096
+         },
+         "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+         },
+         "kind": {
+          "enum": [
+           "decompilation",
+           "trace",
+           "memory",
+           "hardware",
+           "layout",
+           "diff"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "artifact",
+         "sha256",
+         "kind"
+        ],
+        "additionalProperties": false
+       }
+      },
+      "notes": {
+       "type": "string",
+       "maxLength": 4096
+      },
+      "enum_values": {
+       "type": "object",
+       "maxProperties": 4096,
+       "additionalProperties": {
+        "type": "integer"
+       }
+      }
+     },
+     "required": [
+      "id",
+      "module_sha256",
+      "kind",
+      "state",
+      "value",
+      "evidence"
+     ],
+     "additionalProperties": false
+    },
+    "id": {
+     "type": "string",
+     "maxLength": 4096
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_doctor",
+  "description": "Validate evidence hashes, build identity, feature dependencies and availability.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_research_export",
+  "description": "Generate typed C++ SDK views and feature availability from live-validated findings.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_install",
+  "description": "Install generated SDK/target/research headers into the registered repository after build/title checks. Never overwrites user-authored headers or deploys.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "engine": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "offsets": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "target": {
+     "type": "string",
+     "maxLength": 1024
+    }
+   },
+   "required": [
+    "target"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "payload_scaffold",
+  "description": "Create a self-contained buildable diagnostic resident payload with shared runtime, UE4/Source readers, protocol negotiation and host lifecycle tests.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "maxLength": 64
+    },
+    "engine": {
+     "enum": [
+      "generic",
+      "source",
+      "unreal"
+     ],
+     "type": "string"
+    }
+   },
+   "required": [
+    "name"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_collect_build",
+  "description": "Verify registered-repository build evidence, source pins, ELF architecture/entry/RPC export and payload hash, then ingest immutable build evidence and ELF artifacts. Never deploys.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ }
+]

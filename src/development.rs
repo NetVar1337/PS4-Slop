@@ -271,6 +271,7 @@ impl Development {
     }
 
     pub fn scaffold(&self, kind: &str, name: &str) -> Result<Value> {
+        if kind == "payload" { return crate::scaffold::create(&self.store, name, "generic"); }
         let catalog = sdks();
         let Some(sdk) = catalog.get(kind).filter(|_| valid_project_name(name)) else {
             bail!("Choose homebrew/plugin/payload and a simple project name");
@@ -507,7 +508,7 @@ mod tests {
 
     fn base_settings() -> Value {
         let mut data: Value =
-            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["host"] = json!("127.0.0.1");
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");

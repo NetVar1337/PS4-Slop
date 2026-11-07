@@ -733,9 +733,9 @@ impl SessionHub {
         if name.starts_with("analysis_") {
             return self.analysis_call(name, arguments);
         }
-        if name == "recipe_run" {
+        if name == "recipe_run" || (name == "recipe_session" && arguments["action"] == "advance") {
             // Recipe steps reach the registry directly, so enforce the shared debug lease up front.
-            let steps = crate::recipes::referenced_tools(&lock(&self.registry), &arguments).unwrap_or_default();
+            let steps = if name == "recipe_session" { crate::sessions::referenced_tools(&lock(&self.registry), &arguments)? } else { crate::recipes::referenced_tools(&lock(&self.registry), &arguments)? };
             if steps.iter().any(|step| CONTROL_TOOLS.contains(&step.as_str()))
                 && lock(&self.debug).controller.as_deref() != Some(client)
             {
@@ -1461,7 +1461,7 @@ pub(crate) mod testing {
     }
 
     pub fn profile_document() -> Value {
-        let mut settings: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let mut settings: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         settings["host"] = json!("127.0.0.1");
         settings["artifact_directory"] = json!("artifacts");
         settings["qualification_file"] = json!("qualification.json");

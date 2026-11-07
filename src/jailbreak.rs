@@ -672,7 +672,7 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("hen.bin");
         fs::write(&path, b"not the patched HEN").unwrap();
-        let data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         let profile = test_profile(data, directory.path());
         let report = hen_report(&path, &profile).unwrap();
         assert_eq!(report["ok"], json!(false));
@@ -706,7 +706,7 @@ mod tests {
         let payload = directory.path().join("ps4debug.bin");
         fs::write(&payload, b"payload").unwrap();
         let (_, sha256) = hash_file(&payload).unwrap();
-        let data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         let mut data = data;
         data["debugger"]["payload_sha256"] = json!(sha256);
         let profile = test_profile(data, directory.path());
@@ -717,14 +717,14 @@ mod tests {
     #[test]
     fn missing_afterglow_directory_is_an_error() {
         let directory = tempdir().unwrap();
-        let data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         let profile = test_profile(data, directory.path());
         assert!(afterglow_verify(&profile, Some(&directory.path().join("missing"))).is_err());
     }
 
     #[test]
     fn tracked_profile_hashes_are_the_known_good_afterglow_build() {
-        let data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         assert_eq!(
             data["jailbreak"]["expected_hen_md5"],
             json!(HEN_MD5_PATCHED)

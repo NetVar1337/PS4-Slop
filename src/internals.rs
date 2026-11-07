@@ -34,6 +34,8 @@ pub struct Target {
     pub status_magic: u32,
     pub fingerprints: Vec<(u64, Vec<u8>)>,
     pub pointers: Vec<(u64, u64)>,
+    pub rpc_version: Option<u16>,
+    pub staging: String,
 }
 
 fn text<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
@@ -66,6 +68,10 @@ impl Target {
             pointers.push((address(&item["address"])?, address(&item["expected"])?));
         }
         ensure!(raw["pointers"].as_array().map_or(0, Vec::len) <= 64, "Too many pointer checks");
+        let rpc_version = raw["rpc_version"].as_u64().map(|v| v as u16);
+        ensure!(raw.get("rpc_version").is_none() || raw["rpc_version"] == 1, "Unsupported RPC version");
+        let staging = raw["staging"].as_str().unwrap_or("elf_rpc").to_owned();
+        ensure!(["immediate", "elf_rpc"].contains(&staging.as_str()), "Unsupported staging protocol");
         Ok(Self {
             raw,
             name,
@@ -77,6 +83,7 @@ impl Target {
             status_magic: status_magic as u32,
             fingerprints,
             pointers,
+            rpc_version, staging,
         })
     }
 
@@ -179,7 +186,6 @@ impl PayloadImage {
             rpc_value = Some(symbol.value);
         }
         let rpc_value = rpc_value.context("Payload needs one defined executable payload_rpc_entry")?;
-        ensure!(rpc_value >= image_entry, "Payload RPC symbol precedes the image entry");
         let signature: [u8; SIGNATURE_SIZE] = image
             .read(rpc_value, SIGNATURE_SIZE)
             .context("Cannot read payload RPC signature")?
@@ -194,9 +200,8 @@ impl PayloadImage {
     }
 
     fn rpc_entry(&self, relocated_entry: u64) -> Result<u64> {
-        relocated_entry
-            .checked_add(self.rpc_value - self.image_entry)
-            .context("Relocated RPC entry overflow")
+        let offset = i128::from(self.rpc_value) - i128::from(self.image_entry);
+        u64::try_from(i128::from(relocated_entry) + offset).context("Relocated RPC entry overflow")
     }
 }
 
@@ -271,6 +276,15 @@ fn status_value(target: &Target, raw: u64) -> Result<Value> {
 }
 
 impl Workbench {
+    fn verify_resident_protocol(&mut self, pid: u32) -> Result<()> {
+        let version = self.internals.residents.get(&pid).context("No recovered payload")?.target.rpc_version;
+        if let Some(version) = version {
+            let descriptor = self.call_resident(pid, 7, 0, 0)?;
+            ensure!(descriptor >> 32 == 0x50535742 && ((descriptor >> 16) & 0xffff) == version as u64 && descriptor & 0xff == 0xff,
+                "Payload RPC protocol mismatch; no control command dispatched");
+        }
+        Ok(())
+    }
     fn rpc_stub(&mut self, pid: u32) -> Result<u64> {
         if let Some(stub) = self.internals.rpc_stubs.get(&pid) {
             return Ok(*stub);
@@ -299,12 +313,25 @@ impl Workbench {
             let maps = target.verify(&mut self.debugger, pid)?;
             ensure!(recover_entry(self, pid, &image, &maps)?.is_none(), "Payload is already resident; refusing a second ELF_RPC upload");
             let stub = self.rpc_stub(pid)?;
-            let image_entry = self.debugger.load_elf_rpc(pid, &bytes)?;
-            let rpc_entry = image.rpc_entry(image_entry)?;
+            let (image_entry, rpc_entry) = if target.staging == "immediate" {
+                self.debugger.load_elf(pid, &bytes)?; // exactly one uncertain mutation
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let entry = loop {
+                    let maps = self.debugger.maps(pid)?.as_array().cloned().context("Invalid maps")?;
+                    if let Some(entry) = recover_entry(self, pid, &image, &maps)? { break entry; }
+                    ensure!(Instant::now() < deadline && !crate::sessions::cancelled(), "Immediate ELF readiness uncertain; recover explicitly, never re-upload automatically");
+                    std::thread::sleep(Duration::from_millis(50));
+                };
+                (0, entry)
+            } else {
+                let image_entry = self.debugger.load_elf_rpc(pid, &bytes)?;
+                (image_entry, image.rpc_entry(image_entry)?)
+            };
             let actual = self.debugger.read_memory(pid, rpc_entry, SIGNATURE_SIZE, false)?;
             ensure!(actual == image.signature, "Relocated payload RPC signature mismatch; state is uncertain");
             let resident = Resident { target: target.clone(), payload: image.clone(), rpc_entry };
             self.internals.residents.insert(pid, resident);
+            self.verify_resident_protocol(pid)?;
             let deadline = Instant::now() + Duration::from_secs(10);
             let status = loop {
                 let raw = self.call_resident(pid, 0, 0, 0)?;
@@ -320,7 +347,7 @@ impl Workbench {
                 "pid":pid,"target":target.name,"application_version":target.application_version,
                 "target_sha256":target.sha256(),"payload_sha256":image.sha256,"payload_size":image.size,
                 "image_entry":format!("{image_entry:#x}"),"rpc_entry":format!("{rpc_entry:#x}"),"rpc_stub":format!("{stub:#x}"),
-                "status":status,"raw_entry_called":false,"automatic_retry":false,"hardware_compatibility_guaranteed":false,
+                "status":status,"staging":target.staging,"rpc_version":target.rpc_version,"raw_entry_called":false,"automatic_retry":false,"hardware_compatibility_guaranteed":false,
             }))
         })();
         self.audit_result("payload_stage", &result)?;
@@ -335,6 +362,7 @@ impl Workbench {
         let rpc_entry = recover_entry(self, pid, &image, &maps)?.context("Payload RPC signature was not found in anonymous executable mappings")?;
         let stub = self.rpc_stub(pid)?;
         self.internals.residents.insert(pid, Resident { target: target.clone(), payload: image.clone(), rpc_entry });
+        self.verify_resident_protocol(pid)?;
         let raw = self.call_resident(pid, 0, 0, 0)?;
         let status = status_value(&target, raw)?;
         Ok(json!({"pid":pid,"recovered":true,"rpc_entry":format!("{rpc_entry:#x}"),"rpc_stub":format!("{stub:#x}"),"payload_sha256":image.sha256,"status":status}))
@@ -342,6 +370,7 @@ impl Workbench {
 
     pub fn payload_status(&mut self, pid: u32) -> Result<Value> {
         self.profile.require("process_inject")?;
+        self.verify_resident_protocol(pid)?;
         let target = self.internals.residents.get(&pid).map(|resident| resident.target.clone()).context("No recovered payload for this PID")?;
         let raw = self.call_resident(pid, 0, 0, 0)?;
         let mut status = status_value(&target, raw)?;
@@ -352,6 +381,11 @@ impl Workbench {
 
     pub fn payload_rpc(&mut self, pid: u32, command: u64, argument: u64, argument2: u64) -> Result<Value> {
         self.profile.require("process_inject")?;
+        self.verify_resident_protocol(pid)?;
+        if self.internals.residents.get(&pid).is_some_and(|r| r.target.rpc_version.is_some()) {
+            ensure!(command <= 7, "Unsupported negotiated RPC command");
+        }
+        ensure!(command != 1 || argument <= u32::MAX as u64, "Feature mask exceeds uint32");
         self.store.audit("payload_rpc_intent", json!({"pid":pid,"command":command,"argument":format!("{argument:#x}"),"argument2":format!("{argument2:#x}")}))?;
         let result = self.call_resident(pid, command, argument, argument2);
         self.audit_result(
@@ -489,6 +523,11 @@ mod tests {
         assert_eq!(image.signature, builder.text[..16]);
         assert!(PayloadImage::parse(&elf, &"0".repeat(64)).is_err());
         assert!(PayloadImage::parse(b"not an elf", &digest(b"not an elf")).is_err());
+        let mut later_entry=elf.clone();
+        later_entry[24..32].copy_from_slice(&(builder.text_va()+32).to_le_bytes());
+        let earlier=PayloadImage::parse(&later_entry,&digest(&later_entry)).unwrap();
+        assert_eq!(earlier.rpc_entry(0x800020).unwrap(),0x800000);
+        assert!(earlier.rpc_entry(1).is_err());
     }
 
     #[test]

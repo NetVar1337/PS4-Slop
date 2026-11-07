@@ -753,7 +753,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const REFERENCE_PROFILE: &str = include_str!("../profiles/ps4-1400.json");
+    const REFERENCE_PROFILE: &str = include_str!("../tests/fixtures/profile.json");
 
     pub(crate) fn settings() -> Value {
         let mut data: Value = serde_json::from_str(REFERENCE_PROFILE).unwrap();
@@ -819,13 +819,13 @@ mod tests {
     }
 
     #[test]
-    fn reference_profile_stays_read_only_and_unidentified() {
+    fn offline_fixture_stays_read_only_and_unidentified() {
         let data: Value = serde_json::from_str(REFERENCE_PROFILE).unwrap();
         for permission in PERMISSIONS {
             assert_eq!(
                 data["permissions"][permission],
                 Value::Bool(false),
-                "tracked profile must keep {permission} disabled"
+                "offline fixture must keep {permission} disabled"
             );
         }
         assert!(data["jailbreak"]["installed_commit"].is_null());

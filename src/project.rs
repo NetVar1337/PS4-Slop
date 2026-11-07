@@ -32,6 +32,7 @@ pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option
     if name == "project_export_target" {
         return Some(export_target(&registry.workbench, args));
     }
+    if name == "project_bind_module" { return Some(bind_module(registry, args)); }
     let store = &registry.workbench.store;
     Some(match name {
         "project_open" => open(store, args),
@@ -42,6 +43,59 @@ pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option
         "recipe_run" => crate::recipes::run(registry, args),
         _ => return None,
     })
+}
+
+/// Bind an observed process and captured binary to the active project. The
+/// whole-artifact research hash and live executable-map hash are distinct.
+fn bind_module(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    let id = resolve_project(&registry.workbench.store, args)?;
+    let pid = args["pid"].as_u64().context("pid required")? as u32;
+    let artifact = args["artifact"].as_str().context("artifact required")?;
+    let bytes = registry.workbench.read_artifact(artifact, crate::bytesource::ARTIFACT_MAX)?;
+    let image = crate::binimage::Image::from_elf(&bytes, None)?;
+    let sha = crate::config::sha256_hex(&bytes);
+    let info = registry.workbench.debugger.process_info(pid)?;
+    let module = args["module"].as_str().unwrap_or("eboot.bin");
+    let maps = registry.workbench.debugger.maps(pid)?;
+    let selected: Vec<&Value> = maps.as_array().context("Invalid maps")?.iter().filter(|m| {
+        let name = m["name"].as_str().unwrap_or("");
+        name == module || name == "executable" || name.ends_with(&format!("/{module}"))
+    }).collect();
+    let base = selected.iter().filter_map(|m| m["start"].as_u64()).min().context("No module mappings")?;
+    let mut text_ranges: Vec<(u64,u64)> = selected.iter().filter(|m| m["protection"].as_u64().unwrap_or(0) & 5 == 5).filter_map(|m| Some((m["start"].as_u64()?,m["end"].as_u64()?))).collect();
+    text_ranges.sort_unstable();
+    let mut hash = Sha256::new(); let mut total = 0u64; let mut previous = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    for (start,end) in text_ranges {
+        ensure!(end > start && start >= previous, "Invalid/overlapping executable maps"); previous = end;
+        total = total.checked_add(end-start).context("Text size overflow")?;
+        ensure!(total <= registry.workbench.profile.limit("transfer_bytes") as u64, "Live text exceeds transfer budget");
+        let mut at = start;
+        while at < end {
+            ensure!(!crate::sessions::cancelled() && std::time::Instant::now() < deadline, "Module binding cancelled or deadline exceeded");
+            let length = ((end-at) as usize).min(registry.workbench.profile.limit("memory_bytes"));
+            let content = registry.workbench.debugger.read_memory(pid, at, length, false)?;
+            ensure!(content.len() == length, "Short executable-text read"); hash.update(content); at += length as u64;
+        }
+    }
+    ensure!(total > 0, "No readable executable maps");
+    let text_sha = hex::encode(hash.finalize());
+    let site = image.entry.or_else(|| image.exec_segments().find(|s| s.data.len() >= 64).map(|s| s.vaddr + 32)).context("No file-backed verification site")?;
+    let expected = image.read(site,16).context("Verification site not captured")?;
+    let runtime_site = base.checked_add(site.checked_sub(image.base).context("Verification site below image")?).context("Verification address overflow")?;
+    let actual = registry.workbench.debugger.read_memory(pid,runtime_site,16,false)?;
+    ensure!(actual == expected,"Captured module verification bytes no longer match the observed process");
+    let store = &registry.workbench.store;
+    let meta = read_json(&index_path(store,&format!("{id}/project.json"))?)?.context("Project missing")?;
+    ensure!(meta["title_id"] == info["title_id"] && info["title_id"].as_str().is_some(), "Observed title does not match active project");
+    let result = record(store, &json!({"project":id,"modules":[{"name":module,"sha256":sha,"base":format!("{base:#x}"),"path":info["path"],"executable_text_sha256":text_sha}]}))?;
+    let mut enriched = artifact_record(store, artifact, None, Some("project_bind_module"), &json!({"module":module,"module_sha256":sha,"pid":pid}), &[])?;
+    enriched["sha256"] = json!(sha);
+    append_records(store,&id,&[enriched])?;
+    let annotation = crate::analysis::annotate(store,artifact,&sha,site-image.base,"Observed module verification site; executable-text hash is checked separately","ModuleEntry")?;
+    auto_record(store,"annotation_save",&json!({"project":id}),&annotation)?;
+    Ok(json!({"module_sha256":sha,"executable_text_sha256":text_sha,"image_base":format!("{base:#x}"),"module":module,"process":info,"record":result,"annotation":annotation}))
 }
 
 fn slug(text: &str, maximum: usize) -> String {
@@ -109,7 +163,7 @@ pub fn active_project(store: &ArtifactStore) -> Result<Option<String>> {
         .filter(|id| index_path(store, &format!("{id}/project.json")).is_ok_and(|p| p.is_file())))
 }
 
-fn resolve_project(store: &ArtifactStore, args: &Value) -> Result<String> {
+pub(crate) fn resolve_project(store: &ArtifactStore, args: &Value) -> Result<String> {
     match args["project"].as_str() {
         Some(_) => {
             let id = project_id(&json!({"project": args["project"]}))?;
@@ -122,7 +176,7 @@ fn resolve_project(store: &ArtifactStore, args: &Value) -> Result<String> {
     }
 }
 
-fn load_records(store: &ArtifactStore, id: &str) -> Result<Vec<Value>> {
+pub(crate) fn load_records(store: &ArtifactStore, id: &str) -> Result<Vec<Value>> {
     let path = index_path(store, &format!("{id}/records.jsonl"))?;
     if !path.is_file() {
         return Ok(Vec::new());
@@ -331,7 +385,7 @@ fn record(store: &ArtifactStore, args: &Value) -> Result<Value> {
     }
     for module in args["modules"].as_array().into_iter().flatten() {
         let mut record = new_record("module");
-        for key in ["name", "sha256", "base", "size", "path", "version"] {
+        for key in ["name", "sha256", "base", "size", "path", "version", "executable_text_sha256"] {
             if let Some(value) = module.get(key) {
                 record.insert(key.into(), value.clone());
             }
@@ -655,7 +709,7 @@ fn cident(text: &str, fallback: &str) -> String {
     if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
         out = format!("_{out}");
     }
-    out
+    crate::sdkgen::safe_ident(&out)
 }
 
 struct OffsetEntry {
@@ -670,8 +724,36 @@ struct OffsetEntry {
 struct OffsetsData {
     module_names: BTreeMap<String, String>,
     groups: BTreeMap<String, Vec<OffsetEntry>>,
-    dump_bytes: BTreeMap<String, Vec<u8>>,
+    dump_bytes: BTreeMap<String, Capture>,
     skipped: Vec<Value>,
+}
+struct Capture { bytes: Vec<u8>, module_base: Option<u64>, start: Option<u64> }
+impl Capture {
+    fn fingerprint(&self, rva: u64, length: usize) -> Option<String> {
+        if self.bytes.starts_with(b"\x7fELF") {
+            if self.bytes.get(16..18) == Some(&4u16.to_le_bytes()) {
+                let image = crate::binimage::Image::from_elf(&self.bytes, None).ok()?;
+                return image.read(self.module_base?.checked_add(rva)?, length).map(hex::encode);
+            }
+            return fingerprint_hex(&self.bytes, rva, length);
+        }
+        let offset = match self.start {
+            Some(start) => self.module_base?.checked_add(rva)?.checked_sub(start)?,
+            None => rva, // explicitly unbased raw dumps use module-relative zero
+        };
+        fingerprint_hex(&self.bytes, offset, length)
+    }
+}
+
+/// Read an RVA through PT_LOAD mappings. Raw captures start at module RVA zero;
+/// ELF/core file offsets are never interchangeable with virtual addresses.
+fn fingerprint_hex(bytes: &[u8], rva: u64, length: usize) -> Option<String> {
+    if bytes.starts_with(b"\x7fELF") {
+        let image = crate::binimage::Image::from_elf(bytes, None).ok()?;
+        return image.read(image.base.checked_add(rva)?, length).map(hex::encode);
+    }
+    let start = usize::try_from(rva).ok()?;
+    bytes.get(start..start.checked_add(length)?).map(hex::encode)
 }
 
 /// Shared collection for both exporters: module names, annotation-derived offset
@@ -691,7 +773,7 @@ fn collect_offsets(workbench: &crate::workbench::Workbench, records: &[Value], w
 
     // Newest recorded dump-like artifact per module sha, for verify fingerprints.
     let transfer = workbench.profile.limit("transfer_bytes");
-    let mut dump_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    let mut dump_bytes: BTreeMap<String, Capture> = BTreeMap::new();
     for record in records.iter().rev() {
         if record["type"] != "artifact" {
             continue;
@@ -707,7 +789,9 @@ fn collect_offsets(workbench: &crate::workbench::Workbench, records: &[Value], w
         if let Some(path) = record["path"].as_str()
             && let Ok(bytes) = workbench.read_artifact(path, transfer)
         {
-            dump_bytes.insert(sha, bytes);
+            let module_base = records.iter().rev().find(|r|r["type"]=="module" && r["sha256"].as_str()==Some(&sha)).and_then(|r|crate::tools::address(&r["base"]).ok());
+            let start = crate::tools::address(&record["address"]).ok();
+            dump_bytes.insert(sha, Capture { bytes, module_base, start });
         }
     }
 
@@ -716,7 +800,7 @@ fn collect_offsets(workbench: &crate::workbench::Workbench, records: &[Value], w
     let mut seen: BTreeMap<String, HashSet<String>> = BTreeMap::new();
     let mut skipped: Vec<Value> = Vec::new();
     for record in records.iter().rev() {
-        if record["type"] != "artifact" || record["kind"] != "annotation" {
+        if record["type"] != "artifact" || !["annotation", "annotations-ported"].contains(&record["kind"].as_str().unwrap_or("")) {
             continue;
         }
         let Some(path) = record["path"].as_str() else { continue };
@@ -729,11 +813,15 @@ fn collect_offsets(workbench: &crate::workbench::Workbench, records: &[Value], w
         if want_sha.as_ref().is_some_and(|w| *w != sha) {
             continue;
         }
-        let Ok(rva) = crate::tools::address(&body["rva"]) else {
+        let bodies = if body["format"] == crate::bindiff::PORT_FORMAT {
+            body["annotations"].as_array().cloned().unwrap_or_default()
+        } else { vec![body.clone()] };
+        for entry in bodies {
+        let Ok(rva) = crate::tools::address(&entry["rva"]) else {
             skipped.push(json!({"path": path, "reason": "annotation rva is not an address"}));
             continue;
         };
-        let base_symbol = cident(body["symbol"].as_str().unwrap_or(""), &format!("off_{rva:x}"));
+        let base_symbol = cident(entry["symbol"].as_str().unwrap_or(""), &format!("off_{rva:x}"));
         let taken = seen.entry(sha.clone()).or_default();
         let mut symbol = base_symbol.clone();
         let mut suffix = 2;
@@ -741,19 +829,16 @@ fn collect_offsets(workbench: &crate::workbench::Workbench, records: &[Value], w
             symbol = format!("{base_symbol}_{suffix}");
             suffix += 1;
         }
-        let verify_hex = dump_bytes.get(&sha).and_then(|dump| {
-            let start = usize::try_from(rva).ok()?;
-            let end = start.checked_add(verify_bytes)?;
-            (end <= dump.len()).then(|| hex::encode(&dump[start..end]))
-        });
-        groups.entry(sha).or_default().push(OffsetEntry {
+        let verify_hex = dump_bytes.get(&sha).and_then(|dump| dump.fingerprint(rva, verify_bytes));
+        groups.entry(sha.clone()).or_default().push(OffsetEntry {
             symbol,
             rva,
-            comment: body["comment"].as_str().unwrap_or("").replace('\n', " "),
-            evidence: body["artifact"].clone(),
+            comment: entry["comment"].as_str().unwrap_or("").replace('\n', " "),
+            evidence: body["artifact"].as_str().map_or_else(|| json!(path), Value::from),
             evidence_sha256: body["artifact_sha256"].clone(),
             verify_hex,
         });
+        }
     }
     OffsetsData { module_names, groups, dump_bytes, skipped }
 }
@@ -775,6 +860,7 @@ fn export_offsets(workbench: &crate::workbench::Workbench, args: &Value) -> Resu
         .filter(|n| !n.is_empty())
         .or_else(|| meta["name"].as_str().map(|n| slug(&n.to_ascii_lowercase(), 48)).filter(|n| !n.is_empty()))
         .unwrap_or_else(|| slug(&id, 48));
+    let namespace = crate::sdkgen::safe_ident(&namespace);
     let data = collect_offsets(workbench, &records, &want_sha, verify_bytes);
     let OffsetsData { module_names, groups, skipped, .. } = data;
     let total: usize = groups.values().map(Vec::len).sum();
@@ -784,32 +870,38 @@ fn export_offsets(workbench: &crate::workbench::Workbench, args: &Value) -> Resu
     hpp.push_str("// Generated by project_export_offsets; do not edit by hand.\n");
     hpp.push_str("// Regenerate from the workbench project index after annotation_save/annotation_port.\n");
     hpp.push_str(&format!("// project: {id}  title_id: {}  app_version: {}\n", meta["title_id"], meta["app_version"]));
-    hpp.push_str("#pragma once\n#include <cstddef>\n#include <cstdint>\n\n");
+    hpp.push_str("#pragma once\n#include <cstddef>\n#include <cstdint>\n#include <internals/verify.hpp>\n\n");
     hpp.push_str(&format!("namespace {namespace} {{\n\n"));
-    hpp.push_str("struct VerifyCheck {\n    std::uintptr_t offset;\n    std::size_t length;\n    std::uint8_t bytes[32];\n};\n\n");
+    hpp.push_str("using VerifyCheck = internals::VerifyCheck;\n\n");
     let mut modules_json = Vec::new();
     for (sha, entries) in &groups {
         let module = module_names.get(sha).cloned().unwrap_or_else(|| "module".to_owned());
-        let modns = slug(&module.to_ascii_lowercase(), 48);
+        let modns = crate::sdkgen::safe_ident(&module.to_ascii_lowercase());
         hpp.push_str(&format!("namespace {modns} {{ // {module}  sha256={sha}\n"));
-        hpp.push_str("inline constexpr VerifyCheck kVerifyChecks[] = {\n");
+        let checks = entries.iter().filter(|entry| entry.verify_hex.is_some()).count().min(64);
+        let mut emitted_checks = 0usize;
+        if checks > 0 { hpp.push_str("inline constexpr VerifyCheck kVerifyChecks[] = {\n"); }
         let mut offsets_json = Vec::new();
         for entry in entries {
-            if let Some(hex_text) = &entry.verify_hex {
+            if let Some(hex_text) = &entry.verify_hex && emitted_checks < checks {
                 let bytes = hex::decode(hex_text).unwrap_or_default();
                 let list: Vec<String> = bytes.iter().map(|b| format!("0x{b:02x}")).collect();
                 hpp.push_str(&format!("    {{ {:#x}, {}, {{ {} }} }},\n", entry.rva, bytes.len(), list.join(", ")));
+                emitted_checks += 1;
             }
-            let comment = if entry.comment.is_empty() { String::new() } else { format!(" // {}", entry.comment) };
-            hpp.push_str(&format!("inline constexpr std::uintptr_t {} = {:#x};{comment}\n", entry.symbol, entry.rva));
             offsets_json.push(json!({
                 "symbol": entry.symbol, "rva": format!("{:#x}", entry.rva), "comment": entry.comment,
                 "evidence": entry.evidence, "evidence_sha256": entry.evidence_sha256,
                 "verify": entry.verify_hex.as_ref().map(|hex_text| json!({"offset": format!("{:#x}", entry.rva), "hex": hex_text})).unwrap_or(Value::Null),
             }));
         }
-        hpp.push_str("};\n");
-        hpp.push_str("inline constexpr std::size_t kVerifyCheckCount = sizeof(kVerifyChecks) / sizeof(kVerifyChecks[0]);\n\n");
+        if checks > 0 { hpp.push_str("};\n"); }
+        else { hpp.push_str("inline constexpr const VerifyCheck* kVerifyChecks = nullptr;\n"); }
+        hpp.push_str(&format!("inline constexpr std::size_t kVerifyCheckCount = {checks};\n"));
+        for entry in entries {
+            let comment = entry.comment.replace(['\r', '\n'], " ");
+            hpp.push_str(&format!("inline constexpr std::uintptr_t {} = {:#x}; // {}\n", entry.symbol, entry.rva, comment));
+        }
         hpp.push_str(&format!("}} // namespace {modns}\n\n"));
         modules_json.push(json!({"module": module, "module_sha256": sha, "offsets": offsets_json}));
     }
@@ -825,7 +917,7 @@ fn export_offsets(workbench: &crate::workbench::Workbench, args: &Value) -> Resu
         "verify_bytes": verify_bytes,
         "modules": modules_json,
     });
-    let provenance = json!({"project": id, "format": OFFSETS_FORMAT, "tool": "project_export_offsets"});
+    let provenance = json!({"project": id, "format": OFFSETS_FORMAT, "tool": "project_export_offsets", "module_sha256":if groups.len() == 1 { groups.keys().next() } else { None }});
     let header = store.save("offsets", hpp.as_bytes(), provenance.clone(), "hpp")?;
     let manifest = store.save("offsets", &serde_json::to_vec_pretty(&doc)?, provenance, "json")?;
     store.audit("project_export_offsets", json!({"project": id, "offsets": total, "modules": groups.len()}))?;
@@ -837,6 +929,9 @@ fn export_offsets(workbench: &crate::workbench::Workbench, args: &Value) -> Resu
 }
 /// Insert one absolute-address fingerprint, or record why it was skipped.
 fn push_fingerprint(fingerprints: &mut BTreeMap<u64, String>, skipped: &mut Vec<Value>, base: u64, rva: u64, hex_text: &str, source: &str) {
+    if fingerprints.len() >= 64 && !base.checked_add(rva).is_some_and(|address|fingerprints.contains_key(&address)) {
+        skipped.push(json!({"rva":format!("{rva:#x}"),"source":source,"reason":"64-site verification budget reached"}));return;
+    }
     match base.checked_add(rva) {
         Some(absolute) => {
             fingerprints.entry(absolute).or_insert_with(|| hex_text.to_owned());
@@ -906,11 +1001,7 @@ fn export_target(workbench: &crate::workbench::Workbench, args: &Value) -> Resul
     // signature_sites: RVAs verified unique by signature_make; bytes from the dump.
     for site in args["signature_sites"].as_array().into_iter().flatten() {
         let rva = crate::tools::address(site)?;
-        match data.dump_bytes.get(&sha).and_then(|dump| {
-            let start = usize::try_from(rva).ok()?;
-            let end = start.checked_add(verify_bytes)?;
-            (end <= dump.len()).then(|| hex::encode(&dump[start..end]))
-        }) {
+        match data.dump_bytes.get(&sha).and_then(|dump| dump.fingerprint(rva, verify_bytes)) {
             Some(hex_text) => push_fingerprint(&mut fingerprints, &mut skipped, base, rva, &hex_text, "signature"),
             None => skipped.push(json!({"rva": format!("{rva:#x}"), "source": "signature", "reason": "no recorded dump covers this site"})),
         }
@@ -932,8 +1023,12 @@ fn export_target(workbench: &crate::workbench::Workbench, args: &Value) -> Resul
         "title_id": title_id,
         "process_name": process_name,
         "process_path": process_path,
-        "application_version": meta["app_version"].as_str().unwrap_or("01.00"),
-        "executable_text_sha256": sha,
+        "application_version": meta["app_version"].as_str().context("Record the observed app_version before exporting a target")?,
+        "executable_text_sha256": module_record.and_then(|r| r.get("executable_text_sha256")).unwrap_or(&json!(sha)),
+        "module_sha256": sha,
+        "image_base":format!("{base:#x}"),
+        "rpc_version":args["rpc_version"].as_u64().unwrap_or(1),
+        "staging":args["staging"].as_str().unwrap_or("immediate"),
         "status_magic": format!("{status_magic:#x}"),
         "fingerprints": fingerprints.iter().map(|(address, hex_text)| json!({"address": format!("{address:#x}"), "hex": hex_text})).collect::<Vec<_>>(),
         "pointers": pointers,
@@ -1067,6 +1162,8 @@ mod tests {
         assert!(hpp.contains("namespace eboot_bin"), "{hpp}");
         assert!(hpp.contains("inline constexpr std::uintptr_t EntityList = 0x100; // entity list"), "{hpp}");
         assert!(hpp.contains("{ 0x100, 7, { 0x48, 0x8b, 0x05, 0x11, 0x22, 0x33, 0x44 } },"), "{hpp}");
+        std::fs::write(directory.path().join("offsets.hpp"), &hpp).unwrap();
+        crate::test_support::compile_run(directory.path(), "#include \"offsets.hpp\"\nint main() { static_assert(test_game::eboot_bin::EntityList == 0x100); static_assert(test_game::eboot_bin::kVerifyCheckCount == 1); const internals::VerifyCheck* p = test_game::eboot_bin::kVerifyChecks; return p->length == 7 ? 0 : 1; }", false);
         let doc: Value = serde_json::from_slice(&workbench.read_artifact(out["manifest"]["path"].as_str().unwrap(), 1 << 20).unwrap()).unwrap();
         assert_eq!(doc["format"], OFFSETS_FORMAT);
         assert_eq!(doc["modules"][0]["module"], "eboot.bin");
@@ -1079,6 +1176,26 @@ mod tests {
         let other_dir = tempfile::tempdir().unwrap();
         let other = crate::workbench::Workbench::new(test_profile(other_dir.path())).unwrap();
         assert!(export_offsets(&other, &json!({})).unwrap_err().to_string().contains("No active project"));
+    }
+
+    #[test]
+    fn fingerprints_use_elf_segments_not_file_offsets() {
+        let mut elf = vec![0u8; 0x2000];
+        elf[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        elf[32..40].copy_from_slice(&64u64.to_le_bytes());
+        elf[54..56].copy_from_slice(&56u16.to_le_bytes());
+        elf[56..58].copy_from_slice(&1u16.to_le_bytes());
+        elf[64..68].copy_from_slice(&1u32.to_le_bytes());
+        elf[68..72].copy_from_slice(&5u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
+        elf[96..104].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[0x1100..0x1104].copy_from_slice(&[0x48,0x89,0xe5,0xc3]);
+        assert_eq!(fingerprint_hex(&elf, 0x100, 4).as_deref(), Some("4889e5c3"));
+        assert!(fingerprint_hex(&elf, 0x2000, 4).is_none());
+        elf[4] = 1;
+        assert!(fingerprint_hex(&elf, 0x100, 4).is_none());
     }
 
     #[test]

@@ -61,7 +61,7 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let mut settings: Value =
-            serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         settings["host"] = json!("127.0.0.1");
         settings["artifact_directory"] = json!("artifacts");
         settings["qualification_file"] = json!("qualification.json");
@@ -238,6 +238,8 @@ struct ConsoleState {
     content_id: &'static str,
     rpc_installs: usize,
     elf_uploads: usize,
+    rpc_descriptor: Option<u64>,
+    publish_elf_map: bool,
     apply_writes: bool,
     /// Memory reads served before every further read drops the connection.
     read_budget: Option<usize>,
@@ -266,6 +268,8 @@ impl FakeConsole {
             content_id: "UP0000-CUSA12552_00-TEST000000000000",
             rpc_installs: 0,
             elf_uploads: 0,
+            rpc_descriptor: None,
+            publish_elf_map: false,
             apply_writes: true,
             read_budget: None,
             reads: 0,
@@ -371,7 +375,7 @@ fn serve_console(mut stream: TcpStream, log: &CommandLog, state: &Mutex<ConsoleS
             0xbdaa_0006 => {
                 let command = u64::from_le_bytes(body[20..28].try_into().unwrap());
                 let lifecycle = if command == 2 { 4u64 } else { 2u64 };
-                let status = (0x4158_4553u64 << 32) | lifecycle;
+                let status = if command == 7 { lock(state).rpc_descriptor.unwrap_or((0x4158_4553u64 << 32) | lifecycle) } else { (0x4158_4553u64 << 32) | lifecycle };
                 reply.extend(OK);
                 reply.extend(71u32.to_le_bytes());
                 reply.extend(status.to_le_bytes());
@@ -422,7 +426,9 @@ fn serve_console(mut stream: TcpStream, log: &CommandLog, state: &Mutex<ConsoleS
                 if stream.read_exact(&mut elf).is_err() {
                     return;
                 }
-                lock(state).elf_uploads += 1;
+                { let mut state=lock(state);state.elf_uploads += 1;
+                  if state.publish_elf_map { state.maps.push((0x9000,0xa000,5,"")); }
+                }
                 reply.extend(OK);
             }
             0xbdaa_0009 => {
@@ -2006,6 +2012,50 @@ fn resident_payload_stages_controls_and_reuses_one_rpc_stub() {
     assert_eq!(shutdown["status"]["lifecycle_name"], "disabled");
     assert_eq!(console.rpc_installs(), 1);
     assert_eq!(console.elf_uploads(), 1);
+}
+
+#[test]
+fn immediate_resident_staging_negotiates_and_blocks_mismatched_controls() {
+    let console=FakeConsole::spawn();
+    let mut env=Env::new();env.port("debug",console.port);
+    let workbench=Workbench::new(env.profile()).unwrap();
+    let (old_target,payload,sha,signature)=internals_artifacts(&workbench);
+    let mut target:Value=serde_json::from_slice(&workbench.store.read(&old_target).unwrap()).unwrap();
+    target["staging"]=json!("immediate");target["rpc_version"]=json!(1);
+    let target=workbench.store.save("target",&serde_json::to_vec(&target).unwrap(),json!({}),"json").unwrap()["path"].as_str().unwrap().to_owned();
+    console.configure(|state|{
+        state.rpc_descriptor=Some(0x50535742000100ff);state.publish_elf_map=true;
+        for (i,b) in signature.iter().enumerate(){state.overlay.insert(0x9000+i as u64,*b);}
+    });
+    let profile=env.qualify(&["process_inject"],std::slice::from_ref(&sha));
+    let mut registry=ToolRegistry::with_toolset(Workbench::new(profile).unwrap(),ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let staged=registry.call("payload_stage",json!({"pid":71,"target":target,"payload":payload,"sha256":sha})).unwrap();
+    assert_eq!(staged["staging"],"immediate");assert_eq!(staged["status"]["lifecycle"],2);
+    assert_eq!(console.elf_uploads(),1);
+    assert_eq!(lock(&console.log).iter().filter(|(cmd,_)|*cmd==0xbdaa0007).count(),1);
+    assert_eq!(lock(&console.log).iter().filter(|(cmd,_)|*cmd==0xbdaa0010).count(),0);
+    console.configure(|state|state.rpc_descriptor=Some(0x50535742000200ff));
+    let error=registry.call("payload_rpc",json!({"pid":71,"command":1,"argument":"0x1"})).unwrap_err();
+    assert!(error.to_string().contains("protocol mismatch"));
+    assert!(!lock(&console.log).iter().any(|(cmd,body)|*cmd==0xbdaa0006&&u64::from_le_bytes(body[20..28].try_into().unwrap())==1));
+}
+
+#[test]
+fn headerless_module_capture_binds_and_exports_a_stage_target() {
+    let console=FakeConsole::spawn();let mut env=Env::new();env.port("debug",console.port);
+    let mut registry=ToolRegistry::with_toolset(Workbench::new(env.profile()).unwrap(),ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    registry.call("project_open",json!({"title_id":"CUSA12552","app_version":"01.00","name":"Headerless fixture"})).unwrap();
+    let captured=registry.call("module_capture",json!({"pid":71})).unwrap();
+    assert_eq!(captured["original_elf_headers_available"],false);
+    let bound=registry.call("project_bind_module",json!({"pid":71,"artifact":captured["artifact"]["path"]})).unwrap();
+    assert_eq!(bound["executable_text_sha256"],digest(&vec![0x41;0x4000]));
+    let target=registry.call("project_export_target",json!({"module_sha256":bound["module_sha256"],"image_base":bound["image_base"]})).unwrap();
+    let body:Value=serde_json::from_slice(&registry.workbench.store.read(target["target"]["path"].as_str().unwrap()).unwrap()).unwrap();
+    assert_eq!(body["executable_text_sha256"],bound["executable_text_sha256"]);
+    assert_eq!(body["module_sha256"],bound["module_sha256"]);
+    assert_eq!(body["fingerprints"][0]["address"],"0x4020");
+    assert_eq!(body["staging"],"immediate");assert_eq!(body["rpc_version"],1);
+    assert_eq!(console.elf_uploads(),0);
 }
 
 #[test]

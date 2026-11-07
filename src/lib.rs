@@ -26,6 +26,14 @@ pub mod mcp;
 pub mod extensions;
 pub mod dumping;
 pub mod engines;
+pub mod sdkgen;
+pub mod research;
+pub mod sessions;
+pub mod hooks;
+pub mod scaffold;
+pub mod replay;
+#[cfg(test)]
+pub mod test_support;
 pub mod dyntrace;
 pub mod dynaccess;
 pub mod binstatic;

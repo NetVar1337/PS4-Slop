@@ -1,5 +1,9 @@
 # PS4-DebugMCPs
 
+For buildable diagnostic payloads, typed research, generated SDK integration,
+durable development sessions, and memory replay, see
+[the project pipeline](docs/PROJECT_PIPELINE.md).
+
 A local PS4 research workbench, command-line interface, and **stdio MCP server**
 for the supplied **firmware 14.00 / Afterglow** setup. Version 0.3 is a native
 **Rust** implementation (single binary, official `rmcp` MCP SDK) and the **only**
@@ -106,7 +110,7 @@ the running exe aside) before `cargo build --release`.
 
 ## Tool groups
 
-There are **115 standalone tools**. The default `read-only` toolset keeps mutating
+Run `tools` for the current standalone catalog. The default `read-only` toolset keeps mutating
 tools hidden even if the profile enables them; use an explicit toolset to expose
 additional tools. Profile permissions and exact-profile qualification remain
 required regardless of toolset.

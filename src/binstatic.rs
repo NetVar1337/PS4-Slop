@@ -416,7 +416,7 @@ fn annotation_port(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "json",
     )?;
     let mut result = json!({
-        "artifact": saved["path"], "module_sha256": sha_b, "ported": ported.len(), "unported": unported.len(),
+        "artifact": saved["path"], "provenance": saved, "module_sha256": sha_b, "ported": ported.len(), "unported": unported.len(),
         "sample": ported.iter().take(50).cloned().collect::<Vec<_>>(),
         "unported_sample": unported.iter().take(50).cloned().collect::<Vec<_>>(),
         "note": "Source artifacts are never modified",

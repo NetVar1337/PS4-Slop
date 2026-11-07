@@ -29,14 +29,14 @@
     "list_entries": 4096
   },
   "permissions": {
-    "ftp_upload": false,
-    "payload_execute": false,
-    "process_inject": false,
-    "process_write": false,
-    "debug_control": false,
-    "kernel_read": false,
-    "kernel_write": false,
-    "build": false
+    "ftp_upload": true,
+    "payload_execute": true,
+    "process_inject": true,
+    "process_write": true,
+    "debug_control": true,
+    "kernel_read": true,
+    "kernel_write": true,
+    "build": true
   },
   "ftp_upload_roots": ["/data/ps4-debugmcps"],
   "artifact_directory": "../workspace",

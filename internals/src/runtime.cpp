@@ -1,12 +1,19 @@
 #include <internals/runtime.hpp>
 
+#ifdef _WIN32
+#include <thread>
+#include <chrono>
+static void usleep(unsigned int us) { std::this_thread::sleep_for(std::chrono::microseconds(us)); }
+#else
 #include <unistd.h>
+#endif
 
 namespace internals {
 
 std::uint64_t DispatchRpc(const RpcCallbacks& callbacks, std::uint64_t command,
                           std::uint64_t argument, std::uint64_t argument2) noexcept {
     switch (command) {
+    case 7: return kProtocolDescriptor;
     case 0:
         return callbacks.status != nullptr ? callbacks.status(callbacks.context) : kInvalidRpcResult;
     case 1:
@@ -55,6 +62,12 @@ bool Runtime::Start() noexcept {
         return false;
     }
     SetLifecycle(Lifecycle::Ready);
+    for (std::uint32_t i = 0; i < kMaxConfigWords; ++i) {
+        if (callbacks_.read_config) config_mirror_[i].store(callbacks_.read_config(callbacks_.context, i), std::memory_order_release);
+    }
+    for (std::uint32_t i = 0; i < kMaxTelemetryWords; ++i) {
+        telemetry_mirror_[i].store(callbacks_.telemetry ? callbacks_.telemetry(callbacks_.context, i) : kInvalidRpcResult, std::memory_order_release);
+    }
     return true;
 }
 
@@ -85,6 +98,9 @@ void Runtime::Tick() noexcept {
     if (lifecycle_.load(std::memory_order_acquire) == Lifecycle::Ready && callbacks_.tick != nullptr) {
         callbacks_.tick(callbacks_.context);
     }
+    if (callbacks_.telemetry) {
+        for (std::uint32_t i = 0; i < kMaxTelemetryWords; ++i) telemetry_mirror_[i].store(callbacks_.telemetry(callbacks_.context, i), std::memory_order_release);
+    }
 
     if (!shutdown_requested_.load(std::memory_order_acquire)) {
         return;
@@ -113,6 +129,7 @@ int Runtime::Run() noexcept {
 std::uint64_t Runtime::Rpc(std::uint64_t command, std::uint64_t argument,
                            std::uint64_t argument2) noexcept {
     switch (command) {
+    case 7: return kProtocolDescriptor;
     case 0:
         return PackStatus();
     case 1:
@@ -134,8 +151,8 @@ std::uint64_t Runtime::Rpc(std::uint64_t command, std::uint64_t argument,
         return argument < kMaxConfigWords ? ReadConfig(static_cast<std::uint32_t>(argument))
                                           : kInvalidRpcResult;
     case 6:
-        return argument < kMaxTelemetryWords && callbacks_.telemetry != nullptr
-                   ? callbacks_.telemetry(callbacks_.context, static_cast<std::uint32_t>(argument))
+        return argument < kMaxTelemetryWords
+                   ? telemetry_mirror_[argument].load(std::memory_order_acquire)
                    : kInvalidRpcResult;
     default:
         return kInvalidRpcResult;

@@ -759,6 +759,38 @@ mod tests {
         assert_eq!(sdk["properties"][0], json!({"name": "Health", "type": "IntProperty", "offset": 0x30, "size": 4}));
         let text = registry.workbench.read_artifact(result["sdk_text"]["path"].as_str().unwrap(), 1 << 20).unwrap();
         assert!(String::from_utf8(text).unwrap().contains("class MyActor : public Object {\n\tIntProperty Health; // 0x30 (0x4)"));
+        let exported = registry.call("engine_sdk_export", json!({"unreal":result["json"]["path"]})).unwrap();
+        let hpp = registry.workbench.read_artifact(exported["artifact"]["path"].as_str().unwrap(), 1 << 20).unwrap();
+        std::fs::write(directory.path().join("engine.hpp"), hpp).unwrap();
+        let bytes = pool_dump(base);
+        std::fs::write(directory.path().join("image.bin"), bytes).unwrap();
+        let image_path = serde_json::to_string(&directory.path().join("image.bin").to_string_lossy()).unwrap();
+        let source = format!(r#"
+#include "engine.hpp"
+#include <cassert>
+#include <fstream>
+#include <vector>
+#include <cstring>
+int main() {{
+    std::ifstream file({image_path}, std::ios::binary);
+    std::vector<unsigned char> bytes((std::istreambuf_iterator<char>(file)), {{}});
+    const auto base = reinterpret_cast<std::uintptr_t>(bytes.data());
+    for (std::size_t i=0;i+8<=bytes.size();i+=8) {{
+        std::uint64_t value=0; std::memcpy(&value,bytes.data()+i,8);
+        if (value >= 0x100000000ULL && value < 0x100000000ULL + bytes.size()) {{ value = base + value - 0x100000000ULL; std::memcpy(bytes.data()+i,&value,8); }}
+    }}
+    internals::ReadableRange range{{base,base+bytes.size()}};
+    internals::MappedMemory memory{{&range,1}};
+    ue4::Store store(base,game::kUe4Offsets,memory.Reader());
+    assert(store.available());
+    std::size_t named=0;
+    const auto count=store.for_each([&](std::size_t, std::uintptr_t object) {{ std::uint32_t index=0; char text[128]; assert(store.name_index_of(object,index)); assert(store.name_of(index,text,sizeof(text))>0); ++named; }});
+    assert(count == 4 && named == count);
+    char text[8]; assert(store.name_of(0,text,sizeof(text))==4); assert(std::strcmp(text,"None")==0);
+    assert(store.name_of(0xffffffff,text,sizeof(text))==0);
+}}
+"#);
+        crate::test_support::compile_run(directory.path(), &source, false);
     }
 
     #[test]
@@ -809,5 +841,22 @@ mod tests {
             serde_json::from_slice(&registry.workbench.read_artifact(result["json"]["path"].as_str().unwrap(), 1 << 20).unwrap()).unwrap();
         assert_eq!(full["names"][2]["name"], "Wide");
         assert_eq!(full["offsets"]["property_offset"], 0x44);
+    }
+
+    #[test]
+    fn sparse_module_and_heap_replay_is_hash_checked() {
+        let dir=tempfile::tempdir().unwrap();
+        let mut registry=crate::tools::ToolRegistry::new(Workbench::new(crate::artifacts::tests::test_profile(dir.path())).unwrap()).unwrap();
+        let base=0x100000000u64;
+        let bytes=pool_dump(base);
+        let module=registry.workbench.store.save("module",&bytes[..0x2000],json!({}),"bin").unwrap();
+        let heap=registry.workbench.store.save("heap",&bytes[0x2000..],json!({}),"bin").unwrap();
+        let document=json!({"format":"ps4wb-memory-image-v1","image_base":format!("{base:#x}"),"regions":[{"address":format!("{base:#x}"),"artifact":module,"protection":3,"selected":true},{"address":format!("{:#x}",base+0x2000),"artifact":heap,"protection":3,"selected":false}],"missing":[]});
+        let image=registry.workbench.store.save("memory-image",&serde_json::to_vec(&document).unwrap(),json!({}),"json").unwrap();
+        let result=registry.call("unreal_dump",json!({"artifact":image["path"]})).unwrap();
+        assert_eq!(result["counts"]["objects"],4);
+        assert_eq!(result["counts"]["names"],9);
+        std::fs::write(registry.workbench.store.path(document["regions"][1]["artifact"]["path"].as_str().unwrap()).unwrap(),"changed").unwrap();
+        assert!(registry.call("unreal_dump",json!({"artifact":image["path"]})).unwrap_err().to_string().contains("region changed"));
     }
 }

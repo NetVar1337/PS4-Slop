@@ -351,10 +351,10 @@ impl ServerHandler for McpServer {
                 !cancelled.is_cancelled(),
                 "Request cancelled before dispatch; no command sent"
             );
-            server.execute(
+            crate::sessions::with_cancellation(move || cancelled.is_cancelled(), || server.execute(
                 &request.name,
                 Value::Object(request.arguments.unwrap_or_default()),
-            )
+            ))
         })
         .await
         .map_err(protocol_error)?;

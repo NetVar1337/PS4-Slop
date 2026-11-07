@@ -132,6 +132,10 @@
         "description": "Module/app version",
         "minLength": 1,
         "maxLength": 64
+       },
+       "executable_text_sha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
        }
       },
       "required": [
@@ -494,8 +498,14 @@
      "maxLength": 20,
      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
     },
-    "process_name": {"type": "string", "maxLength": 256},
-    "process_path": {"type": "string", "maxLength": 1024},
+    "process_name": {
+     "type": "string",
+     "maxLength": 256
+    },
+    "process_path": {
+     "type": "string",
+     "maxLength": 1024
+    },
     "status_magic": {
      "type": "string",
      "description": "Payload status magic (default 0x5053494E 'PSIN')",
@@ -512,7 +522,11 @@
      "type": "array",
      "description": "RVAs verified unique by signature_make; each becomes an absolute-address fingerprint",
      "maxItems": 64,
-     "items": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"}
+     "items": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
     },
     "pointers": {
      "type": "array",
@@ -521,12 +535,34 @@
      "items": {
       "type": "object",
       "properties": {
-       "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
-       "expected": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"}
+       "address": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "expected": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       }
       },
-      "required": ["address", "expected"],
+      "required": [
+       "address",
+       "expected"
+      ],
       "additionalProperties": false
      }
+    },
+    "rpc_version": {
+     "const": 1,
+     "type": "integer"
+    },
+    "staging": {
+     "enum": [
+      "immediate",
+      "elf_rpc"
+     ],
+     "type": "string"
     }
    },
    "required": [],
@@ -602,6 +638,41 @@
    "destructiveHint": true,
    "idempotentHint": false,
    "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_bind_module",
+  "description": "Bind a captured ELF to the observed process/title and active project; separately hash live executable maps, record base and verification evidence. Read-only toward the console.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "artifact": {
+     "type": "string"
+    },
+    "module": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "pid",
+    "artifact"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
   },
   "permission": null
  }

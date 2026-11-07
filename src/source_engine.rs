@@ -1353,7 +1353,7 @@ mod tests {
     }
 
     fn registry(directory: &std::path::Path) -> ToolRegistry {
-        let mut data: Value = serde_json::from_str(include_str!("../profiles/ps4-1400.json")).unwrap();
+        let mut data: Value = serde_json::from_str(include_str!("../tests/fixtures/profile.json")).unwrap();
         data["artifact_directory"] = json!("artifacts");
         data["qualification_file"] = json!("qualification.json");
         let path = directory.join("profile.json");

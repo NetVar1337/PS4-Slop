@@ -688,15 +688,42 @@
   "inputSchema": {
    "type": "object",
    "properties": {
-    "unreal": {"type": "string", "maxLength": 1024, "description": "unreal_dump JSON artifact"},
-    "source": {"type": "string", "maxLength": 1024, "description": "source_dump JSON artifact"},
-    "namespace": {"type": "string", "maxLength": 64, "description": "C++ namespace (default game)"},
-    "max_objects": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "UE4 iteration cap (default 65536)"}
+    "unreal": {
+     "type": "string",
+     "maxLength": 1024,
+     "description": "unreal_dump JSON artifact"
+    },
+    "source": {
+     "type": "string",
+     "maxLength": 1024,
+     "description": "source_dump JSON artifact"
+    },
+    "namespace": {
+     "type": "string",
+     "maxLength": 64,
+     "description": "C++ namespace (default game)"
+    },
+    "max_objects": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1048576,
+     "description": "UE4 iteration cap (default 65536)"
+    },
+    "module_sha256": {
+     "type": "string",
+     "pattern": "^[a-f0-9]{64}$",
+     "description": "Bind the generated SDK to an already recorded exact module build (required for project_install)"
+    }
    },
    "required": [],
    "additionalProperties": false
   },
-  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
   "permission": null
  }
 ]
