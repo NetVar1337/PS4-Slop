@@ -6,13 +6,18 @@ durable development sessions, and memory replay, see
 repository (like Apex-PS4/Fortnite-PS4) with `game_new`/`game_update`/`game_stage`,
 see [authoring a game project](docs/GAME_PROJECT.md) and [examples/game](examples/game).
 
+Game repositories now share evidence-gated features, semantic bindings,
+transactional generated installs, bounded draw/input/snapshot helpers, named RPC
+profiles, and an actionable `game_verify` report. Use the `ps4-game-project` MCP
+prompt for the resident-diagnostics-first workflow.
+
 A local PS4 research workbench, command-line interface, and **stdio MCP server**
 for the supplied **firmware 14.00 / Afterglow** setup. Version 0.3 is a native
 **Rust** implementation (single binary, official `rmcp` MCP SDK) and the **only**
 server: MCP, CLI, broker, GDB Remote bridge and console transports all live in
-`src/`. The Python package `ps4_workbench/` contains only the IDA / Ghidra /
-Binary Ninja / iaito analysis-agent adapters that run *inside* those applications
-and talk to the Rust broker. Runs on the development PC, not on the console.
+`src/`. The Python package `ps4_workbench/` contains the analysis-agent adapters
+that run inside IDA/Ghidra/Binary Ninja/iaito plus broker-client, bounded-build
+and control-plane utilities. Everything runs on the development PC, not on the console.
 
 Version **0.2** adds a shared session broker, a GDB Remote bridge, IDA Pro 9.5
 integration and a Ghidra 12.2 Java agent. For the requested live workflow, start

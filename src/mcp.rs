@@ -423,6 +423,10 @@ impl ServerHandler for McpServer {
                     "ps4-dynamic-analysis",
                     "Plan qualified dynamic analysis with one control owner",
                 ),
+                (
+                    "ps4-game-project",
+                    "Author and validate an evidence-bound standalone game repository",
+                ),
             ]
             .into_iter()
             .map(|(name, description)| Prompt::new(name, Some(description), None))
@@ -454,6 +458,9 @@ impl ServerHandler for McpServer {
             }
             "ps4-dynamic-analysis" => {
                 "Inspect session_state and console_status without probes. Verify the exact profile and locally attested debugger build. Establish one control owner and the explicit PC callback IP before attaching. Use real stop events, never invent a stop. Capture maps and bounded memory with provenance. Require explicit intent and enabled policy for each mutation; never automatically retry an uncertain command. Detach cleanly when finished. Static memory shadows do not execute PS4 code."
+            }
+            "ps4-game-project" => {
+                "Create or adopt a standalone repository with game_new and its workbench.json. Require an explicit source commit before game_update; validate local inputs before console reads. Pass repository and observed app_version to game_update, preserve the returned target/offset/SDK artifacts, and use project_finding for exact-build typed evidence. Implement game-specific providers in the game repository, not the shared workbench. Use game_verify to distinguish implementation, evidence and runtime state and follow its next_actions. Start with resident diagnostics and a read-only snapshot; run host and OpenOrbis checks before staging. Keep unsupported feature bits disabled, never treat ported annotations as live validation, and require explicit qualified intent for game_stage. Use named RPC metadata and mirror-confirmed profiles where available."
             }
             _ => return Err(ErrorData::invalid_params("Unknown prompt", None)),
         };

@@ -5,6 +5,15 @@
 // feature table records which live-validated findings each bit requires.
 // Unsafe capabilities stay rejected unless explicitly compiled in.
 #include <cstdint>
+#include <internals/capabilities.hpp>
+#if __has_include("generated/feature_dependencies.hpp")
+#include "generated/feature_dependencies.hpp"
+#else
+namespace features {
+inline constexpr std::uint32_t kEvidenceMask = 0;
+inline constexpr bool dependencies_satisfied(std::uint32_t) noexcept { return true; }
+}
+#endif
 
 namespace features {
 
@@ -28,9 +37,11 @@ inline constexpr std::uint32_t kNativeMinimap = 1u << 13;
 // build; project_doctor reports availability per feature.
 inline constexpr std::uint32_t kImplementedMask = kDiagnostics;
 
-// Fail-closed gate: any requested bit that is not implemented is rejected.
-inline constexpr bool allowed(std::uint32_t requested) noexcept {
-    return (requested & ~kImplementedMask) == 0;
+// Fail-closed gate: implementation, exact-build evidence and dependencies are
+// all required. A game can additionally reject unavailable runtime providers.
+inline bool allowed(std::uint32_t requested) noexcept {
+    const internals::FeatureCapabilities capabilities{kImplementedMask, kEvidenceMask, kImplementedMask};
+    return capabilities.allows(requested) && dependencies_satisfied(requested);
 }
 
 } // namespace features

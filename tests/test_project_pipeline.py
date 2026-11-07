@@ -107,6 +107,23 @@ class GeneratedProjectTests(unittest.TestCase):
         (artifact_root / "fixture-target.json").write_text(json.dumps({"format": "ps4wb-internals-target-v1", "title_id": "CUSA44556",
             "module_sha256": sha, "image_base": "0x400000", "fingerprints": [{"address": "0x400100", "hex": "9090"}]}))
         self.call("project_install", target="fixture-target.json", engine=sdk["artifact"]["path"])
+        generated = project / "src/generated"
+        install = json.loads((generated / "install.json").read_text())
+        self.assertEqual(install["format"], "ps4wb-installed-v1")
+        self.assertEqual(install["module_sha256"], sha)
+        checked = subprocess.run([sys.executable, str(project / "build.py"), "--check-generated"],
+                                 capture_output=True, text=True, timeout=120)
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        config = generated / "engine_config.hpp"
+        original = config.read_bytes()
+        try:
+            config.write_bytes(original + b"// partial install\n")
+            rejected = subprocess.run([sys.executable, str(project / "build.py"), "--check-generated"],
+                                      capture_output=True, text=True, timeout=120)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("rerun project_install", rejected.stdout + rejected.stderr)
+        finally:
+            config.write_bytes(original)
         output = subprocess.run([sys.executable, str(project / "build.py"), "--host-test"], capture_output=True, text=True, timeout=120)
         self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
         # Optional local SDK check: collect the actual ELF and its source evidence.
@@ -160,6 +177,21 @@ class GameScaffoldTests(unittest.TestCase):
         self.assertIn("doctor", verified)
         self.assertIn("summary", verified)
         self.assertFalse(verified["hardware_verified"])
+        recipe = json.loads((repo / "recipe.json").read_text())
+        self.assertEqual(recipe["commands"][0][-2:], ["--output", "build/game.elf"])
+        sdk_root = Path(os.environ.get("OO_PS4_TOOLCHAIN", str(Path.home() / ".local/openorbis-ps4-toolchain")))
+        if (sdk_root / "link.x").is_file():
+            output = subprocess.run([sys.executable, str(repo / "build.py"), "--engine", "source",
+                                     "--output", descriptor["payload"]], cwd=repo,
+                                    capture_output=True, text=True, timeout=120)
+            self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
+            self.assertTrue((repo / descriptor["payload"]).is_file())
+        checked = self.call("game_verify", repository=str(repo), host_tests=True,
+                            cross_build=(sdk_root / "link.x").is_file())
+        self.assertTrue(checked["checks"]["host_test"]["success"], checked)
+        if (sdk_root / "link.x").is_file():
+            self.assertTrue(checked["checks"]["cross_build"]["success"], checked)
+        self.assertTrue(checked["next_actions"])
 
 
 class DescriptorDrivenUpdateTests(unittest.TestCase):
@@ -179,10 +211,31 @@ class DescriptorDrivenUpdateTests(unittest.TestCase):
             (Path(repo) / "workbench.json").write_text(json.dumps({
                 "format": "ps4wb-scaffold-v1", "engine": "unreal", "payload": "payload.elf",
                 "generated_directory": "src/generated", "rpc_version": 1, "staging": "immediate"}))
-            self.assertEqual(load_descriptor(repo)["engine"], "unreal")
+            descriptor = load_descriptor(repo)
+            assert descriptor is not None
+            self.assertEqual(descriptor["engine"], "unreal")
             (Path(repo) / "workbench.json").write_text(json.dumps({"format": "other"}))
             with self.assertRaises(WorkbenchError):
                 load_descriptor(repo)
+
+    def test_update_delegates_research_to_game_update(self):
+        from unittest.mock import patch
+        from ps4_workbench import ctl
+        client = self.broker.client()
+        with tempfile.TemporaryDirectory() as repo:
+            (Path(repo) / "workbench.json").write_text(json.dumps({
+                "format": "ps4wb-scaffold-v1", "engine": "unreal", "payload": "payload.elf",
+                "generated_directory": "src/generated", "rpc_version": 1, "staging": "immediate"}))
+            argv = ["--url", self.broker.url, "--token-file", str(self.broker.token),
+                    "update", "--project-dir", repo, "--pid", "71", "--no-build"]
+            parsed = ctl.build_parser().parse_args(argv)
+            result = {"session": "a" * 32, "target": "target.json", "installed": None}
+            with patch("ps4_workbench.ctl._call", return_value=result) as call:
+                returned = ctl._update(client, parsed)
+            self.assertEqual(call.call_args.args[1], "game_update")
+            self.assertEqual(call.call_args.kwargs["repository"], str(Path(repo).resolve()))
+            self.assertEqual(call.call_args.kwargs["engine"], "unreal")
+            self.assertEqual(returned["session"], "a" * 32)
 
     def test_update_dry_run_derives_plan_from_workbench_json(self):
         from ps4_workbench import ctl

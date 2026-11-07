@@ -32,7 +32,9 @@ console state first (docs/QUALIFICATION.md section 6).
 
 import argparse
 import json
+import struct
 import sys
+from pathlib import Path
 
 from .client import BrokerClient
 from .config import WorkbenchError, parse_address, require_hash, require_integer
@@ -58,7 +60,7 @@ def _add_common(parser):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="ps4-workbench-ctl", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="ps4-workbench-ctl", description=__doc__ or "PS4 workbench control plane")
     _add_common(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -89,22 +91,36 @@ def build_parser():
     p.add_argument("--command", type=int, required=True)
     p.add_argument("--argument", default="0x0")
     p.add_argument("--argument2", default="0x0")
-    p = sub.add_parser("features", help="set the payload feature bitmask (RPC command 1)")
+    p = sub.add_parser("features", help="set features by mask or generated names (RPC command 1)")
     p.add_argument("--pid", type=int, required=True)
-    p.add_argument("--bits", required=True, help="feature bitmask, decimal or 0x...")
+    p.add_argument("--bits", help="feature bitmask, decimal or 0x...")
+    p.add_argument("--names", help="comma-separated generated feature names, or safe")
+    p.add_argument("--project-dir", default=".", help="game repository for named features")
 
-    p = sub.add_parser("config", help="read/write a config word (RPC 5 read / 4 write)")
+    p = sub.add_parser("config", help="read/write a config word by index or generated name")
     p.add_argument("action", choices=["get", "set"])
     p.add_argument("--pid", type=int, required=True)
-    p.add_argument("--index", type=int, required=True)
-    p.add_argument("--value", default=None, help="value for set, decimal or 0x...")
-    p = sub.add_parser("telemetry", help="read a telemetry word (RPC command 6)")
+    p.add_argument("--index", type=int)
+    p.add_argument("--name")
+    p.add_argument("--project-dir", default=".")
+    p.add_argument("--value", default=None, help="typed value for set, decimal or 0x...")
+    p = sub.add_parser("telemetry", help="read a telemetry word by index or generated name")
     p.add_argument("--pid", type=int, required=True)
-    p.add_argument("--index", type=int, required=True)
+    p.add_argument("--index", type=int)
+    p.add_argument("--name")
+    p.add_argument("--project-dir", default=".")
     p = sub.add_parser("watch", help="poll payload_status heartbeat and report staleness")
     p.add_argument("--pid", type=int, required=True)
     p.add_argument("--interval", type=float, default=1.0, help="seconds between polls (default 1.0)")
     p.add_argument("--count", type=int, default=0, help="stop after N polls (0 = until Ctrl+C)")
+    p.add_argument("--safe-features", help="request this mask/name list once per stall episode")
+    p.add_argument("--project-dir", default=".")
+    p = sub.add_parser("profile", help="save/load a build-bound config profile with mirror confirmation")
+    p.add_argument("action", choices=["save", "load"])
+    p.add_argument("--pid", type=int, required=True)
+    p.add_argument("--path", required=True)
+    p.add_argument("--project-dir", default=".")
+    p.add_argument("--features", help="save: mask/name override instead of reading active telemetry")
 
     p = sub.add_parser("export-offsets", help="project_export_offsets: annotations -> offsets.hpp + manifest")
     p.add_argument("--project", default=None)
@@ -175,23 +191,35 @@ def run(argv, client_factory=BrokerClient):
                              argument=hex(parse_address(args.argument)),
                              argument2=hex(parse_address(args.argument2)))
     elif args.command == "features":
+        if (args.bits is None) == (args.names is None):
+            raise WorkbenchError("Pass exactly one of --bits or --names")
+        mask = parse_address(args.bits) if args.bits is not None else _feature_mask(load_rpc_descriptor(args.project_dir), args.names)
+        require_integer(mask, "feature mask", 0, 2**32 - 1)
         result = _call(client, "payload_rpc", pid=require_integer(args.pid, "pid", 1, 2147483647),
-                             command=RPC_FEATURES, argument=hex(parse_address(args.bits)), argument2="0x0")
+                             command=RPC_FEATURES, argument=hex(mask), argument2="0x0")
+        result["feature_mask"] = hex(mask)
     elif args.command == "config":
         pid = require_integer(args.pid, "pid", 1, 2147483647)
-        index = require_integer(args.index, "index", 0, 31)
+        field = _rpc_field(args, "config")
+        index = field["index"]
         if args.action == "get":
             result = _call(client, "payload_rpc", pid=pid, command=RPC_READ_CONFIG,
                            argument=hex(index), argument2="0x0")
+            result.update(name=field["name"], value=_decode_rpc(field, result["raw"]))
         else:
             if args.value is None:
                 raise WorkbenchError("config set requires --value")
+            encoded = _encode_rpc(field, args.value)
             result = _call(client, "payload_rpc", pid=pid, command=RPC_WRITE_CONFIG,
-                           argument=hex(index), argument2=hex(parse_address(args.value)))
+                           argument=hex(index), argument2=hex(encoded))
+            result.update(name=field["name"], value=_decode_rpc(field, encoded))
     elif args.command == "telemetry":
+        field = _rpc_field(args, "telemetry")
         result = _call(client, "payload_rpc", pid=require_integer(args.pid, "pid", 1, 2147483647),
-                       command=RPC_READ_TELEMETRY, argument=hex(require_integer(args.index, "index", 0, 15)),
-                       argument2="0x0")
+                       command=RPC_READ_TELEMETRY, argument=hex(field["index"]), argument2="0x0")
+        result.update(name=field["name"], value=_decode_rpc(field, result["raw"]))
+    elif args.command == "profile":
+        result = _profile_save(client, args) if args.action == "save" else _profile_load(client, args)
     elif args.command == "watch":
         result = _watch(client, args)
     elif args.command == "session":
@@ -249,6 +277,179 @@ def load_descriptor(project_dir):
     return descriptor
 
 
+def load_rpc_descriptor(project_dir):
+    """Load generated RPC metadata without accepting paths outside the repo."""
+    descriptor = load_descriptor(project_dir)
+    if descriptor is None:
+        raise WorkbenchError("Named RPC operations require a game workbench.json")
+    root = Path(project_dir).resolve()
+    path = (root / descriptor.get("generated_directory", "src/generated") / "rpc.json").resolve()
+    if not path.is_relative_to(root):
+        raise WorkbenchError("Generated RPC descriptor escapes the repository")
+    try:
+        result = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkbenchError(f"Cannot read generated RPC descriptor: {error}") from error
+    if result.get("format") != "ps4wb-rpc-v1":
+        raise WorkbenchError("Unsupported generated RPC descriptor")
+    return result
+
+
+def _feature_mask(descriptor, value):
+    """Parse a numeric mask or a comma-separated list of feature names."""
+    try:
+        return parse_address(value)
+    except (ValueError, TypeError, WorkbenchError):
+        pass
+    features = {item.get("name"): require_integer(item.get("bit"), "feature bit", 0, 2**32 - 1)
+                for item in descriptor.get("features", [])}
+    mask = 0
+    for name in str(value).split(","):
+        name = name.strip()
+        if not name or name == "safe":
+            continue
+        if name not in features:
+            raise WorkbenchError(f"Unknown feature: {name}")
+        mask |= features[name]
+    return require_integer(mask, "feature mask", 0, 2**32 - 1)
+
+
+def _rpc_field(args, group):
+    name = getattr(args, "name", None)
+    index = getattr(args, "index", None)
+    if (name is None) == (index is None):
+        raise WorkbenchError(f"Pass exactly one of --name or --index for {group}")
+    if name is not None:
+        descriptor = load_rpc_descriptor(args.project_dir)
+        for field in descriptor.get(group, []):
+            if field.get("name") == name:
+                return field
+        raise WorkbenchError(f"Unknown {group} field: {name}")
+    return {"name": str(index), "index": require_integer(index, "index", 0, 31 if group == "config" else 15), "type": "u64"}
+
+
+def _raw_int(value):
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return parse_address(value)
+    raise WorkbenchError("RPC result is not an integer")
+
+
+def _decode_rpc(field, raw):
+    raw = _raw_int(raw)
+    kind = field.get("type", "u64")
+    if kind == "bool":
+        return bool(raw)
+    if kind == "f32":
+        return struct.unpack("<f", struct.pack("<I", raw & 0xffffffff))[0]
+    if kind == "f64":
+        return struct.unpack("<d", struct.pack("<Q", raw & 0xffffffffffffffff))[0]
+    if kind == "i64":
+        return raw - (1 << 64) if raw & (1 << 63) else raw
+    return raw
+
+
+def _encode_rpc(field, value):
+    kind = field.get("type", "u64")
+    if kind == "bool":
+        if str(value).lower() in ("true", "1"):
+            return 1
+        if str(value).lower() in ("false", "0"):
+            return 0
+        raise WorkbenchError("Boolean RPC values must be true/false or 1/0")
+    if kind == "f32":
+        return struct.unpack("<I", struct.pack("<f", float(value)))[0]
+    if kind == "f64":
+        return struct.unpack("<Q", struct.pack("<d", float(value)))[0]
+    parsed = int(str(value), 0)
+    bits = 64
+    minimum = -(1 << (bits - 1)) if kind == "i64" else 0
+    maximum = (1 << (bits - 1)) - 1 if kind == "i64" else (1 << bits) - 1
+    if not minimum <= parsed <= maximum:
+        raise WorkbenchError(f"RPC value is outside {kind} range")
+    return parsed & maximum
+
+
+def _profile_hash(body):
+    import hashlib
+    return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _active_features(client, descriptor, pid):
+    for field in descriptor.get("telemetry", []):
+        if field.get("role") == "active_features":
+            result = _call(client, "payload_rpc", pid=pid, command=RPC_READ_TELEMETRY,
+                           argument=hex(field["index"]), argument2="0x0")
+            return _raw_int(result["raw"])
+    raise WorkbenchError("No active_features telemetry role; pass --features explicitly")
+
+
+def _profile_save(client, args):
+    from pathlib import Path
+    descriptor = load_rpc_descriptor(args.project_dir)
+    pid = require_integer(args.pid, "pid", 1, 2147483647)
+    features = _feature_mask(descriptor, args.features) if args.features else _active_features(client, descriptor, pid)
+    words = []
+    for index in range(32):
+        result = _call(client, "payload_rpc", pid=pid, command=RPC_READ_CONFIG,
+                       argument=hex(index), argument2="0x0")
+        words.append(hex(_raw_int(result["raw"])))
+    body = {"format": "ps4wb-profile-v1", "module_sha256": descriptor.get("module_sha256"),
+            "features": hex(features), "config": words}
+    body["sha256"] = _profile_hash(body)
+    path = Path(args.path)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(body, indent=2, sort_keys=True))
+    temporary.replace(path)
+    return {"saved": str(path), "features": hex(features), "config_words": len(words),
+            "module_sha256": body["module_sha256"], "sha256": body["sha256"]}
+
+
+def _profile_load(client, args):
+    import time
+    from pathlib import Path
+    descriptor = load_rpc_descriptor(args.project_dir)
+    try:
+        body = json.loads(Path(args.path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise WorkbenchError(f"Cannot read profile: {error}") from error
+    if body.get("format") != "ps4wb-profile-v1" or not isinstance(body.get("config"), list) or len(body["config"]) > 32:
+        raise WorkbenchError("Invalid profile format")
+    if body.get("module_sha256") != descriptor.get("module_sha256"):
+        raise WorkbenchError("Profile belongs to another module build")
+    expected_hash = body.pop("sha256", None)
+    if expected_hash != _profile_hash(body):
+        raise WorkbenchError("Profile hash mismatch")
+    pid = require_integer(args.pid, "pid", 1, 2147483647)
+    features = _raw_int(body.get("features"))
+    require_integer(features, "features", 0, 2**32 - 1)
+    for index, word in enumerate(body["config"]):
+        expected = _raw_int(word)
+        require_integer(expected, "config word", 0, 2**64 - 1)
+        _call(client, "payload_rpc", pid=pid, command=RPC_WRITE_CONFIG,
+              argument=hex(index), argument2=hex(expected))
+        deadline = time.monotonic() + 2.0
+        while True:
+            result = _call(client, "payload_rpc", pid=pid, command=RPC_READ_CONFIG,
+                           argument=hex(index), argument2="0x0")
+            if _raw_int(result["raw"]) == expected:
+                break
+            if time.monotonic() >= deadline:
+                raise WorkbenchError(f"Config mirror timeout at index {index}; later writes were not sent")
+            time.sleep(0.02)
+    result = _call(client, "payload_rpc", pid=pid, command=RPC_FEATURES,
+                   argument=hex(features), argument2="0x0")
+    try:
+        active = _active_features(client, descriptor, pid)
+    except WorkbenchError:
+        active = features  # Legacy descriptors cannot provide independent confirmation.
+    if active != features:
+        raise WorkbenchError(f"Feature activation mismatch: requested {features:#x}, active {active:#x}")
+    return {"loaded": args.path, "features": hex(features), "config_words": len(body["config"]),
+            "mirror_confirmed": True, "result": result}
+
+
 def _artifact_bytes(client, path, expected_sha=None):
     import hashlib
     content = bytearray()
@@ -272,10 +473,8 @@ def _expanded(client, value):
 
 def _update(client, args):
     """Research, install generated inputs, build fresh ELF, preserve evidence."""
-    import hashlib
     from pathlib import Path
     import shlex
-    import subprocess
     import os
     from .build import build
 
@@ -312,41 +511,25 @@ def _update(client, args):
     if args.dry_run:
         return dict(plan, dry_run=True)
 
-    # A new project needs the real application version; never invent one.
-    active = _call(client, "project_open")
-    if not active.get("active"):
-        if not args.app_version:
-            raise WorkbenchError("Open a project with the observed title/app version, or pass --app-version")
-        info = _call(client, "process_info", pid=args.pid)
-        _call(client, "project_open", title_id=info["title_id"], app_version=args.app_version, name=args.game or namespace_default)
+    # Rust owns research, project registration and installation. The CLI only
+    # adds the local build/evidence steps, keeping both entry points identical.
+    inputs.update(repository=str(repo), engine=engine, sdk=game.get("sdk", "payload"), staging="immediate")
+    if args.app_version:
+        inputs["app_version"] = args.app_version
     if args.session_id:
-        update = _call(client, "recipe_session", action="status", session=args.session_id)
-    else:
-        update = _call(client, "recipe_session", action="create", recipe=recipe, inputs=inputs)
-    session_id = update["id"]
-    while update["state"] in ("pending", "running"):
-        update = _expanded(client, _call(client, "recipe_session", action="advance", session=session_id))
-        print(json.dumps({"session": session_id, "state": update["state"], "completed": update["completed"], "total": update["total"]}), file=sys.stderr, flush=True)
-    if update["state"] != "completed":
-        raise WorkbenchError(f"Research session {session_id} is {update['state']}; inspect it before explicitly retrying")
-    outputs = update["outputs"]
-    target_ref = outputs["project_export_target"]["target"]
-    target = json.loads(_artifact_bytes(client, target_ref["path"], target_ref["sha256"]))
-    prior = _call(client, "project_manifest").get("manifest") or {}
-    commit = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10)
-    if commit.returncode:
-        raise WorkbenchError("Payload repository must have a pinned source commit")
-    manifest = dict(prior, format="ps4wb-project-v1", title_id=target["title_id"],
-                    app_version=target["application_version"], module_sha256=target["module_sha256"],
-                    engine=engine, sdk=game.get("sdk", "payload"),
-                    source_commit=commit.stdout.strip(), repository=str(repo), staging="immediate", rpc_version=1)
-    _call(client, "project_manifest", manifest=manifest)
-    installed = _call(client, "project_install", target=target_ref["path"],
-                      offsets=outputs["project_export_offsets"]["header"]["path"],
-                      engine=outputs["engine_sdk_export"]["artifact"]["path"])
+        inputs["session"] = args.session_id
+    update = _call(client, "game_update", **inputs)
+    session_id = update["session"]
+    installed = update.get("installed")
+    target_path = update["target"]
     if args.no_build:
         return {"session": session_id, "update": update, "installed": installed, "build": None, "deployed": False}
-    argv = json.loads(args.build_argv) if args.build_argv else shlex.split(args.build_cmd, posix=os.name != "nt")
+    try:
+        argv = json.loads(args.build_argv) if args.build_argv else shlex.split(args.build_cmd, posix=os.name != "nt")
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise WorkbenchError(f"Invalid build command: {error}") from error
+    if not isinstance(argv, list) or not argv or not all(isinstance(part, str) for part in argv):
+        raise WorkbenchError("build-argv must be a non-empty JSON string array")
     argv = [a[1:-1] if len(a) > 1 and a[0] == a[-1] == '"' else a for a in argv]
     evidence = build(repo, argv, args.payload or default_payload)
     collected = _call(client, "project_collect_build")
@@ -354,7 +537,7 @@ def _update(client, args):
     sha = evidence["payload"]["sha256"]
     return {"session": session_id, "update": update, "installed": installed, "build": evidence,
             "payload": {"path": str(payload_file), "sha256": sha}, "collected": collected, "deployed": False,
-            "next": {"ingest": ["ps4-workbench", "ingest", str(payload_file)], "target": target_ref["path"],
+            "next": {"ingest": ["ps4-workbench", "ingest", str(payload_file)], "target": target_path,
                      "payload_sha256": sha, "action": "qualify the exact tested output before staging"}}
 
 
@@ -363,9 +546,11 @@ def _watch(client, args):
 
     pid = require_integer(args.pid, "pid", 1, 2147483647)
     interval = max(0.05, args.interval)
+    safe_mask = _feature_mask(load_rpc_descriptor(args.project_dir), args.safe_features) if args.safe_features is not None else None
     previous = None
     stale = 0
     polls = 0
+    safe_sent = False
     while True:
         # WorkbenchError propagates: inspect the console, then payload_recover
         # or a manual re-stage; never an automatic retry.
@@ -375,6 +560,7 @@ def _watch(client, args):
             stale += 1
         else:
             stale = 0
+            safe_sent = False
         previous = heartbeat
         polls += 1
         print(json.dumps(dict(status, poll=polls, stale_polls=stale), sort_keys=True), flush=True)
@@ -383,6 +569,11 @@ def _watch(client, args):
                 "warning": "heartbeat unchanged for 3 polls; payload may be stalled. "
                            "Inspect the console, then payload_recover or a manual re-stage."
             }, sort_keys=True), flush=True)
+            if safe_mask is not None and not safe_sent:
+                _call(client, "payload_rpc", pid=pid, command=RPC_FEATURES,
+                      argument=hex(safe_mask), argument2="0x0")
+                safe_sent = True
+                print(json.dumps({"safe_features_requested": hex(safe_mask)}), flush=True)
             stale = 0
         if args.count and polls >= args.count:
             return {"polls": polls, "last": status}

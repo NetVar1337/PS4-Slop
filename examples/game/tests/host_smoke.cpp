@@ -11,7 +11,9 @@ int main() {
     assert(payload_host_start());
     assert((payload_rpc_entry(0, 0, 0, 0, 0, 0) & 0xff) == 2);
     assert(payload_rpc_entry(6, 0, 0, 0, 0, 0) == 0); // unconfigured target
+    payload_rpc_entry(1, 1u << 7, 0, 0, 0, 0); // diagnostics need generated evidence
     payload_host_tick();
+    assert(payload_rpc_entry(6, 2, 0, 0, 0, 0) == 0);
     payload_rpc_entry(2, 0, 0, 0, 0, 0);
     payload_host_tick();
     assert((payload_rpc_entry(0, 0, 0, 0, 0, 0) & 0xff) == 4);

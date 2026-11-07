@@ -206,7 +206,7 @@
  },
  {
   "name": "game_verify",
-  "description": "Read-only evidence check for a game project: project_doctor feature/evidence report, project_summary, and optional payload_inspect of a collected build manifest. Host-side consistency only; console acceptance still requires observed hardware results.",
+  "description": "Actionable game-project doctor: project evidence summary plus per-feature implementation, exact-build evidence, optional runtime-active state, next actions, and optional host-test/cross-build checks. Default is read-only; build checks write local outputs and runtime checks use the payload RPC policy. Host results never establish hardware acceptance.",
   "inputSchema": {
    "type": "object",
    "properties": {
@@ -221,16 +221,35 @@
      "type": "string",
      "description": "Optional collected-build manifest artifact to inspect",
      "maxLength": 1024
+    },
+    "repository": {
+     "type": "string",
+     "description": "Game repository; defaults to the registered manifest repository",
+     "maxLength": 1024
+    },
+    "pid": {
+     "type": "integer",
+     "description": "Optional resident PID used to read active_features telemetry",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "host_tests": {
+     "type": "boolean",
+     "description": "Run the repository's host smoke test (writes local test outputs)"
+    },
+    "cross_build": {
+     "type": "boolean",
+     "description": "Run the OpenOrbis build for the descriptor payload (writes local build outputs)"
     }
    },
    "required": [],
    "additionalProperties": false
   },
   "annotations": {
-   "readOnlyHint": true,
+   "readOnlyHint": false,
    "destructiveHint": false,
-   "idempotentHint": true,
-   "openWorldHint": false
+   "idempotentHint": false,
+   "openWorldHint": true
   },
   "permission": null
  }

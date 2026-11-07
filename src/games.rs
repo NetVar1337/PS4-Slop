@@ -30,6 +30,12 @@ pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option
 const GAME_FILES: &[(&str, &str)] = &[
     ("src/payload.cpp", include_str!("../templates/game/payload.cpp")),
     ("src/features.hpp", include_str!("../templates/game/features.hpp")),
+    ("include/internals/capabilities.hpp", include_str!("../internals/include/internals/capabilities.hpp")),
+    ("include/internals/snapshot.hpp", include_str!("../internals/include/internals/snapshot.hpp")),
+    ("include/internals/draw.hpp", include_str!("../internals/include/internals/draw.hpp")),
+    ("include/internals/input.hpp", include_str!("../internals/include/internals/input.hpp")),
+    ("draw.cpp", include_str!("../internals/src/draw.cpp")),
+    ("input.cpp", include_str!("../internals/src/input.cpp")),
     ("Makefile", include_str!("../templates/game/Makefile")),
     ("offsets/README.md", include_str!("../templates/game/offsets/README.md")),
 ];
@@ -139,10 +145,16 @@ fn new_project(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
     let python = if cfg!(windows) { "python" } else { "python3" };
     let recipe = json!({"sdk":"payload","source_commit":source_commit,
-        "commands":[[python,"build.py","--engine",engine]],"output":payload,"environment":{},"timeout_seconds":300});
+        "commands":[[python,"build.py","--engine",engine,"--output",payload]],"output":payload,"environment":{},"timeout_seconds":300});
     emit(&folder, "recipe.json", &serde_json::to_string_pretty(&recipe)?)?;
     let mut descriptor = json!({"format":"ps4wb-scaffold-v1","engine":engine,"rpc_version":1,
         "staging":"immediate","payload":payload,"generated_directory":"src/generated",
+        "config":[],
+        "telemetry":[
+            {"name":"verification","index":0,"type":"u64"},
+            {"name":"object_count","index":1,"type":"u64"},
+            {"name":"active_features","index":2,"type":"u64","role":"active_features"}
+        ],
         "hardware_verified":false});
     if !title_id.is_empty() {
         descriptor["title_id"] = json!(title_id);
@@ -176,7 +188,7 @@ fn new_project(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "host_test": [python, "build.py", "--host-test", "--engine", engine],
         "next": [
             "ps4-workbench call project_open with the observed title_id/app_version",
-            "ps4-workbench call game_update --arguments '{\"pid\": <pid>}' (engine pipeline + project_install)",
+            "ps4-workbench call game_update --arguments '{\"pid\": <pid>, \"repository\": <repo>, \"app_version\": <observed>}'",
             "make && make inject PID=<pid> TARGET_MANIFEST=<target artifact>",
         ],
         "hardware_verified": false,
@@ -239,8 +251,51 @@ fn stage(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
               "hardware_verified":false}))
 }
 
-/// Read-only evidence check for a game project: doctor report, project summary,
-/// and optional payload inspection of a collected build manifest.
+fn implemented_mask(repo: &Path) -> Result<Option<u32>> {
+    let path = repo.join("src/features.hpp");
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let source = String::from_utf8(crate::workbench::read_bounded(&path, 1 << 20)?)?;
+    let constants = regex::Regex::new(r"k([A-Za-z0-9]+)\s*=\s*1u\s*<<\s*(\d+)")?;
+    let values: std::collections::BTreeMap<String, u32> = constants.captures_iter(&source)
+        .filter_map(|capture| Some((capture[1].to_owned(), 1u32.checked_shl(capture[2].parse().ok()?)?)))
+        .collect();
+    let expression = regex::Regex::new(r"kImplementedMask\s*=\s*([^;]+)")?
+        .captures(&source).and_then(|capture| capture.get(1)).map(|value| value.as_str());
+    let Some(expression) = expression else { return Ok(None) };
+    let mut mask = 0u32;
+    for part in expression.split('|') {
+        let name = part.trim().trim_matches(['(', ')'].as_slice()).trim().trim_start_matches('k');
+        let Some(bit) = values.get(name) else { return Ok(None) };
+        mask |= bit;
+    }
+    Ok(Some(mask))
+}
+
+fn output_tail(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    text.chars().rev().take(4096).collect::<String>().chars().rev().collect()
+}
+
+fn host_check(repo: &Path, engine: &str, payload: &str, cross: bool) -> Result<Value> {
+    let python = if cfg!(windows) { "python" } else { "python3" };
+    let mut arguments = vec!["build.py", "--engine", engine];
+    if cross {
+        arguments.extend(["--output", payload]);
+    } else {
+        arguments.push("--host-test");
+    }
+    let output = std::process::Command::new(python).args(arguments).current_dir(repo).output()
+        .with_context(|| format!("Cannot run {} check in {}", if cross { "cross-build" } else { "host" }, repo.display()))?;
+    Ok(json!({"kind":if cross { "cross_build" } else { "host_test" },
+        "success":output.status.success(),"returncode":output.status.code(),
+        "stdout":output_tail(&output.stdout),"stderr":output_tail(&output.stderr),
+        "payload":if cross { json!(payload) } else { Value::Null }}))
+}
+
+/// Evidence, implementation and optional runtime checks for a game project.
+/// Host/cross-build checks are opt-in because they write local build outputs.
 fn verify(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
     let mut call_args = json!({});
     if let Some(project) = args["project"].as_str() {
@@ -248,6 +303,65 @@ fn verify(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
     }
     let doctor = registry.call("project_doctor", call_args.clone())?;
     let summary = registry.call("project_summary", call_args.clone())?;
+    let manifest = registry.call("project_manifest", call_args.clone())?["manifest"].clone();
+    let repository = args["repository"].as_str().map(str::to_owned)
+        .or_else(|| manifest["repository"].as_str().map(str::to_owned));
+    let repo = repository.as_deref().map(|path| crate::config::resolve_lenient(Path::new(path))).transpose()?;
+    if let Some(repo) = &repo {
+        ensure!(repo.is_dir(), "Project repository does not exist: {}", repo.display());
+    }
+    let descriptor = repo.as_deref().map(read_descriptor).transpose()?.unwrap_or(Value::Null);
+    let implemented = repo.as_deref().map(implemented_mask).transpose()?.flatten();
+    let mut runtime_mask = None;
+    if let Some(pid) = args["pid"].as_u64() {
+        let repo = repo.as_ref().context("repository required for runtime feature checks")?;
+        let rpc_path = repo.join(descriptor["generated_directory"].as_str().unwrap_or("src/generated")).join("rpc.json");
+        let rpc: Value = serde_json::from_slice(&crate::workbench::read_bounded(&rpc_path, 1 << 20)?)?;
+        let field = rpc["telemetry"].as_array().into_iter().flatten()
+            .find(|field| field["role"] == "active_features").context("No active_features telemetry role")?;
+        let result = registry.call("payload_rpc", json!({"pid":pid,"command":6,
+            "argument":field["index"],"argument2":"0x0"}))?;
+        runtime_mask = Some(crate::tools::address(&result["raw"])? as u32);
+    }
+    let mut features = serde_json::Map::new();
+    let mut next_actions = std::collections::BTreeSet::new();
+    for (name, report) in doctor["features"].as_object().into_iter().flatten() {
+        let bit = report["bit"].as_u64().unwrap_or(0) as u32;
+        let is_implemented = implemented.map(|mask| mask & bit != 0);
+        let evidence = report["available"].as_bool().unwrap_or(false);
+        let active = runtime_mask.map(|mask| mask & bit != 0);
+        let missing: Vec<String> = report["missing_findings"].as_array().into_iter().flatten()
+            .filter_map(Value::as_str).map(str::to_owned).collect();
+        let next = if is_implemented == Some(false) {
+            format!("Implement the {name} provider and add its bit to kImplementedMask")
+        } else if is_implemented.is_none() {
+            "Declare the repository and a readable kImplementedMask to check implementation".to_owned()
+        } else if !evidence {
+            format!("Record live_validated exact-build hardware evidence for {name}: {}", missing.join(", "))
+        } else if active == Some(false) {
+            format!("Initialize or enable the {name} provider and read back active_features")
+        } else {
+            format!("Run the exact-build {name} acceptance gate and preserve observed evidence")
+        };
+        next_actions.insert(next.clone());
+        features.insert(name.clone(), json!({"bit":bit,"implemented":is_implemented,
+            "evidence_available":evidence,"runtime_active":active,"missing_findings":missing,"next":next}));
+    }
+    if features.is_empty() {
+        next_actions.insert("Declare feature requirements and semantic bindings in the project manifest".to_owned());
+    }
+    let mut checks = serde_json::Map::new();
+    if args["host_tests"].as_bool() == Some(true) {
+        let repo = repo.as_ref().context("repository required for host_tests")?;
+        let engine = descriptor["engine"].as_str().or_else(|| manifest["engine"].as_str()).unwrap_or("generic");
+        checks.insert("host_test".into(), host_check(repo, engine, "", false)?);
+    }
+    if args["cross_build"].as_bool() == Some(true) {
+        let repo = repo.as_ref().context("repository required for cross_build")?;
+        let engine = descriptor["engine"].as_str().or_else(|| manifest["engine"].as_str()).unwrap_or("generic");
+        let payload = descriptor["payload"].as_str().unwrap_or("build/payload.elf");
+        checks.insert("cross_build".into(), host_check(repo, engine, payload, true)?);
+    }
     let mut inspect = Value::Null;
     if let Some(payload) = args["payload"].as_str() {
         inspect = registry.call("payload_inspect", json!({"manifest": payload}))?;
@@ -255,39 +369,91 @@ fn verify(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
     Ok(json!({
         "doctor": doctor,
         "summary": summary,
+        "features": features,
+        "implemented_features":implemented.map(|mask| json!(format!("{mask:#x}"))),
+        "runtime_features":runtime_mask.map(|mask| json!(format!("{mask:#x}"))),
+        "checks":checks,
+        "next_actions":next_actions.into_iter().collect::<Vec<_>>(),
         "payload_inspect": inspect,
         "hardware_verified": false,
-        "note": "Host-side evidence consistency only; console acceptance still requires observed hardware results.",
+        "note": "Implementation/evidence/host checks do not replace observed exact-build hardware acceptance.",
     }))
+}
+
+fn read_descriptor(repo: &Path) -> Result<Value> {
+    let path = repo.join("workbench.json");
+    if !path.is_file() {
+        return Ok(Value::Null);
+    }
+    let descriptor: Value = serde_json::from_slice(&crate::workbench::read_bounded(&path, 64 << 10)?)?;
+    ensure!(descriptor["format"] == "ps4wb-scaffold-v1", "Unsupported workbench descriptor");
+    Ok(descriptor)
+}
+
+fn pinned_source_commit(repo: &Path) -> Result<String> {
+    let commit = std::process::Command::new("git")
+        .args(["-C", repo.to_str().context("Repository path is not UTF-8")?, "rev-parse", "HEAD"])
+        .output()
+        .context("git rev-parse failed")?;
+    ensure!(commit.status.success(), "Payload repository must have a pinned source commit; commit the scaffold before game_update");
+    Ok(String::from_utf8_lossy(&commit.stdout).trim().to_owned())
+}
+
+fn default_namespace(repo: &Path) -> String {
+    repo.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| crate::sdkgen::safe_ident(&name.to_ascii_lowercase()))
+        .unwrap_or_else(|| "game".to_owned())
 }
 
 /// Drive the engine pipeline as a durable session, register the build contract,
 /// and install generated inputs into the registered repository.
 fn update(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
     let store = registry.workbench.store.clone();
+    let pid = crate::tools::number(args, "pid")?;
+    let explicit_repo = args["repository"].as_str()
+        .map(|value| crate::config::resolve_lenient(Path::new(value)))
+        .transpose()?;
+    if let Some(repo) = &explicit_repo {
+        ensure!(repo.is_dir(), "Payload repository must exist: {}", repo.display());
+    }
+    // A fresh scaffold must be build-pinned before any console operation.
+    let explicit_commit = explicit_repo.as_deref().map(pinned_source_commit).transpose()?;
+    let explicit_descriptor = explicit_repo.as_deref().map(read_descriptor).transpose()?.unwrap_or(Value::Null);
     let project = match crate::project::active_project(&store)? {
         Some(project) => project,
         None => {
-            let title_id = args["title_id"].as_str().context(
-                "No active project; pass title_id and app_version (observed values) to open one",
-            )?;
-            let app_version = args["app_version"].as_str().context("app_version required")?;
-            let name = args["name"].as_str().unwrap_or(title_id);
-            registry.call(
-                "project_open",
-                json!({"title_id":title_id,"app_version":app_version,"name":name}),
-            )?;
+            let title_id = match args["title_id"].as_str().or_else(|| explicit_descriptor["title_id"].as_str()) {
+                Some(value) => value.to_owned(),
+                None => registry.call("process_info", json!({"pid":pid}))?["title_id"]
+                    .as_str().context("Observed process has no title id")?.to_owned(),
+            };
+            let app_version = args["app_version"].as_str().context("app_version required when opening a project")?;
+            let name = args["name"].as_str().unwrap_or(&title_id);
+            registry.call("project_open", json!({"title_id":title_id,"app_version":app_version,"name":name}))?;
             crate::project::require_active(&store)?
         }
     };
     let prior = crate::research::manifest_of(&store, &project)?;
+    let repo = match explicit_repo {
+        Some(repo) => repo,
+        None => prior.as_ref().map(|m| crate::config::resolve_lenient(Path::new(&m.repository)))
+            .transpose()?.context("repository required when no manifest is registered")?,
+    };
+    ensure!(repo.is_dir(), "Payload repository must exist: {}", repo.display());
+    let source_commit = match explicit_commit {
+        Some(commit) => commit,
+        None => pinned_source_commit(&repo)?,
+    };
+    let descriptor = if explicit_descriptor.is_null() { read_descriptor(&repo)? } else { explicit_descriptor };
     let engine = args["engine"].as_str()
         .or_else(|| prior.as_ref().map(|m| m.engine.as_str()))
-        .context("engine required (no active manifest)")?;
-    ensure!(
-        ["generic", "unreal", "source"].contains(&engine),
-        "Unknown engine"
-    );
+        .or_else(|| descriptor["engine"].as_str())
+        .context("engine required (no active manifest or workbench.json)")?;
+    ensure!(["generic", "unreal", "source"].contains(&engine), "Unknown engine");
+    if let Some(prior) = &prior {
+        ensure!(prior.engine == engine, "Descriptor engine does not match the active project manifest");
+    }
     let update_mode = args["old_artifact"].is_string();
     if update_mode {
         ensure!(
@@ -305,11 +471,11 @@ fn update(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         }
         None => default_recipe(engine, update_mode)?.to_owned(),
     };
-    let pid = crate::tools::number(args, "pid")?;
+    let namespace = args["namespace"].as_str().map(str::to_owned).unwrap_or_else(|| default_namespace(&repo));
     let mut inputs = json!({
         "pid": pid,
         "module": args["module"].as_str().unwrap_or("eboot.bin"),
-        "namespace": args["namespace"].as_str().unwrap_or("game"),
+        "namespace": namespace,
         "status_magic": args["status_magic"].as_str().unwrap_or_else(|| default_magic(engine)),
     });
     for key in ["module_sha256", "image_base"] {
@@ -358,24 +524,6 @@ fn update(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         1 << 20,
     )?;
     let target: Value = serde_json::from_slice(&target_bytes)?;
-    let repository = match args["repository"].as_str() {
-        Some(value) => value.to_owned(),
-        None => prior
-            .as_ref()
-            .map(|m| m.repository.clone())
-            .context("repository required when no manifest is registered")?,
-    };
-    let repo = crate::config::resolve_lenient(Path::new(&repository))?;
-    ensure!(repo.is_dir(), "Payload repository must exist: {}", repo.display());
-    let commit = std::process::Command::new("git")
-        .args(["-C", repo.to_str().context("Repository path is not UTF-8")?, "rev-parse", "HEAD"])
-        .output()
-        .context("git rev-parse failed")?;
-    ensure!(
-        commit.status.success(),
-        "Payload repository must have a pinned source commit"
-    );
-    let source_commit = String::from_utf8_lossy(&commit.stdout).trim().to_owned();
     let sdk = args["sdk"].as_str().unwrap_or(match engine {
         "unreal" => "openorbis",
         _ => "payload",
@@ -399,6 +547,14 @@ fn update(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         if !prior.bindings.is_empty() {
             manifest["bindings"] = serde_json::to_value(&prior.bindings)?;
         }
+        manifest["config"] = serde_json::to_value(&prior.config)?;
+        manifest["telemetry"] = serde_json::to_value(&prior.telemetry)?;
+    }
+    if descriptor["config"].is_array() {
+        manifest["config"] = descriptor["config"].clone();
+    }
+    if descriptor["telemetry"].is_array() {
+        manifest["telemetry"] = descriptor["telemetry"].clone();
     }
     registry.call("project_manifest", json!({"manifest": manifest}))?;
     let installed = if args["install"].as_bool().unwrap_or(true) {
@@ -421,9 +577,14 @@ fn update(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "engine": engine,
         "update": update_mode,
         "module_sha256": target["module_sha256"],
+        "repository": repo.display().to_string(),
+        "payload": descriptor["payload"].as_str().unwrap_or("build/payload.elf"),
+        "target": target_ref["path"],
+        "offsets": offsets_ref["path"],
+        "engine_sdk": sdk_ref["path"],
         "installed": installed,
         "next": {
-            "build": "make (or python build.py --engine <engine>) in the payload repository",
+            "build": "make (or python build.py --engine <engine> --output <payload>) in the payload repository",
             "stage": "ps4-workbench inject --pid <pid> --target <target artifact> --payload <elf>  (or game_stage)",
             "verify": "game_verify",
         },
@@ -535,6 +696,33 @@ mod tests {
     }
 
     #[test]
+    fn game_update_reads_descriptor_and_validates_source_pin_before_console() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let mut registry = make_registry(&dir);
+        registry.call("game_new", json!({"name":"DescriptorGame","engine":"source",
+            "directory":parent.path().to_str().unwrap(),"title_id":"CUSA12552"})).unwrap();
+        let repo = parent.path().join("DescriptorGame");
+        registry.call("project_open", json!({"title_id":"CUSA12552","app_version":"01.00"})).unwrap();
+        let error = registry.call("game_update", json!({"pid":1,"repository":repo})).unwrap_err();
+        assert!(error.to_string().contains("pinned source commit"), "{error}");
+
+        for command in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "scaffold"],
+        ] {
+            let output = std::process::Command::new("git").args(["-C", repo.to_str().unwrap()])
+                .args(command).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        }
+        // A bad recipe stops before any console recipe step. Reaching this error
+        // proves engine/repository defaults came from workbench.json.
+        let error = registry.call("game_update", json!({"pid":1,"repository":repo,"recipe":"not_a_recipe"})).unwrap_err();
+        assert!(error.to_string().contains("Unknown built-in recipe"), "{error}");
+    }
+
+    #[test]
     fn game_verify_reports_doctor_and_summary() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = make_registry(&dir);
@@ -555,6 +743,29 @@ mod tests {
     }
 
     #[test]
+    fn game_verify_distinguishes_implementation_and_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = make_registry(&dir);
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/features.hpp"),
+            "inline constexpr std::uint32_t kPaint = 1u << 0;\ninline constexpr std::uint32_t kDiagnostics = 1u << 7;\ninline constexpr std::uint32_t kImplementedMask = kPaint | kDiagnostics;\n").unwrap();
+        registry.call("project_open", json!({"title_id":"CUSA99999","app_version":"01.00"})).unwrap();
+        registry.call("project_manifest", json!({"manifest":{
+            "format":"ps4wb-project-v1","title_id":"CUSA99999","app_version":"01.00",
+            "module_sha256":"a".repeat(64),"engine":"source","sdk":"payload","source_commit":"b".repeat(40),
+            "repository":repo,"staging":"immediate","rpc_version":1,
+            "features":{"paint":{"bit":1,"requires":["missing_paint"]},"esp":{"bit":4,"requires":["missing_esp"]}}
+        }})).unwrap();
+        let out = registry.call("game_verify", json!({})).unwrap();
+        assert_eq!(out["features"]["paint"]["implemented"], true);
+        assert_eq!(out["features"]["paint"]["evidence_available"], false);
+        assert_eq!(out["features"]["esp"]["implemented"], false);
+        assert!(out["features"]["esp"]["next"].as_str().unwrap().contains("Implement"));
+        assert!(out["next_actions"].as_array().unwrap().len() >= 2);
+    }
+
+    #[test]
     fn game_stage_requires_pid_and_existing_files() {
         let dir = tempfile::tempdir().unwrap();
         let mut registry = make_registry(&dir);
@@ -566,6 +777,16 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("game_stage"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn shared_game_runtime_kit_passes_host_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_support::compile_run_with_sources(
+            dir.path(),
+            include_str!("../tests/fixtures/game_runtime_kit_smoke.cpp"),
+            &["draw.cpp", "input.cpp"],
+        );
     }
 
     #[test]

@@ -14,7 +14,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#if __has_include(<internals/memory.hpp>)
 #include <internals/memory.hpp>
+#else
+#include "memory.hpp"
+#endif
 
 namespace internals {
 

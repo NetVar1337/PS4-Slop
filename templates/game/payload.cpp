@@ -20,6 +20,7 @@
 
 namespace {
 std::atomic<std::uint64_t> verified{0}, object_count{0};
+std::atomic<std::uint32_t> active_features{0};
 internals::MemoryReader memory;
 bool Initialize(void*) noexcept {
     // Resident diagnostics become ready even when game-specific functionality is
@@ -30,15 +31,23 @@ bool Initialize(void*) noexcept {
     return true;
 }
 bool Features(void*, std::uint32_t bits) noexcept {
-    // Fail-closed: unknown or unimplemented feature bits are rejected.
-    return features::allowed(bits);
+    // Disabling is always allowed. Anything active needs a verified target,
+    // exact-build evidence, implementation and a satisfied dependency graph.
+    if (bits != 0 && (!verified.load(std::memory_order_acquire) || !features::allowed(bits))) return false;
+    active_features.store(bits, std::memory_order_release);
+    return true;
 }
 std::uint64_t Telemetry(void*, std::uint32_t index) noexcept {
     if (index == 0) return verified.load(std::memory_order_acquire);
     if (index == 1) return object_count.load(std::memory_order_acquire);
+    if (index == 2) return active_features.load(std::memory_order_acquire);
     return internals::kInvalidRpcResult;
 }
 void Tick(void*) noexcept {
+    if ((active_features.load(std::memory_order_acquire) & features::kDiagnostics) == 0) {
+        object_count.store(0, std::memory_order_release);
+        return;
+    }
     if (!verified.load(std::memory_order_acquire) || !memory.read) return;
 #if defined(PS4WB_ENGINE_UNREAL) && __has_include("generated/engine.hpp")
     ue4::Store store(target::kModuleBase, game::kUe4Offsets, memory);

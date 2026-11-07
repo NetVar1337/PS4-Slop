@@ -12,6 +12,10 @@ pub fn compiler() -> PathBuf {
     "c++".into()
 }
 pub fn compile_run(directory: &Path, source: &str, runtime: bool) {
+    compile_run_with_sources(directory, source, if runtime { &["runtime.cpp"] } else { &[] });
+}
+
+pub fn compile_run_with_sources(directory: &Path, source: &str, sources: &[&str]) {
     let path = directory.join("test.cpp");
     std::fs::write(&path, source).unwrap();
     let executable = directory.join(if cfg!(windows) { "test.exe" } else { "test" });
@@ -23,8 +27,8 @@ pub fn compile_run(directory: &Path, source: &str, runtime: bool) {
         .arg("-I")
         .arg(directory)
         .arg(&path);
-    if runtime {
-        command.arg(root.join("internals/src/runtime.cpp"));
+    for source in sources {
+        command.arg(root.join("internals/src").join(source));
     }
     let output = command
         .arg("-o")

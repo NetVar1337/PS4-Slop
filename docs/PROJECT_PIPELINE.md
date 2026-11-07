@@ -88,15 +88,20 @@ silently become C++ types. Typed Source members come from typed findings.
 
 Call `project_install` with the target artifact and optional engine/offsets
 headers. It checks build/title/provenance hashes, then installs `target.hpp`,
-`engine.hpp`, `offsets.hpp`, `research.hpp`, `engine_config.hpp`, and a manifest
-under the registered repository's generated directory. Existing user-authored
-headers are refused. The repository's `workbench.json` can select that directory.
+`engine.hpp`, `offsets.hpp`, `research.hpp`, `feature_dependencies.hpp`,
+`engine_config.hpp`, `manifest.json`, `rpc.json`, and a hash-committed
+`install.json` under the registered repository's generated directory. Existing
+user-authored headers are refused. Temporary-file replacement, rollback on
+ordinary write errors, and per-file hashes prevent builds from consuming a
+partial or mixed install. The repository's `workbench.json` selects that
+directory and carries typed config/telemetry metadata for `rpc.json`.
 
 For a Source diagnostic scaffold, manifest `bindings` map `entity_slots`,
 `entity_count`, `entity_stride`, `entity_pointer`, and `entity_serial` to finding
-IDs. Missing/unvalidated bindings produce an unavailable layout. Enumeration
-is incremental and rechecks pointer/serial identity. This is separate from
-Apex's existing renderer and exact-build engine implementation.
+IDs. Missing/unvalidated bindings produce an unavailable layout. Additional
+semantic bindings are exported through `game::bindings` with availability and
+build-bound values. Enumeration is incremental and rechecks pointer/serial
+identity. This is separate from Apex's renderer and exact-build providers.
 
 `offset_refresh`, `unreal_update`, and `source_update` carry annotations across
 binary updates. Ported annotations now feed offset export directly. They remain
@@ -141,6 +146,13 @@ artifacts. Build evidence does not grant console permissions or qualify a new
 payload hash. Qualification/staging remains a separate exact-configuration step.
 
 ## Runtime and hook contract
+
+Game scaffolds also include the shared runtime kit: bounded draw/text geometry,
+controller state and reconnect handling, trivially-copyable snapshot
+publication, and capability masks. Renderer backends and game-specific providers
+stay in each game repository. Runtime feature activation requires the
+implemented mask, generated exact-build evidence mask and dependency closure;
+`game_verify` reports those states separately and suggests the next action.
 
 RPC commands 0..6 retain lifecycle/features/shutdown/stage/config/telemetry
 semantics. Command 7 is a read-only descriptor, `0x50535742000100ff`: PSWB,

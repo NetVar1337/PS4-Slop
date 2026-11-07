@@ -31,7 +31,7 @@ def source_snapshot(repo):
     return {'sha256': digest, 'files': files}
 
 
-def build(repo, argv, payload, timeout=600, max_log=1024 * 1024):
+def build(repo, argv, payload, timeout: float = 600, max_log=1024 * 1024):
     repo = Path(repo).resolve(strict=True)
     output = (repo / payload).resolve()
     if not output.is_relative_to(repo) or output == repo:
@@ -54,10 +54,13 @@ def build(repo, argv, payload, timeout=600, max_log=1024 * 1024):
                                    start_new_session=os.name != 'nt', creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0)
     except OSError as error:
         raise WorkbenchError(f'Cannot start build: {error}') from error
+    stdout = process.stdout
+    if stdout is None:
+        raise WorkbenchError('Cannot capture build output')
 
     def read():
         while True:
-            block = process.stdout.read(4096)
+            block = stdout.read(4096)
             if not block:
                 break
             room = max_log - len(logs)
@@ -83,7 +86,7 @@ def build(repo, argv, payload, timeout=600, max_log=1024 * 1024):
     process.wait(timeout=10)
     reader.join(timeout=5)
     if not reader.is_alive():
-        process.stdout.close()
+        stdout.close()
     if reader.is_alive():
         raise WorkbenchError('Build left stdout open; detached children are unsupported')
     log_path = (repo / 'build' / 'workbench-build.log').resolve()

@@ -3,7 +3,9 @@
 # do not duplicate them here.
 WORKBENCH_DIR ?= ../PS4-MCP
 TARGET       ?= __PAYLOAD__
-SRCS         := src/payload.cpp $(WORKBENCH_DIR)/internals/src/runtime.cpp
+SRCS         := src/payload.cpp $(WORKBENCH_DIR)/internals/src/runtime.cpp \
+                $(WORKBENCH_DIR)/internals/src/draw.cpp $(WORKBENCH_DIR)/internals/src/input.cpp
+LDLIBS_EXTRA ?= -lScePad -lSceUserService
 CXXFLAGS_EXTRA := __ENGINE_DEFINE__
 include $(WORKBENCH_DIR)/templates/payload/orbis.mk
 

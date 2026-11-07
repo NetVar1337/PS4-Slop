@@ -1,29 +1,29 @@
 # Game-project authoring
 
-Tools that turn the research pipeline into a standalone per-game repository
-(like Apex-PS4 / Fortnite-PS4) without per-project injectors or build glue.\r
-See [GAME_PROJECT.md](../GAME_PROJECT.md) for the end-to-end flow.\r
-\r
-- `game_new` (local file writes, no console): emits `workbench.json`\r
-  (`ps4wb-scaffold-v1`), a Makefile that includes\r
-  `templates/payload/orbis.mk`, the engine feature pack (`src/features.hpp`\r
-  with the standard fail-closed bit table), the shared internals headers and\r
-  runtime, a host smoke test, and the per-build `offsets/` store.\r
-- `game_update` (console reads via a durable recipe session): runs\r
-  `unreal_pipeline`/`source_pipeline` (or the `*_update` variants with\r
-  `old_artifact` + `annotations`), registers the `ps4wb-project-v1` contract,\r
-  and `project_install`s the generated headers into the registered\r
-  repository's `generated_directory`. Resumable via `session`.\r
-- `game_stage` (permission `process_inject`): ingests local target/payload\r
-  files when needed, computes the payload hash when omitted, then runs\r
-  `payload_stage` + `payload_status` in one call. The CLI equivalent is\r
-  `ps4-workbench inject --pid ... --target ... --payload ...`, which is what\r
-  scaffolded `make inject` targets call.\r
-- `game_verify` (read-only): `project_doctor` + `project_summary` (+ optional\r
-  `payload_inspect`). Host-side consistency only.\r
-\r
-`ctl update --project-dir <repo>` reads the repo's `workbench.json` and derives\r
-engine, recipe, payload path, and namespace, so updates no longer need `--game`.\r
-`ctl export-offsets --archive` (or `project_export_offsets` with\r
-`"archive": true`) additionally writes `offsets/<module_sha256[:16]>/`\r
-into the registered repository.\r
+Tools for standalone game repositories without per-project injectors or build
+glue. See [GAME_PROJECT.md](../GAME_PROJECT.md) for the complete workflow.
+
+- `game_new` emits `workbench.json`, shared runtime/engine headers, the bounded
+  draw/input/snapshot/capability kit, evidence-aware feature bits, host tests,
+  and a per-build offset store. The game repository owns semantic providers and
+  renderer backends.
+- `game_update` reads the repository descriptor, validates its source commit
+  before console access, runs the durable engine pipeline, registers the build
+  contract, and installs generated inputs. The CLI calls this same Rust tool and
+  then performs local build/evidence collection.
+- `project_install` publishes `install.json` last with per-file hashes. Both
+  build paths reject partial or modified generated sets. Generated feature
+  dependencies and `research::kAvailableFeatures` gate activation together with
+  `kImplementedMask` and runtime providers. Semantic bindings are exposed via
+  `game::bindings`.
+- `rpc.json` provides named features and typed config/telemetry metadata. The
+  CLI supports named access, build-bound profile save/load with RPC5 mirror
+  confirmation, and one-shot safe features on heartbeat stalls.
+- `game_stage` retains hash-qualified, single-attempt staging and never retries
+  uncertain mutations.
+- `game_verify` reports implementation, evidence, optional runtime-active state,
+  and next actions per feature. `host_tests`, `cross_build`, and `pid` checks are
+  opt-in. None establishes hardware acceptance.
+
+The `ps4-game-project` MCP prompt guides the same resident-diagnostics-first
+workflow.
