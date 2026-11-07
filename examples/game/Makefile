@@ -1,16 +1,13 @@
 # game resident payload build.
-# Shared OpenOrbis toolchain flags come from the workbench's orbis.mk fragment;
-# do not duplicate them here.
-# This example lives inside the PS4-MCP repo; real projects use ../PS4-MCP.
+# This example lives inside PS4-MCP; standalone projects use ../PS4-MCP.
 WORKBENCH_DIR ?= ../..
 TARGET       ?= payload.elf
-SRCS         := src/payload.cpp $(WORKBENCH_DIR)/internals/src/runtime.cpp
+SRCS         := src/payload.cpp $(WORKBENCH_DIR)/internals/src/runtime.cpp \
+                $(WORKBENCH_DIR)/internals/src/draw.cpp $(WORKBENCH_DIR)/internals/src/input.cpp
+LDLIBS_EXTRA ?= -lScePad -lSceUserService
 CXXFLAGS_EXTRA := -DPS4WB_ENGINE_UNREAL
 include $(WORKBENCH_DIR)/templates/payload/orbis.mk
 
-# Staging goes through the workbench CLI (ps4-workbench inject), which performs
-# the hash-qualified upload and RPC recovery; no per-project injector needed.
-# Requires a qualified local profile with the process_inject permission.
 PS4_PROFILE     ?= $(WORKBENCH_DIR)/profiles/ps4-1400.local.json
 PS4_WORKBENCH   ?= ps4-workbench
 PID             ?= 0

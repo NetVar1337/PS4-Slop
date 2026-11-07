@@ -5,7 +5,7 @@
 // feature table records which live-validated findings each bit requires.
 // Unsafe capabilities stay rejected unless explicitly compiled in.
 #include <cstdint>
-#include <internals/capabilities.hpp>
+#include "../include/internals/capabilities.hpp"
 #if __has_include("generated/feature_dependencies.hpp")
 #include "generated/feature_dependencies.hpp"
 #else

@@ -4,7 +4,9 @@
       "python",
       "build.py",
       "--engine",
-      "unreal"
+      "unreal",
+      "--output",
+      "payload.elf"
     ]
   ],
   "environment": {},

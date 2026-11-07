@@ -1,7 +1,7 @@
 #include <cassert>
 #include <cstdint>
-#include <internals/runtime.hpp>
-#include <internals/verify.hpp>
+#include "../include/internals/runtime.hpp"
+#include "../include/internals/verify.hpp"
 extern bool payload_host_start();
 extern void payload_host_tick();
 extern "C" std::uint64_t payload_rpc_entry(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t);

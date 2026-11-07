@@ -1,5 +1,9 @@
 #pragma once
+#if __has_include(<internals/memory.hpp>)
 #include <internals/memory.hpp>
+#else
+#include "memory.hpp"
+#endif
 namespace source {
 struct EntityLayout {
     std::uintptr_t slots = 0;

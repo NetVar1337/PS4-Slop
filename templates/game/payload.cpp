@@ -3,13 +3,28 @@
 // generated engine.hpp/target.hpp bound to the exact module hash; until then
 // the payload stays resident-only and every game feature reports unavailable.
 #include <atomic>
+#if __has_include(<internals/runtime.hpp>)
 #include <internals/runtime.hpp>
 #include <internals/verify.hpp>
-#include <internals/ue4.hpp>
-#include <internals/source.hpp>
 #include <internals/platform.hpp>
+#else
+#include "../../internals/include/internals/runtime.hpp"
+#include "../../internals/include/internals/verify.hpp"
+#include "../../internals/include/internals/platform.hpp"
+#endif
+#if __has_include("generated/target.hpp")
 #include "generated/target.hpp"
-#include "generated/engine_config.hpp"
+#include "generated/engine_config.hpp" // IWYU pragma: keep
+#else
+#include "../payload/target.hpp"
+#include "../payload/engine_config.hpp" // IWYU pragma: keep
+#endif
+#if defined(PS4WB_ENGINE_UNREAL)
+#include <internals/ue4.hpp>
+#endif
+#if defined(PS4WB_ENGINE_SOURCE)
+#include <internals/source.hpp>
+#endif
 #include "features.hpp"
 #if __has_include("generated/engine.hpp")
 #include "generated/engine.hpp"

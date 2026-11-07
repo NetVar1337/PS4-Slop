@@ -1,5 +1,9 @@
 #pragma once
+#if __has_include(<internals/memory.hpp>)
 #include <internals/memory.hpp>
+#else
+#include "memory.hpp"
+#endif
 
 namespace ue4 {
 enum class NamesKind : std::uint8_t { Unavailable, Pool, Array };
@@ -75,7 +79,7 @@ public:
             if (entry > UINTPTR_MAX - at - 2) return 0;
             text = entry + at + 2;
             length = header >> 6;
-            wide = (header & 1) != 0;
+            wide = header % 2 != 0;
         } else {
             std::uintptr_t array = 0, chunk = 0;
             if (base_ > UINTPTR_MAX - o_.gnames) return 0;
@@ -86,7 +90,7 @@ public:
                 entry > UINTPTR_MAX - o_.name_entry_string) return 0;
             std::uint32_t flags = 0;
             if (!reader_.Get(entry, flags)) return 0;
-            wide = (flags & 1) != 0;
+            wide = flags % 2 != 0;
             text = entry + o_.name_entry_string;
         }
         const auto count = length < capacity - 1 ? length : capacity - 1;

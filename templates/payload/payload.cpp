@@ -1,11 +1,26 @@
 #include <atomic>
+#if __has_include(<internals/runtime.hpp>)
 #include <internals/runtime.hpp>
 #include <internals/verify.hpp>
-#include <internals/ue4.hpp>
-#include <internals/source.hpp>
 #include <internals/platform.hpp>
+#else
+#include "../../internals/include/internals/runtime.hpp"
+#include "../../internals/include/internals/verify.hpp"
+#include "../../internals/include/internals/platform.hpp"
+#endif
+#if defined(PS4WB_ENGINE_UNREAL)
+#include <internals/ue4.hpp>
+#endif
+#if defined(PS4WB_ENGINE_SOURCE)
+#include <internals/source.hpp>
+#endif
+#if __has_include("generated/target.hpp")
 #include "generated/target.hpp"
-#include "generated/engine_config.hpp"
+#include "generated/engine_config.hpp" // IWYU pragma: keep
+#else
+#include "../payload/target.hpp"
+#include "../payload/engine_config.hpp" // IWYU pragma: keep
+#endif
 #if __has_include("generated/engine.hpp")
 #include "generated/engine.hpp"
 #endif
@@ -28,6 +43,7 @@ bool Features(void*, std::uint32_t bits) noexcept { return bits == 0; }
 std::uint64_t Telemetry(void*, std::uint32_t index) noexcept {
     if (index == 0) return verified.load(std::memory_order_acquire);
     if (index == 1) return object_count.load(std::memory_order_acquire);
+    if (index == 2) return 0; // generic diagnostics implement no feature bits
     return internals::kInvalidRpcResult;
 }
 void Tick(void*) noexcept {

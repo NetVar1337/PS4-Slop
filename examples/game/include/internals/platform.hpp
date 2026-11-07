@@ -1,5 +1,9 @@
 #pragma once
+#if __has_include(<internals/memory.hpp>)
 #include <internals/memory.hpp>
+#else
+#include "memory.hpp"
+#endif
 #ifdef __PS4__
 #include <orbis/libkernel.h>
 #endif
@@ -12,7 +16,7 @@ inline bool Read(void*, std::uintptr_t address, void* out, std::size_t size) noe
         void* end = nullptr;
         std::int32_t protection = 0;
         if (sceKernelQueryMemoryProtection(reinterpret_cast<void*>(address), &begin, &end, &protection) != 0 ||
-            !(protection & 1) || address < reinterpret_cast<std::uintptr_t>(begin) ||
+            protection % 2 == 0 || address < reinterpret_cast<std::uintptr_t>(begin) ||
             address >= reinterpret_cast<std::uintptr_t>(end)) return false;
         const auto remaining = reinterpret_cast<std::uintptr_t>(end) - address;
         const auto count = size < remaining ? size : remaining;

@@ -12,7 +12,11 @@ pub fn compiler() -> PathBuf {
     "c++".into()
 }
 pub fn compile_run(directory: &Path, source: &str, runtime: bool) {
-    compile_run_with_sources(directory, source, if runtime { &["runtime.cpp"] } else { &[] });
+    compile_run_with_sources(
+        directory,
+        source,
+        if runtime { &["runtime.cpp"] } else { &[] },
+    );
 }
 
 pub fn compile_run_with_sources(directory: &Path, source: &str, sources: &[&str]) {

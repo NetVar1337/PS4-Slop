@@ -440,35 +440,14 @@ def _profile_load(client, args):
             time.sleep(0.02)
     result = _call(client, "payload_rpc", pid=pid, command=RPC_FEATURES,
                    argument=hex(features), argument2="0x0")
-    try:
-        active = _active_features(client, descriptor, pid)
-    except WorkbenchError:
-        active = features  # Legacy descriptors cannot provide independent confirmation.
+    has_active_role = any(field.get("role") == "active_features" for field in descriptor.get("telemetry", []))
+    # Legacy descriptors cannot confirm independently. A described readback that
+    # fails is an error, never evidence that activation succeeded.
+    active = _active_features(client, descriptor, pid) if has_active_role else features
     if active != features:
         raise WorkbenchError(f"Feature activation mismatch: requested {features:#x}, active {active:#x}")
     return {"loaded": args.path, "features": hex(features), "config_words": len(body["config"]),
             "mirror_confirmed": True, "result": result}
-
-
-def _artifact_bytes(client, path, expected_sha=None):
-    import hashlib
-    content = bytearray()
-    while len(content) <= 16 * 1024 * 1024:
-        part = _call(client, "artifact_read", artifact=path, offset=len(content), length=4096)
-        block = bytes.fromhex(part["hex"])
-        content.extend(block)
-        if len(block) < 4096:
-            if expected_sha and hashlib.sha256(content).hexdigest() != expected_sha:
-                raise WorkbenchError(f"Artifact changed: {path}")
-            return bytes(content)
-    raise WorkbenchError("Artifact exceeds 16 MiB")
-
-
-def _expanded(client, value):
-    if "result_saved" in value:
-        ref = value["result_saved"]
-        return json.loads(_artifact_bytes(client, ref["path"], ref["sha256"]))
-    return value
 
 
 def _update(client, args):

@@ -1,5 +1,5 @@
 #pragma once
-#include <internals/verify.hpp>
+#include "../../include/internals/verify.hpp"
 namespace target {
 inline constexpr std::uintptr_t kModuleBase = 0;
 inline constexpr const internals::VerifyCheck* kVerifyChecks = nullptr;

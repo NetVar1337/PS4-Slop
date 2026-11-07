@@ -36,3 +36,19 @@ jobs:
       - run: cargo build --locked
       - run: python -m compileall -q ps4_workbench tests integrations
       - run: python -m unittest discover -q
+
+  game-project:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: sudo apt-get update && sudo apt-get install -y clang lld make
+      - run: scripts/setup-toolchain.sh
+      - run: cargo build --locked
+      - run: python -m unittest -v tests.test_project_pipeline.GeneratedProjectTests tests.test_project_pipeline.GameScaffoldTests
+      - run: python examples/game/build.py --host-test --engine unreal
+      - run: python examples/game/build.py --engine unreal --output payload.elf
+      - run: make -C examples/game host-test all

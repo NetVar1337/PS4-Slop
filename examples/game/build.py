@@ -24,7 +24,12 @@ def validate_generated(root):
         raise SystemExit(f"Invalid generated install manifest: {error}") from error
     if install.get("format") != "ps4wb-installed-v1" or install.get("module_sha256") != manifest.get("module_sha256"):
         raise SystemExit("Generated inputs belong to different builds; rerun project_install")
-    for record in install.get("files", []):
+    records = install.get("files")
+    if not isinstance(records, list) or len(records) > 32:
+        raise SystemExit("Invalid generated file list; rerun project_install")
+    for record in records:
+        if not isinstance(record, dict):
+            raise SystemExit("Invalid generated file record; rerun project_install")
         name = record.get("file", "")
         if not name or Path(name).name != name:
             raise SystemExit("Invalid generated file name in install manifest")

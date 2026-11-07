@@ -2,6 +2,12 @@
   "engine": "unreal",
   "format": "ps4wb-scaffold-v1",
   "generated_directory": "src/generated",
+  "config": [],
+  "telemetry": [
+    {"name": "verification", "index": 0, "type": "u64"},
+    {"name": "object_count", "index": 1, "type": "u64"},
+    {"name": "active_features", "index": 2, "type": "u64", "role": "active_features"}
+  ],
   "hardware_verified": false,
   "payload": "payload.elf",
   "rpc_version": 1,
