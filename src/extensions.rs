@@ -18,6 +18,7 @@ pub const CATALOGS: &[(&str, &str)] = &[
     ("jailbreak", include_str!("catalog/jailbreak.json")),
     ("internals", include_str!("catalog/internals.json")),
     ("offsetscan", include_str!("catalog/offsetscan.json")),
+    ("games", include_str!("catalog/games.json")),
 ];
 
 /// Every tool schema: the base catalog followed by all extension catalogs.
@@ -45,4 +46,5 @@ pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option
         .or_else(|| crate::jailbreak::dispatch(registry, name, args))
         .or_else(|| crate::internals::dispatch(registry, name, args))
         .or_else(|| crate::offsetscan::dispatch(registry, name, args))
+        .or_else(|| crate::games::dispatch(registry, name, args))
 }

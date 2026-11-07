@@ -461,7 +461,11 @@
      "description": "Verify fingerprint length per offset, sliced from a recorded dump (default 16)",
      "minimum": 1,
      "maximum": 32
-    }
+    },
+   "archive": {
+    "type": "boolean",
+    "description": "Also write the generated header and manifest into the registered repository's offsets/<module_sha256[:16]>/ per-build store"
+   }
    },
    "required": [],
    "additionalProperties": false

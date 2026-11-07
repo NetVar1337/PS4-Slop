@@ -31,6 +31,7 @@ pub mod research;
 pub mod sessions;
 pub mod hooks;
 pub mod scaffold;
+pub mod games;
 pub mod replay;
 #[cfg(test)]
 pub mod test_support;

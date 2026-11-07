@@ -1,0 +1,10 @@
+{
+  "engine": "unreal",
+  "format": "ps4wb-scaffold-v1",
+  "generated_directory": "src/generated",
+  "hardware_verified": false,
+  "payload": "payload.elf",
+  "rpc_version": 1,
+  "staging": "immediate",
+  "title_id": "CUSA00000"
+}

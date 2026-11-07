@@ -1,0 +1,237 @@
+[
+ {
+  "name": "game_new",
+  "description": "Emit a standalone, buildable game repository under directory/name: workbench.json descriptor, Makefile that includes the shared templates/payload/orbis.mk toolchain fragment, the engine feature pack (features.hpp with fail-closed feature bits), shared internals headers/runtime, host smoke test, and a per-build offsets/ store. Local file writes only; no console access, no deploy. Staging later goes through `ps4-workbench inject` / game_stage, so game repos need no own injector.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string",
+     "description": "Repository directory and project name",
+     "minLength": 1,
+     "maxLength": 64,
+     "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+    },
+    "engine": {
+     "enum": ["generic", "source", "unreal"],
+     "type": "string",
+     "description": "Engine feature pack to scaffold (default generic)"
+    },
+    "directory": {
+     "type": "string",
+     "description": "Existing parent directory in which <name>/ is created",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "title_id": {
+     "type": "string",
+     "description": "Observed PS4 title id, e.g. CUSA12552",
+     "pattern": "^[A-Z]{4}[0-9]{5}$"
+    },
+    "payload": {
+     "type": "string",
+     "description": "Payload ELF path inside the repo (default payload.elf)",
+     "minLength": 1,
+     "maxLength": 128,
+     "pattern": "^[A-Za-z0-9_./-]{1,128}$"
+    }
+   },
+   "required": ["name", "directory"],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "game_update",
+  "description": "Run the game-aware engine pipeline for the active project as a durable recipe session (unreal_pipeline/source_pipeline, or unreal_update/source_update when old_artifact+annotations are given), register the ps4wb-project-v1 build contract, and install the generated target/offsets/engine headers into the registered repository's generated directory. Console reads only; the recipe's own permission checks apply per step. Resumable via session id.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "description": "Target process id",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "recipe": {
+     "type": "string",
+     "description": "Built-in recipe name; defaults to the engine pipeline for the active manifest",
+     "maxLength": 64,
+     "pattern": "^[A-Za-z0-9_]{1,64}$"
+    },
+    "engine": {
+     "enum": ["generic", "source", "unreal"],
+     "type": "string",
+     "description": "Override the engine (default: active manifest engine)"
+    },
+    "title_id": {
+     "type": "string",
+     "description": "Open a new project with this observed title id when none is active",
+     "pattern": "^[A-Z]{4}[0-9]{5}$"
+    },
+    "app_version": {
+     "type": "string",
+     "description": "Observed application version when opening a new project",
+     "minLength": 1,
+     "maxLength": 32
+    },
+    "name": {
+     "type": "string",
+     "description": "Project name when opening a new project (default: title id)",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "module": {
+     "type": "string",
+     "description": "Module name (default eboot.bin)",
+     "maxLength": 256
+    },
+    "namespace": {
+     "type": "string",
+     "description": "C++ namespace for generated headers (default game)",
+     "maxLength": 64
+    },
+    "module_sha256": {
+     "type": "string",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "image_base": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "signature_sites": {
+     "type": "array",
+     "maxItems": 64,
+     "items": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
+    },
+    "status_magic": {
+     "type": "string",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "old_artifact": {
+     "type": "string",
+     "description": "Previous annotated build artifact; selects the *_update recipe together with annotations",
+     "maxLength": 1024
+    },
+    "annotations": {
+     "type": "string",
+     "description": "Annotation artifact for the old build (e.g. offsets/<sha>/annotations.json)",
+     "maxLength": 1024
+    },
+    "session": {
+     "type": "string",
+     "description": "Resume an existing durable session id",
+     "pattern": "^[0-9a-f]{32}$"
+    },
+    "install": {
+     "type": "boolean",
+     "description": "Install generated inputs into the repository (default true)"
+    },
+    "repository": {
+     "type": "string",
+     "description": "Payload repository; defaults to the registered manifest repository",
+     "maxLength": 1024
+    },
+    "sdk": {
+     "enum": ["openorbis", "payload"],
+     "type": "string",
+     "description": "SDK recorded in the manifest (default: openorbis for unreal, payload otherwise)"
+    },
+    "staging": {
+     "enum": ["immediate", "elf_rpc"],
+     "type": "string",
+     "description": "Staging mode recorded in the manifest (default immediate)"
+    }
+   },
+   "required": ["pid"],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "game_stage",
+  "description": "One-call hash-qualified staging: ingest local target/payload files into the artifact store when needed, compute the payload SHA-256 when not supplied, run payload_stage (verify target identity, refuse duplicate residency, upload the ELF once, recover the exported RPC entry), then read payload_status. Requires the process_inject permission and a hardware-qualified payload hash allowlist entry. Never retried automatically.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "target": {
+     "type": "string",
+     "description": "ps4wb-internals-target-v1 artifact path or local JSON file",
+     "maxLength": 1024
+    },
+    "payload": {
+     "type": "string",
+     "description": "payload ELF artifact path or local file",
+     "maxLength": 1024
+    },
+    "sha256": {
+     "type": "string",
+     "description": "Expected (and hardware-qualified) payload SHA-256; computed from the file when omitted",
+     "pattern": "^[0-9a-f]{64}$"
+    }
+   },
+   "required": ["pid", "target", "payload"],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "process_inject"
+ },
+ {
+  "name": "game_verify",
+  "description": "Read-only evidence check for a game project: project_doctor feature/evidence report, project_summary, and optional payload_inspect of a collected build manifest. Host-side consistency only; console acceptance still requires observed hardware results.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "payload": {
+     "type": "string",
+     "description": "Optional collected-build manifest artifact to inspect",
+     "maxLength": 1024
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ }
+]

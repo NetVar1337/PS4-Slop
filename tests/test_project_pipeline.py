@@ -118,5 +118,106 @@ class GeneratedProjectTests(unittest.TestCase):
             self.assertFalse(collected["deployed"])
 
 
+
+class GameScaffoldTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.broker = RustBroker(toolset="full")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.broker.close()
+
+    def call(self, tool, **arguments):
+        return self.broker.client().request("call", name=tool, arguments=arguments)
+
+    def test_game_new_emits_repo_shaped_project_and_verify_runs(self):
+        parent = tempfile.TemporaryDirectory(prefix="ps4-game-new-")
+        self.addCleanup(parent.cleanup)
+        self.call("game_new", name="ExamplePS4", engine="source",
+                  directory=parent.name, title_id="CUSA12552", payload="build/game.elf")
+        repo = Path(parent.name) / "ExamplePS4"
+        descriptor = json.loads((repo / "workbench.json").read_text())
+        self.assertEqual(descriptor["engine"], "source")
+        self.assertEqual(descriptor["payload"], "build/game.elf")
+        self.assertEqual(descriptor["rpc_version"], 1)
+        makefile = (repo / "Makefile").read_text()
+        self.assertIn("templates/payload/orbis.mk", makefile)
+        self.assertIn("-DPS4WB_ENGINE_SOURCE", makefile)
+        self.assertIn("inject", makefile)
+        self.assertTrue((repo / "src/features.hpp").is_file())
+        self.assertTrue((repo / "offsets/README.md").is_file())
+        self.assertTrue((repo / "include/internals/runtime.hpp").is_file())
+        output = subprocess.run([sys.executable, str(repo / "build.py"), "--host-test", "--engine", "source"],
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
+        # Duplicate scaffolding is refused.
+        with self.assertRaises(Exception):
+            self.call("game_new", name="ExamplePS4", engine="source", directory=parent.name)
+        # Read-only verification works once a project is open.
+        self.call("project_open", title_id="CUSA12552", app_version="01.00", name="ExamplePS4")
+        verified = self.call("game_verify")
+        self.assertIn("doctor", verified)
+        self.assertIn("summary", verified)
+        self.assertFalse(verified["hardware_verified"])
+
+
+class DescriptorDrivenUpdateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.broker = RustBroker(toolset="full")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.broker.close()
+
+    def test_load_descriptor_reads_workbench_json(self):
+        from ps4_workbench.ctl import load_descriptor
+        with tempfile.TemporaryDirectory() as empty:
+            self.assertIsNone(load_descriptor(empty))
+        with tempfile.TemporaryDirectory() as repo:
+            (Path(repo) / "workbench.json").write_text(json.dumps({
+                "format": "ps4wb-scaffold-v1", "engine": "unreal", "payload": "payload.elf",
+                "generated_directory": "src/generated", "rpc_version": 1, "staging": "immediate"}))
+            self.assertEqual(load_descriptor(repo)["engine"], "unreal")
+            (Path(repo) / "workbench.json").write_text(json.dumps({"format": "other"}))
+            with self.assertRaises(WorkbenchError):
+                load_descriptor(repo)
+
+    def test_update_dry_run_derives_plan_from_workbench_json(self):
+        from ps4_workbench import ctl
+        client = self.broker.client()
+        with tempfile.TemporaryDirectory() as repo:
+            (Path(repo) / "workbench.json").write_text(json.dumps({
+                "format": "ps4wb-scaffold-v1", "engine": "unreal", "payload": "payload.elf",
+                "generated_directory": "src/generated", "rpc_version": 1, "staging": "immediate"}))
+            argv = ["--url", self.broker.url, "--token-file", str(self.broker.token),
+                    "update", "--project-dir", repo, "--pid", "71", "--dry-run"]
+            plan = ctl._update(client, ctl.build_parser().parse_args(argv))
+            self.assertEqual(plan["engine"], "unreal")
+            self.assertEqual(plan["pipeline_recipe"], "unreal_pipeline")
+            self.assertEqual(plan["payload_repo"], str(Path(repo).resolve()))
+            self.assertEqual(plan["inputs"]["status_magic"], "0x5053494e")
+            self.assertTrue(plan["dry_run"])
+            # Update path ports annotations through the engine update recipe.
+            argv += ["--old-artifact", "old.elf", "--annotations", "ann.json"]
+            plan = ctl._update(client, ctl.build_parser().parse_args(argv))
+            self.assertEqual(plan["update_recipe"], "offset_refresh")
+            self.assertEqual(plan["update_inputs"]["old_artifact"], "old.elf")
+        # Named games still work without a descriptor.
+        argv = ["--url", self.broker.url, "--token-file", str(self.broker.token),
+                "update", "--game", "apex", "--pid", "71", "--dry-run"]
+        plan = ctl._update(client, ctl.build_parser().parse_args(argv))
+        self.assertEqual(plan["game"], "apex")
+        self.assertEqual(plan["engine"], "source")
+        self.assertEqual(plan["pipeline_recipe"], "source_pipeline")
+        # Neither --game nor a descriptor is an error.
+        with tempfile.TemporaryDirectory() as empty:
+            argv = ["--url", self.broker.url, "--token-file", str(self.broker.token),
+                    "update", "--project-dir", empty, "--pid", "71", "--dry-run"]
+            with self.assertRaises(WorkbenchError):
+                ctl._update(client, ctl.build_parser().parse_args(argv))
+
+
 if __name__ == "__main__":
     unittest.main()

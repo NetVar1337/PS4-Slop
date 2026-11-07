@@ -26,13 +26,18 @@ def run(argv):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host-test", action="store_true")
+    parser.add_argument("--engine", choices=["generic", "source", "unreal"], default="generic",
+                        help="engine feature pack define (PS4WB_ENGINE_SOURCE/PS4WB_ENGINE_UNREAL)")
     parser.add_argument("--sdk", default=os.environ.get("OO_PS4_TOOLCHAIN"))
     args = parser.parse_args()
     root = Path(__file__).resolve().parent
     build = root / "build"
     build.mkdir(exist_ok=True)
     cxx = compiler("CXX", "clang++")
+    engine_define = {"source": "-DPS4WB_ENGINE_SOURCE", "unreal": "-DPS4WB_ENGINE_UNREAL"}.get(args.engine)
     common = ["-std=c++17", "-O2", "-Wall", "-Wextra", "-I" + str(root / "include"), "-I" + str(root / "src")]
+    if engine_define:
+        common.append(engine_define)
     sources = [root / "src/payload.cpp", root / "runtime.cpp"]
     if args.host_test:
         output = build / ("host-smoke.exe" if os.name == "nt" else "host-smoke")

@@ -19,7 +19,8 @@ Then drive it:
     ... watch --pid 71
     ... update --game fortnite --pid 71          # or --game apex (full pipeline)
     ... update --game apex --pid 71 --old-artifact old.elf --annotations ann.json
-    ... export-offsets --module-sha256 <64hex> --namespace fortnite
+    ... update --project-dir ../Fortnite-PS4 --pid 71   # reads workbench.json
+    ... export-offsets --module-sha256 <64hex> --namespace fortnite [--archive]
 
 The payload RPC command numbers follow the shared ABI in
 ``internals/include/internals/runtime.hpp``: 0 = status, 1 = features,
@@ -110,9 +111,13 @@ def build_parser():
     p.add_argument("--module-sha256", default=None)
     p.add_argument("--namespace", default=None)
     p.add_argument("--verify-bytes", type=int, default=None)
+    p.add_argument("--archive", action="store_true", help="also write offsets/<sha>/ into the repo per-build store")
 
     p = sub.add_parser("update", help="game-aware update pipeline: dump -> SDK -> offsets/target -> build -> next steps")
-    p.add_argument("--game", choices=["fortnite", "apex"], required=True)
+    p.add_argument("--game", choices=["fortnite", "apex"], default=None,
+                   help="named game; omitted = derive from workbench.json in --project-dir")
+    p.add_argument("--project-dir", default=".",
+                   help="game repository with workbench.json (default: cwd); supplies engine, repo, payload path")
     p.add_argument("--pid", type=int, required=True)
     p.add_argument("--module", default=None)
     p.add_argument("--module-sha256", default=None)
@@ -210,6 +215,8 @@ def run(argv, client_factory=BrokerClient):
             arguments["namespace"] = args.namespace
         if args.verify_bytes is not None:
             arguments["verify_bytes"] = require_integer(args.verify_bytes, "verify_bytes", 1, 32)
+        if args.archive:
+            arguments["archive"] = True
         result = _call(client, "project_export_offsets", **arguments)
     else:  # pragma: no cover - argparse enforces the choices
         raise WorkbenchError("unknown command")
@@ -218,9 +225,28 @@ def run(argv, client_factory=BrokerClient):
 
 
 GAMES = {
-    "fortnite": {"recipe": "unreal_pipeline", "repo": "../Fortnite-PS4", "payload": "payload.elf"},
-    "apex": {"recipe": "source_pipeline", "repo": "../Apex-PS4", "payload": "build/apex_payload.elf", "status_magic": "0x41584553"},
+    "fortnite": {"recipe": "unreal_pipeline", "repo": "../Fortnite-PS4", "payload": "payload.elf",
+                 "engine": "unreal", "status_magic": "0x5053494e", "sdk": "openorbis"},
+    "apex": {"recipe": "source_pipeline", "repo": "../Apex-PS4", "payload": "build/apex_payload.elf",
+             "engine": "source", "status_magic": "0x41584553", "sdk": "payload"},
 }
+
+ENGINE_GAMES = {
+    "unreal": {"recipe": "unreal_pipeline", "engine": "unreal", "status_magic": "0x5053494e", "sdk": "openorbis"},
+    "source": {"recipe": "source_pipeline", "engine": "source", "status_magic": "0x41584553", "sdk": "payload"},
+}
+
+
+def load_descriptor(project_dir):
+    """Read a game repo's workbench.json (ps4wb-scaffold-v1), or return None."""
+    from pathlib import Path
+    path = Path(project_dir) / "workbench.json"
+    if not path.is_file():
+        return None
+    descriptor = json.loads(path.read_text())
+    if not isinstance(descriptor, dict) or descriptor.get("format") != "ps4wb-scaffold-v1":
+        raise WorkbenchError(f"{path}: unsupported descriptor format")
+    return descriptor
 
 
 def _artifact_bytes(client, path, expected_sha=None):
@@ -253,9 +279,21 @@ def _update(client, args):
     import os
     from .build import build
 
-    game = GAMES[args.game]
-    repo = Path(args.payload_repo or game["repo"]).resolve()
-    inputs = {"pid": args.pid, "namespace": args.namespace or "game",
+    descriptor = load_descriptor(args.project_dir)
+    if args.game:
+        game = dict(GAMES[args.game])
+        repo = Path(args.payload_repo or game["repo"]).resolve()
+        default_payload = game["payload"]
+        namespace_default = args.game
+    elif descriptor and descriptor.get("engine") in ENGINE_GAMES:
+        game = dict(ENGINE_GAMES[descriptor["engine"]])
+        repo = Path(args.payload_repo or args.project_dir).resolve()
+        default_payload = descriptor.get("payload", "payload.elf")
+        namespace_default = "".join(c if c.isalnum() else "_" for c in repo.name.lower()).strip("_") or "game"
+    else:
+        raise WorkbenchError("Pass --game, or run with --project-dir pointing at a repo whose workbench.json declares engine unreal/source")
+    engine = game["engine"]
+    inputs = {"pid": args.pid, "namespace": args.namespace or namespace_default,
               "status_magic": game.get("status_magic", "0x5053494e")}
     for key in ("module", "module_sha256", "image_base", "signature_sites"):
         value = getattr(args, key)
@@ -264,11 +302,11 @@ def _update(client, args):
     if bool(args.old_artifact) != bool(args.annotations):
         raise WorkbenchError("Pass --old-artifact and --annotations together")
     recipe = game["recipe"]
-    plan = {"game": args.game, "pipeline_recipe": recipe, "inputs": inputs,
+    plan = {"game": args.game or engine, "engine": engine, "pipeline_recipe": recipe, "inputs": inputs,
             "payload_repo": str(repo), "build_cmd": None if args.no_build else args.build_cmd}
     if args.old_artifact:
         inputs.update(old_artifact=args.old_artifact, annotations=args.annotations)
-        recipe = ("unreal" if args.game == "fortnite" else "source") + "_update"
+        recipe = engine + "_update"
         plan["update_recipe"] = "offset_refresh"
         plan["update_inputs"] = dict(inputs)
     if args.dry_run:
@@ -280,7 +318,7 @@ def _update(client, args):
         if not args.app_version:
             raise WorkbenchError("Open a project with the observed title/app version, or pass --app-version")
         info = _call(client, "process_info", pid=args.pid)
-        _call(client, "project_open", title_id=info["title_id"], app_version=args.app_version, name=args.game)
+        _call(client, "project_open", title_id=info["title_id"], app_version=args.app_version, name=args.game or namespace_default)
     if args.session_id:
         update = _call(client, "recipe_session", action="status", session=args.session_id)
     else:
@@ -300,7 +338,7 @@ def _update(client, args):
         raise WorkbenchError("Payload repository must have a pinned source commit")
     manifest = dict(prior, format="ps4wb-project-v1", title_id=target["title_id"],
                     app_version=target["application_version"], module_sha256=target["module_sha256"],
-                    engine="unreal" if args.game == "fortnite" else "source", sdk="openorbis" if args.game == "fortnite" else "payload",
+                    engine=engine, sdk=game.get("sdk", "payload"),
                     source_commit=commit.stdout.strip(), repository=str(repo), staging="immediate", rpc_version=1)
     _call(client, "project_manifest", manifest=manifest)
     installed = _call(client, "project_install", target=target_ref["path"],
@@ -310,7 +348,7 @@ def _update(client, args):
         return {"session": session_id, "update": update, "installed": installed, "build": None, "deployed": False}
     argv = json.loads(args.build_argv) if args.build_argv else shlex.split(args.build_cmd, posix=os.name != "nt")
     argv = [a[1:-1] if len(a) > 1 and a[0] == a[-1] == '"' else a for a in argv]
-    evidence = build(repo, argv, args.payload or game["payload"])
+    evidence = build(repo, argv, args.payload or default_payload)
     collected = _call(client, "project_collect_build")
     payload_file = Path(evidence["payload"]["path"])
     sha = evidence["payload"]["sha256"]

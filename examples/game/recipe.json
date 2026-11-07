@@ -1,0 +1,15 @@
+{
+  "commands": [
+    [
+      "python",
+      "build.py",
+      "--engine",
+      "unreal"
+    ]
+  ],
+  "environment": {},
+  "output": "payload.elf",
+  "sdk": "payload",
+  "source_commit": "cb233bc022f71092bdffe4bdfd36ef41532b9970",
+  "timeout_seconds": 300
+}

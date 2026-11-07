@@ -2,7 +2,9 @@
 
 For buildable diagnostic payloads, typed research, generated SDK integration,
 durable development sessions, and memory replay, see
-[the project pipeline](docs/PROJECT_PIPELINE.md).
+[the project pipeline](docs/PROJECT_PIPELINE.md). To author a standalone game
+repository (like Apex-PS4/Fortnite-PS4) with `game_new`/`game_update`/`game_stage`,
+see [authoring a game project](docs/GAME_PROJECT.md) and [examples/game](examples/game).
 
 A local PS4 research workbench, command-line interface, and **stdio MCP server**
 for the supplied **firmware 14.00 / Afterglow** setup. Version 0.3 is a native

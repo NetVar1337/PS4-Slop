@@ -135,6 +135,21 @@ enum Command {
     Hash {
         file: PathBuf,
     },
+    /// One-call hash-qualified payload staging: ingest local target/payload
+    /// files when needed, upload the ELF once via payload_stage (immediate
+    /// CMD_PROC_ELF staging with RPC-entry recovery), then read payload_status.
+    /// Uses the console address from the profile; requires the process_inject
+    /// permission and a hardware-qualified payload hash. Never auto-retried.
+    Inject {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        payload: PathBuf,
+        #[arg(long, help = "Expected (qualified) payload SHA-256; computed when omitted")]
+        sha256: Option<String>,
+    },
     Qualify {
         #[arg(long)]
         evidence: PathBuf,
@@ -456,6 +471,50 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                         json!({"original_name":file.file_name(),"sha256":digest(&content)}),
                         "bin",
                     )?
+                }
+                Command::Inject {
+                    pid,
+                    target,
+                    payload,
+                    sha256,
+                } => {
+                    let intern = |registry: &ToolRegistry,
+                                  path: &Path,
+                                  kind: &str,
+                                  extension: &str|
+                     -> Result<String> {
+                        let text = path.to_string_lossy().to_string();
+                        if registry.workbench.read_artifact(&text, 1 << 20).is_ok() {
+                            return Ok(text);
+                        }
+                        let local = ps4_workbench_rs::config::resolve_lenient(path)?;
+                        ensure!(local.is_file(), "Not an artifact or local file: {}", local.display());
+                        let content =
+                            read_bounded(&local, registry.workbench.profile.limit("transfer_bytes"))?;
+                        let saved = registry.workbench.store.save(
+                            kind,
+                            &content,
+                            json!({"original_name":local.file_name(),"source":"local-file"}),
+                            extension,
+                        )?;
+                        Ok(saved["path"].as_str().context("Missing saved path")?.to_owned())
+                    };
+                    let target_artifact = intern(&registry, &target, "internals-target", "json")?;
+                    let payload_artifact = intern(&registry, &payload, "payload", "elf")?;
+                    let payload_bytes = registry.workbench.read_artifact(
+                        &payload_artifact,
+                        profile.limit("transfer_bytes"),
+                    )?;
+                    let sha = match sha256 {
+                        Some(value) => require_hash(&value, "sha256")?.to_owned(),
+                        None => digest(&payload_bytes),
+                    };
+                    let staged = registry.call(
+                        "payload_stage",
+                        json!({"pid":pid,"target":target_artifact,"payload":payload_artifact,"sha256":sha}),
+                    )?;
+                    let status = registry.call("payload_status", json!({"pid":pid}))?;
+                    json!({"stage":staged,"status":status,"payload_sha256":sha,"automatic_retry":false,"hardware_verified":false})
                 }
                 _ => unreachable!(),
             };

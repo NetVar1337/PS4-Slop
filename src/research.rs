@@ -244,6 +244,11 @@ fn load(store: &ArtifactStore, project: &str) -> Result<Research> {
     }
     Ok(state)
 }
+/// The registered project manifest, if any (used by game tooling to derive
+/// engine/repository defaults without mutating state).
+pub(crate) fn manifest_of(store: &ArtifactStore, project: &str) -> Result<Option<Manifest>> {
+    Ok(load(store, project)?.manifest)
+}
 fn save(store: &ArtifactStore, project: &str, state: &mut Research) -> Result<()> {
     ensure!(state.findings.len() <= 10_000, "Too many findings");
     state.revision += 1;

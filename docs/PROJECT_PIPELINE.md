@@ -1,5 +1,10 @@
 # Evidence to resident payload
 
+To create a new standalone game repository around this pipeline (scaffold,
+shared toolchain, one-call staging, per-build offset store), see
+[GAME_PROJECT.md](GAME_PROJECT.md): `game_new`, `game_update`, `game_stage`,
+`game_verify`, `ps4-workbench inject`, and `ctl update --project-dir`.
+
 The workbench now has a connected development path: identify an exact build,
 record typed research, export SDKs, install generated inputs, build a fresh ELF,
 collect its evidence, and stage it through an explicitly qualified transport.

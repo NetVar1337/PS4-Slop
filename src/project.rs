@@ -918,12 +918,47 @@ fn export_offsets(workbench: &crate::workbench::Workbench, args: &Value) -> Resu
         "modules": modules_json,
     });
     let provenance = json!({"project": id, "format": OFFSETS_FORMAT, "tool": "project_export_offsets", "module_sha256":if groups.len() == 1 { groups.keys().next() } else { None }});
+    let doc_bytes = serde_json::to_vec_pretty(&doc)?;
     let header = store.save("offsets", hpp.as_bytes(), provenance.clone(), "hpp")?;
-    let manifest = store.save("offsets", &serde_json::to_vec_pretty(&doc)?, provenance, "json")?;
+    let manifest = store.save("offsets", &doc_bytes, provenance, "json")?;
+    // Optional per-build archive inside the registered repository:
+    // offsets/<module_sha256[:16]>/offsets.{hpp,json}, the checked-in store that
+    // update recipes port annotations from (see templates/game/offsets).
+    let mut archived = Value::Null;
+    if args["archive"].as_bool().unwrap_or(false) {
+        let contract = crate::research::manifest_of(store, &id)?
+            .context("archive requires a registered project manifest with a repository")?;
+        let repo = crate::config::resolve_lenient(std::path::Path::new(&contract.repository))?;
+        ensure!(repo.is_dir(), "Manifest repository missing: {}", repo.display());
+        let build = want_sha.clone().or_else(|| {
+            if groups.len() == 1 { groups.keys().next().cloned() } else { None }
+        }).context("archive needs module_sha256 or exactly one recorded module")?;
+        let archive_root = repo.join("offsets").join(&build[..16]);
+        let directory = crate::config::resolve_lenient(&archive_root)?;
+        ensure!(
+            directory.starts_with(&repo) && directory != repo,
+            "Offsets archive escapes repository"
+        );
+        std::fs::create_dir_all(&directory)?;
+        let write_atomic = |name: &str, bytes: &[u8]| -> Result<std::path::PathBuf> {
+            let final_path = directory.join(name);
+            let temp = directory.join(format!(".{name}.{}", uuid::Uuid::new_v4().simple()));
+            std::fs::write(&temp, bytes)?;
+            std::fs::rename(&temp, &final_path)?;
+            Ok(final_path)
+        };
+        let header_path = write_atomic("offsets.hpp", hpp.as_bytes())?;
+        let manifest_path = write_atomic("offsets.json", &doc_bytes)?;
+        archived = json!({"directory": directory.display().to_string(),
+            "header": header_path.display().to_string(),
+            "manifest": manifest_path.display().to_string(),
+            "module_sha256": build});
+        store.audit("project_export_offsets_archive", json!({"project": id, "directory": directory.display().to_string(), "module_sha256": build}))?;
+    }
     store.audit("project_export_offsets", json!({"project": id, "offsets": total, "modules": groups.len()}))?;
     Ok(json!({
         "project": id, "format": OFFSETS_FORMAT, "namespace": namespace,
-        "header": header, "manifest": manifest,
+        "header": header, "manifest": manifest, "archived": archived,
         "offsets": total, "modules": groups.len(), "skipped": skipped,
     }))
 }
@@ -1176,6 +1211,60 @@ mod tests {
         let other_dir = tempfile::tempdir().unwrap();
         let other = crate::workbench::Workbench::new(test_profile(other_dir.path())).unwrap();
         assert!(export_offsets(&other, &json!({})).unwrap_err().to_string().contains("No active project"));
+    }
+
+    #[test]
+    fn export_offsets_archive_writes_per_build_store_into_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let mut registry = ToolRegistry::with_toolset(
+            crate::workbench::Workbench::new(test_profile(directory.path())).unwrap(),
+            crate::tools::Toolset::Full,
+        )
+        .unwrap();
+        let store = registry.workbench.store.clone();
+        open(&store, &json!({"title_id": "CUSA12345", "app_version": "01.00", "name": "Test Game"})).unwrap();
+        let sha = "a".repeat(64);
+        registry
+            .call("project_manifest", json!({"manifest": {
+                "format": "ps4wb-project-v1", "title_id": "CUSA12345", "app_version": "01.00",
+                "module_sha256": sha, "engine": "unreal", "sdk": "openorbis",
+                "source_commit": "b".repeat(40), "repository": repo.path().display().to_string(),
+                "staging": "immediate", "rpc_version": 1,
+            }})).unwrap();
+        let ann = store.save("annotation", &serde_json::to_vec(&json!({
+            "artifact": "evidence.bin", "artifact_sha256": "b".repeat(64), "module_sha256": sha,
+            "rva": "0x100", "comment": "entity list", "symbol": "EntityList"
+        })).unwrap(), json!({}), "json").unwrap();
+        record(&store, &json!({
+            "artifacts": [ann["path"].as_str().unwrap()],
+            "module_sha256": sha,
+            "modules": [{"name": "eboot.bin", "sha256": sha}],
+        })).unwrap();
+
+        let out = export_offsets(&registry.workbench, &json!({"verify_bytes": 7, "archive": true})).unwrap();
+        assert_eq!(out["archived"]["module_sha256"], sha);
+        let build_dir = repo.path().join("offsets").join(&sha[..16]);
+        assert!(build_dir.join("offsets.hpp").is_file());
+        assert!(build_dir.join("offsets.json").is_file());
+        let hpp = std::fs::read_to_string(build_dir.join("offsets.hpp")).unwrap();
+        assert!(hpp.contains("EntityList = 0x100"), "{hpp}");
+        let doc: Value = serde_json::from_slice(&std::fs::read(build_dir.join("offsets.json")).unwrap()).unwrap();
+        assert_eq!(doc["format"], OFFSETS_FORMAT);
+        // Re-export overwrites the generated per-build files atomically.
+        let again = export_offsets(&registry.workbench, &json!({"archive": true})).unwrap();
+        assert_eq!(again["archived"]["module_sha256"], sha);
+
+        // Without a registered manifest repository, archive is refused.
+        let plain = tempfile::tempdir().unwrap();
+        let workbench2 = crate::workbench::Workbench::new(test_profile(plain.path())).unwrap();
+        open(&workbench2.store, &json!({"title_id": "CUSA12345", "name": "No Manifest"})).unwrap();
+        assert!(
+            export_offsets(&workbench2, &json!({"archive": true}))
+                .unwrap_err()
+                .to_string()
+                .contains("registered project manifest")
+        );
     }
 
     #[test]
