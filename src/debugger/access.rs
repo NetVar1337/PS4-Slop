@@ -1358,6 +1358,7 @@ mod tests {
                     (0x50_0000, 0x50_1000, 3, "fixture.elf".to_owned()),
                 ],
                 extra_memory: vec![(OBJECT, object), (0x50_0100, OBJECT.to_le_bytes().to_vec())],
+                ..Default::default()
             },
         );
         let directory = tempfile::tempdir().unwrap();

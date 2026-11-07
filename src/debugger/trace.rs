@@ -1544,6 +1544,7 @@ mod tests {
             pid: 71, thread_id: 72, base: BASE, image: import_image(), rip: BASE, program,
             extra_maps: vec![(KERNEL, KERNEL + 0x1000, 5, "libkernel.sprx".into())],
             extra_memory: vec![(rsp, (BASE + 0x50).to_le_bytes().to_vec()), (KERNEL, vec![0x90; 0x100])],
+            ..Default::default()
         };
         let (_directory, mut debugger) = attach(fixture);
         let filter = regex::Regex::new("(?i)usleep").unwrap();
@@ -1583,6 +1584,7 @@ mod tests {
             pid: 71, thread_id: 72, base: BASE, image: vec![0x90; 0x100], rip: BASE, program,
             extra_maps: vec![(KERNEL, KERNEL + 0x1000, 5, "libkernel.sprx".into())],
             extra_memory: vec![(KERNEL, kernel), (rsp, (BASE + 0x10).to_le_bytes().to_vec())],
+            ..Default::default()
         };
         let (_directory, mut debugger) = attach(fixture);
         let (probes, plan) = debugger.plan_syscalls(None, &[], &["write".to_owned()], None, false, DEFAULT_SCAN_LIMIT).unwrap();

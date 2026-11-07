@@ -8,7 +8,7 @@
 //! current project so `auto_record` only needs the artifact store.
 use crate::artifacts::{ArtifactStore, utc_now};
 use crate::{Result, tools::ToolRegistry};
-use anyhow::{Context, anyhow, bail};
+use anyhow::{Context, anyhow, bail, ensure};
 use serde_json::{Map, Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, OpenOptions};
@@ -26,6 +26,12 @@ const AUTO_RECORD_SKIP: &[&str] = &["artifact_list", "artifact_info", "artifact_
 
 /// Returns `None` when `name` is not a tool owned by this area.
 pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option<Result<Value>> {
+    if name == "project_export_offsets" {
+        return Some(export_offsets(&registry.workbench, args));
+    }
+    if name == "project_export_target" {
+        return Some(export_target(&registry.workbench, args));
+    }
     let store = &registry.workbench.store;
     Some(match name {
         "project_open" => open(store, args),
@@ -633,6 +639,314 @@ pub fn auto_record(store: &ArtifactStore, tool: &str, args: &Value, result: &Val
     Ok(records.len())
 }
 
+
+/// Export format emitted by `project_export_offsets` (the `.json` companion of the `.hpp`).
+pub const OFFSETS_FORMAT: &str = "ps4wb-offsets-v1";
+
+/// Sanitize `text` into a usable C++ identifier; falls back when unusable.
+fn cident(text: &str, fallback: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    if out.is_empty() {
+        return fallback.to_owned();
+    }
+    if out.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        out = format!("_{out}");
+    }
+    out
+}
+
+struct OffsetEntry {
+    symbol: String,
+    rva: u64,
+    comment: String,
+    evidence: Value,
+    evidence_sha256: Value,
+    verify_hex: Option<String>,
+}
+
+struct OffsetsData {
+    module_names: BTreeMap<String, String>,
+    groups: BTreeMap<String, Vec<OffsetEntry>>,
+    dump_bytes: BTreeMap<String, Vec<u8>>,
+    skipped: Vec<Value>,
+}
+
+/// Shared collection for both exporters: module names, annotation-derived offset
+/// entries grouped by module hash, and the newest dump-like artifact per module
+/// used for verify fingerprints.
+fn collect_offsets(workbench: &crate::workbench::Workbench, records: &[Value], want_sha: &Option<String>, verify_bytes: usize) -> OffsetsData {
+    // module sha256 -> display name, from module records
+    let mut module_names: BTreeMap<String, String> = BTreeMap::new();
+    for record in records {
+        if record["type"] == "module"
+            && let (Some(sha), Some(name)) = (record["sha256"].as_str(), record["name"].as_str())
+            && sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            module_names.insert(sha.to_ascii_lowercase(), name.to_owned());
+        }
+    }
+
+    // Newest recorded dump-like artifact per module sha, for verify fingerprints.
+    let transfer = workbench.profile.limit("transfer_bytes");
+    let mut dump_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for record in records.iter().rev() {
+        if record["type"] != "artifact" {
+            continue;
+        }
+        let Some(sha) = record["module_sha256"].as_str().map(str::to_ascii_lowercase) else { continue };
+        if want_sha.as_ref().is_some_and(|w| *w != sha) || dump_bytes.contains_key(&sha) {
+            continue;
+        }
+        let kind = record["kind"].as_str().unwrap_or("");
+        if !["elf", "dump", "memory", "snapshot", "core"].iter().any(|k| kind.contains(k)) {
+            continue;
+        }
+        if let Some(path) = record["path"].as_str()
+            && let Ok(bytes) = workbench.read_artifact(path, transfer)
+        {
+            dump_bytes.insert(sha, bytes);
+        }
+    }
+
+    // Annotation artifact bodies -> offset entries grouped by module sha.
+    let mut groups: BTreeMap<String, Vec<OffsetEntry>> = BTreeMap::new();
+    let mut seen: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for record in records.iter().rev() {
+        if record["type"] != "artifact" || record["kind"] != "annotation" {
+            continue;
+        }
+        let Some(path) = record["path"].as_str() else { continue };
+        let body = workbench
+            .read_artifact(path, MAX_SIDECAR)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+        let Some(body) = body else { continue };
+        let Some(sha) = body["module_sha256"].as_str().map(str::to_ascii_lowercase) else { continue };
+        if want_sha.as_ref().is_some_and(|w| *w != sha) {
+            continue;
+        }
+        let Ok(rva) = crate::tools::address(&body["rva"]) else {
+            skipped.push(json!({"path": path, "reason": "annotation rva is not an address"}));
+            continue;
+        };
+        let base_symbol = cident(body["symbol"].as_str().unwrap_or(""), &format!("off_{rva:x}"));
+        let taken = seen.entry(sha.clone()).or_default();
+        let mut symbol = base_symbol.clone();
+        let mut suffix = 2;
+        while !taken.insert(symbol.clone()) {
+            symbol = format!("{base_symbol}_{suffix}");
+            suffix += 1;
+        }
+        let verify_hex = dump_bytes.get(&sha).and_then(|dump| {
+            let start = usize::try_from(rva).ok()?;
+            let end = start.checked_add(verify_bytes)?;
+            (end <= dump.len()).then(|| hex::encode(&dump[start..end]))
+        });
+        groups.entry(sha).or_default().push(OffsetEntry {
+            symbol,
+            rva,
+            comment: body["comment"].as_str().unwrap_or("").replace('\n', " "),
+            evidence: body["artifact"].clone(),
+            evidence_sha256: body["artifact_sha256"].clone(),
+            verify_hex,
+        });
+    }
+    OffsetsData { module_names, groups, dump_bytes, skipped }
+}
+
+/// Export the active project's evidence annotations into a generated C++ header
+/// (per-module namespaces, RVA constants, runtime verify fingerprints) plus a
+/// `ps4wb-offsets-v1` JSON manifest. Verify bytes are sliced from a recorded dump
+/// artifact of the same module when one exists; otherwise the check is omitted.
+/// Fully local: reads only the artifact store and project index.
+fn export_offsets(workbench: &crate::workbench::Workbench, args: &Value) -> Result<Value> {
+    let store = &workbench.store;
+    let id = resolve_project(store, args)?;
+    let meta = read_json(&index_path(store, &format!("{id}/project.json"))?)?.unwrap_or_else(|| json!({"id": id}));
+    let records = load_records(store, &id)?;
+    let want_sha = args["module_sha256"].as_str().map(str::to_ascii_lowercase);
+    let verify_bytes = args["verify_bytes"].as_u64().unwrap_or(16).clamp(1, 32) as usize;
+    let namespace = args["namespace"].as_str()
+        .map(|n| slug(&n.to_ascii_lowercase(), 48))
+        .filter(|n| !n.is_empty())
+        .or_else(|| meta["name"].as_str().map(|n| slug(&n.to_ascii_lowercase(), 48)).filter(|n| !n.is_empty()))
+        .unwrap_or_else(|| slug(&id, 48));
+    let data = collect_offsets(workbench, &records, &want_sha, verify_bytes);
+    let OffsetsData { module_names, groups, skipped, .. } = data;
+    let total: usize = groups.values().map(Vec::len).sum();
+
+    // Generated C++ header.
+    let mut hpp = String::new();
+    hpp.push_str("// Generated by project_export_offsets; do not edit by hand.\n");
+    hpp.push_str("// Regenerate from the workbench project index after annotation_save/annotation_port.\n");
+    hpp.push_str(&format!("// project: {id}  title_id: {}  app_version: {}\n", meta["title_id"], meta["app_version"]));
+    hpp.push_str("#pragma once\n#include <cstddef>\n#include <cstdint>\n\n");
+    hpp.push_str(&format!("namespace {namespace} {{\n\n"));
+    hpp.push_str("struct VerifyCheck {\n    std::uintptr_t offset;\n    std::size_t length;\n    std::uint8_t bytes[32];\n};\n\n");
+    let mut modules_json = Vec::new();
+    for (sha, entries) in &groups {
+        let module = module_names.get(sha).cloned().unwrap_or_else(|| "module".to_owned());
+        let modns = slug(&module.to_ascii_lowercase(), 48);
+        hpp.push_str(&format!("namespace {modns} {{ // {module}  sha256={sha}\n"));
+        hpp.push_str("inline constexpr VerifyCheck kVerifyChecks[] = {\n");
+        let mut offsets_json = Vec::new();
+        for entry in entries {
+            if let Some(hex_text) = &entry.verify_hex {
+                let bytes = hex::decode(hex_text).unwrap_or_default();
+                let list: Vec<String> = bytes.iter().map(|b| format!("0x{b:02x}")).collect();
+                hpp.push_str(&format!("    {{ {:#x}, {}, {{ {} }} }},\n", entry.rva, bytes.len(), list.join(", ")));
+            }
+            let comment = if entry.comment.is_empty() { String::new() } else { format!(" // {}", entry.comment) };
+            hpp.push_str(&format!("inline constexpr std::uintptr_t {} = {:#x};{comment}\n", entry.symbol, entry.rva));
+            offsets_json.push(json!({
+                "symbol": entry.symbol, "rva": format!("{:#x}", entry.rva), "comment": entry.comment,
+                "evidence": entry.evidence, "evidence_sha256": entry.evidence_sha256,
+                "verify": entry.verify_hex.as_ref().map(|hex_text| json!({"offset": format!("{:#x}", entry.rva), "hex": hex_text})).unwrap_or(Value::Null),
+            }));
+        }
+        hpp.push_str("};\n");
+        hpp.push_str("inline constexpr std::size_t kVerifyCheckCount = sizeof(kVerifyChecks) / sizeof(kVerifyChecks[0]);\n\n");
+        hpp.push_str(&format!("}} // namespace {modns}\n\n"));
+        modules_json.push(json!({"module": module, "module_sha256": sha, "offsets": offsets_json}));
+    }
+    hpp.push_str(&format!("}} // namespace {namespace}\n"));
+
+    let doc = json!({
+        "format": OFFSETS_FORMAT,
+        "project": id,
+        "title_id": meta["title_id"],
+        "app_version": meta["app_version"],
+        "generated_at": utc_now(),
+        "namespace": namespace,
+        "verify_bytes": verify_bytes,
+        "modules": modules_json,
+    });
+    let provenance = json!({"project": id, "format": OFFSETS_FORMAT, "tool": "project_export_offsets"});
+    let header = store.save("offsets", hpp.as_bytes(), provenance.clone(), "hpp")?;
+    let manifest = store.save("offsets", &serde_json::to_vec_pretty(&doc)?, provenance, "json")?;
+    store.audit("project_export_offsets", json!({"project": id, "offsets": total, "modules": groups.len()}))?;
+    Ok(json!({
+        "project": id, "format": OFFSETS_FORMAT, "namespace": namespace,
+        "header": header, "manifest": manifest,
+        "offsets": total, "modules": groups.len(), "skipped": skipped,
+    }))
+}
+/// Insert one absolute-address fingerprint, or record why it was skipped.
+fn push_fingerprint(fingerprints: &mut BTreeMap<u64, String>, skipped: &mut Vec<Value>, base: u64, rva: u64, hex_text: &str, source: &str) {
+    match base.checked_add(rva) {
+        Some(absolute) => {
+            fingerprints.entry(absolute).or_insert_with(|| hex_text.to_owned());
+        }
+        None => skipped.push(json!({"rva": format!("{rva:#x}"), "source": source, "reason": "absolute address overflow"})),
+    }
+}
+
+/// Export format consumed by `payload_stage`/`payload_recover`/`process_call`.
+pub const TARGET_FORMAT: &str = "ps4wb-internals-target-v1";
+
+/// Emit a ready-to-stage `ps4wb-internals-target-v1` manifest from the active
+/// project: identity from the project/module records, executable-text hash from
+/// the module record, and absolute-address fingerprints from annotations plus
+/// optional `signature_sites` (RVAs returned by `signature_make`). Bytes come
+/// from the recorded dump of the same module; without a base and a dump the
+/// corresponding fingerprint is skipped, never fabricated.
+fn export_target(workbench: &crate::workbench::Workbench, args: &Value) -> Result<Value> {
+    let store = &workbench.store;
+    let id = resolve_project(store, args)?;
+    let meta = read_json(&index_path(store, &format!("{id}/project.json"))?)?.unwrap_or_else(|| json!({"id": id}));
+    let title_id = meta["title_id"].as_str().context("Project has no title_id; reopen it with project_open title_id")?;
+    let records = load_records(store, &id)?;
+    let want_sha = args["module_sha256"].as_str().map(str::to_ascii_lowercase);
+    let verify_bytes = args["verify_bytes"].as_u64().unwrap_or(16).clamp(1, 32) as usize;
+    let data = collect_offsets(workbench, &records, &want_sha, verify_bytes);
+    let sha = match (&want_sha, data.groups.len()) {
+        (Some(sha), _) => sha.clone(),
+        (None, 1) => data.groups.keys().next().cloned().unwrap_or_default(),
+        (None, 0) => bail!("No offsets recorded for this project; record annotations first"),
+        (None, _) => bail!("Multiple modules have annotations; supply module_sha256"),
+    };
+    let entries = data.groups.get(&sha).map(Vec::as_slice).unwrap_or(&[]);
+    let module = data.module_names.get(&sha).cloned().unwrap_or_else(|| "eboot.bin".to_owned());
+    let module_record = records.iter().find(|r| {
+        r["type"] == "module" && r["sha256"].as_str().map(str::to_ascii_lowercase) == Some(sha.clone())
+    });
+    let base = if args["image_base"].is_string() {
+        crate::tools::address(&args["image_base"])?
+    } else {
+        module_record
+            .and_then(|r| r["base"].as_str())
+            .map(|text| crate::tools::address(&json!(text)))
+            .transpose()?
+            .context("Supply image_base or record the module base (project_record modules[].base)")?
+    };
+    let process_name = args["process_name"].as_str().unwrap_or(&module).to_owned();
+    let process_path = args["process_path"].as_str()
+        .map(str::to_owned)
+        .or_else(|| module_record.and_then(|r| r["path"].as_str()).map(str::to_owned))
+        .unwrap_or_else(|| format!("/app0/{process_name}"));
+    let status_magic = if args["status_magic"].is_string() {
+        crate::tools::address(&args["status_magic"])?
+    } else {
+        0x5053494E // "PSIN", internals/runtime.hpp kDefaultStatusMagic
+    };
+    ensure!(status_magic <= u32::MAX as u64, "status_magic must be uint32");
+
+    let mut fingerprints: BTreeMap<u64, String> = BTreeMap::new();
+    let mut skipped = data.skipped.clone();
+    for entry in entries {
+        match &entry.verify_hex {
+            Some(hex_text) => push_fingerprint(&mut fingerprints, &mut skipped, base, entry.rva, hex_text, "annotation"),
+            None => skipped.push(json!({"rva": format!("{:#x}", entry.rva), "source": "annotation", "reason": "no recorded dump covers this offset"})),
+        }
+    }
+    // signature_sites: RVAs verified unique by signature_make; bytes from the dump.
+    for site in args["signature_sites"].as_array().into_iter().flatten() {
+        let rva = crate::tools::address(site)?;
+        match data.dump_bytes.get(&sha).and_then(|dump| {
+            let start = usize::try_from(rva).ok()?;
+            let end = start.checked_add(verify_bytes)?;
+            (end <= dump.len()).then(|| hex::encode(&dump[start..end]))
+        }) {
+            Some(hex_text) => push_fingerprint(&mut fingerprints, &mut skipped, base, rva, &hex_text, "signature"),
+            None => skipped.push(json!({"rva": format!("{rva:#x}"), "source": "signature", "reason": "no recorded dump covers this site"})),
+        }
+    }
+    ensure!(!fingerprints.is_empty(), "No fingerprints could be built; record a dump and annotations or signature_sites first");
+
+    let mut pointers = Vec::new();
+    for pointer in args["pointers"].as_array().into_iter().flatten().take(64) {
+        let address = crate::tools::address(&pointer["address"])?;
+        let expected = crate::tools::address(&pointer["expected"])?;
+        pointers.push(json!({"address": format!("{address:#x}"), "expected": format!("{expected:#x}")}));
+    }
+    ensure!(args["pointers"].as_array().map_or(0, Vec::len) <= 64, "Too many pointer checks");
+    ensure!(fingerprints.len() <= 64, "Too many fingerprints (max 64)");
+
+    let manifest = json!({
+        "format": TARGET_FORMAT,
+        "name": meta["name"].as_str().unwrap_or(&id),
+        "title_id": title_id,
+        "process_name": process_name,
+        "process_path": process_path,
+        "application_version": meta["app_version"].as_str().unwrap_or("01.00"),
+        "executable_text_sha256": sha,
+        "status_magic": format!("{status_magic:#x}"),
+        "fingerprints": fingerprints.iter().map(|(address, hex_text)| json!({"address": format!("{address:#x}"), "hex": hex_text})).collect::<Vec<_>>(),
+        "pointers": pointers,
+    });
+    let saved = store.save("internals-target", &serde_json::to_vec_pretty(&manifest)?, json!({"project": id, "tool": "project_export_target", "module_sha256": sha}), "json")?;
+    store.audit("project_export_target", json!({"project": id, "module": module, "fingerprints": fingerprints.len(), "pointers": pointers.len()}))?;
+    Ok(json!({
+        "project": id, "format": TARGET_FORMAT, "target": saved, "module": module,
+        "image_base": format!("{base:#x}"), "fingerprints": fingerprints.len(),
+        "pointers": pointers.len(), "skipped": skipped,
+    }))
+}
+
 /// Error helper for callers wanting a uniform message.
 pub fn require_active(store: &ArtifactStore) -> Result<String> {
     active_project(store)?.ok_or_else(|| anyhow!("No active project; call project_open first"))
@@ -722,5 +1036,93 @@ mod tests {
         assert!(project_id(&json!({})).is_err());
         assert_eq!(artifact_kind("elfdump-0123456789abcdef0123456789abcdef.elf"), "elfdump");
         assert_eq!(artifact_kind("custom.bin"), "file");
+    }
+
+    #[test]
+    fn export_offsets_generates_header_and_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let workbench = crate::workbench::Workbench::new(test_profile(directory.path())).unwrap();
+        let store = &workbench.store;
+        open(store, &json!({"title_id": "CUSA12345", "name": "Test Game"})).unwrap();
+        let sha = "a".repeat(64);
+        let mut dump = vec![0u8; 0x200];
+        dump[0x100..0x107].copy_from_slice(&[0x48, 0x8b, 0x05, 0x11, 0x22, 0x33, 0x44]);
+        let dump_art = store.save("elfdump", &dump, json!({"module": "eboot.bin", "module_sha256": sha}), "elf").unwrap();
+        let ann = store.save("annotation", &serde_json::to_vec(&json!({
+            "artifact": "evidence.bin", "artifact_sha256": "b".repeat(64), "module_sha256": sha,
+            "rva": "0x100", "comment": "entity list", "symbol": "EntityList"
+        })).unwrap(), json!({}), "json").unwrap();
+        record(store, &json!({
+            "artifacts": [dump_art["path"].as_str().unwrap(), ann["path"].as_str().unwrap()],
+            "module_sha256": sha,
+            "modules": [{"name": "eboot.bin", "sha256": sha}],
+        })).unwrap();
+
+        let out = export_offsets(&workbench, &json!({"verify_bytes": 7})).unwrap();
+        assert_eq!(out["format"], OFFSETS_FORMAT);
+        assert_eq!(out["offsets"], 1);
+        assert_eq!(out["namespace"], "test_game");
+        let hpp = String::from_utf8(workbench.read_artifact(out["header"]["path"].as_str().unwrap(), 1 << 20).unwrap()).unwrap();
+        assert!(hpp.contains("namespace test_game"), "{hpp}");
+        assert!(hpp.contains("namespace eboot_bin"), "{hpp}");
+        assert!(hpp.contains("inline constexpr std::uintptr_t EntityList = 0x100; // entity list"), "{hpp}");
+        assert!(hpp.contains("{ 0x100, 7, { 0x48, 0x8b, 0x05, 0x11, 0x22, 0x33, 0x44 } },"), "{hpp}");
+        let doc: Value = serde_json::from_slice(&workbench.read_artifact(out["manifest"]["path"].as_str().unwrap(), 1 << 20).unwrap()).unwrap();
+        assert_eq!(doc["format"], OFFSETS_FORMAT);
+        assert_eq!(doc["modules"][0]["module"], "eboot.bin");
+        assert_eq!(doc["modules"][0]["offsets"][0]["symbol"], "EntityList");
+        assert_eq!(doc["modules"][0]["offsets"][0]["verify"]["hex"], "488b0511223344");
+
+        let none = export_offsets(&workbench, &json!({"module_sha256": "c".repeat(64)})).unwrap();
+        assert_eq!(none["offsets"], 0);
+        assert_eq!(none["modules"], 0);
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = crate::workbench::Workbench::new(test_profile(other_dir.path())).unwrap();
+        assert!(export_offsets(&other, &json!({})).unwrap_err().to_string().contains("No active project"));
+    }
+
+    #[test]
+    fn export_target_builds_stage_manifest() {
+        let directory = tempfile::tempdir().unwrap();
+        let workbench = crate::workbench::Workbench::new(test_profile(directory.path())).unwrap();
+        let store = &workbench.store;
+        open(store, &json!({"title_id": "CUSA12345", "app_version": "01.02", "name": "Test Game"})).unwrap();
+        let sha = "a".repeat(64);
+        let mut dump = vec![0u8; 0x200];
+        dump[0x100..0x104].copy_from_slice(&[0x48, 0x8b, 0x05, 0x11]);
+        dump[0x140..0x144].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let dump_art = store.save("elfdump", &dump, json!({"module": "eboot.bin", "module_sha256": sha}), "elf").unwrap();
+        let ann = store.save("annotation", &serde_json::to_vec(&json!({
+            "artifact": "evidence.bin", "artifact_sha256": "b".repeat(64), "module_sha256": sha,
+            "rva": "0x100", "comment": "entity list", "symbol": "EntityList"
+        })).unwrap(), json!({}), "json").unwrap();
+        record(store, &json!({
+            "artifacts": [dump_art["path"].as_str().unwrap(), ann["path"].as_str().unwrap()],
+            "module_sha256": sha,
+            "modules": [{"name": "eboot.bin", "sha256": sha, "base": "0x400000", "path": "/app0/eboot.bin"}],
+        })).unwrap();
+
+        let out = export_target(&workbench, &json!({
+            "verify_bytes": 4, "signature_sites": ["0x140"],
+            "pointers": [{"address": "0x400010", "expected": "0x400000"}],
+        })).unwrap();
+        assert_eq!(out["format"], TARGET_FORMAT);
+        assert_eq!(out["module"], "eboot.bin");
+        assert_eq!(out["image_base"], "0x400000");
+        assert_eq!(out["fingerprints"], 2);
+        assert_eq!(out["pointers"], 1);
+        let doc: Value = serde_json::from_slice(&workbench.read_artifact(out["target"]["path"].as_str().unwrap(), 1 << 20).unwrap()).unwrap();
+        assert_eq!(doc["format"], TARGET_FORMAT);
+        assert_eq!(doc["title_id"], "CUSA12345");
+        assert_eq!(doc["process_name"], "eboot.bin");
+        assert_eq!(doc["process_path"], "/app0/eboot.bin");
+        assert_eq!(doc["application_version"], "01.02");
+        assert_eq!(doc["executable_text_sha256"], sha);
+        assert_eq!(doc["status_magic"], "0x5053494e");
+        assert_eq!(doc["fingerprints"][0]["address"], "0x400100");
+        assert_eq!(doc["fingerprints"][0]["hex"], "488b0511");
+        assert_eq!(doc["fingerprints"][1]["address"], "0x400140");
+        assert_eq!(doc["fingerprints"][1]["hex"], "deadbeef");
+        assert_eq!(doc["pointers"][0]["expected"], "0x400000");
     }
 }

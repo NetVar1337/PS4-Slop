@@ -1610,6 +1610,78 @@ impl Debugger {
         }))
     }
 
+    /// Kernel-space counterpart of [`Self::memory_search`]: local pattern scan over
+    /// chunked `CMD_KERNEL_READ` (0xbdcc0002) reads; never sends a kernel write.
+    pub fn kernel_search(
+        &mut self,
+        address: u64,
+        length: usize,
+        pattern: &str,
+        max_matches: usize,
+    ) -> Result<Value> {
+        ensure!((1..=4096).contains(&max_matches), "max_matches must be 1-4096");
+        address_range(address, length, self.profile.limit("memory_bytes"))?;
+        let pat_len = crate::analysis::pattern_len(pattern)?;
+        let overlap = pat_len.saturating_sub(1);
+
+        let mut matches = Vec::new();
+        let mut scanned = 0usize;
+        let mut truncated = false;
+        let mut carry: Vec<u8> = Vec::new();
+        let mut carry_addr = address;
+
+        for (chunk_address, chunk_length) in Self::page_chunks(address, length) {
+            let content = self.read_memory(0, chunk_address, chunk_length, true)?;
+            scanned += content.len();
+            let base = if carry.is_empty() {
+                chunk_address
+            } else {
+                carry_addr
+            };
+            let mut window = Vec::with_capacity(carry.len() + content.len());
+            window.extend_from_slice(&carry);
+            window.extend_from_slice(&content);
+
+            let found = crate::analysis::scan_pattern_at(
+                &window,
+                pattern,
+                base,
+                max_matches - matches.len(),
+            )?;
+            if let Some(items) = found["matches"].as_array() {
+                for item in items {
+                    if !matches.contains(item) {
+                        matches.push(item.clone());
+                        if matches.len() >= max_matches {
+                            break;
+                        }
+                    }
+                }
+            }
+            if matches.len() >= max_matches {
+                truncated = true;
+                break;
+            }
+            let keep = overlap.min(window.len());
+            carry.clear();
+            if keep > 0 {
+                carry.extend_from_slice(&window[window.len() - keep..]);
+                carry_addr = base + (window.len() - keep) as u64;
+            }
+        }
+        Ok(json!({
+            "address": format!("{address:#x}"),
+            "length": length,
+            "pattern": pattern,
+            "matches": matches,
+            "count": matches.len(),
+            "scanned_bytes": scanned,
+            "truncated": truncated,
+            "kernel": true,
+            "note": "Local scan of chunked kernel reads with full 4 KiB page-boundary overlap",
+        }))
+    }
+
     /// Assemble or hex-decode a patch at `address`, optionally NOP-pad to the
     /// overwritten instruction boundary, record original bytes, write, and readback-verify.
     pub fn apply_patch(
@@ -2337,5 +2409,72 @@ mod tests {
         let run = debugger.run(None, None, 1, Duration::from_secs(3)).unwrap();
         assert_eq!(run["stops"][0]["event"]["status"], (11 << 8) | 0x7f);
         debugger.detach().unwrap();
+    }
+
+    #[test]
+    fn rpc_elf_and_scan_against_fake() {
+        let mut image = vec![0x90u8; 0x100];
+        image[0x20..0x24].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let fixture = fake::Fixture {
+            pid: 71,
+            thread_id: 72,
+            base: 0x40_0000,
+            image,
+            rip: 0x40_0000,
+            ..Default::default()
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fake = fake::spawn_fixture(listener, fixture);
+        let directory = tempfile::tempdir().unwrap();
+        let mut debugger = Debugger::new(qualified_profile(directory.path(), fake.port));
+
+        // CMD_PROC_INTALL + CMD_PROC_CALL (68-byte body)
+        let stub = debugger.install_rpc(71).unwrap();
+        assert_eq!(stub, 0x9000);
+        let rax = debugger.call_rpc(71, stub, 0x5000, [1, 0, 0, 0, 0, 0]).unwrap();
+        assert_eq!(rax, (0x4158_4553u64 << 32) | 2);
+        // CMD_PROC_ELF: ready status, bytes, terminal status (no entry reply)
+        debugger.load_elf(71, b"\x7fELFfake").unwrap();
+        // CMD_PROC_SCAN ArrBytes exact over the fixture image
+        let scan = debugger.scan_process(71, 10, &[0xde, 0xad, 0xbe, 0xef], 8).unwrap();
+        assert_eq!(scan["count"], 1, "{scan}");
+        assert_eq!(scan["matches"][0], "0x400020");
+        assert_eq!(scan["server_side"], true);
+    }
+
+    #[test]
+    fn kernel_base_read_write_and_search_against_fake() {
+        const KERNEL: u64 = 0x8000_0000;
+        let mut kernel = vec![0xccu8; 0x100];
+        // mov rax, 4; mov r10, rcx; syscall; ret  at +0x10
+        kernel[0x10..0x1d].copy_from_slice(&[0x48, 0xc7, 0xc0, 4, 0, 0, 0, 0x49, 0x89, 0xca, 0x0f, 0x05, 0xc3]);
+        let fixture = fake::Fixture {
+            pid: 71,
+            thread_id: 72,
+            base: 0x40_0000,
+            image: vec![0x90; 0x100],
+            rip: 0x40_0000,
+            extra_maps: vec![(KERNEL, KERNEL + 0x1000, 5, "libkernel.sprx".into())],
+            extra_memory: vec![(KERNEL, kernel)],
+            ..Default::default()
+        };
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let fake = fake::spawn_fixture(listener, fixture);
+        let directory = tempfile::tempdir().unwrap();
+        let mut debugger = Debugger::new(qualified_profile(directory.path(), fake.port));
+
+        // CMD_KERNEL_BASE (0xbdcc0001)
+        assert_eq!(debugger.kernel_base().unwrap()["kernel_base"], "0x80000000");
+        // CMD_KERNEL_READ (0xbdcc0002): body has no pid
+        let bytes = debugger.read_memory(0, KERNEL + 0x10, 13, true).unwrap();
+        assert_eq!(bytes[..5], [0x48, 0xc7, 0xc0, 4, 0]);
+        // CMD_KERNEL_WRITE (0xbdcc0003) then readback
+        debugger.write_memory(0, KERNEL + 0x80, &[0x41, 0x42], true).unwrap();
+        assert_eq!(debugger.read_memory(0, KERNEL + 0x80, 2, true).unwrap(), vec![0x41, 0x42]);
+        // kernel_search finds the syscall wrapper through a wildcard pattern
+        let found = debugger.kernel_search(KERNEL, 0x100, "48 c7 c0 ?? ?? ?? ?? 49 89 ca 0f 05 c3", 16).unwrap();
+        assert_eq!(found["count"], 1);
+        assert_eq!(found["matches"][0].as_str().unwrap(), format!("{:#x}", KERNEL + 0x10));
+        assert_eq!(found["kernel"], true);
     }
 }

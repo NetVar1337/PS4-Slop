@@ -455,6 +455,72 @@ impl Debugger {
         })
     }
 
+    /// One-shot ELF execution through CMD_PROC_ELF: the server loads the image
+    /// and spawns a thread at its raw entry. Two status words, no entry reply.
+    pub fn load_elf(&mut self, pid: u32, elf: &[u8]) -> Result<()> {
+        self.require_qualified_debugger("process_inject")?;
+        Self::pid(pid)?;
+        ensure!(self.attached_pid.is_none(), "ELF execution is blocked during debugger attachment");
+        ensure!(!elf.is_empty() && elf.len() <= u32::MAX as usize, "Invalid ELF size");
+        ensure!(elf.len() <= self.profile.limit("transfer_bytes"), "ELF exceeds configured transfer limit");
+        let mut body = Vec::with_capacity(8);
+        body.extend(pid.to_le_bytes());
+        body.extend((elf.len() as u32).to_le_bytes());
+        self.exchange(|debugger| {
+            debugger.packet(0xbdaa0007, &body)?;
+            debugger.status()?;
+            debugger.write(elf)?;
+            debugger.status()
+        })
+    }
+
+    /// Server-side exact-value scan through CMD_PROC_SCAN (0xbdaa0009).
+    /// `value_type`: 0-9 numeric types, 10 = byte array, 11 = string.
+    /// `compare_type`: 0 = ExactValue (the only mode this client exposes).
+    /// The server walks every readable map, steps by the value width and
+    /// streams one u64 address per match, terminated by a u64::MAX sentinel.
+    pub fn scan_process(&mut self, pid: u32, value_type: u8, data: &[u8], max_matches: usize) -> Result<Value> {
+        Self::pid(pid)?;
+        ensure!((1..=4096).contains(&max_matches), "max_matches must be 1-4096");
+        ensure!(!data.is_empty() && data.len() <= u32::MAX as usize, "Scan data must be nonempty");
+        ensure!(data.len() <= self.profile.limit("memory_bytes"), "Scan data exceeds configured memory limit");
+        let mut body = Vec::with_capacity(10);
+        body.extend(pid.to_le_bytes());
+        body.push(value_type);
+        body.push(0u8); // ExactValue
+        body.extend((data.len() as u32).to_le_bytes());
+        let mut matches = Vec::new();
+        let mut truncated = false;
+        self.exchange_read(|debugger| {
+            debugger.packet(0xbdaa0009, &body)?;
+            debugger.status()?;
+            debugger.write(data)?;
+            debugger.status()?;
+            loop {
+                let address = qword(&debugger.read(8)?, 0);
+                if address == u64::MAX {
+                    break;
+                }
+                if matches.len() < max_matches {
+                    matches.push(format!("{address:#x}"));
+                } else {
+                    truncated = true;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(json!({
+            "pid": pid,
+            "value_type": value_type,
+            "compare_type": "exact",
+            "matches": matches,
+            "count": matches.len(),
+            "truncated": truncated,
+            "server_side": true,
+            "note": "CMD_PROC_SCAN over all readable maps; matches are value-width aligned, not byte-aligned",
+        }))
+    }
+
     pub fn require_qualified_debugger(&self, permission: &str) -> Result<()> {
         let qualification = self.profile.require(permission)?;
         let settings = &self.profile.data["debugger"];
@@ -807,6 +873,9 @@ pub mod fake {
         data["ports"]["debug"] = json!(port);
         data["permissions"]["debug_control"] = json!(true);
         data["permissions"]["process_write"] = json!(true);
+        data["permissions"]["kernel_read"] = json!(true);
+        data["permissions"]["kernel_write"] = json!(true);
+        data["permissions"]["process_inject"] = json!(true);
         data["jailbreak"]["installed_commit"] = json!("a".repeat(40));
         data["jailbreak"]["hen_build"] = json!("test-hen");
         data["debugger"]["expected_brand"] = json!("ps4debug-NG by Pharaoh2k v1.3.4");
@@ -816,7 +885,7 @@ pub mod fake {
         let profile = Profile::load(path).unwrap();
         let record = json!({
             "profile_sha256": profile.fingerprint(), "attestation": crate::config::ATTESTATION,
-            "approved_permissions": ["debug_control", "process_write"], "debugger_payload_sha256": "b".repeat(64),
+            "approved_permissions": ["debug_control", "process_write", "kernel_read", "kernel_write", "process_inject"], "debugger_payload_sha256": "b".repeat(64),
             "payload_sha256_allowlist": [], "build_recipe_sha256_allowlist": [],
         });
         std::fs::write(profile.qualification_path(), record.to_string()).unwrap();
@@ -841,7 +910,7 @@ pub mod fake {
     /// are consumed in order until one hits an enabled software breakpoint, an armed
     /// hardware watchpoint, or raises a fault signal; that step produces one stop
     /// event. A resume that exhausts the program produces no event (still running).
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub struct Fixture {
         pub pid: u32,
         pub thread_id: u32,
@@ -851,8 +920,26 @@ pub mod fake {
         pub program: Vec<FixtureStep>,
         /// Additional named maps `(start, end, protection bits, name)`.
         pub extra_maps: Vec<(u64, u64, u64, String)>,
-        /// Additional memory contents `(address, bytes)` (other modules, heap, stack).
+        /// Additional memory contents `(address, bytes)` (other modules, heap, stack, kernel image).
         pub extra_memory: Vec<(u64, Vec<u8>)>,
+        /// Kernel base reported by `0xbdcc0001` (CMD_KERNEL_BASE); defaults to 0x8000_0000.
+        pub kernel_base: u64,
+    }
+
+    impl Default for Fixture {
+        fn default() -> Self {
+            Self {
+                pid: 0,
+                thread_id: 0,
+                base: 0,
+                image: Vec::new(),
+                rip: 0,
+                program: Vec::new(),
+                extra_maps: Vec::new(),
+                extra_memory: Vec::new(),
+                kernel_base: 0x8000_0000,
+            }
+        }
     }
 
     /// One scripted instruction for [`Fixture::program`].
@@ -1044,6 +1131,7 @@ pub mod fake {
         gsbase: u64,
         overlay: BTreeMap<u64, u8>,
         maps: Vec<(u64, u64, u64, String)>,
+        kernel_base: u64,
         next_alloc: u64,
         fixture: Option<Fixture>,
         /// Enabled software breakpoints by slot.
@@ -1100,6 +1188,7 @@ pub mod fake {
             gsbase: 0,
             overlay: BTreeMap::new(),
             maps,
+            kernel_base: fixture.as_ref().map_or(0x8000_0000, |fixture| fixture.kernel_base),
             next_alloc: 0x9000_0000,
             fixture,
             breakpoints: BTreeMap::new(),
@@ -1180,6 +1269,109 @@ pub mod fake {
                                     guard.overlay.insert(address + i as u64, b);
                                 }
                                 success(&mut stream);
+                            }
+                            0xbdcc0001 => {
+                                success(&mut stream);
+                                let base = state.lock().unwrap().kernel_base;
+                                let _ = stream.write_all(&base.to_le_bytes());
+                            }
+                            0xbdcc0002 => {
+                                // Kernel read body has no pid: <Q address><I length>.
+                                let address = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                                let length = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let guard = state.lock().unwrap();
+                                let _ = stream.write_all(&fake_memory(address, length, &guard.overlay, guard.fixture.as_ref()));
+                            }
+                            0xbdcc0003 => {
+                                // Kernel write body has no pid: <Q address><I length>, then data, then status.
+                                let address = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                                let length = u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let mut data = vec![0u8; length];
+                                if stream.read_exact(&mut data).is_err() {
+                                    return;
+                                }
+                                let mut guard = state.lock().unwrap();
+                                for (i, b) in data.into_iter().enumerate() {
+                                    guard.overlay.insert(address + i as u64, b);
+                                }
+                                success(&mut stream);
+                            }
+                            0xbdaa0005 => {
+                                success(&mut stream);
+                                let _ = stream.write_all(&0x9000u64.to_le_bytes());
+                            }
+                            0xbdaa0006 => {
+                                // 68-byte body: pid, stub, rip, then six u64 args.
+                                // The resident ABI passes the RPC command as rdi (first arg).
+                                let command = u64::from_le_bytes(body[20..28].try_into().unwrap());
+                                let lifecycle = if command == 2 { 4u64 } else { 2u64 };
+                                success(&mut stream);
+                                let mut response = Vec::new();
+                                response.extend(71u32.to_le_bytes());
+                                response.extend(((0x4158_4553u64 << 32) | lifecycle).to_le_bytes());
+                                let _ = stream.write_all(&response);
+                            }
+                            0xbdaa0007 => {
+                                // CMD_PROC_ELF: ready status, ELF bytes, terminal status (no entry).
+                                let length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let mut elf = vec![0u8; length];
+                                if stream.read_exact(&mut elf).is_err() {
+                                    return;
+                                }
+                                success(&mut stream);
+                            }
+                            0xbdaa0009 => {
+                                // CMD_PROC_SCAN: {pid, valueType, compareType, lenData},
+                                // ready status, lenData bytes, second status, u64 matches, u64::MAX sentinel.
+                                let value_type = body[4];
+                                let compare_type = body[5];
+                                let length = u32::from_le_bytes(body[6..10].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let mut data = vec![0u8; length];
+                                if stream.read_exact(&mut data).is_err() {
+                                    return;
+                                }
+                                success(&mut stream);
+                                let guard = state.lock().unwrap();
+                                let element = match value_type {
+                                    2 | 3 => 2,
+                                    4 | 5 | 8 => 4,
+                                    6 | 7 | 9 => 8,
+                                    10 | 11 => length.max(1),
+                                    _ => 1,
+                                };
+                                if compare_type == 0 && element > 0 && length >= element {
+                                    for (start, end, protection, _) in &guard.maps {
+                                        if protection & 1 == 0 || end <= start {
+                                            continue;
+                                        }
+                                        let size = (end - start) as usize;
+                                        let content = fake_memory(*start, size, &guard.overlay, guard.fixture.as_ref());
+                                        let mut offset = 0usize;
+                                        while offset + element <= content.len() {
+                                            if content[offset..offset + element] == data[..element] {
+                                                let address = start + offset as u64;
+                                                let _ = stream.write_all(&address.to_le_bytes());
+                                            }
+                                            offset += element;
+                                        }
+                                    }
+                                }
+                                let _ = stream.write_all(&u64::MAX.to_le_bytes());
+                            }
+                            0xbdaa0010 => {
+                                // CMD_PROC_ELF_RPC: ready status, ELF bytes, terminal status + entry u64.
+                                let length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                                success(&mut stream);
+                                let mut elf = vec![0u8; length];
+                                if stream.read_exact(&mut elf).is_err() {
+                                    return;
+                                }
+                                success(&mut stream);
+                                let _ = stream.write_all(&0x9000u64.to_le_bytes());
                             }
                             0xbdaa0008 => {
                                 // Reproduce ps4debug-NG@8be828fe proc_protect_handle missing `return 0;`:

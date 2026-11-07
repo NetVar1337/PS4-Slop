@@ -146,7 +146,9 @@ integers above 2^53 in results are returned as hex strings.
   string, and wildcard byte targets), bidirectional runtime/static/module+offset
   address translation (`address_rebase`, which also reports the containing process
   map and falls back to a map-offset image-base estimate for addresses outside the
-  module list), and sectionless in-memory ELF64 reconstruction (`memory_elf_dump`).
+  module list), sectionless in-memory ELF64 reconstruction (`memory_elf_dump`),
+  server-side exact-value scans (`memory_scan_server` via `CMD_PROC_SCAN`), and
+  PID-by-name resolution (`process_find`).
   `memory_peek` avoids artifact creation
   for live views; `memory_region_dump` chunks larger readable ranges and preserves
   incomplete captures explicitly.
@@ -171,6 +173,19 @@ integers above 2^53 in results are returned as hex strings.
   memory (`memory_alloc`, `memory_free`, `memory_protect`) with readback
   verification. Kernel access is separately gated and is not kernel breakpoint
   debugging.
+- **Kernel (separately qualified):** `kernel_base`, `kernel_read`, `kernel_write`
+  (expected bytes + backup + readback, also requires `kernel_read`) and
+  `kernel_search` (bounded local wildcard-pattern scan over chunked
+  `CMD_KERNEL_READ` reads). All require the `kernel_read`/`kernel_write` profile
+  permissions, a matching qualification record, and the pinned debugger brand and
+  payload hash. The loopback fixture implements `BDCC0001/2/3` for offline tests.
+- **Resident payloads** ([internals.md](docs/features/internals.md)): hash-qualified
+  ELF staging through `CMD_PROC_ELF_RPC` (`payload_stage`/`_recover`/`_status`/
+  `_rpc`/`_shutdown`), one-shot `CMD_PROC_ELF` execution (`payload_run`),
+  fingerprint-pinned function calls (`process_call`), the shared runtime ABI
+  (`internals/runtime.hpp` + reference `internals/src/runtime.cpp`) and
+  fail-closed target verification (`internals/verify.hpp`) fed by
+  `project_export_offsets` and `project_export_target`.
 - **Research artifacts:** hashes, metadata sidecars, bounded chunk reads,
   module/RVA annotations, Ghidra handoff bundles, experiment ZIPs.
 - **Static analysis & Orbis OS (local, no console):** `artifact_info` parses ELF64
@@ -216,9 +231,14 @@ Reverse-engineering suite (each area documented in `docs/features/`):
   (shortest unique AOB, verified), `orbis_prototypes` (prototypes parsed from your SDK headers).
 - **Project & automation** ([project.md](docs/features/project.md)): per-game project index
   (`project_open`/`_record`/`_query`/`_summary`, artifacts auto-recorded while a project is
-  open), `recipe_list`/`recipe_run` (chained tool calls that still pass every permission
+  open), `project_export_offsets` (evidence annotations → generated `offsets.hpp` +
+  `ps4wb-offsets-v1` manifest with runtime verify fingerprints for `internals/verify.hpp`),
+  `recipe_list`/`recipe_run` (chained tool calls that still pass every permission
   check), and broker `analysis_apply_prototypes`/`_struct`/`_coverage`/`_classes`/`_symbols`
-  to push results into IDA/Ghidra/Binary Ninja/iaito.
+  to push results into IDA/Ghidra/Binary Ninja/iaito. The `ps4_workbench/ctl.py`
+  control plane (`python -m ps4_workbench.ctl`) drives a running broker: `status`,
+  `tools`, `call`, `preflight`, `stage`, `recover`, `payload-status`, `rpc`,
+  `features`, `shutdown`, `export-offsets`.
 
 Tools that resume the target (`debug_trace_*`, `debug_coverage`, `debug_find_accesses`,
 `debug_crash_triage`, `debug_run_script`) require the qualified `debug_control` permission,
@@ -307,6 +327,8 @@ ps4_workbench/       Python analysis-agent adapters (IDA/Ghidra/Binary Ninja/iai
 profiles/            Console profile; local qualification files are ignored
 examples/            MCP configs, manifest and evidence templates
 integrations/        IDA/Binary Ninja/iaito connection scripts; Ghidra Java/Python clients and annotations
+internals/           Shared payload headers: runtime ABI (runtime.hpp), fail-closed verify (verify.hpp)
+scripts/             setup-toolchain, setup-profile, qualify-local, start-broker (.sh/.ps1)
 docs/                Compatibility, qualification, development, protocol notes
 tests/               Python adapter tests against the real broker; tests/manual installed-app harnesses
 workspace/           Generated captures, logs, audit journal, projects (ignored)

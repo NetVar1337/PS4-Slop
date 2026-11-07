@@ -716,6 +716,49 @@
   "permission": "kernel_read"
  },
  {
+  "name": "kernel_search",
+  "description": "Kernel-space pattern search (hex bytes with ?? wildcards) over a bounded kernel range; local scan of chunked CMD_KERNEL_READ reads, never a kernel write. Requires explicit kernel-read qualification; kernel access is not kernel breakpoint debugging.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "address": {
+     "type": "string",
+     "description": "Unsigned kernel address, e.g. 0xffffffff80001000; string avoids JSON precision loss",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "length": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 1048576
+    },
+    "pattern": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "max_results": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 4096
+    }
+   },
+   "required": [
+    "address",
+    "length",
+    "pattern"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": "kernel_read"
+ },
+ {
   "name": "kernel_write",
   "description": "High-risk kernel write with expected bytes, backup and readback; requires kernel_read too.",
   "inputSchema": {
@@ -1815,6 +1858,73 @@
     "readOnlyHint": true,
     "destructiveHint": false,
     "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
+  },
+  {
+   "name": "memory_scan_server",
+   "description": "Server-side exact-value scan through CMD_PROC_SCAN (0xbdaa0009): the console scans every readable map of the process, stepping by the value width, and streams matching addresses (sentinel-terminated). value_type selects the element type; data_hex is the little-endian value or the exact byte array/string. Matches are value-width aligned. For byte-by-byte wildcard patterns use memory_search instead.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "pid": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2147483647
+     },
+     "value_type": {
+      "type": "string",
+      "enum": ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "float", "double", "bytes", "string"]
+     },
+     "data_hex": {
+      "type": "string",
+      "description": "Little-endian value or exact byte array/string to find",
+      "minLength": 2,
+      "maxLength": 8192
+     },
+     "max_results": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4096
+     }
+    },
+    "required": [
+     "pid",
+     "value_type",
+     "data_hex"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": false,
+    "openWorldHint": true
+   },
+   "permission": null
+  },
+  {
+   "name": "process_find",
+   "description": "Resolve process IDs by case-insensitive name substring from the live process list.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+     }
+    },
+    "required": [
+     "name"
+    ],
+    "additionalProperties": false
+   },
+   "annotations": {
+    "readOnlyHint": true,
+    "destructiveHint": false,
+    "idempotentHint": true,
     "openWorldHint": true
    },
    "permission": null

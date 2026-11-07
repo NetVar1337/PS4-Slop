@@ -366,14 +366,87 @@ impl Workbench {
     pub fn payload_shutdown(&mut self, pid: u32) -> Result<Value> {
         self.payload_rpc(pid, 2, 0, 0)
     }
+
+    /// One-shot ELF execution (CMD_PROC_ELF): the server spawns the raw image
+    /// entry. No target manifest or RPC symbol is required; the ELF is still
+    /// hash-qualified and audited. Never use this for resident RPC payloads.
+    pub fn payload_run(&mut self, pid: u32, payload: &str, sha256: &str) -> Result<Value> {
+        let qualification = self.profile.require("process_inject")?;
+        ensure!(self.debugger.attached_pid.is_none(), "Detach the active debugger before ELF execution");
+        let bytes = self.read_artifact(payload, self.profile.limit("transfer_bytes"))?;
+        require_hash(sha256, "sha256")?;
+        ensure!(digest(&bytes) == sha256, "Payload SHA-256 mismatch");
+        ensure!(bytes.len() >= 64 && bytes.starts_with(b"\x7fELF"), "Payload is not ELF64");
+        ensure!(bytes[4] == 2 && bytes[5] == 1 && bytes[6] == 1, "Payload must be little-endian ELF64 version 1");
+        ensure!(u16::from_le_bytes(bytes[16..18].try_into()?) == 3, "Payload must be ET_DYN");
+        ensure!(u16::from_le_bytes(bytes[18..20].try_into()?) == 62, "Payload must be x86-64");
+        ensure!(qualification["payload_sha256_allowlist"].as_array().is_some_and(|items| items.iter().any(|item| item.as_str() == Some(sha256))), "ELF is not in the hardware-qualified payload hash allowlist");
+        self.store.audit("payload_run_intent", json!({"pid":pid,"payload_sha256":sha256}))?;
+        let result = (|| -> Result<Value> {
+            self.debugger.load_elf(pid, &bytes)?;
+            Ok(json!({
+                "pid":pid,"payload_sha256":sha256,"payload_size":bytes.len(),
+                "server_spawned_entry":true,"automatic_retry":false,"hardware_compatibility_guaranteed":false,
+            }))
+        })();
+        self.audit_result("payload_run", &result)?;
+        result
+    }
+
+    /// Call a fingerprint-pinned function in the target process through the RPC
+    /// stub (CMD_PROC_CALL). The target manifest must contain a fingerprint at
+    /// exactly `address`; its expected bytes are re-verified before every call.
+    pub fn process_call(&mut self, pid: u32, target: &str, address: u64, arguments: Vec<u64>) -> Result<Value> {
+        self.profile.require("process_inject")?;
+        ensure!(address != 0, "Call address must be nonzero");
+        ensure!(arguments.len() <= 6, "At most six SysV arguments");
+        let target = Target::parse(serde_json::from_slice(&self.read_artifact(target, MAX_TARGET_BYTES)?)?)?;
+        target.verify_identity(&mut self.debugger, pid)?;
+        let fingerprint = target
+            .fingerprints
+            .iter()
+            .find(|(at, _)| *at == address)
+            .context("Target manifest must pin the call address with a fingerprint")?;
+        let actual = self.debugger.read_memory(pid, address, fingerprint.1.len(), false)?;
+        ensure!(actual == fingerprint.1, "Callee fingerprint mismatch at {address:#x}; refusing to call");
+        self.store.audit("process_call_intent", json!({
+            "pid":pid,"target":target.name,"address":format!("{address:#x}"),
+            "arguments":arguments.iter().map(|a|format!("{a:#x}")).collect::<Vec<_>>(),
+        }))?;
+        let stub = self.rpc_stub(pid)?;
+        let mut args = [0u64; 6];
+        args[..arguments.len()].copy_from_slice(&arguments);
+        let result = self.debugger.call_rpc(pid, stub, address, args);
+        self.audit_result("process_call", &result.as_ref().map(|rax| json!({"rax":format!("{rax:#x}")})).map_err(|error| anyhow::anyhow!(error.to_string())))?;
+        let rax = result?;
+        Ok(json!({
+            "pid":pid,"target":target.name,"address":format!("{address:#x}"),
+            "rax":format!("{rax:#x}"),"fingerprint_verified":true,"automatic_retry":false,
+        }))
+    }
 }
 
 pub fn dispatch(registry: &mut ToolRegistry, name: &str, args: &Value) -> Option<Result<Value>> {
-    if !matches!(name, "payload_stage" | "payload_recover" | "payload_status" | "payload_rpc" | "payload_shutdown") {
+    if !matches!(name, "payload_stage" | "payload_recover" | "payload_status" | "payload_rpc" | "payload_shutdown" | "payload_run" | "process_call") {
         return None;
     }
     Some((|| {
         match name {
+            "payload_run" => registry.workbench.payload_run(
+                crate::tools::number(args, "pid")? as u32,
+                crate::tools::string(args, "payload")?,
+                crate::tools::string(args, "sha256")?,
+            ),
+            "process_call" => registry.workbench.process_call(
+                crate::tools::number(args, "pid")? as u32,
+                crate::tools::string(args, "target")?,
+                address(&args["address"])?,
+                args["arguments"]
+                    .as_array()
+                    .map(|items| items.iter().map(address).collect::<Result<Vec<_>>>())
+                    .transpose()?
+                    .unwrap_or_default(),
+            ),
             "payload_stage" => registry.workbench.payload_stage(
                 crate::tools::number(args, "pid")? as u32,
                 crate::tools::string(args, "target")?,

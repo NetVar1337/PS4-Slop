@@ -73,5 +73,38 @@
     },
     "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
     "permission": "process_inject"
+  },
+  {
+    "name": "payload_run",
+    "description": "One-shot ELF execution through CMD_PROC_ELF: validates ELF64/ET_DYN/x86-64 and the hardware-qualified SHA-256 allowlist, then the server spawns the raw image entry. No target manifest or RPC symbol required. Never use for resident RPC payloads (use payload_stage).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "payload": {"type": "string", "maxLength": 1024, "description": "ELF artifact to execute"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Expected and hardware-qualified ELF SHA-256"}
+      },
+      "required": ["pid", "payload", "sha256"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "process_call",
+    "description": "Call a fingerprint-pinned function in the target process through the RPC stub (CMD_PROC_CALL, 68-byte body, six SysV u64 arguments). The ps4wb-internals-target-v1 manifest must contain a fingerprint at exactly the call address; its expected bytes are re-verified before every call. Identity is re-checked, every call is audited, and failures are never retried.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "target": {"type": "string", "maxLength": 1024, "description": "ps4wb-internals-target-v1 JSON artifact whose fingerprints pin the call address"},
+        "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Function address, pinned by a manifest fingerprint"},
+        "arguments": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"}, "description": "Up to six SysV u64 arguments (rdi,rsi,rdx,rcx,r8,r9)"}
+      },
+      "required": ["pid", "target", "address"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
   }
 ]

@@ -429,6 +429,118 @@
   "permission": null
  },
  {
+  "name": "project_export_offsets",
+  "description": "Export the active project's evidence annotations (annotation_save records) into a generated C++ offsets header plus a ps4wb-offsets-v1 JSON manifest: per-module namespaces, RVA constants with comments, and runtime verify fingerprints sliced from a recorded dump artifact of the same module when available. Fully local; emits two offsets artifacts.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Restrict the export to one recorded module hash",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "C++ namespace for the generated header; defaults to the project name slug",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "verify_bytes": {
+     "type": "integer",
+     "description": "Verify fingerprint length per offset, sliced from a recorded dump (default 16)",
+     "minimum": 1,
+     "maximum": 32
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_export_target",
+  "description": "Emit a ready-to-stage ps4wb-internals-target-v1 manifest from the active project: identity from project/module records, executable-text hash from the module record, and absolute-address fingerprints from annotations plus optional signature_sites (RVAs verified unique by signature_make). Fingerprint bytes come from the recorded dump of the same module; anything unproven is skipped, never fabricated.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Module to target; required when several modules have annotations",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "image_base": {
+     "type": "string",
+     "description": "Runtime module base for absolute fingerprints; defaults to the module record's base",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "process_name": {"type": "string", "maxLength": 256},
+    "process_path": {"type": "string", "maxLength": 1024},
+    "status_magic": {
+     "type": "string",
+     "description": "Payload status magic (default 0x5053494E 'PSIN')",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "verify_bytes": {
+     "type": "integer",
+     "description": "Fingerprint length per site (default 16, max 32)",
+     "minimum": 1,
+     "maximum": 32
+    },
+    "signature_sites": {
+     "type": "array",
+     "description": "RVAs verified unique by signature_make; each becomes an absolute-address fingerprint",
+     "maxItems": 64,
+     "items": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"}
+    },
+    "pointers": {
+     "type": "array",
+     "description": "Optional pointer checks: absolute address + expected uint64",
+     "maxItems": 64,
+     "items": {
+      "type": "object",
+      "properties": {
+       "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
+       "expected": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"}
+      },
+      "required": ["address", "expected"],
+      "additionalProperties": false
+     }
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
   "name": "recipe_list",
   "description": "List built-in recipes (bounded chains of tool calls) with their inputs, steps and whether every step tool is currently available.",
   "inputSchema": {

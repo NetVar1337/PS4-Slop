@@ -387,7 +387,84 @@ fn serve_console(mut stream: TcpStream, log: &CommandLog, state: &Mutex<ConsoleS
                 }
                 lock(state).elf_uploads += 1;
                 reply.extend(OK);
-                reply.extend(0x5000u64.to_le_bytes());
+                reply.extend(0x9000u64.to_le_bytes());
+            }
+            0xbdcc_0001 => {
+                reply.extend(OK);
+                reply.extend(0x8000_0000u64.to_le_bytes());
+            }
+            0xbdcc_0002 => {
+                let address = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                let length = u32::from_le_bytes(body[8..12].try_into().unwrap()) as u64;
+                reply.extend(OK);
+                reply.extend((address..address + length).map(|at| *lock(state).overlay.get(&at).unwrap_or(&0x4b)));
+            }
+            0xbdcc_0003 => {
+                let address = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                let mut data = vec![0u8; u32::from_le_bytes(body[8..12].try_into().unwrap()) as usize];
+                if stream.write_all(&OK).is_err() || stream.read_exact(&mut data).is_err() {
+                    return;
+                }
+                let mut state = lock(state);
+                if state.apply_writes {
+                    for (offset, byte) in data.into_iter().enumerate() {
+                        state.overlay.insert(address + offset as u64, byte);
+                    }
+                }
+                reply.extend(OK);
+            }
+            0xbdaa_0007 => {
+                let length = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+                if stream.write_all(&OK).is_err() {
+                    return;
+                }
+                let mut elf = vec![0u8; length];
+                if stream.read_exact(&mut elf).is_err() {
+                    return;
+                }
+                lock(state).elf_uploads += 1;
+                reply.extend(OK);
+            }
+            0xbdaa_0009 => {
+                let value_type = body[4];
+                let compare_type = body[5];
+                let length = u32::from_le_bytes(body[6..10].try_into().unwrap()) as usize;
+                if stream.write_all(&OK).is_err() {
+                    return;
+                }
+                let mut data = vec![0u8; length];
+                if stream.read_exact(&mut data).is_err() {
+                    return;
+                }
+                if stream.write_all(&OK).is_err() {
+                    return;
+                }
+                let element = match value_type {
+                    2 | 3 => 2,
+                    4 | 5 | 8 => 4,
+                    6 | 7 | 9 => 8,
+                    10 | 11 => length.max(1),
+                    _ => 1,
+                };
+                let state = lock(state);
+                if compare_type == 0 && element > 0 && length >= element {
+                    for (start, end, _, _) in &state.maps {
+                        let mut at = *start;
+                        while at + element as u64 <= *end {
+                            let matches = (0..element).all(|i| *state.overlay.get(&(at + i as u64)).unwrap_or(&0x41) == data[i]);
+                            if matches {
+                                if stream.write_all(&at.to_le_bytes()).is_err() {
+                                    return;
+                                }
+                            }
+                            at += element as u64;
+                        }
+                    }
+                }
+                if stream.write_all(&u64::MAX.to_le_bytes()).is_err() {
+                    return;
+                }
+                continue;
             }
             0xbdaa_0002 => {
                 let mut state = lock(state);
@@ -1906,7 +1983,9 @@ fn resident_payload_stages_controls_and_reuses_one_rpc_stub() {
     let (target, payload, sha256, signature) = internals_artifacts(&workbench);
     console.configure(|state| {
         for (index, byte) in signature.iter().enumerate() {
-            state.overlay.insert(0x5000 + index as u64, *byte);
+            // Seed outside the eboot text map (0x4000-0x8000): seeding inside it
+            // would change the executable-text SHA-256 that payload_stage verifies.
+            state.overlay.insert(0x9000 + index as u64, *byte);
         }
     });
     let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
@@ -2052,6 +2131,88 @@ fn kernel_write_two_statuses() {
     expected.extend(1u32.to_le_bytes());
     expected.extend(b"x");
     assert!(scripted.wait_sent(48 + 25).ends_with(&expected));
+}
+
+/// `kernel_write` then `kernel_search` through the full registry path against
+/// the FakeConsole kernel handlers (0xbdcc0001/2/3).
+#[test]
+fn kernel_write_and_search_through_registry() {
+    let console = FakeConsole::spawn();
+    let mut env = Env::new();
+    env.port("debug", console.port);
+    env.qualify(&["kernel_read", "kernel_write"], &[]);
+    let mut registry = env.registry();
+
+    let base = registry.call("kernel_base", json!({})).unwrap();
+    assert_eq!(base["kernel_base"], "0x80000000");
+
+    // FakeConsole kernel reads default to 0x4b; seed a pattern via kernel_write.
+    let written = registry.call("kernel_write", json!({
+        "address": "0x80000100", "hex_data": "488b05414141", "expected_hex": "4b4b4b4b4b4b",
+    })).unwrap();
+    assert_eq!(written["verified"], true);
+    assert_eq!(console.bodies(0xbdcc_0003).len(), 1);
+
+    let found = registry.call("kernel_search", json!({
+        "address": "0x80000000", "length": 0x200, "pattern": "48 8b ??", "max_results": 16,
+    })).unwrap();
+    assert_eq!(found["count"], 1, "{found}");
+    assert_eq!(found["matches"][0], "0x80000100");
+    assert_eq!(found["kernel"], true);
+    assert!(console.bodies(0xbdcc_0002).len() >= 2, "write expected-byte read + search reads");
+
+    // Without kernel_read approval the tool stays closed.
+    let mut plain = Env::new().registry();
+    assert!(plain.call("kernel_search", json!({"address": "0x0", "length": 16, "pattern": "48"}))
+        .unwrap_err().to_string().contains("disabled"));
+}
+
+/// `payload_run`, `process_call`, `memory_scan_server` and `process_find`
+/// through the full registry path against FakeConsole.
+#[test]
+fn payload_run_process_call_server_scan_and_process_find() {
+    let console = FakeConsole::spawn();
+    let mut env = Env::new();
+    env.port("debug", console.port);
+    let workbench = Workbench::new(env.profile()).unwrap();
+    let (target, payload, sha256, _signature) = internals_artifacts(&workbench);
+    let profile = env.qualify(&["process_inject"], &[sha256.clone()]);
+    let workbench = Workbench::new(profile).unwrap();
+    let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+
+    let run = registry.call("payload_run", json!({"pid":71,"payload":payload,"sha256":sha256})).unwrap();
+    assert_eq!(run["server_spawned_entry"], true);
+    assert_eq!(console.elf_uploads(), 1);
+
+    let called = registry.call("process_call", json!({"pid":71,"target":target,"address":"0x4000","arguments":["0x1","0x2"]})).unwrap();
+    assert_eq!(called["fingerprint_verified"], true);
+    let expected = (0x4158_4553u64 << 32) | 2;
+    assert_eq!(called["rax"], format!("{expected:#x}"));
+
+    let error = registry.call("process_call", json!({"pid":71,"target":target,"address":"0x5000"})).unwrap_err();
+    assert!(error.to_string().contains("fingerprint"), "{error}");
+
+    let scan = registry.call("memory_scan_server", json!({"pid":71,"value_type":"bytes","data_hex":"414141","max_results":4})).unwrap();
+    assert_eq!(scan["count"], 4);
+    assert_eq!(scan["matches"][0], "0x4000");
+    assert_eq!(scan["truncated"], true);
+    assert_eq!(scan["server_side"], true);
+
+    let found = registry.call("process_find", json!({"name":"SAMP"})).unwrap();
+    assert_eq!(found["count"], 1);
+    assert_eq!(found["matches"][0]["pid"], 71);
+    assert_eq!(registry.call("process_find", json!({"name":"zzz"})).unwrap()["count"], 0);
+
+    // A payload outside the allowlist is rejected before any byte is sent.
+    let mut env2 = Env::new();
+    env2.port("debug", console.port);
+    let wb2 = Workbench::new(env2.profile()).unwrap();
+    let (_t2, payload2, sha2, _s2) = internals_artifacts(&wb2);
+    let wb2 = Workbench::new(env2.qualify(&["process_inject"], &[])).unwrap();
+    let mut reg2 = ToolRegistry::with_toolset(wb2, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let err = reg2.call("payload_run", json!({"pid":71,"payload":payload2,"sha256":sha2})).unwrap_err();
+    assert!(err.to_string().contains("allowlist"), "{err}");
+    assert_eq!(console.elf_uploads(), 1);
 }
 
 /// `test_watchpoint_encoding`

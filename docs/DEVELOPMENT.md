@@ -40,6 +40,37 @@ list omits 14.00 at the research date; treat its runtime output as unsupported
 until independently ported/qualified. This workbench offers build/export plumbing,
 not a 14.00 port, compatible ELF loader, or unsafe BIN conversion.
 
+## Payload build toolchain and control plane (scripts/)
+
+`scripts/setup-toolchain.sh` (Linux/WSL) and `scripts/setup-toolchain.ps1`
+(Windows) install a working payload compiler without building LLVM from source:
+
+1. **OpenOrbis PS4 SDK** (headers, NID link stubs, `link.x`, `crt1.o`) from a
+   pinned release archive with a pinned SHA-256 — v0.5.3 `toolchain-llvm-18.2.zip`
+   on Windows (its nested tar.gz is handled), v0.5.4 `toolchain-llvm-18.tar.gz`
+   on Linux — into `~/.local/openorbis-ps4-toolchain`.
+2. **Vanilla LLVM clang/ld.lld** (`winget install LLVM.LLVM` on Windows,
+   `apt install clang lld` on Debian/Ubuntu); the scripts verify they exist.
+3. A **ps4-payload-sdk-style shim** at `~/.local/ps4-payload-sdk/bin/orbis-clang`
+   (`.cmd` on Windows) so `Injector-PS4`'s `make elf PS4_PAYLOAD_SDK=...` works
+   unchanged, and `orbis-clang++`.
+
+Verified end-to-end on the development PC by compiling and linking
+`Fortnite-PS4/src/payload.cpp` into an `ET_DYN` x86-64 ELF with an exported
+`payload_rpc_entry` (see [features/internals.md](features/internals.md)).
+Set `OO_PS4_TOOLCHAIN` to the SDK root; `sdk_status` reports it.
+
+- `scripts/setup-profile` copies `profiles/ps4-1400.json` to the ignored
+  `profiles/ps4-1400.local.json` and optionally sets the console host.
+- `scripts/qualify-local` runs `cargo test`, the Python suite and `validate`,
+  then invokes the real `qualify` CLI with your evidence/attestation/approvals.
+- `scripts/start-broker` starts the shared broker (default port 24600);
+  `python -m ps4_workbench.ctl` is the host control plane against it
+  (`status`, `tools`, `call`, `preflight`, `stage`, `recover`, `payload-status`,
+  `rpc`, `features`, `shutdown`, `export-offsets`).
+
+None of these scripts contacts the console by itself.
+
 ## Build recipes
 
 Each scaffold creates `workspace/projects/NAME/recipe.json`:

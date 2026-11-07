@@ -81,6 +81,10 @@ or more `--payload-sha256 ACTUAL_TESTED_BIN_HASH` options. For builds, supply
 `--approve build` and `--build-recipe-sha256 ACTUAL_REVIEWED_RECIPE_HASH`.
 For debugger mutations or kernel reads, pin exact branding and binary hash first.
 
+`scripts/qualify-local.sh` / `.ps1` runs the offline checks (`cargo test`, the
+Python suite, `validate`) first and then invokes this same `qualify` CLI with
+your arguments.
+
 Qualification saves a copy of the evidence and binds the entire profile hash,
 permissions and allowlists. It is **user attestation and risk acceptance**, not
 proof automatically established by this application. The local files are not

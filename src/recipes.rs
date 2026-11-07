@@ -65,6 +65,43 @@ pub const BUILTIN_RECIPES: &str = r#"[
   "steps": [
    {"tool": "debug_coverage", "arguments": {"module": "${module}"}},
    {"tool": "coverage_diff", "arguments": {"a": "${baseline}", "b": "${steps.0.coverage_artifact.path}"}}
+  ]},
+ {"format": "ps4wb-recipe-v1", "name": "offset_refresh",
+  "description": "After a game update: dump the new build, rebuild its ELF, diff against the previous annotated build, port annotations, and regenerate the offsets header/manifest.",
+  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
+             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"},
+             "old_artifact": {"type": "string", "required": true, "description": "Previously annotated build artifact"},
+             "annotations": {"type": "string", "required": true, "description": "Annotation artifact for the old build"},
+             "module_sha256": {"type": "string", "description": "Restrict the offsets export to one module hash"},
+             "namespace": {"type": "string", "description": "C++ namespace for the generated header"}},
+  "steps": [
+   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
+   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
+   {"tool": "binary_diff", "arguments": {"artifact_a": "${old_artifact}", "artifact_b": "${steps.1.artifact.path}"}},
+   {"tool": "annotation_port", "arguments": {"diff": "${steps.2.artifact}", "sources": ["${annotations}"], "artifact_a": "${old_artifact}", "artifact_b": "${steps.1.artifact.path}"}},
+   {"tool": "project_export_offsets", "arguments": {"module_sha256": "${module_sha256}", "namespace": "${namespace}"}}
+  ]},
+ {"format": "ps4wb-recipe-v1", "name": "stage_and_verify",
+  "description": "Stage a hash-qualified resident payload, read its lifecycle status, then set the feature bitmask.",
+  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
+             "target": {"type": "string", "required": true, "description": "ps4wb-internals-target-v1 artifact (project_export_target)"},
+             "payload": {"type": "string", "required": true, "description": "Resident payload ELF artifact"},
+             "sha256": {"type": "string", "required": true, "description": "Expected payload SHA-256"},
+             "features": {"type": "string", "default": "0x0", "description": "Feature bitmask for RPC command 1"}},
+  "steps": [
+   {"tool": "payload_stage", "arguments": {"pid": "${pid}", "target": "${target}", "payload": "${payload}", "sha256": "${sha256}"}},
+   {"tool": "payload_status", "arguments": {"pid": "${pid}"}},
+   {"tool": "payload_rpc", "arguments": {"pid": "${pid}", "command": 1, "argument": "${features}"}}
+  ]},
+ {"format": "ps4wb-recipe-v1", "name": "payload_crash_bundle",
+  "description": "Triage a fault of the attached process, capture Klog, and archive both into one experiment bundle for payload_recover analysis.",
+  "inputs": {"pid": {"type": "integer", "required": true, "description": "Attached target process id"},
+             "seconds": {"type": "integer", "default": 5, "description": "Klog capture duration"},
+             "notes": {"type": "string", "description": "Notes stored in the bundle"}},
+  "steps": [
+   {"tool": "debug_crash_triage", "arguments": {"wait": true}},
+   {"tool": "klog_capture", "arguments": {"seconds": "${seconds}"}},
+   {"tool": "experiment_bundle", "arguments": {"paths": ["${steps.0.@artifact}", "${steps.1.@artifact}"], "notes": "${notes}"}}
   ]}
 ]"#;
 

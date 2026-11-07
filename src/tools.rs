@@ -98,7 +98,7 @@ impl ToolRegistry {
                         tool["inputSchema"]["properties"]["length"]["maximum"] =
                             json!(workbench.profile.limit("memory_bytes").min(8192));
                     }
-                    Some("memory_read" | "memory_snapshot" | "memory_search" | "kernel_read") => {
+                    Some("memory_read" | "memory_snapshot" | "memory_search" | "kernel_read" | "kernel_search") => {
                         tool["inputSchema"]["properties"]["length"]["maximum"] =
                             json!(workbench.profile.limit("memory_bytes"));
                     }
@@ -330,6 +330,12 @@ impl ToolRegistry {
                 )
             }
             "kernel_base" => self.workbench.debugger.kernel_base(),
+            "kernel_search" => self.workbench.debugger.kernel_search(
+                address(&args["address"])?,
+                number(args, "length")? as usize,
+                string(args, "pattern")?,
+                args["max_results"].as_u64().unwrap_or(256) as usize,
+            ),
             "debug_attach" | "debug_detach" | "debug_control" | "debug_breakpoint"
             | "debug_watchpoint" => {
                 self.workbench.store.audit(
@@ -425,6 +431,34 @@ impl ToolRegistry {
                 string(args, "pattern")?,
                 args["max_results"].as_u64().unwrap_or(256) as usize,
             ),
+            "memory_scan_server" => {
+                let value_type = match string(args, "value_type")? {
+                    "u8" => 0u8, "i8" => 1, "u16" => 2, "i16" => 3, "u32" => 4, "i32" => 5,
+                    "u64" => 6, "i64" => 7, "float" => 8, "double" => 9, "bytes" => 10, "string" => 11,
+                    other => bail!("Unsupported value_type: {other}"),
+                };
+                let data = hex::decode(string(args, "data_hex")?)?;
+                ensure!(!data.is_empty(), "data_hex must be nonempty");
+                self.workbench.debugger.scan_process(
+                    number(args, "pid")? as u32,
+                    value_type,
+                    &data,
+                    args["max_results"].as_u64().unwrap_or(256) as usize,
+                )
+            }
+            "process_find" => {
+                let needle = string(args, "name")?.to_ascii_lowercase();
+                ensure!(!needle.is_empty(), "name must be nonempty");
+                let processes = self.workbench.debugger.processes()?;
+                let matches: Vec<Value> = processes
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|p| p["name"].as_str().unwrap_or("").to_ascii_lowercase().contains(&needle))
+                    .cloned()
+                    .collect();
+                Ok(json!({"name": args["name"], "matches": matches, "count": matches.len()}))
+            }
             "debug_label" => match string(args, "action")? {
                 "set" => self
                     .workbench

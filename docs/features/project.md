@@ -4,7 +4,7 @@ All three features are local-only: none of them talks to the console by itself.
 
 ## Per-game project index
 
-Tools (permission `null`): `project_open`, `project_record`, `project_query`, `project_summary`.
+Tools (permission `null`): `project_open`, `project_record`, `project_query`, `project_summary`, `project_export_offsets`, `project_export_target`.
 
 Storage is plain files under the artifact directory, with no SQLite or C dependency:
 
@@ -31,6 +31,36 @@ Storage is plain files under the artifact directory, with no SQLite or C depende
 - `project_summary` lists the modules and their hashes, then groups records into dumps, traces,
   coverage and annotations. It also returns findings, open questions, tag counts, artifact-kind
   counts and total bytes.
+
+### Offsets export for payloads
+
+`project_export_offsets` turns the active project's `annotation_save` records (each carries
+`module_sha256`, `rva`, `symbol`, `comment` and a bound evidence artifact) into two artifacts:
+
+- `offsets-<uuid>.hpp`: a generated C++ header with per-module namespaces, `inline constexpr`
+  RVA constants with comments, and `kVerifyChecks[]`/`kVerifyCheckCount` fingerprint tables for
+  `internals/verify.hpp` (`internals::verify_module`, fail-closed).
+- `offsets-<uuid>.json`: a `ps4wb-offsets-v1` manifest with the same offsets plus each offset's
+  `verify.hex` bytes when a recorded dump artifact of the same module covers that RVA
+  (`verify_bytes` selects the fingerprint length, default 16, max 32).
+
+Options: `project` (defaults to active), `module_sha256` (restrict to one build),
+`namespace` (defaults to the project-name slug). Verify bytes come from the newest recorded
+dump-like artifact (`elf`/`dump`/`memory`/`snapshot`/`core` kinds) for that module; without one,
+the check is omitted rather than fabricated. After a game update, re-run `binary_diff` +
+`annotation_port` and regenerate.
+
+### Target manifests for payload staging
+
+`project_export_target` emits a `ps4wb-internals-target-v1` artifact that
+`payload_stage` / `payload_recover` / `process_call` consume directly: identity
+from the project and module records, the module's executable-text hash, and
+absolute-address fingerprints built from annotations plus optional
+`signature_sites` (RVAs verified unique by `signature_make`). Fingerprint bytes
+are sliced from the recorded dump of the same module; sites without a dump are
+skipped with a reason. `image_base` (or the module record's `base`) makes RVAs
+absolute; `pointers` passes explicit pointer checks through. Requires the
+project to have a `title_id`. See [internals.md](internals.md).
 
 ### Automatic recording
 

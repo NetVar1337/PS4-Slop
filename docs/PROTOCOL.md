@@ -27,8 +27,21 @@ Implemented commands:
   `BDBB000E` thread TLS `fsbase`/`gsbase` read (16 bytes), `BDBB000F` thread TLS
   `fsbase`/`gsbase` write (with readback verification), `BDBB0010` halt/continue,
   `BDBB0012/13` step all/specific thread.
+- RPC / ELF: `BDAA0005` install RPC stub, `BDAA0006` call (68-byte body:
+  pid, stub, rip, six SysV u64 args; response is status + 12-byte pid/rax),
+  `BDAA0007` one-shot ELF (ready status, ELF bytes, terminal status; no entry),
+  `BDAA0010` ELF RPC (same exchange plus a final entry u64).
+- Scan: `BDAA0009` exact-value server-side scan (10-byte body: pid, valueType,
+  compareType=0, lenData; ready status, lenData bytes, second status, then one
+  u64 per match over all readable maps, terminated by a u64::MAX sentinel).
+  valueType 0-9 numeric, 10 byte array, 11 string; matches are value-width
+  aligned. All three families are implemented by the loopback fake for offline
+  tests (`BDAA0005/6/7/9/10`).
 - Kernel: `BDCC0001` base, `BDCC0002` read, `BDCC0003` write
   (ready and terminal statuses). Kernel tools require separate opt-in.
+  `kernel_search` scans a bounded kernel range locally through chunked `BDCC0002`
+  reads (never a write). The loopback fake implements all three commands for
+  offline tests (`fake::Fixture.kernel_base`, default `0x8000_0000`).
 
 Attach body is `<I pid>` followed by four network-order IPv4 address bytes.
 The local callback listens on the selected interface at fixed TCP 755 (verified
