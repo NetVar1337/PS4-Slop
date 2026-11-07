@@ -14,6 +14,11 @@ Then drive it:
     ... stage --pid 71 --target target.json --payload payload.elf --sha256 <64hex>
     ... rpc --pid 71 --command 1 --argument 5      # features bitmask
     ... payload-status --pid 71
+    ... config get --pid 71 --index 0
+    ... telemetry --pid 71 --index 0
+    ... watch --pid 71
+    ... update --game fortnite --pid 71          # or --game apex (full pipeline)
+    ... update --game apex --pid 71 --old-artifact old.elf --annotations ann.json
     ... export-offsets --module-sha256 <64hex> --namespace fortnite
 
 The payload RPC command numbers follow the shared ABI in
@@ -105,6 +110,22 @@ def build_parser():
     p.add_argument("--module-sha256", default=None)
     p.add_argument("--namespace", default=None)
     p.add_argument("--verify-bytes", type=int, default=None)
+
+    p = sub.add_parser("update", help="game-aware update pipeline: dump -> SDK -> offsets/target -> build -> next steps")
+    p.add_argument("--game", choices=["fortnite", "apex"], required=True)
+    p.add_argument("--pid", type=int, required=True)
+    p.add_argument("--module", default=None)
+    p.add_argument("--module-sha256", default=None)
+    p.add_argument("--namespace", default=None)
+    p.add_argument("--image-base", default=None)
+    p.add_argument("--signature-sites", nargs="*", default=None)
+    p.add_argument("--old-artifact", default=None, help="previous annotated build; with --annotations uses offset_refresh")
+    p.add_argument("--annotations", default=None)
+    p.add_argument("--payload-repo", default=None, help="payload repo for the build (default per game)")
+    p.add_argument("--payload", default=None, help="payload ELF path relative to the repo")
+    p.add_argument("--build-cmd", default="make", help="payload build command (default make)")
+    p.add_argument("--no-build", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="print the plan without any console calls")
     return parser
 
 
@@ -158,6 +179,8 @@ def run(argv, client_factory=BrokerClient):
                        argument2="0x0")
     elif args.command == "watch":
         result = _watch(client, args)
+    elif args.command == "update":
+        result = _update(client, args)
     elif args.command == "export-offsets":
         arguments = {}
         if args.project is not None:
@@ -173,6 +196,74 @@ def run(argv, client_factory=BrokerClient):
         raise WorkbenchError("unknown command")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
+
+
+GAMES = {
+    "fortnite": {"recipe": "unreal_pipeline", "repo": "../Fortnite-PS4", "payload": "payload.elf"},
+    "apex": {"recipe": "source_pipeline", "repo": "../Apex-PS4", "payload": "payload/payload.elf"},
+}
+
+
+def _update(client, args):
+    """Full update pipeline with a deliberate human qualification checkpoint."""
+    game = GAMES[args.game]
+    repo = args.payload_repo or game["repo"]
+    inputs = {"pid": args.pid}
+    for key, value in (("module", args.module), ("module_sha256", args.module_sha256),
+                       ("namespace", args.namespace), ("image_base", args.image_base),
+                       ("signature_sites", args.signature_sites)):
+        if value is not None:
+            inputs[key] = value
+
+    plan = {"game": args.game, "pipeline_recipe": game["recipe"], "inputs": inputs,
+            "payload_repo": repo, "build_cmd": None if args.no_build else args.build_cmd}
+    if args.old_artifact and args.annotations:
+        plan["update_recipe"] = "offset_refresh"
+        plan["update_inputs"] = {"pid": args.pid, "module": args.module,
+                                 "old_artifact": args.old_artifact, "annotations": args.annotations,
+                                 "module_sha256": args.module_sha256, "namespace": args.namespace}
+    if args.dry_run:
+        plan["dry_run"] = True
+        return plan
+
+    # 1. Fresh dump + engine SDK + offsets/target, or update-port from an older build.
+    if args.old_artifact and args.annotations:
+        update = _call(client, "recipe_run", recipe="offset_refresh", inputs=plan["update_inputs"])
+    else:
+        update = _call(client, "recipe_run", recipe=game["recipe"], inputs=inputs)
+
+    # 2. Build the payload locally; never through the console.
+    build = None
+    if not args.no_build:
+        import subprocess
+        proc = subprocess.run(args.build_cmd, cwd=repo, shell=True,
+                              capture_output=True, text=True, timeout=600)
+        build = {"command": args.build_cmd, "cwd": repo, "exit_code": proc.returncode,
+                 "stdout": proc.stdout[-2000:], "stderr": proc.stderr[-2000:]}
+        if proc.returncode != 0:
+            raise WorkbenchError(f"payload build failed in {repo}: {proc.stderr[-500:]}")
+
+    # 3. Hash the payload and print the human-checkpoint next steps.
+    import hashlib
+    from pathlib import Path
+    payload_file = Path(repo) / (args.payload or game["payload"])
+    if not payload_file.is_file():
+        raise WorkbenchError(f"payload not found: {payload_file}")
+    sha = hashlib.sha256(payload_file.read_bytes()).hexdigest()
+    next_steps = [
+        f"ps4-workbench --profile profiles/ps4-1400.local.json ingest {payload_file}",
+        "ps4-workbench --profile profiles/ps4-1400.local.json qualify --replace "
+        f"--evidence <your-tests.md> --attest I_TESTED_THIS_EXACT_CONFIGURATION "
+        f"--approve process_inject --payload-sha256 {sha}",
+        "python -m ps4_workbench.ctl ... call recipe_run "
+        + json.dumps({"recipe": "stage_and_verify",
+                      "inputs": {"pid": args.pid, "target": "<target artifact from update>",
+                                 "payload": "<ingested payload artifact>", "sha256": sha}}),
+    ]
+    return {"update": update, "build": build,
+            "payload": {"path": str(payload_file), "sha256": sha},
+            "next": next_steps,
+            "note": "Qualification is a human checkpoint: test on hardware, then run these yourself."}
 
 
 def _watch(client, args):

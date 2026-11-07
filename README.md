@@ -229,6 +229,10 @@ Reverse-engineering suite (each area documented in `docs/features/`):
   `artifact_cfg` (blocks artifacts feed `debug_coverage`), `artifact_callgraph`,
   `binary_diff` + `annotation_port` (carry research across game updates), `signature_make`
   (shortest unique AOB, verified), `orbis_prototypes` (prototypes parsed from your SDK headers).
+- **Offset scanning** ([offsetscan.md](docs/features/offsetscan.md)): `offset_scan`
+  (verify offsets live, relocate moved signatures) and `module_integrity`
+  (dump-vs-disk executable-text diff). `engine_sdk_export` turns `unreal_dump` /
+  `source_dump` results into payload SDK headers (ue4::Offsets, netvars).
 - **Project & automation** ([project.md](docs/features/project.md)): per-game project index
   (`project_open`/`_record`/`_query`/`_summary`, artifacts auto-recorded while a project is
   open), `project_export_offsets` (evidence annotations → generated `offsets.hpp` +
@@ -238,7 +242,12 @@ Reverse-engineering suite (each area documented in `docs/features/`):
   to push results into IDA/Ghidra/Binary Ninja/iaito. The `ps4_workbench/ctl.py`
   control plane (`python -m ps4_workbench.ctl`) drives a running broker: `status`,
   `tools`, `call`, `preflight`, `stage`, `recover`, `payload-status`, `rpc`,
-  `features`, `shutdown`, `export-offsets`.
+  `features`, `shutdown`, `export-offsets`. `update --game fortnite|apex` runs the
+  full update loop (pipeline recipe or `offset_refresh`, local payload build,
+  hash, printed qualification/staging commands; qualification stays a human
+  checkpoint). Built-in recipes include `deep_dump`, `unreal_pipeline` /
+  `source_pipeline` (game-aware SDK + offsets + target), `offset_refresh`,
+  `stage_and_verify` and `payload_crash_bundle`.
 
 Tools that resume the target (`debug_trace_*`, `debug_coverage`, `debug_find_accesses`,
 `debug_crash_triage`, `debug_run_script`) require the qualified `debug_control` permission,

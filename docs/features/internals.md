@@ -86,6 +86,25 @@ When the game updates, the payload hash changes by design:
 4. On a fault, `payload_crash_bundle` captures triage + Klog into one experiment
    bundle; `payload_recover` re-finds the resident RPC entry without re-uploading.
 
+### Full pipelines per game
+
+- `recipe_run` `unreal_pipeline` (Fortnite): dump → `elf_rebuild` →
+  `unreal_dump` → `engine_sdk_export` (ue4::Offsets header) →
+  `project_export_offsets` → `project_export_target`.
+- `recipe_run` `source_pipeline` (Apex Legends): dump → `elf_rebuild` →
+  `source_dump` → `engine_sdk_export` (netvar/datamap header) →
+  `project_export_offsets` → `project_export_target`.
+- `recipe_run` `deep_dump`: dump → `elf_rebuild` → functions → RTTI →
+  Orbis import prototypes, one full RE pass.
+- `offset_scan` ([offsetscan.md](offsetscan.md)) verifies offsets live and
+  relocates moved signatures; `module_integrity` diffs dump vs disk.
+
+`python -m ps4_workbench.ctl update --game fortnite|apex --pid N` runs the whole
+loop: the pipeline recipe (or `offset_refresh` with `--old-artifact` +
+`--annotations`), builds the payload locally, hashes it, and prints the exact
+`ingest` / `qualify --replace` / `stage_and_verify` commands. Qualification
+stays a human checkpoint; `--dry-run` prints the plan without any console calls.
+
 The new code paths are covered by offline fixture and synthetic-binary tests
 only; hardware qualification is your own recorded testing, not a compatibility
 guarantee.

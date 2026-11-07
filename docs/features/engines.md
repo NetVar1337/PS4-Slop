@@ -1,10 +1,26 @@
 # Engine & metadata recovery
 
 Five read-only tools (permission `null`) that recover runtime metadata from
-offline artifacts or live process memory. Code: `src/engines.rs` (dispatch),
+offline artifacts or live process memory, plus `engine_sdk_export`, which turns
+the recovered metadata into payload SDK headers. Code: `src/engines.rs` (dispatch),
 `src/bytesource.rs` (shared byte source), `src/il2cpp.rs`, `src/unreal.rs`,
 `src/rtti.rs`, `src/yara.rs`, `src/cryptoscan.rs`; schemas in
 `src/catalog/engines.json`.
+
+## SDK export
+
+`engine_sdk_export` takes one of `unreal` (a `ps4wb-unreal-v1` artifact) or
+`source` (a `ps4wb-source-v1` artifact) and emits a C++ header artifact:
+
+- `unreal` → `ue4::Offsets` for `Fortnite-PS4/src/ue4.hpp`: dump-proven
+  GObjects/GNames RVAs plus the layout proven by `unreal.rs` itself
+  (`TUObjectArray` NumElements @ +0xC, FNamePool Blocks @ +0x8, entry stride 2,
+  block shift 16, header Len = value >> 6, chunked-object-array support).
+- `source` → per-class `inline constexpr std::ptrdiff_t` constants from
+  `recv_tables[].props` and `datamaps[].fields` (Apex/Respawn netvars).
+
+Both are offline and read-only; unknown fields stay zero (unavailable) with
+notes, never fabricated.
 
 ## Targets and bounds
 

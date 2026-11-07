@@ -1,0 +1,51 @@
+[
+ {
+  "name": "offset_scan",
+  "description": "Verify offsets against the live target and relocate moved signatures: exact fingerprints from a ps4wb-offsets-v1 manifest, and wildcard signatures at their expected RVA. A signature that no longer matches is searched through the module's executable maps: exactly one hit = relocated, none = missing, several = ambiguous.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "module": {"type": "string", "maxLength": 256, "description": "Module name (default eboot.bin)"},
+    "image_base": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Optional module base override; otherwise derived from maps"},
+    "offsets": {"type": "string", "maxLength": 1024, "description": "ps4wb-offsets-v1 artifact from project_export_offsets"},
+    "signatures": {
+     "type": "array",
+     "maxItems": 256,
+     "items": {
+      "type": "object",
+      "properties": {
+       "symbol": {"type": "string", "maxLength": 128},
+       "rva": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"},
+       "pattern": {"type": "string", "minLength": 1, "maxLength": 1024, "description": "Hex bytes with ?? wildcards"}
+      },
+      "required": ["rva", "pattern"],
+      "additionalProperties": false
+     }
+    },
+    "relocate": {"type": "boolean", "description": "Search the module for moved signatures (default true)"},
+    "max_matches": {"type": "integer", "minimum": 1, "maximum": 64, "description": "Relocation match cap per signature (default 4)"}
+   },
+   "required": ["pid"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
+  "permission": null
+ },
+ {
+  "name": "module_integrity",
+  "description": "Diff an in-memory ELF dump against the on-disk ELF: changed executable-text ranges with expected/actual bytes (runtime hooks/patches), unmapped bytes and totals. dump must be an ELF (run elf_rebuild first for raw memory dumps).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "dump": {"type": "string", "maxLength": 1024, "description": "In-memory ELF dump artifact"},
+    "disk": {"type": "string", "maxLength": 1024, "description": "On-disk ELF artifact"},
+    "max_ranges": {"type": "integer", "minimum": 1, "maximum": 1024, "description": "Changed-range cap (default 64)"}
+   },
+   "required": ["dump", "disk"],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+  "permission": null
+ }
+]

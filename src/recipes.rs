@@ -102,6 +102,49 @@ pub const BUILTIN_RECIPES: &str = r#"[
    {"tool": "debug_crash_triage", "arguments": {"wait": true}},
    {"tool": "klog_capture", "arguments": {"seconds": "${seconds}"}},
    {"tool": "experiment_bundle", "arguments": {"paths": ["${steps.0.@artifact}", "${steps.1.@artifact}"], "notes": "${notes}"}}
+  ]},
+ {"format": "ps4wb-recipe-v1", "name": "deep_dump",
+  "description": "Full module RE dump: in-memory ELF dump, rebuilt ELF with sections/NID names, function discovery, RTTI classes and Orbis import prototypes in one pass.",
+  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
+             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"}},
+  "steps": [
+   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
+   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
+   {"tool": "artifact_functions", "arguments": {"artifact": "${steps.1.artifact.path}"}},
+   {"tool": "rtti_recover", "arguments": {"artifact": "${steps.1.artifact.path}"}},
+   {"tool": "orbis_prototypes", "arguments": {"action": "imports", "artifact": "${steps.1.artifact.path}", "use_sdk": true}}
+  ]},
+ {"format": "ps4wb-recipe-v1", "name": "unreal_pipeline",
+  "description": "UE4 game (e.g. Fortnite): dump the loaded module, rebuild the ELF, recover GNames/GObjects, export the ue4::Offsets SDK header, then regenerate offsets and a stage-ready target manifest.",
+  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
+             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"},
+             "module_sha256": {"type": "string", "description": "Restrict exports to one module hash"},
+             "namespace": {"type": "string", "description": "C++ namespace for generated headers"},
+             "image_base": {"type": "string", "description": "Runtime module base for the target manifest"},
+             "signature_sites": {"type": "array", "description": "Optional RVAs verified unique by signature_make"}},
+  "steps": [
+   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
+   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
+   {"tool": "unreal_dump", "arguments": {"artifact": "${steps.1.artifact.path}", "sdk": true}},
+   {"tool": "engine_sdk_export", "arguments": {"unreal": "${steps.2.json.path}", "namespace": "${namespace}"}},
+   {"tool": "project_export_offsets", "arguments": {"module_sha256": "${module_sha256}", "namespace": "${namespace}"}},
+   {"tool": "project_export_target", "arguments": {"module_sha256": "${module_sha256}", "image_base": "${image_base}", "signature_sites": "${signature_sites}"}}
+  ]},
+ {"format": "ps4wb-recipe-v1", "name": "source_pipeline",
+  "description": "Source/Respawn game (e.g. Apex Legends): dump the loaded module, rebuild the ELF, recover netvars/datamaps, export the netvar SDK header, then regenerate offsets and a stage-ready target manifest.",
+  "inputs": {"pid": {"type": "integer", "required": true, "description": "Target process id"},
+             "module": {"type": "string", "description": "Module name; defaults to eboot.bin"},
+             "module_sha256": {"type": "string", "description": "Restrict exports to one module hash"},
+             "namespace": {"type": "string", "description": "C++ namespace for generated headers"},
+             "image_base": {"type": "string", "description": "Runtime module base for the target manifest"},
+             "signature_sites": {"type": "array", "description": "Optional RVAs verified unique by signature_make"}},
+  "steps": [
+   {"tool": "memory_elf_dump", "arguments": {"pid": "${pid}", "module": "${module}"}},
+   {"tool": "elf_rebuild", "arguments": {"artifact": "${steps.0.artifact.path}"}},
+   {"tool": "source_dump", "arguments": {"artifact": "${steps.1.artifact.path}"}},
+   {"tool": "engine_sdk_export", "arguments": {"source": "${steps.2.artifact.path}", "namespace": "${namespace}"}},
+   {"tool": "project_export_offsets", "arguments": {"module_sha256": "${module_sha256}", "namespace": "${namespace}"}},
+   {"tool": "project_export_target", "arguments": {"module_sha256": "${module_sha256}", "image_base": "${image_base}", "signature_sites": "${signature_sites}"}}
   ]}
 ]"#;
 

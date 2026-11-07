@@ -3,6 +3,7 @@
 pub mod config;
 pub mod jailbreak;
 pub mod internals;
+pub mod offsetscan;
 pub mod artifacts;
 pub mod analysis;
 pub mod development;

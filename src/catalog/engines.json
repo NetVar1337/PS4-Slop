@@ -681,5 +681,22 @@
    "openWorldHint": true
   },
   "permission": null
+ },
+ {
+  "name": "engine_sdk_export",
+  "description": "Export engine-specific SDK headers from engine dump artifacts: unreal (ps4wb-unreal-v1) generates ue4::Offsets for the payload's ue4.hpp (dump-proven RVAs plus the PS4-proven FNamePool layout), source (ps4wb-source-v1) generates per-class netvar/datamap offset constants.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "unreal": {"type": "string", "maxLength": 1024, "description": "unreal_dump JSON artifact"},
+    "source": {"type": "string", "maxLength": 1024, "description": "source_dump JSON artifact"},
+    "namespace": {"type": "string", "maxLength": 64, "description": "C++ namespace (default game)"},
+    "max_objects": {"type": "integer", "minimum": 1, "maximum": 1048576, "description": "UE4 iteration cap (default 65536)"}
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {"readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false},
+  "permission": null
  }
 ]

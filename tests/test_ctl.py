@@ -71,6 +71,20 @@ class CtlTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("sha256", err)
 
+    def test_update_dry_run_plans_both_games(self):
+        code, out, err = self.run_ctl("update", "--game", "fortnite", "--pid", "71", "--dry-run")
+        self.assertEqual(code, 0, err)
+        plan = json.loads(out)
+        self.assertEqual(plan["pipeline_recipe"], "unreal_pipeline")
+        self.assertTrue(plan["dry_run"])
+
+        code, out, err = self.run_ctl("update", "--game", "apex", "--pid", "71",
+                                      "--old-artifact", "old.elf", "--annotations", "ann.json", "--dry-run")
+        self.assertEqual(code, 0, err)
+        plan = json.loads(out)
+        self.assertEqual(plan["update_recipe"], "offset_refresh")
+        self.assertEqual(plan["update_inputs"]["old_artifact"], "old.elf")
+
 
 if __name__ == "__main__":
     unittest.main()
