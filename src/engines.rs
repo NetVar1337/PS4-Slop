@@ -72,7 +72,7 @@ fn unreal_sdk(workbench: &Workbench, path: &str, ns: &str, max_objects: u64) -> 
     let object_name = doc["offsets"]["object_name"].as_u64().context("Missing object_name")?;
     let max_names = if names_kind == "FNamePool" { 1u64 << 29 } else { gnames["num_elements"].as_u64().context("Missing name count")? };
     let mut header = format!(
-        "// Generated from {path}; layout {layout}, names {names_kind}.\n#pragma once\n#include <internals/ue4.hpp>\nnamespace {ns} {{\ninline ue4::Offsets make_ue4_offsets() {{\n    ue4::Offsets o;\n    o.gobjects = {root:#x};\n    o.objects_pointer = {slot:#x};\n    o.num_elements = {num:#x};\n    o.max_elements = {max:#x};\n    o.object_stride = {item_size};\n    o.object_name_index = {object_name:#x};\n    o.gnames = {names:#x};\n    o.blocks_pointer = 0; // GNames address is the inline Blocks array\n    o.names_kind = ue4::NamesKind::{kind};\n    o.name_array_indirect = {indirect};\n    o.name_entry_string = {string_offset};\n    o.max_objects = {max_objects};\n    o.max_names = {max_names};\n    o.chunked = {chunked};\n    return o;\n}}\ninline const ue4::Offsets kUe4Offsets = make_ue4_offsets();\n}}\n",
+        "// Generated from {path}; layout {layout}, names {names_kind}.\n#pragma once\n#include <internals/ue4.hpp>\nnamespace {ns} {{\ninline constexpr ue4::Offsets make_ue4_offsets() {{\n    ue4::Offsets o;\n    o.gobjects = {root:#x};\n    o.objects_pointer = {slot:#x};\n    o.num_elements = {num:#x};\n    o.max_elements = {max:#x};\n    o.object_stride = {item_size};\n    o.object_name_index = {object_name:#x};\n    o.gnames = {names:#x};\n    o.blocks_pointer = 0; // GNames address is the inline Blocks array\n    o.names_kind = ue4::NamesKind::{kind};\n    o.name_array_indirect = {indirect};\n    o.name_entry_string = {string_offset};\n    o.max_objects = {max_objects};\n    o.max_names = {max_names};\n    o.chunked = {chunked};\n    return o;\n}}\ninline constexpr ue4::Offsets kUe4Offsets = make_ue4_offsets();\n}}\n",
         num = slot + if chunked { 0x14 } else { 0xc },
         max = slot + if chunked { 0x10 } else { 0x8 },
     );
@@ -221,6 +221,8 @@ mod tests {
         assert!(hpp.contains("o.object_name_index = 0x8;"), "{hpp}");
         assert!(hpp.contains("o.chunked = true;"), "{hpp}");
         assert!(hpp.contains("namespace fortnite"), "{hpp}");
+        assert!(hpp.contains("inline constexpr ue4::Offsets make_ue4_offsets()"), "{hpp}");
+        assert!(hpp.contains("inline constexpr ue4::Offsets kUe4Offsets = make_ue4_offsets();"), "{hpp}");
 
         let out = registry.call("engine_sdk_export", json!({"source": sa["path"], "namespace": "apex"})).unwrap();
         assert_eq!(out["kind"], "source");
