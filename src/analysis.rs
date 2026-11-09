@@ -1,6 +1,6 @@
 //! Local, offline analysis over contained artifacts.
 //!
-//! Native port of the network-free parts of `ps4_workbench/analysis.py`.
+//! Native port of the network-free parts of `ps4_mcp/analysis.py`.
 //! Debugger round-trips (process info, maps, memory reads) stay with the
 //! caller; `snapshot_record` and `correlate_maps` take their results.
 

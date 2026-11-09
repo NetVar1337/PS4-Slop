@@ -1,6 +1,6 @@
-"""Control-plane CLI (ps4_workbench/ctl.py) against the real native broker.
+"""Control-plane CLI (ps4_mcp/ctl.py) against the real native broker.
 
-Build the binary first (``cargo build --locked``); set PS4_WORKBENCH_BIN to override.
+Build the binary first (``cargo build --locked``); set PS4_MCP_BIN to override.
 """
 import contextlib
 import io
@@ -11,7 +11,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from ps4_workbench import ctl
+from ps4_mcp import ctl
 from tests.test_adapters import RustBroker
 
 
@@ -109,7 +109,7 @@ class CtlTests(unittest.TestCase):
             repo, sha = self.rpc_fixture(repo)
             path = str(Path(repo) / "profile.json")
             args = SimpleNamespace(pid=71, project_dir=repo, path=path, features=None)
-            with patch("ps4_workbench.ctl._call", side_effect=lambda client, name, **kw: {"raw": "0x5" if kw["command"] == 6 else kw["argument"]}):
+            with patch("ps4_mcp.ctl._call", side_effect=lambda client, name, **kw: {"raw": "0x5" if kw["command"] == 6 else kw["argument"]}):
                 saved = ctl._profile_save(None, args)
             self.assertEqual(saved["features"], "0x5")
             self.assertEqual(saved["config_words"], 32)
@@ -130,7 +130,7 @@ class CtlTests(unittest.TestCase):
                     state["features"] = int(kw["argument"], 0)
                     return {"raw": "0x0"}
                 raise AssertionError(command)
-            with patch("ps4_workbench.ctl._call", side_effect=rpc):
+            with patch("ps4_mcp.ctl._call", side_effect=rpc):
                 loaded = ctl._profile_load(None, args)
             self.assertTrue(loaded["mirror_confirmed"])
             self.assertEqual(len(writes), 32)
@@ -139,7 +139,7 @@ class CtlTests(unittest.TestCase):
             body = json.loads(Path(path).read_text())
             body["module_sha256"] = "b" * 64
             Path(path).write_text(json.dumps(body))
-            with patch("ps4_workbench.ctl._call") as call:
+            with patch("ps4_mcp.ctl._call") as call:
                 with self.assertRaisesRegex(Exception, "another module"):
                     ctl._profile_load(None, args)
                 call.assert_not_called()
@@ -154,7 +154,7 @@ class CtlTests(unittest.TestCase):
                 if name == "payload_status":
                     return {"heartbeat": 7}
                 return {"raw": "0x0"}
-            with patch("ps4_workbench.ctl._call", side_effect=rpc), contextlib.redirect_stdout(io.StringIO()):
+            with patch("ps4_mcp.ctl._call", side_effect=rpc), contextlib.redirect_stdout(io.StringIO()):
                 ctl._watch(None, args)
             self.assertEqual(sum(name == "payload_rpc" and kw["command"] == 1 for name, kw in calls), 1)
 

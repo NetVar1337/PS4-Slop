@@ -50,7 +50,7 @@ import ghidra.program.model.symbol.Symbol;
 import ghidra.program.model.symbol.SymbolIterator;
 import ghidra.util.task.TaskMonitor;
 
-public class PS4Workbench extends GhidraScript {
+public class PS4Mcp extends GhidraScript {
     private Broker broker;
 
     private static class Broker implements AutoCloseable {
@@ -514,7 +514,7 @@ public class PS4Workbench extends GhidraScript {
             serveAgent(options.length > 3 && "--once".equals(options[3]));
             return;
         }
-        String action = askChoice("PS4 Workbench", "Choose explicit operation", List.of(
+        String action = askChoice("PS4-MCP", "Choose explicit operation", List.of(
             "Serve static-analysis MCP agent", "Session status", "List PS4 processes", "Peek runtime memory",
             "Refresh local static shadow", "Extract PS4 file", "Send qualified BIN payload",
             "Attach process", "Detach process", "List threads", "Read registers", "Halt", "Resume", "Step thread"), "Session status");

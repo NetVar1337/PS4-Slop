@@ -3,7 +3,7 @@
 //! `test_*` names in doc comments are the original test names). Every console
 //! service is an in-process loopback fake; nothing here contacts real hardware.
 
-use ps4_workbench_rs::{
+use ps4_mcp::{
     agents::{AnalysisAgents, AnalysisWorker},
     broker::{BrokerServer, SessionHub, load_token},
     client::{BrokerClient, RemoteRegistry},
@@ -87,7 +87,7 @@ impl Env {
     }
 
     fn registry(&self) -> ToolRegistry {
-        ToolRegistry::with_toolset(self.workbench(), ps4_workbench_rs::tools::Toolset::Full).unwrap()
+        ToolRegistry::with_toolset(self.workbench(), ps4_mcp::tools::Toolset::Full).unwrap()
     }
 
     /// Python `WorkbenchCase.qualify`.
@@ -777,7 +777,7 @@ impl Broker {
         let profile = env.qualify(&["debug_control", "process_write"], &[]);
     let hub = Arc::new(SessionHub::from_registry(ToolRegistry::with_toolset(
         Workbench::new(profile).unwrap(),
-        ps4_workbench_rs::tools::Toolset::Full,
+        ps4_mcp::tools::Toolset::Full,
     ).unwrap()));
         let token_path = env.dir.path().join("broker-token.local");
         let token = load_token(&token_path, true).unwrap();
@@ -844,7 +844,7 @@ fn mock_broker(handler: impl Fn(&Value) -> Value + Send + Sync + 'static) -> u16
 // Subprocess helpers (MCP stdio and CLI)
 // ---------------------------------------------------------------------------
 
-const BINARY: &str = env!("CARGO_BIN_EXE_ps4-workbench");
+const BINARY: &str = env!("CARGO_BIN_EXE_ps4-mcp");
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"tests","version":"1"}}}"#;
 const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 
@@ -1049,7 +1049,7 @@ fn attach_failure_retains_lease_until_explicit_release() {
     let profile = env.qualify(&["debug_control"], &[]);
     let hub = SessionHub::from_registry(ToolRegistry::with_toolset(
         Workbench::new(profile).unwrap(),
-        ps4_workbench_rs::tools::Toolset::Full,
+        ps4_mcp::tools::Toolset::Full,
     ).unwrap());
     assert!(hub.call("ida", "debug_attach", json!({"pid": 71, "listen_address": "127.0.0.1"})).is_err());
     assert_eq!(hub.state()["controller"], "ida");
@@ -1966,7 +1966,7 @@ fn elf_rpc_consumes_ready_upload_final_status_and_entry() {
 }
 
 fn internals_artifacts(workbench: &Workbench) -> (String, String, String, Vec<u8>) {
-    let mut builder = ps4_workbench_rs::binimage::testelf::Builder::new(0);
+    let mut builder = ps4_mcp::binimage::testelf::Builder::new(0);
     builder.text = (0u8..64).collect();
     builder.symbols.push(("payload_rpc_entry".into(), builder.text_va(), 64));
     let elf = builder.build();
@@ -2000,7 +2000,7 @@ fn resident_payload_stages_controls_and_reuses_one_rpc_stub() {
     });
     let profile = env.qualify(&["process_inject"], std::slice::from_ref(&sha256));
     let workbench = Workbench::new(profile).unwrap();
-    let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let mut registry = ToolRegistry::with_toolset(workbench, ps4_mcp::tools::Toolset::Full).unwrap();
     let staged = registry.call("payload_stage", json!({"pid":71,"target":target,"payload":payload,"sha256":sha256})).unwrap();
     assert_eq!(staged["status"]["lifecycle_name"], "ready");
     assert_eq!(staged["raw_entry_called"], false);
@@ -2028,7 +2028,7 @@ fn immediate_resident_staging_negotiates_and_blocks_mismatched_controls() {
         for (i,b) in signature.iter().enumerate(){state.overlay.insert(0x9000+i as u64,*b);}
     });
     let profile=env.qualify(&["process_inject"],std::slice::from_ref(&sha));
-    let mut registry=ToolRegistry::with_toolset(Workbench::new(profile).unwrap(),ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let mut registry=ToolRegistry::with_toolset(Workbench::new(profile).unwrap(),ps4_mcp::tools::Toolset::Full).unwrap();
     let staged=registry.call("payload_stage",json!({"pid":71,"target":target,"payload":payload,"sha256":sha})).unwrap();
     assert_eq!(staged["staging"],"immediate");assert_eq!(staged["status"]["lifecycle"],2);
     assert_eq!(console.elf_uploads(),1);
@@ -2043,7 +2043,7 @@ fn immediate_resident_staging_negotiates_and_blocks_mismatched_controls() {
 #[test]
 fn headerless_module_capture_binds_and_exports_a_stage_target() {
     let console=FakeConsole::spawn();let mut env=Env::new();env.port("debug",console.port);
-    let mut registry=ToolRegistry::with_toolset(Workbench::new(env.profile()).unwrap(),ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let mut registry=ToolRegistry::with_toolset(Workbench::new(env.profile()).unwrap(),ps4_mcp::tools::Toolset::Full).unwrap();
     registry.call("project_open",json!({"title_id":"CUSA12552","app_version":"01.00","name":"Headerless fixture"})).unwrap();
     let captured=registry.call("module_capture",json!({"pid":71})).unwrap();
     assert_eq!(captured["original_elf_headers_available"],false);
@@ -2073,7 +2073,7 @@ fn resident_signature_recovers_and_duplicate_stage_never_uploads() {
             state.overlay.insert(0x9000 + index as u64, *byte);
         }
     });
-    let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let mut registry = ToolRegistry::with_toolset(workbench, ps4_mcp::tools::Toolset::Full).unwrap();
     let error = registry.call("payload_stage", json!({"pid":71,"target":target,"payload":payload,"sha256":sha256})).unwrap_err();
     assert!(error.to_string().contains("already resident"), "{error:#}");
     assert_eq!(console.rpc_installs(), 0);
@@ -2232,7 +2232,7 @@ fn payload_run_process_call_server_scan_and_process_find() {
     let (target, payload, sha256, _signature) = internals_artifacts(&workbench);
     let profile = env.qualify(&["process_inject"], std::slice::from_ref(&sha256));
     let workbench = Workbench::new(profile).unwrap();
-    let mut registry = ToolRegistry::with_toolset(workbench, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let mut registry = ToolRegistry::with_toolset(workbench, ps4_mcp::tools::Toolset::Full).unwrap();
 
     let run = registry.call("payload_run", json!({"pid":71,"payload":payload,"sha256":sha256})).unwrap();
     assert_eq!(run["server_spawned_entry"], true);
@@ -2263,7 +2263,7 @@ fn payload_run_process_call_server_scan_and_process_find() {
     let wb2 = Workbench::new(env2.profile()).unwrap();
     let (_t2, payload2, sha2, _s2) = internals_artifacts(&wb2);
     let wb2 = Workbench::new(env2.qualify(&["process_inject"], &[])).unwrap();
-    let mut reg2 = ToolRegistry::with_toolset(wb2, ps4_workbench_rs::tools::Toolset::Full).unwrap();
+    let mut reg2 = ToolRegistry::with_toolset(wb2, ps4_mcp::tools::Toolset::Full).unwrap();
     let err = reg2.call("payload_run", json!({"pid":71,"payload":payload2,"sha256":sha2})).unwrap_err();
     assert!(err.to_string().contains("allowlist"), "{err}");
     assert_eq!(console.elf_uploads(), 1);
@@ -2339,6 +2339,12 @@ fn real_tcp_klog_capture_saves_raw_bytes() {
     let capture = transports::klog_capture(&env.profile(), 1).unwrap();
     assert_eq!(capture.content, b"kernel log\n\xffbinary\n");
     assert!(!capture.ended_early);
+    assert!(transports::klog_crash_lines(&capture.content).is_empty());
+    let crashes = transports::klog_crash_lines(
+        b"boot ok\npid 81 (eboot.bin), uid 0: exited on signal 11 (core dumped)\nFatal trap 12: page fault while in kernel mode\n",
+    );
+    assert_eq!(crashes.len(), 2);
+    assert_eq!(crashes[0]["line"], 2);
 }
 
 /// `test_real_ftp_login_list_retr_and_verified_stor`
@@ -2497,7 +2503,7 @@ fn mcp_nonfinite_json_rejected() {
 fn mcp_oversize_input_closes_transport() {
     let (_env, mut mcp) = plain_mcp();
     mcp.initialize();
-    mcp.send(&"x".repeat(ps4_workbench_rs::mcp::MAX_MESSAGE + 1));
+    mcp.send(&"x".repeat(ps4_mcp::mcp::MAX_MESSAGE + 1));
     let response = mcp.receive();
     assert!(response["error"]["message"].as_str().unwrap().contains("exceeds"), "{response}");
     mcp.send(&request(json!(2), "ping"));

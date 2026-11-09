@@ -1,6 +1,6 @@
 //! SDK status, project scaffolds and hash-allowlisted local builds.
 //!
-//! Native port of `ps4_workbench/development.py`. Builds run only recipes
+//! Native port of `ps4_mcp/development.py`. Builds run only recipes
 //! whose SHA-256 is on the hardware qualification allowlist, use argv arrays
 //! (never a shell), refuse batch files, bound time and log output, and never
 //! deploy their output.

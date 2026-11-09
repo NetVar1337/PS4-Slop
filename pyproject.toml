@@ -3,9 +3,9 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ps4-workbench-adapters"
+name = "ps4-mcp-adapters"
 version = "0.3.0"
-description = "IDA / Ghidra / Binary Ninja / iaito analysis-agent adapters for the native ps4-workbench broker"
+description = "IDA / Ghidra / Binary Ninja / iaito analysis-agent adapters for the ps4-mcp broker"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-only"
@@ -15,4 +15,4 @@ dependencies = []
 iaito = ["r2pipe"]
 
 [tool.setuptools.packages.find]
-include = ["ps4_workbench*"]
+include = ["ps4_mcp*"]

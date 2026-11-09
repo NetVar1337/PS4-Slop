@@ -34,7 +34,7 @@ jobs:
           python-version: ${{ matrix.python }}
       # Adapter tests talk to the real native broker binary.
       - run: cargo build --locked
-      - run: python -m compileall -q ps4_workbench tests integrations
+      - run: python -m compileall -q ps4_mcp tests integrations
       - run: python -m unittest discover -q
 
   game-project:

@@ -172,7 +172,7 @@ How the broker handles a call:
 
 ### Agent side
 
-The shared logic lives in `ps4_workbench/adapters/base.py` (`ApplyMixin`). Each backend implements
+The shared logic lives in `ps4_mcp/adapters/base.py` (`ApplyMixin`). Each backend implements
 these primitives: `image_base`, `find_function`, `set_prototype`, `name_at`, `set_name`,
 `set_comment`, `define_struct` and `color_block`.
 

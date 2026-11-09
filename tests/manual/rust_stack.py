@@ -15,7 +15,7 @@ from tests.manual.run_installed_apps import elf_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 RELEASE = ROOT / "target" / "release"
-WORKBENCH = RELEASE / ("ps4-workbench.exe" if os.name == "nt" else "ps4-workbench")
+WORKBENCH = RELEASE / ("ps4-mcp.exe" if os.name == "nt" else "ps4-mcp")
 FIXTURE = RELEASE / ("ps4debug-fixture.exe" if os.name == "nt" else "ps4debug-fixture")
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 PID, THREAD = 71, 72

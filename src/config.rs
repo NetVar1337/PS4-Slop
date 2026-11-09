@@ -1,6 +1,6 @@
 //! Local profile policy, hardware qualification and canonical hashing.
 //!
-//! Native port of `ps4_workbench/config.py`. The profile fingerprint is the
+//! Native port of `ps4_mcp/config.py`. The profile fingerprint is the
 //! SHA-256 of Python's `json.dumps(value, sort_keys=True, separators=(",", ":"))`
 //! (with the default `ensure_ascii=True`), so qualification records written by
 //! either implementation stay interchangeable.
@@ -619,7 +619,8 @@ impl Profile {
         match debugger.get("expected_brand") {
             None | Some(Value::Null) => {}
             Some(Value::String(brand))
-                if brand.starts_with("ps4debug-NG by Pharaoh2k v")
+                if (brand.starts_with("ps4debug-NG by Pharaoh2k v")
+                    || brand.starts_with("ps4debug-NG by OSR v"))
                     && brand.chars().count() <= 256 => {}
             Some(_) => bail!("Invalid expected debugger branding"),
         }
@@ -1012,6 +1013,16 @@ mod tests {
         });
         fs::write(profile.qualification_path(), record.to_string()).unwrap();
         profile
+    }
+
+    #[test]
+    fn expected_brand_accepts_osr_variant_only_alongside_pharaoh2k() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut data = settings();
+        data["debugger"]["expected_brand"] = json!("ps4debug-NG by OSR v1.3.4");
+        assert!(write_profile(directory.path(), &data).is_ok());
+        data["debugger"]["expected_brand"] = json!("ps4debug by someone v1");
+        assert!(write_profile(directory.path(), &data).is_err());
     }
 
     #[test]

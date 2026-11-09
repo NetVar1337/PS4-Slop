@@ -57,9 +57,9 @@ of what the console serves or has loaded; it does not remotely attest the PS4.
 ```powershell
 $env:PS4_AFTERGLOW_DIR = "C:/path/to/afterglow-web"
 $env:PS4DEBUG_NG_PAYLOAD = "C:/path/to/ps4debug-ng_v1.3.4_release_2026-11-05.bin"
-ps4-workbench --profile profiles/ps4-1400.local.json afterglow-verify
-ps4-workbench --profile profiles/ps4-1400.local.json debugger-payload-verify
-ps4-workbench --profile profiles/ps4-1400.local.json preflight
+ps4-mcp --profile profiles/ps4-1400.local.json afterglow-verify
+ps4-mcp --profile profiles/ps4-1400.local.json debugger-payload-verify
+ps4-mcp --profile profiles/ps4-1400.local.json preflight
 ```
 
 After loading Afterglow and manually loading the separate ps4debug-NG BIN,

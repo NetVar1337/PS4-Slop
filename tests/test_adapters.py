@@ -1,6 +1,6 @@
-"""Python adapter side (ps4_workbench/) against the real native broker binary.
+"""Python adapter side (ps4_mcp/) against the real native broker binary.
 
-Build the binary first (``cargo build --locked``); set PS4_WORKBENCH_BIN to override.
+Build the binary first (``cargo build --locked``); set PS4_MCP_BIN to override.
 """
 import json
 import os
@@ -14,11 +14,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from ps4_workbench.adapters.base import APPLY_OPERATIONS, ApplyMixin, LiveAnalysis, Unsupported, struct_c_declaration
-from ps4_workbench.agents import AnalysisWorker
-from ps4_workbench.client import BrokerClient, load_token
-from ps4_workbench.config import WorkbenchError, numeric, parse_address
-from ps4_workbench.adapters.binja import BinjaWorkbench
+from ps4_mcp.adapters.base import APPLY_OPERATIONS, ApplyMixin, LiveAnalysis, Unsupported, struct_c_declaration
+from ps4_mcp.agents import AnalysisWorker
+from ps4_mcp.client import BrokerClient, load_token
+from ps4_mcp.config import WorkbenchError, numeric, parse_address
+from ps4_mcp.adapters.binja import BinjaWorkbench
 
 ROOT = Path(__file__).resolve().parents[1]
 EXE = ".exe" if os.name == "nt" else ""
@@ -70,12 +70,12 @@ class BinaryNinjaAdapterTests(unittest.TestCase):
 
 
 def workbench_binary():
-    override = os.environ.get("PS4_WORKBENCH_BIN")
-    candidates = [Path(override)] if override else [ROOT / "target" / kind / ("ps4-workbench" + EXE) for kind in ("debug", "release")]
+    override = os.environ.get("PS4_MCP_BIN")
+    candidates = [Path(override)] if override else [ROOT / "target" / kind / ("ps4-mcp" + EXE) for kind in ("debug", "release")]
     for candidate in candidates:
         if candidate.is_file():
             return candidate
-    raise RuntimeError("ps4-workbench binary not found; run `cargo build --locked` first")
+    raise RuntimeError("ps4-mcp binary not found; run `cargo build --locked` first")
 
 
 class RustBroker:

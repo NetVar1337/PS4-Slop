@@ -1,0 +1,52 @@
+{
+  "name": "ps4-afterglow-1400-readonly-lan",
+  "host": "192.168.86.29",
+  "firmware": "14.00",
+  "jailbreak": {
+    "repository": "https://github.com/well0nez/afterglow-web",
+    "reference_commit": "fc70192f0ddefd7f8f164a87524bd0febbb94efa",
+    "installed_commit": "fc70192f0ddefd7f8f164a87524bd0febbb94efa",
+    "hen_build": "afterglow-web-local",
+    "expected_hen_md5": "6417a84a72f9c7988f0e33b3ae190542",
+    "expected_hen_sha256": "364e5f6fd59e8a7afc207c70e27b840699f8173f3ae0241b63bc6dec6b394bfe",
+    "expected_goldhen_sha256": "39452f5e1c305ac9efcb4745eef7958b4db8c6d85299529f08700970b009ea4d",
+    "expected_patchset_1400_sha256": "615f275b96831cc04173757db39e93f0d27b52888976af2a6444604aa8ac5dbf"
+  },
+  "ports": {
+    "payload": 9090,
+    "ftp": 2121,
+    "klog": 3232,
+    "debug": 744
+  },
+  "debugger": {
+    "backend": "ps4debug-ng",
+    "protocol": "1.3",
+    "reference_commit": "8be828fe09f05f9327d7babdf9dcec4c67fbb816",
+    "expected_brand": "ps4debug-NG by Pharaoh2k v1.3.4",
+    "payload_path": "C:/Users/Admin/Downloads/ps4debug-ng_v1.3.4_release_2026-11-05.bin",
+    "payload_sha256": "8bfe0507972718e6078778c5f9c44d84293197c0547239ab4227bdb351299b3e"
+  },
+  "timeout_seconds": 15,
+  "limits": {
+    "memory_bytes": 1048576,
+    "transfer_bytes": 67108864,
+    "log_bytes": 1048576,
+    "log_seconds": 30,
+    "list_entries": 16384
+  },
+  "permissions": {
+    "ftp_upload": false,
+    "payload_execute": false,
+    "process_inject": false,
+    "process_write": false,
+    "debug_control": false,
+    "kernel_read": true,
+    "kernel_write": false,
+    "build": false
+  },
+  "ftp_upload_roots": [
+    "/data/ps4-debugmcps"
+  ],
+  "artifact_directory": "../workspace",
+  "qualification_file": "qualification.local.json"
+}

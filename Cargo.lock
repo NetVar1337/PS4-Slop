@@ -1521,7 +1521,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ps4-debugmcps"
+name = "ps4-mcp"
 version = "0.3.0"
 dependencies = [
  "aho-corasick",

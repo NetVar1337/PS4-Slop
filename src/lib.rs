@@ -16,6 +16,7 @@ pub mod expr;
 pub mod nid;
 pub mod scanner;
 pub mod transports;
+pub mod proxy;
 pub mod workbench;
 pub mod tools;
 pub mod agents;

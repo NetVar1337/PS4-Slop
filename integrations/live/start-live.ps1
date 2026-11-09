@@ -23,7 +23,7 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$exe = Join-Path $root 'target\release\ps4-workbench.exe'
+$exe = Join-Path $root 'target\release\ps4-mcp.exe'
 $logs = Join-Path $root 'workspace\live-logs'
 $pidFile = Join-Path $logs 'started.pids'
 
@@ -44,6 +44,7 @@ $consoleHost = (Get-Content $Profile -Raw | ConvertFrom-Json).host
 if (-not $CallbackAddress) {
     $CallbackAddress = (Find-NetRoute -RemoteIPAddress $consoleHost | Where-Object IPAddress | Select-Object -First 1).IPAddress
 }
+# Name kept from before the rename so existing firewall rules still match.
 $rule = 'PS4 workbench debug callback (TCP 755)'
 if (-not (Get-NetFirewallRule -DisplayName $rule -ErrorAction SilentlyContinue)) {
     $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(

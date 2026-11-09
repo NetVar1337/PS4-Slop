@@ -236,6 +236,7 @@ impl ToolRegistry {
                 )?;
                 saved["reconnects"] = json!(capture.reconnects);
                 saved["ended_early"] = json!(capture.ended_early);
+                saved["crash_lines"] = json!(crate::transports::klog_crash_lines(&capture.content));
                 Ok(saved)
             }
             "payload_inspect" => self.workbench.inspect_payload(string(args, "manifest")?),

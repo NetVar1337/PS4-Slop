@@ -1,12 +1,12 @@
 //! Loopback ps4debug-NG protocol 1.3 fixture for installed-app bridge tests.
 //!
 //! Serves a local image as process memory so IDA/Ghidra can attach through the
-//! real `ps4-workbench broker` + `gdb-server` stack without a console. This is a
+//! real `ps4-mcp broker` + `gdb-server` stack without a console. This is a
 //! protocol fixture, not an emulator: no instruction is executed; single-steps
 //! only advance RIP by the decoded instruction length.
 use anyhow::{Context, Result};
 use clap::Parser;
-use ps4_workbench_rs::debugger::fake::{Fixture, spawn_fixture};
+use ps4_mcp::debugger::fake::{Fixture, spawn_fixture};
 use std::{net::TcpListener, path::PathBuf};
 
 #[derive(Parser)]

@@ -304,7 +304,7 @@ impl ServerHandler for McpServer {
                 .build(),
         )
         .with_server_info(Implementation::new(
-            "ps4-debugmcps",
+            "ps4-mcp",
             env!("CARGO_PKG_VERSION"),
         ))
         .with_instructions(&self.instructions)

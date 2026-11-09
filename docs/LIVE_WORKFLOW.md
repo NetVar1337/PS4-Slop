@@ -18,8 +18,8 @@ Your installed applications were inspected and tested locally:
 From this repository:
 
 ```powershell
-ps4-workbench call desktop_status
-ps4-workbench broker
+ps4-mcp call desktop_status
+ps4-mcp broker
 ```
 
 Startup does not connect to the console. The broker binds only `127.0.0.1:8765`
@@ -40,10 +40,10 @@ cannot silently switch them to a different console configuration.
 Read-only commands through the already-running broker:
 
 ```powershell
-ps4-workbench remote-call console_status
-ps4-workbench remote-call process_list
-ps4-workbench remote-call session_state
-ps4-workbench remote-call analysis_status
+ps4-mcp remote-call console_status
+ps4-mcp remote-call process_list
+ps4-mcp remote-call session_state
+ps4-mcp remote-call analysis_status
 ```
 
 The actual console debugger still must be enabled and independently qualified
@@ -57,7 +57,7 @@ Open the authorized original ELF/module in IDA. Run
 `integrations/ida/ps4_connect.py` using File → Script file. It connects the local
 broker and registers a read-only IDA analysis agent; it does **not** attach to
 the console or start a GDB listener. IDA 9.5's main-thread APIs are used for
-database access. Set `PS4_WORKBENCH_ROOT` first if you move this checkout.
+database access. Set `PS4_MCP_ROOT` first if you move this checkout.
 
 Keep the script's `ps4` object alive. In a namespace-isolated IDAPython setup,
 instantiate `IDAWorkbench` explicitly in the Python console instead. Stop the
@@ -80,7 +80,7 @@ For native live debugging, first use your qualified profile and an observed PID:
 ```powershell
 $targetPid = [int](Read-Host 'Observed PS4 process PID')
 $callbackIp = Read-Host 'PC IPv4 reachable from the PS4'
-ps4-workbench gdb-server --pid $targetPid --listen-address $callbackIp
+ps4-mcp gdb-server --pid $targetPid --listen-address $callbackIp
 ```
 
 The bridge listens only on PC loopback `127.0.0.1:1234`. It does not attach until
@@ -117,7 +117,7 @@ Unavailable FPU/SIMD registers are marked unavailable, never fabricated as zero.
 ## 3. Connect Ghidra directly without additional dependencies
 
 Add `integrations/ghidra` to Ghidra's Script Manager directories. Run
-**`PS4Workbench.java`** with the intended static program open.
+**`PS4Mcp.java`** with the intended static program open.
 
 Choose an explicit action and select the broker token file:
 
@@ -206,7 +206,7 @@ identify the configured PID as x86-64 FreeBSD for LLDB.
 
 ## 3b. Binary Ninja or iaito as static-analysis agents
 
-With the broker running (`ps4-workbench broker`), register an agent so the
+With the broker running (`ps4-mcp broker`), register an agent so the
 shared MCP's `analysis_*` tools can reach it:
 
 - Binary Ninja: run `integrations/binja/ps4_connect.py` in BN's Python (the

@@ -1,4 +1,4 @@
-"""Installed IDA 9.5 Remote GDB -> ps4-workbench gdb-server -> broker -> ps4debug fixture.
+"""Installed IDA 9.5 Remote GDB -> ps4-mcp gdb-server -> broker -> ps4debug fixture.
 
 Every hop is the shipped Rust binary; only the console is replaced by the loopback
 protocol fixture. Requires IDA Professional 9.5 and a release build with

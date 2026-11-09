@@ -32,7 +32,7 @@ Python server.
 - `cargo clippy --all-targets --features fixture --locked -- -D warnings`: clean.
 - `python -m compileall -q ps4_workbench tests integrations`: passed.
 - `python -m unittest discover -q`: 12 adapter tests passed. They run against the
-  real `ps4-workbench broker` binary: agent registration, job round trip, error
+  real `ps4-mcp broker` binary: agent registration, job round trip, error
   propagation, duplicate-agent rejection, unregistration and wrong-token rejection.
 
 ## Installed-app checks executed (loopback fixture, not PS4)
@@ -56,7 +56,7 @@ executes no code.
 ## Live read-only console checks
 
 - `ftp_list /data` against `192.168.86.25:2121` returned a listing.
-- `pi mcp list` reported `ps4-workbench` connected with 66 tools: the 54 default
+- `pi mcp list` reported `ps4-mcp` connected with 66 tools: the 54 default
   tools, minus the broker-owned `debug_events`, plus 13 analysis/session tools.
 - Memory-map decoding fixed to the upstream packed 58-byte `proc_vm_map_entry`
   (name[32], start, end, offset, u16 prot); the old 64-byte decoder failed with

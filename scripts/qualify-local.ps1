@@ -19,9 +19,9 @@ try {
     Write-Host '[qualify-local] 2/4 python adapter/ctl tests against the real broker'
     python -m unittest discover -q
     if ($LASTEXITCODE) { throw 'python tests failed' }
-    $Bin = if (Test-Path 'target\debug\ps4-workbench.exe') { 'target\debug\ps4-workbench.exe' } else { 'target\release\ps4-workbench.exe' }
-    if (-not (Test-Path $Bin)) { throw 'build the workbench first: cargo build --locked' }
-    Write-Host '[qualify-local] 3/4 workbench validate'
+    $Bin = if (Test-Path 'target\debug\ps4-mcp.exe') { 'target\debug\ps4-mcp.exe' } else { 'target\release\ps4-mcp.exe' }
+    if (-not (Test-Path $Bin)) { throw 'build ps4-mcp first: cargo build --locked' }
+    Write-Host '[qualify-local] 3/4 ps4-mcp validate'
     & $Bin --profile $Profile validate
     if ($LASTEXITCODE) { throw 'validate failed' }
     Write-Host '[qualify-local] 4/4 qualify CLI (no console contact; records your attestation)'

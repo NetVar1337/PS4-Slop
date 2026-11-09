@@ -1,18 +1,18 @@
 [package]
-name = "ps4-debugmcps"
+name = "ps4-mcp"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Local-first PS4 reverse-engineering workbench and MCP server"
+description = "PS4-MCP: local-first PS4 reverse-engineering MCP server and toolset"
 license = "GPL-3.0-only"
-default-run = "ps4-workbench"
+default-run = "ps4-mcp"
 
 [lib]
-name = "ps4_workbench_rs"
+name = "ps4_mcp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ps4-workbench"
+name = "ps4-mcp"
 path = "src/main.rs"
 
 # Loopback ps4debug-NG protocol fixture for installed-app (IDA/Ghidra) bridge tests.
@@ -28,7 +28,7 @@ fixture = []
 aho-corasick = "1"
 anyhow = "1"
 axum = "0.8"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 hex = "0.4"
 iced-x86 = { version = "1", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "intel", "instr_info"] }
 jsonschema = { version = "0.46", default-features = false }

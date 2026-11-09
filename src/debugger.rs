@@ -246,8 +246,10 @@ impl Debugger {
         self.packet(0xbd000501, &[])?;
         let branding = self.text()?;
         let (brand, capability) = branding.split_once('\0').unwrap_or((&branding, ""));
+        // OSR = GoldHEN-patched variant of Pharaoh2k's ps4debug-NG
         ensure!(
-            brand.starts_with("ps4debug-NG by Pharaoh2k v"),
+            brand.starts_with("ps4debug-NG by Pharaoh2k v")
+                || brand.starts_with("ps4debug-NG by OSR v"),
             "Unknown debugger branding; no legacy fallback"
         );
         if let Some(expected) = self.profile.data["debugger"]["expected_brand"].as_str() {

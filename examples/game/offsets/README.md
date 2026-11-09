@@ -1,6 +1,6 @@
 # Per-build offset store
 
-`project_export_offsets` with `archive: true` (or `ps4_workbench.ctl export-offsets
+`project_export_offsets` with `archive: true` (or `ps4_mcp.ctl export-offsets
 --archive`) writes each build's generated header and manifest here, keyed by
 the module SHA-256:
 

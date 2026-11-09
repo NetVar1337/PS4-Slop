@@ -6,7 +6,7 @@
 //! Fortnite-PS4 need no hand-written injector or build glue. `game_update` drives
 //! the engine pipeline as a durable recipe session and installs the generated
 //! inputs into the registered repository. `game_stage` is the hash-qualified
-//! upload plus RPC recovery in one call (the same path `ps4-workbench inject`
+//! upload plus RPC recovery in one call (the same path `ps4-mcp inject`
 //! uses). `game_verify` runs the read-only evidence checks. None of these deploy
 //! anything by themselves; staging still requires the `process_inject` permission
 //! and a hardware-qualified payload hash.
@@ -202,9 +202,9 @@ fn new_project(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "# {name}\n\nResident diagnostic payload scaffolded by `game_new` (engine: {engine}).\n\n\
          - `make` builds `{payload}` with the shared toolchain fragment `templates/payload/orbis.mk`.\n\
          - `make host-test` (or `python build.py --host-test --engine {engine}`) runs the offline lifecycle smoke test.\n\
-         - `make inject PID=<pid> TARGET_MANIFEST=<target artifact>` stages through `ps4-workbench inject`;\n\
+         - `make inject PID=<pid> TARGET_MANIFEST=<target artifact>` stages through `ps4-mcp inject`;\n\
          \x20 no per-project injector is needed. Staging requires a qualified local profile with `process_inject`.\n\
-         - `game_update` (or `ps4_workbench.ctl update --project-dir .`) runs the engine pipeline and\n\
+         - `game_update` (or `ps4_mcp.ctl update --project-dir .`) runs the engine pipeline and\n\
          \x20 `project_install` writes generated headers into `src/generated/`.\n\
          - `offsets/` keeps the per-build generated offset headers/manifests (`project_export_offsets archive`).\n\n\
          Target checks are initially empty and stay unavailable. No build deploys to a console.\n\
@@ -224,8 +224,8 @@ fn new_project(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "files": written,
         "host_test": [python, "build.py", "--host-test", "--engine", engine],
         "next": [
-            "ps4-workbench call project_open with the observed title_id/app_version",
-            "ps4-workbench call game_update --arguments '{\"pid\": <pid>, \"repository\": <repo>, \"app_version\": <observed>}'",
+            "ps4-mcp call project_open with the observed title_id/app_version",
+            "ps4-mcp call game_update --arguments '{\"pid\": <pid>, \"repository\": <repo>, \"app_version\": <observed>}'",
             "make && make inject PID=<pid> TARGET_MANIFEST=<target artifact>",
         ],
         "hardware_verified": false,
@@ -797,7 +797,7 @@ fn update(registry: &mut ToolRegistry, args: &Value) -> Result<Value> {
         "installed": installed,
         "next": {
             "build": "make (or python build.py --engine <engine> --output <payload>) in the payload repository",
-            "stage": "ps4-workbench inject --pid <pid> --target <target artifact> --payload <elf>  (or game_stage)",
+            "stage": "ps4-mcp inject --pid <pid> --target <target artifact> --payload <elf>  (or game_stage)",
             "verify": "game_verify",
         },
         "deployed": false,
@@ -831,7 +831,11 @@ mod tests {
             )
             .unwrap();
         let folder = parent.path().join("GamePS4");
-        assert_eq!(out["project"], folder.display().to_string());
+        // Canonicalize both: Windows runners hand out 8.3 temp paths (RUNNER~1) that game_new expands.
+        assert_eq!(
+            std::fs::canonicalize(out["project"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&folder).unwrap()
+        );
         let descriptor: Value =
             serde_json::from_slice(&std::fs::read(folder.join("workbench.json")).unwrap()).unwrap();
         assert_eq!(descriptor["engine"], "unreal");
@@ -843,7 +847,7 @@ mod tests {
         assert!(makefile.contains("include $(WORKBENCH_DIR)/templates/payload/orbis.mk"));
         assert!(makefile.contains("-DPS4WB_ENGINE_UNREAL"));
         assert!(makefile.contains("build/game_payload.elf"));
-        assert!(makefile.contains("ps4-workbench") && makefile.contains(" inject "));
+        assert!(makefile.contains("ps4-mcp") && makefile.contains(" inject "));
         assert!(folder.join("src/features.hpp").is_file());
         assert!(folder.join("src/payload.cpp").is_file());
         assert!(folder.join("offsets/README.md").is_file());

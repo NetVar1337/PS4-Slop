@@ -478,6 +478,26 @@ pub struct KlogCapture {
     pub ended_early: bool,
 }
 
+/// Klog lines that look like a crash, kernel trap, panic or assertion, so a
+/// crash outside the debugger is visible without reading the raw artifact.
+/// Returns at most 64 `{line, text}` entries (1-based line numbers).
+pub fn klog_crash_lines(content: &[u8]) -> Vec<Value> {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let pattern = PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)exited on signal|fatal trap|\bpanic\b|fault virtual address|instruction pointer\s*=|\bSIG(SEGV|BUS|ILL|FPE|ABRT|SYS|KILL)\b|page fault|core ?dump|crash|unhandled exception|assert(ion)? fail|\babort\(",
+        )
+        .expect("static klog crash pattern")
+    });
+    String::from_utf8_lossy(content)
+        .lines()
+        .enumerate()
+        .filter(|(_, text)| pattern.is_match(text))
+        .take(64)
+        .map(|(index, text)| json!({"line": index + 1, "text": text.trim_end().chars().take(400).collect::<String>()}))
+        .collect()
+}
+
 /// Capture raw Klog for a bounded time. The log is a read-only stream, so a
 /// dropped connection is re-established (up to three times) rather than
 /// silently truncating the capture.
@@ -740,11 +760,12 @@ mod tests {
         assert!(validate_payload(&code, 1 << 20).is_ok());
     }
 
-    #[test]
-    fn ftp_session_quits_cleanly_and_batch_reuses_one_connection() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    /// Loopback FTP server: returns (port, control connections seen, QUITs seen).
+    fn fake_ftp_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         use std::io::{BufRead, BufReader};
         use std::net::TcpListener;
-        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let controls = Arc::new(AtomicUsize::new(0));
@@ -788,6 +809,26 @@ mod tests {
                 });
             }
         });
+        (port, controls, quits)
+    }
+
+    #[test]
+    fn ftp_download_through_loopback_proxy() {
+        use crate::proxy::{Mode, Route, start};
+        let (remote, _, _) = fake_ftp_server();
+        let ports = start("127.0.0.1", &[Route { local: 0, remote, mode: Mode::Ftp }]).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile = crate::artifacts::tests::test_profile(directory.path());
+        profile.data["ports"]["ftp"] = json!(ports[0]);
+        profile.data["limits"]["transfer_bytes"] = json!(1 << 20);
+        let mut batch = FtpBatch::new(&profile);
+        assert_eq!(batch.download("/a").unwrap(), b"payload-bytes");
+        assert_eq!(batch.download("/b").unwrap(), b"payload-bytes");
+    }
+
+    #[test]
+    fn ftp_session_quits_cleanly_and_batch_reuses_one_connection() {
+        let (port, controls, quits) = fake_ftp_server();
         let directory = tempfile::tempdir().unwrap();
         let mut profile = crate::artifacts::tests::test_profile(directory.path());
         profile.data["ports"]["ftp"] = json!(port);

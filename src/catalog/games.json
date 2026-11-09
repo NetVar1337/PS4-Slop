@@ -1,7 +1,7 @@
 [
  {
   "name": "game_new",
-  "description": "Emit a standalone, buildable game repository under directory/name: workbench.json descriptor, Makefile that includes the shared templates/payload/orbis.mk toolchain fragment, the engine feature pack (features.hpp with fail-closed feature bits), shared internals headers/runtime, host smoke test, and a per-build offsets/ store. Local file writes only; no console access, no deploy. Staging later goes through `ps4-workbench inject` / game_stage, so game repos need no own injector.",
+  "description": "Emit a standalone, buildable game repository under directory/name: workbench.json descriptor, Makefile that includes the shared templates/payload/orbis.mk toolchain fragment, the engine feature pack (features.hpp with fail-closed feature bits), shared internals headers/runtime, host smoke test, and a per-build offsets/ store. Local file writes only; no console access, no deploy. Staging later goes through `ps4-mcp inject` / game_stage, so game repos need no own injector.",
   "inputSchema": {
    "type": "object",
    "properties": {

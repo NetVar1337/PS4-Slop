@@ -1,6 +1,6 @@
 //! Contained, hash-recorded local artifact storage.
 //!
-//! Native port of `ps4_workbench/artifacts.py`. Every path is resolved through
+//! Native port of `ps4_mcp/artifacts.py`. Every path is resolved through
 //! symlinks/junctions (reparse points) and must stay strictly inside the
 //! resolved artifact root; reads are bounded by profile limits.
 

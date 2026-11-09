@@ -950,6 +950,27 @@ impl Debugger {
             instruction_json = json!({"address":hex(rip),"error":format!("{error:#}")});
         }
         let classification = classify_crash(&facts);
+        // Which registers hold pointers, and into what: the usual first question for a bad deref.
+        let register_pointers: Vec<Value> = [
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+        ]
+        .iter()
+        .filter_map(|name| {
+            let value = file.get(name)?;
+            let map = map_containing(&maps, value)?;
+            Some(json!({"register":name,"value":hex(value),"location":Self::annotate(value, &modules),"mapping":map_json(&Some(map))}))
+        })
+        .collect();
+        // The instructions after the faulting one show what the code intended to do next.
+        let code_window: Vec<Value> = self
+            .read_code(pid, rip, 64)
+            .map(|bytes| {
+                disasm::decode(&bytes, rip, 8)
+                    .into_iter()
+                    .map(|item| json!({"address":hex(item.address),"text":item.text}))
+                    .collect()
+            })
+            .unwrap_or_default();
         let stack = self.stack_trace(thread, 16).unwrap_or_else(|error| json!({"error":format!("{error:#}")}));
         // Bounded memory captures around rsp and each mapped operand.
         let mut captures = Vec::new();
@@ -992,6 +1013,8 @@ impl Debugger {
             "rsp_mapping": map_json(&facts.rsp_map),
             "instruction": instruction_json,
             "memory_operands": operands_json,
+            "code_window": code_window,
+            "register_pointers": register_pointers,
             "classification": classification.first().cloned(),
             "classifications": classification,
             "registers": registers(&raw)?,
@@ -1475,6 +1498,9 @@ mod tests {
         assert_eq!(report["rip_location"], "fixture.elf+0x40");
         assert!(report["stack"]["frames"].is_array());
         assert!(!report["memory"].as_array().unwrap().is_empty());
+        assert_eq!(report["code_window"][0]["text"], "mov ecx, [rax+0x18]");
+        // rax is null, so it must not be listed as a pointer.
+        assert!(report["register_pointers"].as_array().unwrap().iter().all(|entry| entry["register"] != "rax"));
         // Analyzing the current stop again (no resume) gives the same answer.
         let again = debugger
             .crash_triage(&CrashRequest { wait: false, timeout: Duration::from_secs(1), thread_id: None, max_events: 1, capture_bytes: 0 })

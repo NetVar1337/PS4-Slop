@@ -10,7 +10,7 @@ Everything before staging is read-only toward the console. Staging requires the
 ## 1. Scaffold and pin the repository
 
 ```powershell
-ps4-workbench --toolset full call game_new --arguments '{"name":"MyGame-PS4","engine":"unreal","directory":"C:\\path\\to\\repos","title_id":"CUSA12345"}'
+ps4-mcp --toolset full call game_new --arguments '{"name":"MyGame-PS4","engine":"unreal","directory":"C:\\path\\to\\repos","title_id":"CUSA12345"}'
 cd C:\path\to\repos\MyGame-PS4
 git init
 git add .
@@ -50,13 +50,13 @@ instead of copying toolchain flags into the project.
 MCP (a durable session under the hood, resumable with `session`):
 
 ```powershell
-ps4-workbench --toolset full call game_update --arguments '{"pid":71,"repository":"C:\\path\\to\\repos\\MyGame-PS4","app_version":"01.00"}'
+ps4-mcp --toolset full call game_update --arguments '{"pid":71,"repository":"C:\\path\\to\\repos\\MyGame-PS4","app_version":"01.00"}'
 ```
 
 CLI from the game repository:
 
 ```sh
-python -m ps4_workbench.ctl --url http://127.0.0.1:24600 --token-file profiles/broker-token.local \
+python -m ps4_mcp.ctl --url http://127.0.0.1:24600 --token-file profiles/broker-token.local \
     update --project-dir . --pid 71 --app-version 01.00
 ```
 
@@ -107,7 +107,7 @@ python build.py --engine unreal --output payload.elf
 next actions per feature:
 
 ```powershell
-ps4-workbench --toolset full call game_verify --arguments '{"repository":"C:\\path\\to\\repos\\MyGame-PS4"}'
+ps4-mcp --toolset full call game_verify --arguments '{"repository":"C:\\path\\to\\repos\\MyGame-PS4"}'
 ```
 
 Opt into local build checks or a resident telemetry check:
@@ -126,7 +126,7 @@ Stage only the exact reviewed and qualified output:
 make inject PID=<pid> TARGET_MANIFEST=<target artifact>
 ```
 
-This calls `ps4-workbench inject`; `game_stage` is the MCP equivalent. Upload is
+This calls `ps4-mcp inject`; `game_stage` is the MCP equivalent. Upload is
 single-attempt, mutations are never automatically retried, and no per-project
 injector is needed.
 
@@ -137,11 +137,11 @@ Extend `config` and `telemetry` in `workbench.json`/the project manifest; RPC
 commands and wire words remain unchanged.
 
 ```sh
-python -m ps4_workbench.ctl ... features --pid 71 --project-dir . --names diagnostics
-python -m ps4_workbench.ctl ... config set --pid 71 --project-dir . --name sensitivity --value 1.5
-python -m ps4_workbench.ctl ... telemetry --pid 71 --project-dir . --name active_features
-python -m ps4_workbench.ctl ... profile save --pid 71 --project-dir . --path safe-profile.json
-python -m ps4_workbench.ctl ... profile load --pid 71 --project-dir . --path safe-profile.json
+python -m ps4_mcp.ctl ... features --pid 71 --project-dir . --names diagnostics
+python -m ps4_mcp.ctl ... config set --pid 71 --project-dir . --name sensitivity --value 1.5
+python -m ps4_mcp.ctl ... telemetry --pid 71 --project-dir . --name active_features
+python -m ps4_mcp.ctl ... profile save --pid 71 --project-dir . --path safe-profile.json
+python -m ps4_mcp.ctl ... profile load --pid 71 --project-dir . --path safe-profile.json
 ```
 
 Profiles are SHA-256-checked and bound to the module hash. Loading confirms each
@@ -153,7 +153,7 @@ heartbeat-stall episode.
 ## 6. Keep per-build offsets
 
 ```sh
-python -m ps4_workbench.ctl ... export-offsets --module-sha256 <64hex> --archive
+python -m ps4_mcp.ctl ... export-offsets --module-sha256 <64hex> --archive
 ```
 
 This writes `offsets/<module_sha256[:16]>/offsets.hpp` and `offsets.json` into the
@@ -169,7 +169,7 @@ features for the new build.
 | `game_update` | Descriptor-driven research, contract and generated install |
 | `game_stage` | Qualified single-attempt upload and RPC status |
 | `game_verify` | Actionable implementation/evidence/runtime report |
-| `ps4-workbench inject` | CLI staging used by `make inject` |
+| `ps4-mcp inject` | CLI staging used by `make inject` |
 | `ctl update --project-dir .` | The same update plus local build/collection |
 
 The `ps4-game-project` MCP prompt follows this workflow. Start with resident

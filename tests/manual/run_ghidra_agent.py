@@ -1,4 +1,4 @@
-"""MCP (``ps4-workbench serve --broker``) -> Rust broker -> installed Ghidra 12.2 Java agent.
+"""MCP (``ps4-mcp serve --broker``) -> Rust broker -> installed Ghidra 12.2 Java agent.
 
 Requires Ghidra 12.2 and a release build with ``--features fixture``.
 """
@@ -56,7 +56,7 @@ def main(ghidra="C:/Users/Admin/Desktop/Ghidra"):
         stack.handles.append(log)
         command = ["cmd.exe", "/d", "/c", str(Path(ghidra) / "support/analyzeHeadless.bat"),
                    str(stack.directory), "AgentFixture", "-import", str(stack.image),
-                   "-scriptPath", str(ROOT / "integrations/ghidra"), "-postScript", "PS4Workbench.java",
+                   "-scriptPath", str(ROOT / "integrations/ghidra"), "-postScript", "PS4Mcp.java",
                    "--agent", stack.url, str(stack.token), "--once", "-max-cpu", "1"]
         agent = stack.spawn(command, stdout=log, stderr=subprocess.STDOUT)
         mcp_log = (stack.directory / "mcp.log").open("w", encoding="utf-8")

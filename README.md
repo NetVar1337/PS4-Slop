@@ -15,7 +15,7 @@ A local PS4 research workbench, command-line interface, and **stdio MCP server**
 for the supplied **firmware 14.00 / Afterglow** setup. Version 0.3 is a native
 **Rust** implementation (single binary, official `rmcp` MCP SDK) and the **only**
 server: MCP, CLI, broker, GDB Remote bridge and console transports all live in
-`src/`. The Python package `ps4_workbench/` contains the analysis-agent adapters
+`src/`. The Python package `ps4_mcp/` contains the analysis-agent adapters
 that run inside IDA/Ghidra/Binary Ninja/iaito plus broker-client, bounded-build
 and control-plane utilities. Everything runs on the development PC, not on the console.
 
@@ -39,8 +39,8 @@ From this repository in PowerShell:
 
 ```powershell
 cargo build --release
-./target/release/ps4-workbench validate
-./target/release/ps4-workbench tools
+./target/release/ps4-mcp validate
+./target/release/ps4-mcp tools
 cargo test
 cargo build --locked; python -m unittest discover -q   # adapter tests against the real broker
 ```
@@ -72,11 +72,11 @@ installed on your PS4**. Do not fill unknown values with the reference values.
 Explicit, read-only network actions (only when the corresponding service is enabled):
 
 ```powershell
-ps4-workbench call console_status --arguments '{"probe":true}'
-ps4-workbench call ftp_list --arguments '{"path":"/data"}'
-ps4-workbench call debugger_info
-ps4-workbench call process_list
-ps4-workbench call klog_capture --arguments '{"seconds":5}'
+ps4-mcp call console_status --arguments '{"probe":true}'
+ps4-mcp call ftp_list --arguments '{"path":"/data"}'
+ps4-mcp call debugger_info
+ps4-mcp call process_list
+ps4-mcp call klog_capture --arguments '{"seconds":5}'
 ```
 
 `console_status` without `probe` is completely offline. With `probe`, it checks
@@ -87,17 +87,32 @@ the workbench does not enable it or reconnect automatically.
 On shells with JSON quoting problems, use a file:
 
 ```powershell
-ps4-workbench call memory_read --arguments-file examples/read-memory.json
+ps4-mcp call memory_read --arguments-file examples/read-memory.json
 ```
 
 **Replace the example PID and address with an observed process and mapped range.**
 The example values are not known to be valid on your console.
 
+### Loopback proxy (optional)
+
+If GoldHEN FTP rejects transfers because the PC reaches the console over a
+different route than the data connection (e.g. Tailscale vs. LAN), set the
+profile `host` to `127.0.0.1` and run the built-in relay in its own terminal:
+
+```powershell
+ps4-mcp --profile profiles/ps4-1400.local.json proxy --target 192.168.1.50
+```
+
+It relays the profile's `debug`, `ftp` and `klog` ports from `127.0.0.1` to the
+console (debug goes to port 744 unless you pass `--remote-debug-port`) and
+routes FTP passive-mode data through itself. `PS4_HOST` can replace `--target`.
+The payload port is not relayed.
+
 ## MCP connection
 
 ```powershell
 cargo build --release
-target/release/ps4-workbench --profile profiles/ps4-1400.local.json --toolset read-only serve
+target/release/ps4-mcp --profile profiles/ps4-1400.local.json --toolset read-only serve
 ```
 
 This is a stdio service; do not run it expecting an interactive prompt. Configure
@@ -112,7 +127,7 @@ Stdout carries only JSON-RPC; diagnostics go to stderr. No HTTP listener is expo
 by `serve`. Each inbound line is limited to 1 MiB: malformed or non-finite JSON gets a
 `-32700 Invalid JSON` reply, and an oversized line gets `-32700` and closes the
 transport. Profile changes require a restart. While an MCP client holds the
-server, Windows locks `target/release/ps4-workbench.exe`; stop the client (or rename
+server, Windows locks `target/release/ps4-mcp.exe`; stop the client (or rename
 the running exe aside) before `cargo build --release`.
 
 ## Tool groups
@@ -250,8 +265,8 @@ Reverse-engineering suite (each area documented in `docs/features/`):
   `ps4wb-offsets-v1` manifest with runtime verify fingerprints for `internals/verify.hpp`),
   `recipe_list`/`recipe_run` (chained tool calls that still pass every permission
   check), and broker `analysis_apply_prototypes`/`_struct`/`_coverage`/`_classes`/`_symbols`
-  to push results into IDA/Ghidra/Binary Ninja/iaito. The `ps4_workbench/ctl.py`
-  control plane (`python -m ps4_workbench.ctl`) drives a running broker: `status`,
+  to push results into IDA/Ghidra/Binary Ninja/iaito. The `ps4_mcp/ctl.py`
+  control plane (`python -m ps4_mcp.ctl`) drives a running broker: `status`,
   `tools`, `call`, `preflight`, `stage`, `recover`, `payload-status`, `rpc`,
   `features`, `shutdown`, `export-offsets`. `update --game fortnite|apex` runs the
   full update loop (pipeline recipe or `offset_refresh`, local payload build,
@@ -289,7 +304,7 @@ in-memory ELF headers and never decrypts encrypted SELF/PKG containers.
 Read [the compatibility contract](docs/COMPATIBILITY.md) **before loading any
 debugger or payload**, then follow [the hardware qualification checklist](docs/QUALIFICATION.md).
 
-Before loading Afterglow, run `ps4-workbench --profile profiles/ps4-1400.local.json
+Before loading Afterglow, run `ps4-mcp --profile profiles/ps4-1400.local.json
 afterglow-verify --directory C:/path/to/afterglow-web`. The known-good patched
 14.00 `hen.bin` is pinned by both MD5 and SHA-256; the known upstream unpatched
 MD5 is rejected. Afterglow is a web exploit/HEN path, not a ps4debug-NG loader:
@@ -343,7 +358,7 @@ runtime-tested here.
 ```text
 src/                 Rust: the only server — MCP, CLI, transports, broker, RSP/GDB bridge, analysis, SDK workflows
 src/bin/             ps4debug-fixture: loopback protocol fixture for installed-app tests (`--features fixture`)
-ps4_workbench/       Python analysis-agent adapters (IDA/Ghidra/Binary Ninja/iaito) + broker client
+ps4_mcp/       Python analysis-agent adapters (IDA/Ghidra/Binary Ninja/iaito) + broker client
 profiles/            Console profile; local qualification files are ignored
 examples/            MCP configs, manifest and evidence templates
 integrations/        IDA/Binary Ninja/iaito connection scripts; Ghidra Java/Python clients and annotations

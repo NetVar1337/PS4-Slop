@@ -2,7 +2,7 @@
 
 use anyhow::{Context, ensure};
 use clap::{Args, Parser, Subcommand};
-use ps4_workbench_rs::{
+use ps4_mcp::{
     Result,
     artifacts::utc_now,
     broker,
@@ -23,7 +23,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Native Rust PS4 workbench: MCP, shared IDA/Ghidra broker, GDB bridge and guarded artifacts"
+    about = "PS4-MCP: MCP server and toolset for PS4 reverse engineering — IDA/Ghidra broker, GDB bridge, guarded artifacts"
 )]
 struct Cli {
     #[arg(long, global = true, default_value = "profiles/ps4-1400.json")]
@@ -168,6 +168,27 @@ enum Command {
         #[arg(long)]
         replace: bool,
     },
+    /// Relay the profile's debug/ftp/klog ports on 127.0.0.1 to the console (runs until stopped).
+    /// Use when the profile host is 127.0.0.1; FTP passive data is bridged so GoldHEN
+    /// sees one source IP. Run it in its own terminal or with Start-Process.
+    Proxy {
+        #[arg(long, env = "PS4_HOST", help = "Console address (or set PS4_HOST)")]
+        target: String,
+        #[arg(long, default_value_t = 744, help = "ps4debug-NG port on the console")]
+        remote_debug_port: u16,
+    },
+    /// Full system diagnostic: qualification hash, proxy reachability, PS4 status.
+    Doctor {
+        #[arg(long)]
+        afterglow_directory: Option<PathBuf>,
+        #[arg(long)]
+        debugger_payload: Option<PathBuf>,
+    },
+    /// Download and install the latest ps4-mcp release from GitHub.
+    Update {
+        #[arg(long, short = 'y', help = "Skip the y/N confirmation prompt")]
+        yes: bool,
+    },
 }
 
 fn token_path(profile: &Profile, argument: Option<&Path>) -> Result<PathBuf> {
@@ -176,8 +197,8 @@ fn token_path(profile: &Profile, argument: Option<&Path>) -> Result<PathBuf> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| broker::token_file(profile)),
     )?;
-    let resolved = ps4_workbench_rs::config::resolve_lenient(&path)?;
-    let root = ps4_workbench_rs::config::resolve_lenient(&profile.artifact_root())?;
+    let resolved = ps4_mcp::config::resolve_lenient(&path)?;
+    let root = ps4_mcp::config::resolve_lenient(&profile.artifact_root())?;
     ensure!(
         !resolved.starts_with(root),
         "Token must stay outside MCP-readable artifacts"
@@ -274,7 +295,7 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             input,
         } => {
             let mut registry =
-                ps4_workbench_rs::client::RemoteRegistry::new(remote_client(&profile, &remote)?)?;
+                ps4_mcp::client::RemoteRegistry::new(remote_client(&profile, &remote)?)?;
             Ok(Some(registry.call(&tool, input.value()?)?))
         }
         Command::GdbServer {
@@ -293,7 +314,7 @@ fn run(cli: Cli) -> Result<Option<Value>> {
             eprintln!(
                 "GDB Remote: 127.0.0.1:{port}; PID {pid}; observer={observer}; allow_writes={allow_writes}"
             );
-            ps4_workbench_rs::rsp::serve_with_options(
+            ps4_mcp::rsp::serve_with_options(
                 client,
                 pid,
                 &listen_address,
@@ -302,6 +323,158 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                 allow_writes,
             )?;
             Ok(None)
+        }
+        Command::Proxy { target, remote_debug_port } => {
+            use ps4_mcp::proxy::{Mode, Route, start};
+            let routes = [
+                Route { local: profile.port("debug"), remote: remote_debug_port, mode: Mode::Pipe },
+                Route { local: profile.port("ftp"), remote: profile.port("ftp"), mode: Mode::Ftp },
+                Route { local: profile.port("klog"), remote: profile.port("klog"), mode: Mode::Pipe },
+            ];
+            // An unconfigured port reads as 0, which would bind a random port.
+            let routes: Vec<Route> = routes.into_iter().filter(|r| r.local != 0).collect();
+            ensure!(!routes.is_empty(), "Profile configures none of the debug/ftp/klog ports");
+            start(&target, &routes)?;
+            for route in routes {
+                eprintln!("127.0.0.1:{} -> {target}:{} [{:?}]", route.local, route.remote, route.mode);
+            }
+            eprintln!("Proxy running; Ctrl-C to stop.");
+            loop {
+                std::thread::park();
+            }
+        }
+        Command::Doctor { afterglow_directory, debugger_payload } => {
+            let mut report = serde_json::Map::new();
+
+            // 1. Qualification validity
+            let qual_path = profile.qualification_path();
+            let qual_ok = if qual_path.exists() {
+                let qual: Value = serde_json::from_slice(&std::fs::read(&qual_path)?)?;
+                let qual_hash = qual["profile_sha256"].as_str().unwrap_or("");
+                let profile_hash = profile.fingerprint();
+                let ok = qual_hash == profile_hash;
+                if ok {
+                    eprintln!("[OK]  Qualification valid");
+                } else {
+                    eprintln!("[ERR] Qualification STALE — expected {profile_hash}, file has {qual_hash}");
+                    eprintln!("      Run: scripts/qualify-local.ps1 to re-qualify");
+                }
+                ok
+            } else {
+                eprintln!("[ERR] Qualification missing: {}", qual_path.display());
+                false
+            };
+            report.insert("qualification_valid".into(), qual_ok.into());
+
+            // 2. Proxy TCP reachability
+            let debug_port = profile.data["ports"]["debug"].as_u64().unwrap_or(7441) as u16;
+            let host = profile.data["host"].as_str().unwrap_or("127.0.0.1");
+            let proxy_ok = std::net::TcpStream::connect(format!("{host}:{debug_port}")).is_ok();
+            if proxy_ok {
+                eprintln!("[OK]  Proxy reachable at {host}:{debug_port}");
+            } else {
+                eprintln!("[ERR] Proxy not reachable at {host}:{debug_port} — run: ps4-mcp proxy --target <console IP>");
+            }
+            report.insert("proxy_reachable".into(), proxy_ok.into());
+
+            // 3. Preflight (console connectivity + jailbreak checks)
+            match jailbreak::preflight(&profile, afterglow_directory.as_deref(), debugger_payload.as_deref(), false) {
+                Ok(pf) => {
+                    let console_ok = pf["ok"] == true;
+                    eprintln!("[{}]  Console preflight", if console_ok { "OK " } else { "ERR" });
+                    report.insert("preflight".into(), pf);
+                }
+                Err(e) => {
+                    eprintln!("[ERR] Console preflight: {e}");
+                    report.insert("preflight".into(), json!({"ok": false, "error": e.to_string()}));
+                }
+            }
+
+            report.insert("version".into(), env!("CARGO_PKG_VERSION").into());
+            Ok(Some(Value::Object(report)))
+        }
+        Command::Update { yes } => {
+            let current_ver = env!("CARGO_PKG_VERSION");
+            eprintln!("ps4-mcp v{current_ver}");
+            eprintln!("Checking https://github.com/May-Ethereal/PS4-MCP for updates...");
+
+            let client = reqwest::blocking::Client::builder()
+                .user_agent(concat!("ps4-mcp/", env!("CARGO_PKG_VERSION")))
+                .build()?;
+            let release: Value = client
+                .get("https://api.github.com/repos/May-Ethereal/PS4-MCP/releases/latest")
+                .send()
+                .context("GitHub API request failed")?
+                .error_for_status()
+                .context("GitHub API returned an error")?
+                .json()?;
+
+            let tag = release["tag_name"].as_str().context("Missing tag_name in release")?;
+            let latest_ver = tag.trim_start_matches('v');
+
+            if latest_ver == current_ver {
+                eprintln!("Already up to date ({current_ver}).");
+                return Ok(Some(json!({"status":"up_to_date","version":current_ver})));
+            }
+            eprintln!("New version available: {latest_ver}");
+
+            let assets = release["assets"].as_array().context("No assets in this release")?;
+            let asset = assets
+                .iter()
+                .find(|a| {
+                    let name = a["name"].as_str().unwrap_or("");
+                    name.ends_with(".exe") || (name.contains("windows") && name.contains("x86_64"))
+                })
+                .context("No Windows binary found in this release — check https://github.com/May-Ethereal/PS4-MCP/releases")?;
+            let download_url = asset["browser_download_url"].as_str().context("Missing download URL")?;
+            let asset_name = asset["name"].as_str().unwrap_or("ps4-mcp.exe");
+
+            if !yes {
+                eprint!("Update {current_ver} → {latest_ver}? [y/N] ");
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                ensure!(answer.trim().eq_ignore_ascii_case("y"), "Update cancelled");
+            }
+
+            eprintln!("Downloading {asset_name}...");
+            let mut response = client
+                .get(download_url)
+                .send()
+                .context("Download failed")?
+                .error_for_status()
+                .context("Download error")?;
+
+            let current_exe = std::env::current_exe().context("Cannot locate current executable")?;
+            let new_path = current_exe.with_extension("update.exe");
+            {
+                let mut f = std::fs::File::create(&new_path)?;
+                std::io::copy(&mut response, &mut f)?;
+            }
+
+            // Windows: rename running exe out of the way first (can't overwrite a running exe),
+            // then rename the new download into its place.
+            // Unix: direct rename over the running file works fine (inode stays open).
+            let backup = current_exe.with_extension(format!("v{current_ver}.bak"));
+            #[cfg(windows)]
+            {
+                std::fs::rename(&current_exe, &backup)
+                    .context("Could not rename current binary — is the exe locked by another process?")?;
+                if let Err(e) = std::fs::rename(&new_path, &current_exe) {
+                    let _ = std::fs::rename(&backup, &current_exe); // best-effort restore
+                    return Err(e).context("Could not move new binary into place; original restored");
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                std::fs::rename(&new_path, &current_exe)
+                    .context("Could not replace binary")?;
+                // No backup needed on Unix; keep path consistent with the Windows message below
+                let _ = std::fs::copy(&current_exe, &backup);
+            }
+
+            eprintln!("Updated to {latest_ver}. Previous binary saved as {}", backup.display());
+            Ok(Some(json!({"status":"updated","from":current_ver,"to":latest_ver,"backup":backup.display().to_string()})))
         }
         Command::Qualify {
             evidence,
@@ -461,7 +634,10 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                 Command::Tools => json!(registry.available()),
                 Command::AfterglowVerify { .. }
                 | Command::DebuggerPayloadVerify { .. }
-                | Command::Preflight { .. } => unreachable!(),
+                | Command::Preflight { .. }
+                | Command::Proxy { .. }
+                | Command::Doctor { .. }
+                | Command::Update { .. } => unreachable!(),
                 Command::Call { tool, input } => registry.call(&tool, input.value()?)?,
                 Command::Ingest { file } => {
                     let content = read_bounded(&file, profile.limit("transfer_bytes"))?;
@@ -487,7 +663,7 @@ fn run(cli: Cli) -> Result<Option<Value>> {
                         if registry.workbench.read_artifact(&text, 1 << 20).is_ok() {
                             return Ok(text);
                         }
-                        let local = ps4_workbench_rs::config::resolve_lenient(path)?;
+                        let local = ps4_mcp::config::resolve_lenient(path)?;
                         ensure!(local.is_file(), "Not an artifact or local file: {}", local.display());
                         let content =
                             read_bounded(&local, registry.workbench.profile.limit("transfer_bytes"))?;

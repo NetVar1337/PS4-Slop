@@ -1,18 +1,18 @@
-"""Connect Binary Ninja to the PS4 workbench shared broker as an analysis agent.
+"""Connect Binary Ninja to the PS4-MCP shared broker as an analysis agent.
 
 Run inside Binary Ninja's Python (plugin / Script Manager), where the open
 BinaryView is the global `bv`:
 
-    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/integrations/binja/ps4_connect.py").read())
+    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/integrations/binja/ps4_connect.py").read())
 
 or headless with Binary Ninja's bundled Python:
 
     import binaryninja
     bv = binaryninja.load(r"D:/dumps/eboot.bin")
-    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/integrations/binja/ps4_connect.py").read())
+    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/integrations/binja/ps4_connect.py").read())
 
 Environment:
-    PS4_WORKBENCH_ROOT  repository root (default is this checkout)
+    PS4_MCP_ROOT  repository root (default is this checkout)
     PS4_BROKER_URL      broker URL (default http://127.0.0.1:8765)
 """
 
@@ -22,29 +22,29 @@ from pathlib import Path
 
 
 def _repository_root():
-    configured = os.environ.get("PS4_WORKBENCH_ROOT")
+    configured = os.environ.get("PS4_MCP_ROOT")
     if configured:
         root = Path(configured).expanduser().resolve()
-        if (root / "ps4_workbench" / "adapters" / "binja.py").is_file():
+        if (root / "ps4_mcp" / "adapters" / "binja.py").is_file():
             return root
-        raise RuntimeError("PS4_WORKBENCH_ROOT does not point at a PS4-DebugMCPs checkout")
+        raise RuntimeError("PS4_MCP_ROOT does not point at a PS4-MCP checkout")
     candidates = [Path.cwd()]
     script = globals().get("__file__")
     if script:
         candidates.append(Path(script).resolve().parent)
     for candidate in candidates:
         for root in (candidate, *candidate.parents):
-            if (root / "ps4_workbench" / "adapters" / "binja.py").is_file():
+            if (root / "ps4_mcp" / "adapters" / "binja.py").is_file():
                 return root
     raise RuntimeError(
-        "Cannot locate PS4-DebugMCPs; set PS4_WORKBENCH_ROOT to the repository root"
+        "Cannot locate PS4-MCP; set PS4_MCP_ROOT to the repository root"
     )
 
 repository = str(_repository_root())
 if repository not in sys.path:
     sys.path.insert(0, repository)
 
-from ps4_workbench.adapters.binja import BinjaWorkbench
+from ps4_mcp.adapters.binja import BinjaWorkbench
 
 
 def connect(bv=None, url=None, token_path=None):

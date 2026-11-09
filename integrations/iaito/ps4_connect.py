@@ -1,11 +1,11 @@
-"""Connect radare2/iaito to the PS4 workbench shared broker as an analysis agent.
+"""Connect radare2/iaito to the PS4-MCP shared broker as an analysis agent.
 
 Usage (needs r2 on PATH and the r2pipe package):
 
     python integrations/iaito/ps4_connect.py D:/dumps/eboot.bin
 
 Environment:
-    PS4_WORKBENCH_ROOT  repository root (default is this checkout)
+    PS4_MCP_ROOT  repository root (default is this checkout)
     PS4_BROKER_URL      broker URL (default http://127.0.0.1:8765)
     PS4_IAITO_FILE      binary path when no argv[1] is given
 """
@@ -13,11 +13,11 @@ Environment:
 import os
 import sys
 
-repository = os.environ.get("PS4_WORKBENCH_ROOT", "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs")
+repository = os.environ.get("PS4_MCP_ROOT", "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP")
 if repository not in sys.path:
     sys.path.insert(0, repository)
 
-from ps4_workbench.adapters.iaito import IaitoWorkbench
+from ps4_mcp.adapters.iaito import IaitoWorkbench
 
 
 def main():

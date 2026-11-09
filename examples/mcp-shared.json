@@ -1,7 +1,7 @@
 {
   "mcpServers": {
-    "ps4-shared": {
-      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/target/release/ps4-workbench",
+    "ps4-mcp-shared": {
+      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/target/release/ps4-mcp",
       "args": [
         "--profile",
         "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/profiles/ps4-1400.json",

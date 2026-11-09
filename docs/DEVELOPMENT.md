@@ -68,7 +68,7 @@ Set `OO_PS4_TOOLCHAIN` to the SDK root; `sdk_status` reports it.
 - `scripts/qualify-local` runs `cargo test`, the Python suite and `validate`,
   then invokes the real `qualify` CLI with your evidence/attestation/approvals.
 - `scripts/start-broker` starts the shared broker (default port 24600);
-  `python -m ps4_workbench.ctl` is the host control plane against it
+  `python -m ps4_mcp.ctl` is the host control plane against it
   (`status`, `tools`, `call`, `preflight`, `stage`, `recover`, `payload-status`,
   `rpc`, `features`, `shutdown`, `export-offsets`).
 
@@ -161,13 +161,13 @@ Both register as read-only static-analysis agents (`target: "binja"` /
 `analysis_xrefs`, exactly like the IDA/Ghidra agents. Discovery is reported by
 `desktop_status` via `PS4_BINJA_DIRECTORY` / `PS4_IAITO_DIRECTORY`.
 
-- **Binary Ninja:** `ps4_workbench/adapters/binja.py`. Run
+- **Binary Ninja:** `ps4_mcp/adapters/binja.py`. Run
   `integrations/binja/ps4_connect.py` inside Binary Ninja's Python (plugin /
   Script Manager, where the open view is the global `bv`), or headless with
   BN's bundled Python: `bv = binaryninja.load(path)` then `connect(bv)`.
   Decompilation uses HLIL (falls back to MLIL/LLIL); xrefs use
   `get_code_refs_to`. The input SHA-256 is verified before every job.
-- **iaito/radare2:** `ps4_workbench/adapters/iaito.py`, driven through r2pipe
+- **iaito/radare2:** `ps4_mcp/adapters/iaito.py`, driven through r2pipe
   (needs `r2` on PATH and `pip install r2pipe`):
   `python integrations/iaito/ps4_connect.py D:/dumps/eboot.bin`.
   `aaa` runs once at startup; functions via `aflj`, decompilation via `pdc`
@@ -182,7 +182,7 @@ https://github.com/mrexodia/ida-pro-mcp
 
 The optional upstream IDA MCP is not bundled or installed. This repository now
 also includes its own read-only IDA analysis agent and live broker client in
-`ps4_workbench/adapters/ida.py`, plus the native GDB bridge. The installed IDA
+`ps4_mcp/adapters/ida.py`, plus the native GDB bridge. The installed IDA
 Pro 9.5 adapter/decompiler and native debugger have passed fixture tests; see
 `VALIDATION_02.md`. Running two independent console debugger clients is still not
 supported: share the broker and one control lease.

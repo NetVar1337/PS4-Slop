@@ -21,10 +21,10 @@ echo "[qualify-local] 1/4 cargo test (offline fixture + unit tests)"
 cargo test --locked -j 2
 echo "[qualify-local] 2/4 python adapter/ctl tests against the real broker"
 python -m unittest discover -q || python3 -m unittest discover -q
-echo "[qualify-local] 3/4 workbench validate"
-BIN="target/debug/ps4-workbench"
-[ -x "$BIN" ] || BIN="target/release/ps4-workbench"
-[ -x "$BIN" ] || { echo "build the workbench first: cargo build --locked" >&2; exit 1; }
+echo "[qualify-local] 3/4 ps4-mcp validate"
+BIN="target/debug/ps4-mcp"
+[ -x "$BIN" ] || BIN="target/release/ps4-mcp"
+[ -x "$BIN" ] || { echo "build ps4-mcp first: cargo build --locked" >&2; exit 1; }
 "$BIN" --profile "$PROFILE" validate
 
 echo "[qualify-local] 4/4 qualify CLI (no console contact; records your attestation)"

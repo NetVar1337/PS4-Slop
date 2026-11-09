@@ -3,7 +3,7 @@
 To create a new standalone game repository around this pipeline (scaffold,
 shared toolchain, one-call staging, per-build offset store), see
 [GAME_PROJECT.md](GAME_PROJECT.md): `game_new`, `game_update`, `game_stage`,
-`game_verify`, `ps4-workbench inject`, and `ctl update --project-dir`.
+`game_verify`, `ps4-mcp inject`, and `ctl update --project-dir`.
 
 The workbench now has a connected development path: identify an exact build,
 record typed research, export SDKs, install generated inputs, build a fresh ELF,
@@ -14,7 +14,7 @@ console mutation permissions. No scaffold, install, build, or collection deploys
 ## Build a diagnostic project
 
 ```powershell
-ps4-workbench --toolset full call payload_scaffold --arguments '{"name":"FortniteDiagnostics","engine":"unreal"}'
+ps4-mcp --toolset full call payload_scaffold --arguments '{"name":"FortniteDiagnostics","engine":"unreal"}'
 python workspace/projects/FortniteDiagnostics/build.py --host-test
 python workspace/projects/FortniteDiagnostics/build.py
 ```
@@ -128,7 +128,7 @@ neither restart nor cancellation automatically repeats or undoes it.
 Debugger-control steps retain the broker's debug lease requirement. MCP
 cancellation is also checked between recipe steps.
 
-`python -m ps4_workbench.ctl ... session` exposes those actions. The `update`
+`python -m ps4_mcp.ctl ... session` exposes those actions. The `update`
 command uses durable sessions, registers the new build contract, installs fresh
 generated inputs, then builds. Supply `--session-id` to resume, or `--dry-run`
 to inspect a plan. A new project requires the actual `--app-version`.

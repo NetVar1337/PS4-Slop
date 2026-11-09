@@ -2,10 +2,10 @@
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "servers": {
-      "ps4-workbench": {
+      "ps4-mcp": {
         "type": "local",
         "command": [
-          "C:/path/to/PS4-MCP/target/release/ps4-workbench.exe",
+          "C:/path/to/PS4-MCP/target/release/ps4-mcp.exe",
           "--profile",
           "C:/path/to/PS4-MCP/profiles/ps4-1400.local.json",
           "--toolset",

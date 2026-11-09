@@ -1,4 +1,4 @@
-"""radare2 / iaito analysis-agent adapter for the PS4 workbench broker.
+"""radare2 / iaito analysis-agent adapter for the PS4-MCP broker.
 
 iaito is the radare2 GUI; this adapter drives the same r2 engine headlessly
 through r2pipe, so it works with either an iaito installation or a plain r2

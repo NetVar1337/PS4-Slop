@@ -2,11 +2,11 @@ import os
 import sys
 
 
-repository = os.environ.get("PS4_WORKBENCH_ROOT", "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs")
+repository = os.environ.get("PS4_MCP_ROOT", "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP")
 if repository not in sys.path:
     sys.path.insert(0, repository)
 
-from ps4_workbench.adapters.ghidra import GhidraWorkbench
+from ps4_mcp.adapters.ghidra import GhidraWorkbench
 
 try:
     plugin_tool = state.getTool()  # noqa: F821 - provided by the Ghidra script environment; None when headless

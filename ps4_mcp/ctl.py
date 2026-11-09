@@ -1,13 +1,13 @@
-"""Host control-plane CLI for a running ``ps4-workbench`` broker.
+"""Host control-plane CLI for a running ps4-mcp broker.
 
 Start the broker with a qualified local profile (see docs/QUALIFICATION.md):
 
-    ps4-workbench --profile profiles/ps4-1400.local.json --toolset full \\
+    ps4-mcp --profile profiles/ps4-1400.local.json --toolset full \\
         broker --port 24600 --token-file profiles/broker-token.local
 
 Then drive it:
 
-    python -m ps4_workbench.ctl --url http://127.0.0.1:24600 \\
+    python -m ps4_mcp.ctl --url http://127.0.0.1:24600 \\
         --token-file profiles/broker-token.local status
     ... preflight --probe
     ... call memory_peek '{"pid": 71, "address": "0x400000", "length": 64}'
@@ -60,7 +60,7 @@ def _add_common(parser):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="ps4-workbench-ctl", description=__doc__ or "PS4 workbench control plane")
+    parser = argparse.ArgumentParser(prog="ps4-mcp-ctl", description=__doc__ or "PS4-MCP control plane")
     _add_common(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -516,7 +516,7 @@ def _update(client, args):
     sha = evidence["payload"]["sha256"]
     return {"session": session_id, "update": update, "installed": installed, "build": evidence,
             "payload": {"path": str(payload_file), "sha256": sha}, "collected": collected, "deployed": False,
-            "next": {"ingest": ["ps4-workbench", "ingest", str(payload_file)], "target": target_path,
+            "next": {"ingest": ["ps4-mcp", "ingest", str(payload_file)], "target": target_path,
                      "payload_sha256": sha, "action": "qualify the exact tested output before staging"}}
 
 

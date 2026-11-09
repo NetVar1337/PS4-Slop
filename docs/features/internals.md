@@ -67,7 +67,7 @@ per PID. No automatic retries: an uncertain upload requires manual recovery.
 4. Qualify: enable `process_inject` in the local profile and add the ELF hash to
    the allowlist via `qualify --payload-sha256 ...`.
 5. `scripts/start-broker` (or `serve`), then
-   `python -m ps4_workbench.ctl ... stage --pid N --target T --payload P --sha256 H`,
+   `python -m ps4_mcp.ctl ... stage --pid N --target T --payload P --sha256 H`,
    `rpc --command 1 --argument <bits>` to arm features, `payload-status` to
    observe, `config get|set` / `telemetry` for the config and telemetry words,
    `watch` for heartbeat monitoring, `shutdown` to retire.
@@ -99,7 +99,7 @@ When the game updates, the payload hash changes by design:
 - `offset_scan` ([offsetscan.md](offsetscan.md)) verifies offsets live and
   relocates moved signatures; `module_integrity` diffs dump vs disk.
 
-`python -m ps4_workbench.ctl update --game fortnite|apex --pid N` runs the whole
+`python -m ps4_mcp.ctl update --game fortnite|apex --pid N` runs the whole
 loop: the pipeline recipe (or `offset_refresh` with `--old-artifact` +
 `--annotations`), builds the payload locally, hashes it, and prints the exact
 `ingest` / `qualify --replace` / `stage_and_verify` commands. Qualification

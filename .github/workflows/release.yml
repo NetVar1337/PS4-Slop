@@ -67,7 +67,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            asset: ps4-mcp-linux-x86_64
+          - os: windows-latest
+            asset: ps4-mcp-windows-x86_64.exe
+          - os: macos-latest
+            asset: ps4-mcp-macos-arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -80,22 +86,21 @@ jobs:
       - name: Test
         run: cargo test --locked
       - name: Build the release binaries
-        run: cargo build --release --locked --bin ps4-workbench
+        run: cargo build --release --locked --bin ps4-mcp
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
+          # Flat, platform-named files: `ps4-mcp update` picks its asset by name,
+          # and `gh release create ./*` cannot upload directories.
           mkdir -p dist
-          binary="target/release/ps4-workbench.exe"
-          [ -f "$binary" ] || binary="target/release/ps4-workbench"
-          staging="dist/ps4-workbench-${{ matrix.os }}"
-          mkdir -p "$staging"
-          cp "$binary" "$staging/"
-          cp README.md LICENSE "$staging/" 2>/dev/null || true
-          (cd dist && sha256sum "$(basename "$staging")"/* > "$(basename "$staging").sha256")
+          binary="target/release/ps4-mcp.exe"
+          [ -f "$binary" ] || binary="target/release/ps4-mcp"
+          cp "$binary" "dist/${{ matrix.asset }}"
+          (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
-          name: ps4-workbench-${{ matrix.os }}
+          name: ${{ matrix.asset }}
           path: dist/*
           if-no-files-found: error
 

@@ -1,4 +1,4 @@
-"""Binary Ninja analysis-agent adapter for the PS4 workbench broker.
+"""Binary Ninja analysis-agent adapter for the PS4-MCP broker.
 
 Two ways to use it:
 
@@ -11,7 +11,7 @@ Two ways to use it:
 
        import binaryninja
        bv = binaryninja.load(r"D:/dumps/eboot.bin")
-       from ps4_workbench.adapters.binja import BinjaWorkbench
+       from ps4_mcp.adapters.binja import BinjaWorkbench
        ps4 = BinjaWorkbench("http://127.0.0.1:8765",
                            r"C:/.../profiles/broker-token.local", bv=bv)
        ps4.start_analysis()

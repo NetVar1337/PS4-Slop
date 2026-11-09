@@ -29,7 +29,7 @@ the served version and loaded debugger manually.
 The HEN build string is a manually recorded identity; the workbench does not
 remotely attest it. Identical branding cannot prove identical debugger binaries.
 
-Use `ps4-workbench hash PATH_TO_FILE` to hash an actual binary. Keep
+Use `ps4-mcp hash PATH_TO_FILE` to hash an actual binary. Keep
 the binary and source/build provenance. Do not load an arbitrary debugger just
 because its filename says 14.00. Read `COMPATIBILITY.md` first.
 
@@ -63,7 +63,7 @@ Set the relevant flags to true in your **local profile**, then record a local
 qualification. The command does not contact the console or perform tests:
 
 ```powershell
-ps4-workbench --profile profiles/ps4-1400.local.json qualify `
+ps4-mcp --profile profiles/ps4-1400.local.json qualify `
   --evidence C:/research/my-completed-hardware-tests.md `
   --attest I_TESTED_THIS_EXACT_CONFIGURATION `
   --approve ftp_upload `

@@ -1,4 +1,4 @@
-"""HTTP client for the native ``ps4-workbench broker`` (Rust, ``src/broker.rs``).
+"""HTTP client for the ps4-mcp broker (Rust, ``src/broker.rs``).
 
 The broker owns the token file; this client only reads it.
 """

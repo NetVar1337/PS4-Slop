@@ -16,7 +16,7 @@ try:
         raise RuntimeError("IDA Remote GDB debugger could not load")
     ida_dbg.set_remote_debugger("127.0.0.1", "", int(idc.ARGV[1]))
     sys.path.insert(0, idc.ARGV[3])
-    from ps4_workbench.adapters.ida import IDAWorkbench
+    from ps4_mcp.adapters.ida import IDAWorkbench
     live = IDAWorkbench(idc.ARGV[4], idc.ARGV[5])
     regions = live.sync_debugger_regions(71, apply=True)
     attached = ida_dbg.attach_process(71, -1)

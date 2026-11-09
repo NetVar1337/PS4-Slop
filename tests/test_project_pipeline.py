@@ -7,8 +7,8 @@ import sys
 import tempfile
 import unittest
 
-from ps4_workbench.build import build, source_snapshot
-from ps4_workbench.config import WorkbenchError
+from ps4_mcp.build import build, source_snapshot
+from ps4_mcp.config import WorkbenchError
 from tests.test_adapters import RustBroker
 
 
@@ -204,7 +204,7 @@ class DescriptorDrivenUpdateTests(unittest.TestCase):
         cls.broker.close()
 
     def test_load_descriptor_reads_workbench_json(self):
-        from ps4_workbench.ctl import load_descriptor
+        from ps4_mcp.ctl import load_descriptor
         with tempfile.TemporaryDirectory() as empty:
             self.assertIsNone(load_descriptor(empty))
         with tempfile.TemporaryDirectory() as repo:
@@ -220,7 +220,7 @@ class DescriptorDrivenUpdateTests(unittest.TestCase):
 
     def test_update_delegates_research_to_game_update(self):
         from unittest.mock import patch
-        from ps4_workbench import ctl
+        from ps4_mcp import ctl
         client = self.broker.client()
         with tempfile.TemporaryDirectory() as repo:
             (Path(repo) / "workbench.json").write_text(json.dumps({
@@ -230,7 +230,7 @@ class DescriptorDrivenUpdateTests(unittest.TestCase):
                     "update", "--project-dir", repo, "--pid", "71", "--no-build"]
             parsed = ctl.build_parser().parse_args(argv)
             result = {"session": "a" * 32, "target": "target.json", "installed": None}
-            with patch("ps4_workbench.ctl._call", return_value=result) as call:
+            with patch("ps4_mcp.ctl._call", return_value=result) as call:
                 returned = ctl._update(client, parsed)
             self.assertEqual(call.call_args.args[1], "game_update")
             self.assertEqual(call.call_args.kwargs["repository"], str(Path(repo).resolve()))
@@ -238,7 +238,7 @@ class DescriptorDrivenUpdateTests(unittest.TestCase):
             self.assertEqual(returned["session"], "a" * 32)
 
     def test_update_dry_run_derives_plan_from_workbench_json(self):
-        from ps4_workbench import ctl
+        from ps4_mcp import ctl
         client = self.broker.client()
         with tempfile.TemporaryDirectory() as repo:
             (Path(repo) / "workbench.json").write_text(json.dumps({

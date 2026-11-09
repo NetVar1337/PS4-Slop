@@ -8,8 +8,8 @@ import idc
 
 
 sys.path.insert(0, idc.ARGV[1])
-from ps4_workbench.adapters.ida import IDAWorkbench
-from ps4_workbench.config import WorkbenchError
+from ps4_mcp.adapters.ida import IDAWorkbench
+from ps4_mcp.config import WorkbenchError
 
 try:
     ida_auto.auto_wait()

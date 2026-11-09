@@ -194,7 +194,7 @@
  },
  {
   "name": "klog_capture",
-  "description": "Capture bounded raw Klog bytes and timestamp envelope. Does not enable Klog or reconnect.",
+  "description": "Capture bounded raw Klog bytes and timestamp envelope; crash_lines lists signal exits, kernel traps, panics and assertions found in the capture. Does not enable Klog.",
   "inputSchema": {
    "type": "object",
    "properties": {
