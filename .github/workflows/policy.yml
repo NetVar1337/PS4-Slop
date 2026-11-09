@@ -1,0 +1,38 @@
+name: dependency-policy
+
+# The dependency policy of the workbench.
+#
+#   cargo deny check advisories bans licenses
+#
+# deny.toml is the policy: every advisory is denied, wildcards are denied, unknown registries and
+# unknown git sources are denied, and the licence list is explicit so that a new licence in a new
+# dependency is a decision and not an accident.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-policy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --version 0.16.4 --locked
+      - name: Check the dependency policy
+        run: cargo deny check advisories bans licenses
