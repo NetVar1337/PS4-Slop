@@ -1,13 +1,13 @@
 {
   "mcpServers": {
     "ps4-shared": {
-      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/target/release/ps4-workbench",
+      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/target/release/ps4-workbench",
       "args": [
         "--profile",
-        "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/profiles/ps4-1400.json",
+        "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/profiles/ps4-1400.json",
         "serve", "--broker", "http://127.0.0.1:8765", "--client-id", "mcp-primary"
       ],
-      "cwd": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs"
+      "cwd": "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP"
     }
   }
 }

@@ -5,9 +5,9 @@
       "ps4-workbench": {
         "type": "local",
         "command": [
-          "C:/path/to/PS4-DebugMCPs/target/release/ps4-workbench.exe",
+          "C:/path/to/PS4-MCP/target/release/ps4-workbench.exe",
           "--profile",
-          "C:/path/to/PS4-DebugMCPs/profiles/ps4-1400.local.json",
+          "C:/path/to/PS4-MCP/profiles/ps4-1400.local.json",
           "--toolset",
           "read-only",
           "serve"

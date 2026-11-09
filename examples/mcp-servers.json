@@ -1,15 +1,15 @@
 {
   "mcpServers": {
     "ps4-workbench": {
-      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/target/release/ps4-workbench",
+      "command": "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/target/release/ps4-workbench",
       "args": [
         "--profile",
-        "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs/profiles/ps4-1400.local.json",
+        "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/profiles/ps4-1400.local.json",
         "--toolset",
         "read-only",
         "serve"
       ],
-      "cwd": "C:/Users/Admin/Desktop/GithubProjects/PS4-DebugMCPs"
+      "cwd": "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP"
     }
   }
 }

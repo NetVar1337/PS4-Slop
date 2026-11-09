@@ -2,7 +2,7 @@
 
 // Fail-closed target verification for resident payloads.
 //
-// `project_export_offsets` (PS4-DebugMCPs) generates an `offsets.hpp` whose
+// `project_export_offsets` (PS4-MCP) generates an `offsets.hpp` whose
 // per-module `kVerifyChecks[]` arrays are built from this struct: each entry is
 // a module-relative RVA plus the bytes observed in a recorded dump of the exact
 // module hash the offsets were derived from. A payload calls verify_module()

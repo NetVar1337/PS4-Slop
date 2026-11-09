@@ -1,4 +1,4 @@
-# PS4-DebugMCPs
+# PS4-MCP
 
 For buildable diagnostic payloads, typed research, generated SDK integration,
 durable development sessions, and memory replay, see
