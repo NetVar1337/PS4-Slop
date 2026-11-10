@@ -1,3 +1,0 @@
-C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/CMakeFiles/lua-populate.dir
-C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/CMakeFiles/edit_cache.dir
-C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/CMakeFiles/rebuild_cache.dir
