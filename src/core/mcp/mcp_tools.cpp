@@ -9523,15 +9523,13 @@ json tool_guide(const json& args) {
             if (want == t.id) {
                 json steps = json::array();
                 for (const auto& s : t.steps) {
-    std::fprintf(stderr, "GD-step\n");
-                    json pp = json::parse(s.params, nullptr, false);
-    std::fprintf(stderr, "GD-parsed\n");
-                    steps.push_back({{"tool", s.tool}, {"action", s.action},
-                                     {"params", std::move(pp)},
-                                     {"why", s.why}});
-    std::fprintf(stderr, "GD-pushed\n");
+                    json st;
+                    st["tool"] = s.tool;
+                    st["action"] = s.action;
+                    st["params"] = json::parse(s.params, nullptr, false);
+                    st["why"] = s.why;
+                    steps.push_back(std::move(st));
                 }
-    std::fprintf(stderr, "GD-done\n");
                 return {{"topic", t.id}, {"title", t.title},
                         {"summary", t.summary}, {"steps", steps}};
             }
