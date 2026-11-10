@@ -290,8 +290,19 @@ private:
         }
 
         case ps4::CMD_PROC_MAPS: {
+            const auto* mp = reinterpret_cast<const ps4::proc_maps_packet_t*>(body);
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
             std::lock_guard lk(mu);
+            if (mp->pid == 42) {
+                // system process: no /app0/ maps, so ps4_auto skips it
+                ps4::vm_map_entry_t m{};
+                std::strncpy(m.name, "/system/privileged/SceShellCore", sizeof(m.name) - 1);
+                m.start = 0x800000;
+                m.end   = 0x900000;
+                m.prot  = ps4::kVmProtRead | ps4::kVmProtExec;
+                if (!send_u32(c, 1)) return false;
+                return send_all(c, &m, sizeof(m));
+            }
             if (!send_u32(c, static_cast<uint32_t>(maps.size()))) return false;
             for (const auto& m : maps)
                 if (!send_all(c, &m, sizeof(m))) return false;
@@ -441,16 +452,22 @@ private:
         case ps4::CMD_DEBUG_CONTINUE: {
             const auto* p = reinterpret_cast<const ps4::debug_continue_packet_t*>(body);
             uint64_t hit = 0;
+            bool wp_hit = false;
             {
                 std::lock_guard lk(mu);
                 last_continue_stop = p->stop;
                 if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
                 for (const auto& [idx, bp] : bps)
                     if (bp.enabled) { hit = bp.address; break; }
+                if (!hit)
+                    for (const auto& [idx, wp] : wps)
+                        if (wp.enabled) { wp_hit = true; break; }
             }
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
-            // resuming into an armed breakpoint stops the main thread with SIGTRAP
+            // resuming into an armed breakpoint or watchpoint stops the main
+            // thread with SIGTRAP (watchpoint: rip stays at the faulting insn)
             if (p->stop == 0 && hit) send_event(101, 5u << 8, "main", hit);
+            else if (p->stop == 0 && wp_hit) send_event(101, 5u << 8, "main", 0);
             return true;
         }
 
@@ -1121,4 +1138,146 @@ TEST_CASE(ps4_mcp_debugger_flow) {
     r = dbg({{"action", "ps4_detach"}}, e);
     CHECK(!e);
     CHECK(r.value("attached", true) == false);
+}
+
+TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+
+    std::string err;
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto s = slop::core::process::active_session();
+    REQUIRE(s && s->valid());
+
+    auto dbg = [](const json& args, bool& is_err) {
+        return slop::core::mcp::call_tool("debugger", args, is_err);
+    };
+    bool e = false;
+
+    std::fprintf(stderr, "MARK attach
+");
+    // debug attach
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
+    CHECK(!e);
+    CHECK(r.value("attached", false) == true);
+
+    std::fprintf(stderr, "MARK until
+");
+    // ps4_until: one-call run-until, bp auto-armed and auto-cleared
+    r = dbg({{"action", "ps4_bp_list"}}, e);
+    CHECK(!e);
+    CHECK(r.value("count", 999) == 0);
+    r = dbg({{"action", "ps4_until"}, {"addr", 0x400700}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_until error: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("rip", 0) == 0x400700);
+    CHECK(r.value("signal", 0) == 5);
+    r = dbg({{"action", "ps4_bp_list"}}, e);   // one-shot bp cleared afterwards
+    CHECK(!e);
+    CHECK(r.value("count", 999) == 0);
+
+    std::fprintf(stderr, "MARK trace_calls
+");
+    // ps4_trace_calls: 3 hits, each carrying the arg registers
+    r = dbg({{"action", "ps4_trace_calls"}, {"addr", 0x400600}, {"count", 3}, {"timeout_ms", 2000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_trace_calls error: %s\n", r.dump().c_str());
+    CHECK(r.value("hits_count", -1) == 3);
+    REQUIRE_STR_EQ(r.value("stop_reason", ""), "count_reached");
+    REQUIRE(r.contains("hits") && r["hits"].size() == 3);
+    for (const auto& h : r["hits"]) {
+        CHECK(h.value("rip", 0) == 0x400600);
+        CHECK(h.contains("rdi") && h.contains("r9"));
+    }
+    r = dbg({{"action", "ps4_bp_list"}}, e);   // trace_calls cleared its bp
+    CHECK(!e);
+    CHECK(r.value("count", 999) == 0);
+
+    std::fprintf(stderr, "MARK find_write
+");
+    // ps4_find_write: watchpoint -> event -> callstack, watchpoint auto-cleared
+    r = dbg({{"action", "ps4_find_write"}, {"addr", 0x7FFF00001000}, {"len", 8}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_find_write error: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.contains("callstack") && r["callstack"].is_array());
+    CHECK(r["callstack"].size() >= 1);
+    CHECK(r.contains("writer_rip"));
+    r = dbg({{"action", "ps4_watch_list"}}, e);
+    CHECK(!e);
+    CHECK(r.value("count", 999) == 0);
+
+    std::fprintf(stderr, "MARK trace_steps
+");
+    // ps4_trace_steps: rip advances by one per step
+    r = dbg({{"action", "ps4_trace_steps"}, {"lwpid", 101}, {"count", 4}, {"timeout_ms", 2000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_trace_steps error: %s\n", r.dump().c_str());
+    CHECK(r.value("steps_count", -1) == 4);
+    REQUIRE(r.contains("steps") && r["steps"].size() == 4);
+    for (size_t i = 1; i < 4; ++i)
+        CHECK(r["steps"][i].value("rip", 0) == r["steps"][i - 1].value("rip", 0) + 1);
+
+    std::fprintf(stderr, "MARK ps4_auto
+");
+    // ps4_auto: already connected; picks the /app0/ game process (1234), not 42
+    {
+        bool e2 = false;
+        json a = slop::core::mcp::call_tool(
+            "target",
+            {{"action", "ps4_auto"}, {"host", "127.0.0.1"}, {"port", g.srv.port}},
+            e2);
+        CHECK(!e2);
+        if (e2) std::printf("  ps4_auto error: %s\n", a.dump().c_str());
+        CHECK(a.value("connected", false) == true);
+        CHECK(a.value("pid", 0) == kFakePid);
+        CHECK(a.value("debug_attached", false) == true);
+        CHECK(a.value("module_count", 0) == 2);   // 3 maps, but the anonymous stack map is skipped
+        REQUIRE(a.contains("modules") && a["modules"].size() == 2);
+        CHECK(a["modules"][0].value("name", "") == "eboot.bin");
+        CHECK(a["modules"][0].value("base", 0) == 0x400000);
+        CHECK(a.value("thread_count", 0) == 2);
+        CHECK(a.value("region_count", 0) == 3);
+        REQUIRE(a.contains("candidates"));
+        bool saw_game = false, saw_system = false;
+        for (const auto& c : a["candidates"]) {
+            if (c.value("pid", 0) == kFakePid) {
+                saw_game = true;
+                CHECK(c.value("game", false) == true);
+            }
+            if (c.value("pid", 0) == 42) {
+                saw_system = true;
+                CHECK(c.value("game", false) == false);
+            }
+        }
+        CHECK(saw_game);
+        CHECK(saw_system);
+    }
+
+    std::fprintf(stderr, "MARK guide
+");
+    // guide tool: list + get
+    {
+        bool e2 = false;
+        json l = slop::core::mcp::call_tool("guide", {{"action", "list"}}, e2);
+        CHECK(!e2);
+        CHECK(l.value("count", 0) >= 10);
+        json gt = slop::core::mcp::call_tool(
+            "guide", {{"action", "get"}, {"topic", "ps4_setup"}}, e2);
+        CHECK(!e2);
+        REQUIRE(gt.contains("steps") && gt["steps"].is_array() && !gt["steps"].empty());
+        CHECK(gt["steps"][0].value("tool", "") == "target");
+        CHECK(gt["steps"][0].contains("params"));
+        bool e3 = false;
+        json bad = slop::core::mcp::call_tool(
+            "guide", {{"action", "get"}, {"topic", "nope"}}, e3);
+        CHECK(e3);
+    }
+
+    // ps4_detach at the end
+    std::fprintf(stderr, "MARK detach
+");
+    r = dbg({{"action", "ps4_detach"}}, e);
+    CHECK(!e);
 }
