@@ -15,8 +15,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -205,6 +209,10 @@ class event_listener_t {
 public:
     ~event_listener_t() { stop(); }
 
+    // called from the listener thread for every complete 0x4A0-byte packet;
+    // set once before start() and never mutated afterwards
+    std::function<void(const uint8_t* pkt, size_t len)> on_packet;
+
     bool start(uint16_t port) {
         std::lock_guard lk(mu_);
         if (running_) return true;
@@ -271,12 +279,22 @@ private:
             rt.tv_sec  = 0;
             rt.tv_usec = 500 * 1000;
             setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rt), sizeof(rt));
-            // drain this event connection until the server drops it
-            char buf[0x4A0];
+            // drain this event connection until the server drops it; TCP can
+            // split/coalesce the fixed 0x4A0 packets, so reassemble the stream
+            auto cb = on_packet;
+            std::vector<uint8_t> acc;
+            acc.reserve(ps4::kDebugEventSize * 2);
+            uint8_t buf[0x8000];
             while (!stop_) {
-                int n = ::recv(c, buf, sizeof(buf), 0);
+                int n = ::recv(c, reinterpret_cast<char*>(buf), sizeof(buf), 0);
                 if (n <= 0) break;
                 events_.fetch_add(1);
+                acc.insert(acc.end(), buf, buf + n);
+                while (acc.size() >= ps4::kDebugEventSize) {
+                    if (cb) cb(acc.data(), ps4::kDebugEventSize);
+                    acc.erase(acc.begin(),
+                              acc.begin() + static_cast<ptrdiff_t>(ps4::kDebugEventSize));
+                }
             }
             closesocket(c);
         }
@@ -327,17 +345,73 @@ std::string base_name(const std::string& path) {
     return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
+void reg64_from_ctx(ps4::reg64_t& r, const thread_context_t& c) {
+    r = {};
+    r.r15 = c.r15; r.r14 = c.r14; r.r13 = c.r13; r.r12 = c.r12;
+    r.r11 = c.r11; r.r10 = c.r10; r.r9  = c.r9;  r.r8  = c.r8;
+    r.rdi = c.rdi; r.rsi = c.rsi; r.rbp = c.rbp; r.rbx = c.rbx;
+    r.rdx = c.rdx; r.rcx = c.rcx; r.rax = c.rax;
+    r.rip = c.rip; r.rsp = c.rsp; r.rflags = c.flags;
+}
+
+void ctx_from_reg64(thread_context_t& c, const ps4::reg64_t& r) {
+    c = {};
+    c.r15 = r.r15; c.r14 = r.r14; c.r13 = r.r13; c.r12 = r.r12;
+    c.r11 = r.r11; c.r10 = r.r10; c.r9  = r.r9;  c.r8  = r.r8;
+    c.rdi = r.rdi; c.rsi = r.rsi; c.rbp = r.rbp; c.rbx = r.rbx;
+    c.rdx = r.rdx; c.rcx = r.rcx; c.rax = r.rax;
+    c.rip = r.rip; c.rsp = r.rsp; c.flags = r.rflags;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 // backend impl
 
 struct backend_ps4_t::impl_t {
+    static constexpr size_t kMaxEvents = 4096;
+
+    impl_t() {
+        listener.on_packet = [this](const uint8_t* pkt, size_t n) { push_event(pkt, n); };
+    }
+
     std::shared_ptr<conn_t> conn = std::make_shared<conn_t>();
     std::string branding;
     uint16_t    fw = 0;
     uint32_t    dbg_pid = 0;          // pid the debug session is attached to, 0 = none
     event_listener_t listener;
+
+    // debug event queue, fed by the port-755 listener thread
+    std::mutex ev_mu;
+    std::condition_variable ev_cv;
+    std::deque<ps4_event_t> evq;
+
+    // rpc stub per pid (CMD_PROC_INTALL result) so ps4_call doesn't reinstall
+    std::map<uint32_t, uint64_t> rpcstubs;
+
+    void push_event(const uint8_t* pkt, size_t n) {
+        if (n < ps4::kDebugEventSize) return;
+        const auto* ep = reinterpret_cast<const ps4::debug_event_packet_t*>(pkt);
+        ps4_event_t e{};
+        e.lwpid  = ep->lwpid;
+        e.status = ep->status;
+        e.signal = static_cast<int>((ep->status >> 8) & 0xFF);
+        std::memcpy(e.thread_name, ep->tdname, sizeof(ep->tdname));
+        e.thread_name[sizeof(ep->tdname)] = '\0';
+        ctx_from_reg64(e.ctx, ep->regs);
+        std::memcpy(e.dr, ep->dbregs, sizeof(e.dr));
+        {
+            std::lock_guard lk(ev_mu);
+            if (evq.size() >= kMaxEvents) evq.pop_front();   // drop oldest
+            evq.push_back(std::move(e));
+        }
+        ev_cv.notify_all();
+    }
+
+    void clear_events() {
+        std::lock_guard lk(ev_mu);
+        evq.clear();
+    }
 
     // maps cache so read-coverage checks don't hammer the console
     std::mutex cache_mu;
@@ -443,6 +517,10 @@ struct backend_ps4_t::impl_t {
         if (status == ps4::CMD_ALREADY_DEBUG) { err = 5; return false; }
         if (status != ps4::CMD_SUCCESS) { err = 6; return false; }
         dbg_pid = pid;
+        {
+            std::lock_guard lk(ev_mu);
+            evq.clear();   // fresh debug session: drop stale events
+        }
         return true;
     }
 };
@@ -463,24 +541,6 @@ uint32_t handle_pid(const target_handle_t& h) {
 std::shared_ptr<conn_t> handle_conn(const target_handle_t& h) {
     auto* st = static_cast<attach_state_t*>(h.native);
     return st ? st->conn : nullptr;
-}
-
-void reg64_from_ctx(ps4::reg64_t& r, const thread_context_t& c) {
-    r = {};
-    r.r15 = c.r15; r.r14 = c.r14; r.r13 = c.r13; r.r12 = c.r12;
-    r.r11 = c.r11; r.r10 = c.r10; r.r9  = c.r9;  r.r8  = c.r8;
-    r.rdi = c.rdi; r.rsi = c.rsi; r.rbp = c.rbp; r.rbx = c.rbx;
-    r.rdx = c.rdx; r.rcx = c.rcx; r.rax = c.rax;
-    r.rip = c.rip; r.rsp = c.rsp; r.rflags = c.flags;
-}
-
-void ctx_from_reg64(thread_context_t& c, const ps4::reg64_t& r) {
-    c = {};
-    c.r15 = r.r15; c.r14 = r.r14; c.r13 = r.r13; c.r12 = r.r12;
-    c.r11 = r.r11; c.r10 = r.r10; c.r9  = r.r9;  c.r8  = r.r8;
-    c.rdi = r.rdi; c.rsi = r.rsi; c.rbp = r.rbp; c.rbx = r.rbx;
-    c.rdx = r.rdx; c.rcx = r.rcx; c.rax = r.rax;
-    c.rip = r.rip; c.rsp = r.rsp; c.flags = r.rflags;
 }
 
 } // namespace
@@ -564,6 +624,11 @@ void backend_ps4_t::disconnect() {
     m_impl->listener.stop();
     m_impl->branding.clear();
     m_impl->fw = 0;
+    m_impl->clear_events();
+    {
+        std::lock_guard lk(m_impl->ev_mu);
+        m_impl->rpcstubs.clear();
+    }
 }
 
 bool backend_ps4_t::connected() const noexcept {
@@ -671,6 +736,7 @@ void backend_ps4_t::detach(target_handle_t& h) {
                 c.recv_u32(s);
             }
             m_impl->dbg_pid = 0;
+            m_impl->clear_events();
         }
         delete st;
     }
@@ -1013,6 +1079,265 @@ io_result_t backend_ps4_t::set_thread_context(uint32_t tid, const thread_context
     if (!c.recv_u32(term) || term != ps4::CMD_SUCCESS) { r.error = 5; return r; }
     r.ok = true;
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// live debug session (ps4debug-NG CMD_DEBUG_*)
+
+bool backend_ps4_t::ps4_debug_attach(uint32_t pid, std::string& err) {
+    uint32_t e = 0;
+    if (!m_impl->ensure_debug(pid, e)) {
+        switch (e) {
+        case 1:  err = "not connected to a PS4 console"; break;
+        case 2:  err = "cannot listen on port 755 for debug events "
+                       "(the payload connects back there); is 755 free?"; break;
+        case 5:  err = "console reports CMD_ALREADY_DEBUG: another client is "
+                       "debugging this process"; break;
+        case 6:  err = "payload refused CMD_DEBUG_ATTACH (process gone or not "
+                       "debuggable)"; break;
+        default: err = "CMD_DEBUG_ATTACH failed (code " + std::to_string(e) + ")"; break;
+        }
+        return false;
+    }
+    return true;
+}
+
+bool backend_ps4_t::ps4_debug_detach() {
+    auto& c = *m_impl->conn;
+    {
+        std::lock_guard lk(c.mu);
+        if (c.connected() && m_impl->dbg_pid != 0) {
+            c.send_cmd(ps4::CMD_DEBUG_DETACH, nullptr, 0);
+            uint32_t st = 0;
+            c.recv_u32(st, kShortTimeoutMs);
+            m_impl->dbg_pid = 0;
+        }
+    }
+    m_impl->clear_events();
+    return true;
+}
+
+bool backend_ps4_t::ps4_debug_attached() const noexcept {
+    return m_impl->dbg_pid != 0;
+}
+
+uint32_t backend_ps4_t::ps4_debug_pid() const noexcept {
+    return m_impl->dbg_pid;
+}
+
+io_result_t backend_ps4_t::ps4_set_breakpoint(uint32_t index, bool enabled, uintptr_t addr) {
+    io_result_t r;
+    if (index >= ps4::kMaxSwBreakpoints) { r.error = 1; return r; }
+    if (m_impl->dbg_pid == 0) { r.error = 2; return r; }   // not attached
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    ps4::debug_set_breakpoint_packet_t pkt{};
+    pkt.index   = index;
+    pkt.enabled = enabled ? 1 : 0;
+    pkt.address = addr;
+    if (!c.send_cmd(ps4::CMD_DEBUG_SET_BREAKPOINT, &pkt, sizeof(pkt))) { r.error = 3; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) {
+        // some payload builds send the error status twice on the failure
+        // paths; consume a possible duplicate so the stream stays in sync
+        uint32_t dup = 0;
+        c.recv_u32(dup, kShortTimeoutMs);
+        r.error = 4;
+        return r;
+    }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_set_watchpoint(uint32_t index, bool enabled, uint32_t len,
+                                              uint32_t type, uintptr_t addr) {
+    io_result_t r;
+    if (index >= ps4::kMaxWatchpoints) { r.error = 1; return r; }
+    if (len != 1 && len != 2 && len != 4 && len != 8) { r.error = 2; return r; }
+    if (m_impl->dbg_pid == 0) { r.error = 3; return r; }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    ps4::debug_set_watchpoint_packet_t pkt{};
+    pkt.index     = index;
+    pkt.enabled   = enabled ? 1 : 0;
+    pkt.length    = len;
+    pkt.breaktype = type;
+    pkt.address   = addr;
+    if (!c.send_cmd(ps4::CMD_DEBUG_SET_WATCHPOINT, &pkt, sizeof(pkt))) { r.error = 4; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 5; return r; }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_continue(uint32_t stop) {
+    io_result_t r;
+    if (m_impl->dbg_pid == 0) { r.error = 1; return r; }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    ps4::debug_continue_packet_t pkt{};
+    pkt.stop = stop;
+    if (!c.send_cmd(ps4::CMD_DEBUG_CONTINUE, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_step(uint32_t lwpid) {
+    io_result_t r;
+    if (m_impl->dbg_pid == 0) { r.error = 1; return r; }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    if (lwpid == 0) {
+        if (!c.send_cmd(ps4::CMD_DEBUG_STEP, nullptr, 0)) { r.error = 2; return r; }
+    } else {
+        ps4::debug_lwpid_packet_t pkt{};
+        pkt.lwpid = lwpid;
+        if (!c.send_cmd(ps4::CMD_DEBUG_STEP_THREAD, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_suspend_thread(uint32_t lwpid) {
+    io_result_t r;
+    if (m_impl->dbg_pid == 0) { r.error = 1; return r; }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    ps4::debug_lwpid_packet_t pkt{};
+    pkt.lwpid = lwpid;
+    if (!c.send_cmd(ps4::CMD_DEBUG_SUSPEND, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_resume_thread(uint32_t lwpid) {
+    io_result_t r;
+    if (m_impl->dbg_pid == 0) { r.error = 1; return r; }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    ps4::debug_lwpid_packet_t pkt{};
+    pkt.lwpid = lwpid;
+    if (!c.send_cmd(ps4::CMD_DEBUG_RESUME, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_process_stop(uint32_t pid, uint32_t state) {
+    io_result_t r;
+    if (state > ps4::kStopKill) { r.error = 1; return r; }
+    auto& c = *m_impl->conn;
+    if (!c.connected()) { r.error = 2; return r; }
+    std::lock_guard lk(c.mu);
+    ps4::debug_process_stop_packet_t pkt{};
+    pkt.pid   = pid;
+    pkt.state = static_cast<uint8_t>(state);
+    if (!c.send_cmd(ps4::CMD_DEBUG_PROCESS_STOP, &pkt, sizeof(pkt))) { r.error = 3; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 4; return r; }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_get_dbregs(uint32_t lwpid, uint64_t dr[16]) {
+    io_result_t r;
+    if (m_impl->dbg_pid == 0) { r.error = 1; return r; }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    ps4::debug_lwpid_packet_t pkt{};
+    pkt.lwpid = lwpid;
+    if (!c.send_cmd(ps4::CMD_DEBUG_GETDBREGS, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    if (!c.recv_all(dr, 128)) { r.error = 4; return r; }   // exactly 128 bytes
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_install(uint32_t pid, uint64_t& rpcstub) {
+    io_result_t r;
+    {
+        std::lock_guard lk(m_impl->ev_mu);   // reuse as the rpcstub cache lock
+        if (auto it = m_impl->rpcstubs.find(pid); it != m_impl->rpcstubs.end()) {
+            rpcstub = it->second;
+            r.ok = true;
+            return r;
+        }
+    }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    if (!c.connected()) { r.error = 1; return r; }
+    ps4::proc_intall_packet_t pkt{};
+    pkt.pid = pid;
+    if (!c.send_cmd(ps4::CMD_PROC_INTALL, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    uint64_t stub = 0;
+    if (!c.recv_all(&stub, sizeof(stub)) || stub == 0) { r.error = 4; return r; }
+    rpcstub = stub;
+    {
+        std::lock_guard lk2(m_impl->ev_mu);
+        m_impl->rpcstubs[pid] = stub;
+    }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_call(uint32_t pid, uint64_t rpcstub, uint64_t rip,
+                                    const uint64_t args[6], uint64_t& out_rax) {
+    io_result_t r;
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    if (!c.connected()) { r.error = 1; return r; }
+    ps4::proc_call_packet_t pkt{};
+    pkt.pid     = pid;
+    pkt.rpcstub = rpcstub;
+    pkt.rip     = rip;
+    pkt.rdi = args[0]; pkt.rsi = args[1]; pkt.rdx = args[2];
+    pkt.rcx = args[3]; pkt.r8  = args[4]; pkt.r9  = args[5];
+    if (!c.send_cmd(ps4::CMD_PROC_CALL, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 3; return r; }
+    ps4::proc_call_response_t resp{};
+    if (!c.recv_all(&resp, sizeof(resp))) { r.error = 4; return r; }
+    out_rax = resp.rax;
+    r.ok = true;
+    return r;
+}
+
+size_t backend_ps4_t::ps4_pending_events() {
+    std::lock_guard lk(m_impl->ev_mu);
+    return m_impl->evq.size();
+}
+
+bool backend_ps4_t::ps4_wait_event(ps4_event_t& out, int timeout_ms) {
+    std::unique_lock lk(m_impl->ev_mu);
+    if (m_impl->evq.empty())
+        m_impl->ev_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms),
+                               [this] { return !m_impl->evq.empty(); });
+    if (m_impl->evq.empty()) return false;
+    out = m_impl->evq.front();
+    m_impl->evq.pop_front();
+    return true;
+}
+
+std::vector<ps4_event_t> backend_ps4_t::ps4_drain_events(size_t max, bool clear) {
+    std::lock_guard lk(m_impl->ev_mu);
+    std::vector<ps4_event_t> out;
+    out.reserve(std::min(max, m_impl->evq.size()));
+    while (!m_impl->evq.empty() && out.size() < max) {
+        out.push_back(std::move(m_impl->evq.front()));
+        m_impl->evq.pop_front();
+    }
+    if (clear) m_impl->evq.clear();
+    return out;
 }
 
 // ---------------------------------------------------------------------------

@@ -2887,10 +2887,369 @@ json tool_disasm(const json& args) {
          "analyze_stop)");
 }
 
+// tool: debugger — PS4 live debugging (ps4debug-NG debug session on the console)
+
+namespace {
+
+json ps4_ctx_json(const runtime::thread_context_t& c) {
+    return {{"rip", c.rip}, {"rsp", c.rsp}, {"rbp", c.rbp},
+            {"rax", c.rax}, {"rbx", c.rbx}, {"rcx", c.rcx}, {"rdx", c.rdx},
+            {"rsi", c.rsi}, {"rdi", c.rdi},
+            {"r8", c.r8}, {"r9", c.r9}, {"r10", c.r10}, {"r11", c.r11},
+            {"r12", c.r12}, {"r13", c.r13}, {"r14", c.r14}, {"r15", c.r15},
+            {"flags", c.flags}};
+}
+
+json ps4_event_json(const runtime::ps4_event_t& e) {
+    json o = {{"lwpid", e.lwpid}, {"signal", e.signal}, {"status", e.status},
+              {"thread", e.thread_name}};
+    for (auto& kv : ps4_ctx_json(e.ctx).items()) o[kv.key()] = kv.value();
+    json dr = json::array();
+    for (uint64_t d : e.dr) dr.push_back(d);
+    o["dr"] = dr;
+    return o;
+}
+
+runtime::backend_ps4_t& need_ps4() {
+    auto* p = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active());
+    if (!p || !p->connected())
+        fail("PS4 debug actions require a connected console (target.ps4_connect {host})");
+    return *p;
+}
+
+uint32_t ps4_pid_arg(const json& args) {
+    if (args.contains("pid"))
+        return static_cast<uint32_t>(parse_addr(args, "pid"));
+    if (auto s = process::active_session(); s && s->valid())
+        return s->pid();
+    fail("missing pid (no PS4 target attached either; use target.attach {pid})");
+}
+
+// lwpid argument, or the first thread of the debuggee when omitted
+uint32_t ps4_lwpid_arg(runtime::backend_ps4_t& p, const json& args) {
+    if (args.contains("lwpid"))
+        return static_cast<uint32_t>(parse_addr(args, "lwpid"));
+    const uint32_t pid = ps4_pid_arg(args);
+    auto thr = p.enum_threads(pid);
+    if (thr.ok && !thr.items.empty()) return thr.items.front().tid;
+    fail("missing lwpid (target.threads lists the debuggee's lwpids)");
+}
+
+// ps4debug-NG has no breakpoint/watchpoint query command, so slots we armed
+// are tracked client-side for auto-allocation and clear-by-address
+std::mutex& ps4_slot_mu() { static std::mutex m; return m; }
+std::map<uint64_t, uint32_t>& ps4_bp_slots() { static std::map<uint64_t, uint32_t> m; return m; }  // addr -> index
+std::map<uint64_t, uint32_t>& ps4_wp_slots() { static std::map<uint64_t, uint32_t> m; return m; }  // addr -> index
+std::map<uint32_t, uint64_t>& ps4_rpc_stubs() { static std::map<uint32_t, uint64_t> m; return m; } // pid -> stub
+
+uint32_t ps4_alloc_slot(const std::map<uint64_t, uint32_t>& used, uint32_t max) {
+    for (uint32_t i = 0; i < max; ++i) {
+        bool taken = false;
+        for (const auto& [a, idx] : used)
+            if (idx == i) { taken = true; break; }
+        if (!taken) return i;
+    }
+    fail("no free slot (all " + std::to_string(max) + " in use)");
+}
+
+uint64_t* ps4_reg_ptr(runtime::thread_context_t& c, const std::string& n) {
+    if (n == "rip") return &c.rip;
+    if (n == "rsp") return &c.rsp;
+    if (n == "rbp") return &c.rbp;
+    if (n == "rax") return &c.rax;
+    if (n == "rbx") return &c.rbx;
+    if (n == "rcx") return &c.rcx;
+    if (n == "rdx") return &c.rdx;
+    if (n == "rsi") return &c.rsi;
+    if (n == "rdi") return &c.rdi;
+    if (n == "r8")  return &c.r8;
+    if (n == "r9")  return &c.r9;
+    if (n == "r10") return &c.r10;
+    if (n == "r11") return &c.r11;
+    if (n == "r12") return &c.r12;
+    if (n == "r13") return &c.r13;
+    if (n == "r14") return &c.r14;
+    if (n == "r15") return &c.r15;
+    if (n == "flags" || n == "rflags") return &c.flags;
+    return nullptr;
+}
+
+json tool_debugger_ps4(const std::string& action, const json& args) {
+    auto& p = need_ps4();
+
+    if (action == "ps4_attach") {
+        const uint32_t pid = ps4_pid_arg(args);
+        std::string err;
+        if (!p.ps4_debug_attach(pid, err)) fail("ps4_attach failed: " + err);
+        return {{"attached", true}, {"pid", pid}, {"endpoint", p.endpoint()},
+                {"branding", p.branding()}};
+    }
+    if (action == "ps4_detach") {
+        p.ps4_debug_detach();
+        std::lock_guard lk(ps4_slot_mu());
+        ps4_bp_slots().clear();
+        ps4_wp_slots().clear();
+        return {{"attached", false}};
+    }
+    if (action == "ps4_status") {
+        return {{"attached", p.ps4_debug_attached()},
+                {"pid", p.ps4_debug_pid()},
+                {"pending_events", p.ps4_pending_events()},
+                {"endpoint", p.endpoint()},
+                {"branding", p.branding()},
+                {"backend", "PS4"}};
+    }
+    if (action == "ps4_bp_set") {
+        const uint64_t addr = parse_addr(args, "addr");
+        if (!p.ps4_debug_attached())
+            fail("ps4_bp_set requires ps4_attach first");
+        std::lock_guard lk(ps4_slot_mu());
+        uint32_t index = 0;
+        if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+        } else {
+            auto it = ps4_bp_slots().find(addr);
+            index = it != ps4_bp_slots().end() ? it->second
+                                               : ps4_alloc_slot(ps4_bp_slots(), 30);
+        }
+        auto io = p.ps4_set_breakpoint(index, true, static_cast<uintptr_t>(addr));
+        if (!io.ok) fail("ps4_bp_set failed (slot " + std::to_string(index) +
+                         ", error " + std::to_string(io.error) +
+                         "; duplicate address or slot in use?)");
+        ps4_bp_slots()[addr] = index;
+        return {{"set", true}, {"addr", addr}, {"index", index}, {"hw", false}};
+    }
+    if (action == "ps4_bp_clear") {
+        std::lock_guard lk(ps4_slot_mu());
+        uint64_t addr = 0;
+        uint32_t index = 0;
+        bool have = false;
+        if (args.contains("addr")) {
+            addr = parse_addr(args, "addr");
+            auto it = ps4_bp_slots().find(addr);
+            if (it == ps4_bp_slots().end())
+                fail("ps4_bp_clear: no breakpoint armed at that addr");
+            index = it->second;
+            have = true;
+        } else if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+            for (const auto& [a, i] : ps4_bp_slots())
+                if (i == index) { addr = a; have = true; break; }
+            if (!have) fail("ps4_bp_clear: slot " + std::to_string(index) + " not armed by us");
+        } else {
+            fail("ps4_bp_clear requires addr or index");
+        }
+        auto io = p.ps4_set_breakpoint(index, false, static_cast<uintptr_t>(addr));
+        if (!io.ok) fail("ps4_bp_clear failed (error " + std::to_string(io.error) + ")");
+        ps4_bp_slots().erase(addr);
+        return {{"cleared", true}, {"addr", addr}, {"index", index}};
+    }
+    if (action == "ps4_watch_set") {
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = args.contains("len") ? parse_addr(args, "len") : 8;
+        const uint32_t type = static_cast<uint32_t>(args.value("type", 3u));   // 3 = read/write
+        if (type != 0 && type != 1 && type != 3)
+            fail("ps4_watch_set: type must be 0=exec, 1=write or 3=read_write");
+        if (!p.ps4_debug_attached())
+            fail("ps4_watch_set requires ps4_attach first");
+        std::lock_guard lk(ps4_slot_mu());
+        uint32_t index = 0;
+        if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+        } else {
+            auto it = ps4_wp_slots().find(addr);
+            index = it != ps4_wp_slots().end() ? it->second
+                                               : ps4_alloc_slot(ps4_wp_slots(), 4);
+        }
+        auto io = p.ps4_set_watchpoint(index, true, static_cast<uint32_t>(len), type,
+                                       static_cast<uintptr_t>(addr));
+        if (!io.ok) fail("ps4_watch_set failed (slot " + std::to_string(index) +
+                         ", error " + std::to_string(io.error) + ")");
+        ps4_wp_slots()[addr] = index;
+        return {{"set", true}, {"addr", addr}, {"index", index},
+                {"len", len}, {"type", type}, {"hw", true}};
+    }
+    if (action == "ps4_watch_clear") {
+        std::lock_guard lk(ps4_slot_mu());
+        uint64_t addr = 0;
+        uint32_t index = 0;
+        if (args.contains("addr")) {
+            addr = parse_addr(args, "addr");
+            auto it = ps4_wp_slots().find(addr);
+            if (it == ps4_wp_slots().end())
+                fail("ps4_watch_clear: no watchpoint armed at that addr");
+            index = it->second;
+        } else if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+            for (const auto& [a, i] : ps4_wp_slots())
+                if (i == index) { addr = a; break; }
+        } else {
+            fail("ps4_watch_clear requires addr or index");
+        }
+        auto io = p.ps4_set_watchpoint(index, false, 8, 3, 0);
+        if (!io.ok) fail("ps4_watch_clear failed (error " + std::to_string(io.error) + ")");
+        ps4_wp_slots().erase(addr);
+        return {{"cleared", true}, {"addr", addr}, {"index", index}};
+    }
+    if (action == "ps4_continue") {
+        const uint32_t stop = static_cast<uint32_t>(args.value("stop", 0u));
+        if (stop > 2) fail("ps4_continue: stop must be 0=resume, 1=stop, 2=kill");
+        auto io = p.ps4_continue(stop);
+        if (!io.ok) fail("ps4_continue failed (error " + std::to_string(io.error) + ")");
+        return {{"continued", true}, {"stop", stop}};
+    }
+    if (action == "ps4_step") {
+        const uint32_t lwpid = args.contains("lwpid")
+            ? static_cast<uint32_t>(parse_addr(args, "lwpid")) : 0;   // 0 = all threads
+        auto io = p.ps4_step(lwpid);
+        if (!io.ok) fail("ps4_step failed (error " + std::to_string(io.error) + ")");
+        return {{"stepped", true}, {"lwpid", lwpid}};
+    }
+    if (action == "ps4_suspend" || action == "ps4_resume") {
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        auto io = action == "ps4_suspend" ? p.ps4_suspend_thread(lwpid)
+                                          : p.ps4_resume_thread(lwpid);
+        if (!io.ok) fail(action + " failed (error " + std::to_string(io.error) + ")");
+        return {{"ok", true}, {"lwpid", lwpid},
+                {"suspended", action == "ps4_suspend"}};
+    }
+    if (action == "ps4_process_stop") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint32_t state = static_cast<uint32_t>(args.value("state", 1u));
+        if (state > 2) fail("ps4_process_stop: state must be 0=resume, 1=stop, 2=kill");
+        auto io = p.ps4_process_stop(pid, state);
+        if (!io.ok) fail("ps4_process_stop failed (error " + std::to_string(io.error) + ")");
+        return {{"ok", true}, {"pid", pid}, {"state", state}};
+    }
+    if (action == "ps4_regs") {
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        runtime::thread_context_t ctx{};
+        auto io = p.get_thread_context(lwpid, ctx);
+        if (!io.ok) fail("ps4_regs failed (error " + std::to_string(io.error) +
+                         "; thread stopped?)");
+        json o = ps4_ctx_json(ctx);
+        o["lwpid"] = lwpid;
+        return o;
+    }
+    if (action == "ps4_set_reg") {
+        if (!args.contains("name") || !args.contains("value"))
+            fail("ps4_set_reg requires name and value");
+        const std::string name = args.at("name").get<std::string>();
+        const uint64_t value = parse_addr(args, "value");
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        runtime::thread_context_t ctx{};
+        if (!p.get_thread_context(lwpid, ctx).ok)
+            fail("ps4_set_reg: cannot read regs of lwpid " + std::to_string(lwpid));
+        auto* slot = ps4_reg_ptr(ctx, name);
+        if (!slot) fail("ps4_set_reg: unknown register '" + name +
+                        "' (rax..r15, rip, rsp, rbp, flags)");
+        *slot = value;
+        if (!p.set_thread_context(lwpid, ctx).ok)
+            fail("ps4_set_reg failed writing lwpid " + std::to_string(lwpid));
+        return {{"set", true}, {"lwpid", lwpid}, {"register", name}, {"value", value}};
+    }
+    if (action == "ps4_dbregs") {
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        uint64_t dr[16]{};
+        auto io = p.ps4_get_dbregs(lwpid, dr);
+        if (!io.ok) fail("ps4_dbregs failed (error " + std::to_string(io.error) + ")");
+        json arr = json::array();
+        for (uint64_t d : dr) arr.push_back(d);
+        return {{"lwpid", lwpid}, {"dr", arr}};
+    }
+    if (action == "ps4_wait") {
+        const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
+        runtime::ps4_event_t ev{};
+        if (!p.ps4_wait_event(ev, timeout_ms))
+            return {{"halted", false}, {"timeout_ms", timeout_ms},
+                    {"pending", p.ps4_pending_events()}};
+        json o = ps4_event_json(ev);
+        o["halted"] = true;
+        o["pending"] = p.ps4_pending_events();
+        return o;
+    }
+    if (action == "ps4_events") {
+        const size_t max = std::min<size_t>(args.value("max", 64u), 4096u);
+        const bool clear = args.value("clear", true);
+        auto evs = p.ps4_drain_events(max, clear);
+        json arr = json::array();
+        for (const auto& e : evs) arr.push_back(ps4_event_json(e));
+        return {{"events", arr}, {"count", arr.size()},
+                {"pending", p.ps4_pending_events()}};
+    }
+    if (action == "ps4_callstack") {
+        auto& s = need_session();
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        const size_t depth = std::min<size_t>(args.value("depth", 32u), 64u);
+        runtime::thread_context_t ctx{};
+        if (!p.get_thread_context(lwpid, ctx).ok)
+            fail("ps4_callstack: cannot read regs of lwpid " + std::to_string(lwpid));
+        json arr = json::array();
+        arr.push_back({{"index", 0}, {"ret_addr", ctx.rip}, {"frame_ptr", ctx.rbp}});
+        uint64_t rbp = ctx.rbp;
+        for (size_t i = 1; i < depth && rbp != 0; ++i) {
+            uint64_t next = 0, ret = 0;
+            auto io1 = s.read(static_cast<uintptr_t>(rbp), &next, sizeof(next));
+            auto io2 = s.read(static_cast<uintptr_t>(rbp + 8), &ret, sizeof(ret));
+            if (!io1.ok || !io2.ok || next <= rbp) break;   // chain must ascend
+            arr.push_back({{"index", i}, {"ret_addr", ret}, {"frame_ptr", rbp}});
+            rbp = next;
+        }
+        return {{"lwpid", lwpid}, {"frames", arr}, {"count", arr.size()}};
+    }
+    if (action == "ps4_call") {
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint32_t pid = ps4_pid_arg(args);
+        uint64_t fargs[6]{};
+        if (args.contains("args")) {
+            const json& a = args.at("args");
+            if (!a.is_array() || a.size() > 6)
+                fail("ps4_call: args must be an array of at most 6 numbers");
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i].is_string())
+                    fargs[i] = parse_addr(json{{"v", a[i]}}, "v");
+                else if (a[i].is_number())
+                    fargs[i] = a[i].get<uint64_t>();
+                else
+                    fail("ps4_call: args[" + std::to_string(i) + "] is not a number");
+            }
+        }
+        uint64_t stub = 0;
+        {
+            std::lock_guard lk(ps4_slot_mu());
+            auto it = ps4_rpc_stubs().find(pid);
+            if (it != ps4_rpc_stubs().end()) stub = it->second;
+        }
+        if (stub == 0) {
+            auto io = p.ps4_install(pid, stub);
+            if (!io.ok || stub == 0)
+                fail("ps4_call: CMD_PROC_INTALL failed (error " +
+                     std::to_string(io.error) + ")");
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_rpc_stubs()[pid] = stub;
+        }
+        uint64_t rax = 0;
+        auto io = p.ps4_call(pid, stub, addr, fargs, rax);
+        if (!io.ok) fail("ps4_call failed (error " + std::to_string(io.error) + ")");
+        return {{"called", true}, {"pid", pid}, {"addr", addr},
+                {"rpcstub", stub}, {"rax", rax}};
+    }
+
+    fail("debugger: unknown ps4 action (ps4_attach|ps4_detach|ps4_status|"
+         "ps4_bp_set|ps4_bp_clear|ps4_watch_set|ps4_watch_clear|ps4_continue|"
+         "ps4_step|ps4_suspend|ps4_resume|ps4_process_stop|ps4_regs|"
+         "ps4_set_reg|ps4_dbregs|ps4_wait|ps4_events|ps4_callstack|ps4_call)");
+}
+
+} // namespace
+
 // tool: debugger
 
 json tool_debugger(const json& args) {
     const std::string action = require_action(args);
+    // PS4 live debugging rides the console's ps4debug-NG session, not the
+    // local Win32 debug loop — dispatch before g_dbg is even created
+    if (action.rfind("ps4_", 0) == 0) return tool_debugger_ps4(action, args);
     if (!g_dbg) g_dbg = std::make_unique<debugger::debugger_t>();
     auto& dbg = *g_dbg;
 

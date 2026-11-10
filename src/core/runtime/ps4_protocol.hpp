@@ -39,10 +39,42 @@ constexpr uint32_t CMD_PROC_ALLOC_HINTED = 0xBDAA000E;
 // debug commands (require CMD_DEBUG_ATTACH first)
 constexpr uint32_t CMD_DEBUG_ATTACH          = 0xBDBB0001;
 constexpr uint32_t CMD_DEBUG_DETACH          = 0xBDBB0002;
+constexpr uint32_t CMD_DEBUG_SET_BREAKPOINT  = 0xBDBB0003;
+constexpr uint32_t CMD_DEBUG_SET_WATCHPOINT  = 0xBDBB0004;
 constexpr uint32_t CMD_DEBUG_GET_THREAD_LIST = 0xBDBB0005;
+constexpr uint32_t CMD_DEBUG_SUSPEND         = 0xBDBB0006;
+constexpr uint32_t CMD_DEBUG_RESUME          = 0xBDBB0007;
 constexpr uint32_t CMD_DEBUG_GETREGS         = 0xBDBB0008;
-constexpr uint32_t CMD_DEBUG_THREAD_INFO     = 0xBDBB0011;
 constexpr uint32_t CMD_DEBUG_SETREGS         = 0xBDBB0009;
+constexpr uint32_t CMD_DEBUG_GETDBREGS       = 0xBDBB000C;
+constexpr uint32_t CMD_DEBUG_CONTINUE        = 0xBDBB0010;
+constexpr uint32_t CMD_DEBUG_STEP            = 0xBDBB0012;
+constexpr uint32_t CMD_DEBUG_STEP_THREAD     = 0xBDBB0013;
+constexpr uint32_t CMD_DEBUG_THREAD_INFO     = 0xBDBB0011;
+constexpr uint32_t CMD_DEBUG_PROCESS_STOP    = 0xBDBB0500;
+
+// process RPC: install the payload's rpc stub and call arbitrary code in the
+// target (debugger/source/proc.c). INTALL is the payload's own spelling.
+constexpr uint32_t CMD_PROC_INTALL = 0xBDAA0005;
+constexpr uint32_t CMD_PROC_CALL   = 0xBDAA0006;
+
+// limits enforced payload-side
+constexpr uint32_t kMaxSwBreakpoints = 30;   // software INT3 breakpoints
+constexpr uint32_t kMaxWatchpoints   = 4;    // hardware DR0-DR3
+
+// CMD_DEBUG_CONTINUE stop argument / CMD_DEBUG_PROCESS_STOP state
+constexpr uint32_t kStopResume = 0;   // PT_CONTINUE signal 0 (or SIGCONT)
+constexpr uint32_t kStopStop   = 1;   // SIGSTOP (17)
+constexpr uint32_t kStopKill   = 2;   // SIGKILL (9)
+
+// watchpoint breaktype values (server DR7-encodes breaktype | (4*length))
+constexpr uint32_t kWpExec  = 0;      // execute
+constexpr uint32_t kWpWrite = 1;      // write
+constexpr uint32_t kWpRdWr  = 3;      // read/write
+
+// size of the packed server->client debug event packet sent on port 755
+// whenever a debuggee thread stops (debug.c: DEBUG_INTERRUPT_PACKET_SIZE)
+constexpr size_t kDebugEventSize = 0x4A0;
 
 // status codes
 constexpr uint32_t CMD_SUCCESS       = 0x80000000;
@@ -151,6 +183,45 @@ struct debug_setregs_packet_t {
     uint32_t length;
 };
 
+struct debug_set_breakpoint_packet_t {
+    uint32_t index;
+    uint32_t enabled;
+    uint64_t address;
+};
+
+struct debug_set_watchpoint_packet_t {
+    uint32_t index;
+    uint32_t enabled;
+    uint32_t length;     // bytes: 1, 2, 4 or 8
+    uint32_t breaktype;  // kWpExec / kWpWrite / kWpRdWr
+    uint64_t address;
+};
+
+struct debug_continue_packet_t {
+    uint32_t stop;   // kStopResume / kStopStop / kStopKill
+};
+
+struct debug_process_stop_packet_t {
+    uint32_t pid;
+    uint8_t  state;  // kStopResume / kStopStop / kStopKill
+};
+
+struct proc_intall_packet_t {
+    uint32_t pid;
+};
+
+struct proc_call_packet_t {
+    uint32_t pid;
+    uint64_t rpcstub;
+    uint64_t rip;
+    uint64_t rdi, rsi, rdx, rcx, r8, r9;
+};
+
+struct proc_call_response_t {
+    uint32_t pid;
+    uint64_t rax;
+};
+
 // struct __reg64 from debugger/include/debug.h; the server sends exactly 176
 // bytes for CMD_DEBUG_GETREGS (debug.c: net_send_all(fd, buf, 176))
 struct reg64_t {
@@ -169,6 +240,19 @@ struct reg64_t {
     uint64_t ss;
 };
 
+// server->client debug event, sent packed on the port-755 connection whenever
+// a debuggee thread stops (debug.c: debug_interrupt_packet). status is the raw
+// wait4 status; the signal is (status >> 8) & 0xFF (17 = SIGSTOP is ignored by
+// the payload, 9 = SIGKILL tears the session down).
+struct debug_event_packet_t {
+    uint32_t lwpid;
+    uint32_t status;
+    char     tdname[40];
+    reg64_t  regs;
+    uint8_t  savefpu[832];   // struct savefpu_ymm
+    uint8_t  dbregs[128];    // struct dbreg64
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(packet_header_t) == 12);
@@ -182,6 +266,14 @@ static_assert(sizeof(proc_list_entry_t) == 36);
 static_assert(sizeof(vm_map_entry_t) == 58);
 static_assert(sizeof(debug_attach_packet_t) == 8);
 static_assert(sizeof(debug_setregs_packet_t) == 8);
+static_assert(sizeof(debug_set_breakpoint_packet_t) == 16);
+static_assert(sizeof(debug_set_watchpoint_packet_t) == 24);
+static_assert(sizeof(debug_continue_packet_t) == 4);
+static_assert(sizeof(debug_process_stop_packet_t) == 5);
+static_assert(sizeof(proc_intall_packet_t) == 4);
+static_assert(sizeof(proc_call_packet_t) == 68);
+static_assert(sizeof(proc_call_response_t) == 12);
 static_assert(sizeof(reg64_t) == 176);
+static_assert(sizeof(debug_event_packet_t) == kDebugEventSize);
 
 } // namespace slop::core::runtime::ps4
