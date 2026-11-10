@@ -6,16 +6,17 @@
 
 # reverse-slop
 
-Windows reverse-engineering workbench with desktop interfaces, live process and
-kernel inspection, static analysis and decompilation, dynamic instrumentation,
-network analysis, and a built-in Model Context Protocol (MCP) server for agent
-control.
+PS4 reverse-engineering toolkit with desktop interfaces, live remote analysis
+and debugging of a console running the ps4debug-NG payload, static analysis
+and decompilation of dumped game binaries, host-side network capture, and a
+built-in Model Context Protocol (MCP) server so AI agents can drive whole
+game-RE workflows end to end.
 
 > [!WARNING]
-> Use reverse-slop only on systems and software you own or are authorized to
-> test. Live memory writes, debugging, network manipulation, and the optional
-> kernel bridge can destabilize processes or Windows and needs administrator
-> privileges. Start with the user-mode engine when kernel access is unnecessary.
+> Use reverse-slop only on consoles, games, and systems you own or are
+> authorized to test. Live debugging and memory writes on a PS4 can crash the
+> console or trip anti-cheat; host-side packet capture needs administrator
+> privileges on the analysis PC.
 
 ## Inspiration and attribution
 
@@ -41,40 +42,33 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Remote PS4 targets:** connect directly to a console running the
   [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload (TCP 744) and
   use the same process list, attach, memory read/write/scan, regions, modules,
-  threads, and register tools against the console as against a local process —
-  plus live remote debugging: breakpoints, watchpoints, continue/step, stop
-  events, register get/set, callstacks, and remote function calls on the
-  console via the `debugger` tool's `ps4_*` actions.
-- **Live process analysis:** processes, modules, threads, regions, handles,
-  module dumping, memory scans, watchlists, snapshots, pointer scans, and AOB
-  searches.
-- **Static analysis:** PE, ELF, Mach-O and iOS `.ipa` loading, x86/x64 assembly and
-  x86/x64/ARM64 disassembly, function and cross-reference indexes, strings,
+  and threads against the console — plus live remote debugging: breakpoints,
+  hardware watchpoints, continue/step, stop events, register get/set,
+  callstacks, and remote function calls via the `debugger` tool's `ps4_*`
+  actions and the one-call `target.ps4_auto`.
+- **Live analysis over the wire:** memory read/write/protect/alloc, Cheat
+  Engine-style scans, AOB search, pointer chains, snapshots and diffs,
+  watchlists, and module/region enumeration all run against the console
+  process through ps4debug-NG.
+- **Static analysis:** PE, PS4/Orbis ELF64 (SELF) and Mach-O/`.ipa` loading,
+  x86/x64 and ARM64 disassembly, function and cross-reference indexes, strings,
   globals, vtables, RTTI, signatures, binary diffing, packer detection, and
-  security-focused reconnaissance.
+  security-focused reconnaissance — built for analyzing dumped `eboot.bin`
+  and game modules offline.
 - **Decompiler:** Hyperion p-code lifting, SSA, dead-code elimination, type
   inference, control-flow structuring, and C-like output with source addresses.
-- **Managed .NET support:** ECMA-335 metadata parsing, CIL disassembly, an
-  IL-to-C# decompiler, and a dnSpy-style assembly explorer surfaced in both
-  the Tauri UI (`.NET` tab) and MCP (`dotnet` tool). Managed methods fold into
-  the shared analysis DB so the disassembly, decompiler, and cross-reference
-  tools see every method, not just the native entry stub.
-- **Debugging:** Win32 debugging plus optional kernel-assisted VEH debugging,
-  breakpoints, stepping, registers, call stacks, SEH, watchpoints, tracepoints,
-  and bounded instruction traces.
-- **Instrumentation:** embedded Frida Core 17.17.0 for local and remote devices,
-  spawning, attaching, scripts, messages, RPC, compile, and snapshots.
-- **Emulation:** isolated x86-64 Unicorn execution with register/memory setup,
-  tracing, byte-level taint propagation, and watched output ranges.
-- **Network tooling:** WFP capture and manipulation through the optional kernel bridge,
-  PCAP export, stream reconstruction, connection inspection, and an independent
+- **Emulation:** isolated x86-64 Unicorn execution with demand paging from the
+  loaded image or live console memory, IAT stubs, register/memory setup,
+  tracing, and byte-level taint propagation.
+- **Network tooling:** host-side raw-socket capture (packets, DNS, streams,
+  per-packet HTTP/TLS/DNS classification, PCAP export) plus an independent
   localhost HTTP inspection proxy.
 - **Unpacking and devirtualization:** Magicmida Themida sidecars, VM handler and
   opcode-map recovery, trace/lift/pseudocode flows, CFG recovery, predicate
   proofs, invariants, and IAT auditing.
-- **Agent-native control:** 23 MCP-visible domain tools with consolidated
-  `action` parameters, plus an `/api`-only application-control tool and SSE
-  events.
+- **Agent-native control:** 20 MCP-visible domain tools with consolidated
+  `action` parameters, task playbooks via `guide`, plus an `/api`-only
+  application-control tool and SSE events.
 
 ## Platform and requirements
 
@@ -91,8 +85,7 @@ The strings view with search, UTF-16 flagging and xref counts:
 `tools/build.ps1` locates Visual Studio with `vswhere`, then uses Visual
 Studio's bundled CMake and Ninja. CMake downloads pinned dependencies into
 `_ext/`, including ImGui, FreeType, Zydis, Capstone, Unicorn, nlohmann/json,
-cpp-httplib, SQLite, Lua, fmt, spdlog, and zlib. It also downloads and verifies
-the Frida Core 17.17.0 Windows x86-64 devkit (about 53 MB) on first configure.
+cpp-httplib, SQLite, Lua, fmt, spdlog, and zlib.
 
 ### Additional requirements by component
 
@@ -100,7 +93,7 @@ the Frida Core 17.17.0 Windows x86-64 devkit (about 53 MB) on first configure.
 |---|---|
 | Tauri desktop shell | Node.js/npm, Rust toolchain with Cargo, WebView2 runtime |
 | Themida unpacking | Separately installed Magicmida x86/x64 sidecars |
-| Frida TypeScript project bundling | A usable `frida-compile` setup for the requested project |
+| Host packet capture (`network` tool) | Administrator privileges for SIO_RCVALL |
 
 ## Build
 
@@ -153,8 +146,7 @@ cmake --build --preset ninja-msvc-release
 
 The Tauri UI is the app that ships; `reverse-slop.exe` (ImGui) is the legacy
 shell kept for parity work. The frontend build needs the C++ engine first
-because Tauri bundles `reverse-slop-engine.exe` and `slop_frida.dll` as
-resources.
+because Tauri bundles `reverse-slop-engine.exe` as a resource.
 
 ```powershell
 powershell -File tools/build.ps1
@@ -176,14 +168,14 @@ downloads it when missing.
 Run the same command with `-Full` for a self-contained release installer: the
 setup exe embeds the WebView2 runtime (offline install, no download on the
 target machine) and hard-requires every optional component, so the Magicmida
-sidecars and `slop_frida.dll` are always inside. The build fails loudly instead
+sidecars are always inside. The build fails loudly instead
 of silently shipping a degraded bundle when the network or Magicmida is missing.
 
 Use `-NoFrontend` for a fast C++-only loop (skips Rust, npm, and the bundle).
 
 Release Tauri builds request administrator elevation so the engine sidecar can
-use the kernel bridge. Debug Tauri builds run as the invoking user and can use
-the user-mode backend.
+run host-side packet capture (SIO_RCVALL). Debug Tauri builds run as the
+invoking user and packet capture reports unavailable.
 
 Frontend development:
 
@@ -270,10 +262,10 @@ DWM styling. Built-in views and shortcuts:
 
 ### Headless engine
 
-Safest development path, with no driver loading or client-config changes:
+Safest development path, with no client-config changes:
 
 ```powershell
-.\build\src\engine\reverse-slop-engine.exe --no-driver --no-onboard
+.\build\src\engine\reverse-slop-engine.exe --no-onboard
 ```
 
 Full engine:
@@ -286,7 +278,6 @@ Options:
 
 | Option | Effect |
 |---|---|
-| `--no-driver` | Skip kernel-driver loading; use user-mode backend |
 | `--no-onboard` | Do not register MCP endpoint in supported AI clients |
 | `--quiet` | Suppress mirrored engine output on stderr |
 | `--port <n>` | Override MCP/API port for this process |
@@ -301,7 +292,7 @@ SLOP_ENGINE_READY <port> <token>
 
 If another live reverse-slop endpoint is advertised, a new engine reports that
 endpoint with `SLOP_ENGINE_EXISTING <pid>` and exits rather than competing for
-the driver and port.
+the port.
 
 ### Tauri shell
 
@@ -314,21 +305,24 @@ npm run tauri -- dev
 
 The Rust supervisor starts the C++ engine, waits up to 180 seconds for its
 handshake, places it in a kill-on-close job object, and lets it perform clean
-shutdown when the UI exits. The React shell exposes targets, modules, scripts,
-Frida, scanner/watchlist, disassembly, a `.NET` assembly-explorer tab with a
-dnSpy-style tree and a C#/IL code pane, strings, memory, debugger, PE browser,
-output, inspector, theme/motion settings, and backend selection.
+shutdown when the UI exits. The React shell exposes targets (including the PS4 connect/auto flow),
+modules, scripts, scanner/watchlist, disassembly, strings, memory, the PS4
+debugger, PE browser, output, inspector, and theme/motion settings.
 
 ## Feature reference
 
 ### Process and live-memory workspace
 
+On a connected PS4 these run against the console process over the ps4debug-NG
+wire; a hidden local user-mode backend remains for the automated test fixture.
+
 - Enumerate processes with icons and architecture/elevation metadata.
 - Attach/detach a shared target session.
 - Enumerate modules, threads, virtual-memory regions, heaps, heap blocks, and
   handles.
-- Reconstruct a conventional PE from a mapped module; strict mode rejects
-  unreadable spans, while best-effort mode zero-fills them.
+- Reconstruct a conventional PE from a mapped module (local Windows targets
+  only; PS4 modules are ELF/SELF); strict mode rejects unreadable spans, while
+  best-effort mode zero-fills them.
 - Read/write memory in hex, UTF-8, integer, and floating-point formats.
 - Allocate, free, and change page protection.
 - Cheat Engine-style initial and refined numeric scans with exact/range/change,
@@ -405,17 +399,18 @@ actions drive the payload's debug session live, no local target needed:
   count, timeout_ms}` (bp arg logger: every hit with rdi/rsi/rdx/rcx/r8/r9),
   `ps4_trace_steps {lwpid, count, timeout_ms}` (step+wait loop with rip and the
   disassembled instruction per step), and `ps4_bp_list` / `ps4_watch_list` to
-  see the armed slots. The local `debugger.until {addr}` does the same for
-  Windows targets.
+  see the armed slots.
 - The same controls exist in the ImGui debugger view: while a PS4 backend is
   active it shows a live panel with debug attach/detach, continue/step,
   breakpoint and watchpoint arming, the port-755 event feed, registers of the
   last stopped thread, and remote calls through the rpc stub.
 - The `guide` tool is the AI playbook index: `guide list` shows the topics and
   `guide get {topic}` returns a ready-to-run tool-call sequence (e.g.
-  `ps4_setup`, `ps4_api_trace`, `ps4_find_write`, `find_health`,
-  `find_damage_source`, `pointer_chain`, `runtime_decrypt`, `snapshot_diff`,
-  `emulate_function`, `devirt_cflow`, `unpack_runtime`, `hw_breakpoints`).
+  `ps4_setup`, `ps4_breakpoint`, `ps4_api_trace`, `ps4_find_write`,
+  `ps4_step_trace`, `ps4_remote_call`, `find_health`, `find_damage_source`,
+  `pointer_chain`, `runtime_decrypt`, `ps4_api_monitor`, `snapshot_diff`,
+  `emulate_function`, `devirt_cflow`, `ps4_unpack_runtime`,
+  `ps4_hw_watchpoints`).
 
 ### Static analysis and decompilation
 
@@ -425,10 +420,10 @@ actions drive the payload's debug session live, no local target needed:
 - Background Hyperion recursive analysis with CFGs, globals, vtables, RTTI,
   names, PDB/FLIRT support, and progress/cancellation state.
 - x86/x64 disassembly and assembly.
-- PS4/Orbis ELF64 static analysis: ELF loading, segment-backed section mapping,
-  and SCE `PT_SCE_DYNLIBDATA` import extraction. The PS4 support is offline
-  analysis only; it does not attach to a console, deploy payloads, or inject
-  code into a running game.
+- PS4/Orbis ELF64 (SELF) static analysis: ELF loading, segment-backed section
+  mapping, and SCE `PT_SCE_DYNLIBDATA` import extraction, so a dumped
+  `eboot.bin` or game module can be analyzed offline with the full disasm /
+  xray / decomp surface while the console is driven live over ps4debug-NG.
 - iOS apps and Mach-O: `disasm.load`, `slop.image.load` and both Disassembly
   open dialogs accept an `.ipa`, a thin Mach-O or a FAT Mach-O, detected by
   content. For an `.ipa` the main executable is the `Payload/<Name>.app/`
@@ -448,13 +443,6 @@ actions drive the payload's debug session live, no local target needed:
 - Structured decompilation pipeline: instruction lifting to p-code, SSA,
   propagation, dead-code elimination, type inference, control-flow structuring,
   and C-like emission.
-- Managed (.NET/CLI) pipeline: full ECMA-335 metadata parsing (types, fields
-  with const values, properties, events, nested types, interfaces, attributes),
-  a CIL disassembler with ILDASM-style listings, an IL→C# decompiler, and a
-  dnSpy-style C# renderer for whole types. Managed methods are folded into the
-  shared analysis DB so the disassembly view lists every method after Hyperion
-  analysis completes, not just the native entry stub. Each managed method also
-  carries an entry VA that cross-links back to `disasm` / `decomp`.
 - Per-line virtual-address mappings, optional address annotations, reconstructed
   stack variables, signatures, and persisted user names.
 - Binary-to-binary function diff with added/removed/modified functions and
@@ -492,51 +480,17 @@ File-image patching includes:
 Patches affect the loaded analysis image, not live process memory. Use the memory
 suite for live writes.
 
-### Debugger
+### Debugger (PS4 live debugging)
 
-- Classic Win32 debug loop in user mode.
-- Kernel-assisted stealth VEH mode when `slopdrvr` is available.
-- Software and hardware breakpoints, conditional expressions, log messages,
-  auto-continue tracepoints, and one-shot breakpoints.
-- Continue, step into, step over, step out, and bounded wait-for-halt.
-- Register inspection/mutation, event history, call stacks, and SEH chains.
-- Page-guard access watchpoints and bounded instruction traces.
-- Suspend/resume all target threads.
-- Driver-assisted DR0–DR3 hardware breakpoints and handle-free thread control.
-
-### Kernel bridge
-
-When available, `slopdrvr` adds:
-
-- DTB-aware process memory access and region enumeration
-- Kernel module enumeration, driver dumping, memory read/write/search, and
-  virtual-to-physical translation
-- Kernel calls and deferred-call queues
-- SSDT, PEB, TEB, loader-module, window, heap, and reference inspection
-- Export and symbol lookup through DbgHelp-backed symbol state
-- Integrity checks, anti-debug spoofing, sandbox controls, and driver logging
-- WFP capture/manipulation and network-buffer sniffing
-- Hidden-kernel callback inspection and clean shutdown identity/handshake
-
-Every caller should query backend/driver status rather than assume kernel
-capabilities. Many core process, memory, debugger, and static-analysis features
-continue in user mode.
-
-### Dynamic instrumentation with Frida
-
-Embedded Frida Core supports:
-
-- Local and remote-device discovery
-- Process, application, and frontmost-application enumeration
-- Spawn, piped stdio, resume, kill, and input
-- Spawn and child gating with pending-spawn/child inspection
-- Attach/detach and session resume
-- JavaScript creation/load/unload/destroy/post and debugger endpoint
-- `send()`/console message draining with binary payload support
-- `rpc.exports` calls with arguments and timeout
-- `frida-compile` project bundling
-- Script bytecode compilation and snapshot generation
-- QuickJS and V8 runtime selection where supported by Frida
+The `debugger` tool is PS4-only in this build; see
+"Live debugging on the PS4 (ps4debug-NG)" above for the full `ps4_*` action
+list: software breakpoints, DR0-DR3 hardware watchpoints, continue/step,
+suspend/resume, stop events on the payload's port-755 stream, register
+read/write, callstacks, remote calls (`ps4_call`), and the one-call power
+actions (`ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps`).
+Both the ImGui debugger view and the Tauri debugger tab drive the same
+ps4debug-NG session. Local Win32 debugging, the kernel VEH mode, and the
+driver-backed hardware breakpoints were removed with the Windows toolkit.
 
 ### Emulation and devirtualization
 
@@ -559,18 +513,14 @@ Embedded Frida Core supports:
 
 ### Network and proxy
 
-Driver-backed network features include:
+Host-side network features on the analysis PC (raw socket with SIO_RCVALL,
+needs administrator; `pid`/`port`/`protocol` act as capture filters):
 
-- Capture start/stop, packets, DNS, statistics, filtering, and PCAP export
-- Stream listing, payload reads, and reassembly
-- Packet injection and byte-pattern replacement rules
-- Redirect and DNS-spoof rules
-- Connection termination
-- Hold/inspect/modify/release interception
-- Per-process bandwidth monitoring/control and traffic fingerprinting
-- Connection, interface, WFP callout, socket-handle, TCB, and deep-packet
-  inspection
-- IP, port, and process blocking by direction
+- Capture start/stop, packet paging with text filters, DNS query log,
+  statistics, and PCAP export
+- Stream listing, payload reads, and TCP reassembly from the capture store
+- Connection 4-tuple listing and per-packet deep inspection (HTTP
+  method/host/path, TLS version/SNI/content-type, DNS)
 
 Independent HTTP/1.1 proxy features include start/stop, captured entries,
 exchange detail, and request replay. CONNECT tunnels record metadata/SNI but do
@@ -585,8 +535,6 @@ not decrypt tunnel bodies; replay applies to captured plain HTTP.
 - Hyperion `.hdb` project export/import for names and comments.
 - Host filesystem read/write/list/create/delete/name-search/content-search.
 - Outbound WinHTTP GET/POST requests without browser-cookie inheritance.
-- Host security inspection for hidden modules, minifilters, ETW sessions, and
-  driver-assisted kernel callbacks.
 
 ### Lua scripting
 
@@ -626,9 +574,9 @@ The static-analysis surface:
 | Rich DB | `slop.decomp.vtables()`, `globals()`, `rtti()` |
 
 `decomp.*` requires the Hyperion analysis to be ready — call
-`slop.image.wait_ready()` after loading. Live-process scripting keeps the
-legacy surface: `slop.target.*`, `slop.mem.*`, `slop.disasm.disassemble`,
-and `slop.analyze.packer`.
+`slop.image.wait_ready()` after loading. On a connected PS4 the same
+`slop.target.*` / `slop.mem.*` surface reads and writes the console process
+over the wire, alongside `slop.disasm.disassemble` and `slop.analyze.packer`.
 
 ## MCP and HTTP API
 
@@ -742,8 +690,7 @@ operational guidance are returned by `tools/list`.
 | `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_auto` |
 | `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set` |
 | `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop` |
-| `debugger` | `attach`, `detach`, `status`, `suspend_all`, `resume_all`, `bp_set`, `bp_clear`, `continue`, `step_into`, `step_over`, `step_out`, `wait_halt`, `regs`, `events`, `callstack`, `seh`, `set_register`, `watchpoint_set`, `watchpoint_clear`, `watchpoints`, `trace_run`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call`, `until`, `ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps`, `ps4_bp_list`, `ps4_watch_list` |
-| `driver` | `status`, `backend`, `kernel_modules`, `dump_driver`, `kernel_read`, `kernel_write`, `kernel_search`, `call`, `v2p`, `ssdt`, `peb`, `resolve_export`, `windows`, `find_references`, `heap_walk`, `heap_blocks`, `defer_call`, `defer_list`, `defer_execute`, `defer_results`, `defer_cancel`, `symbols_load`, `symbols_lookup`, `symbols_nearest`, `anti_debug_spoof`, `sandbox_protect`, `sandbox_unprotect`, `log_config`, `read_teb`, `peb_modules`, `integrity_checks`, `sniff_buffers` |
+| `debugger` | `status`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call`, `ps4_bp_list`, `ps4_watch_list`, `ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps` |
 | `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
 | `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |
 | `devirt` | `themida_status`, `themida_start`, `themida_job`, `themida_cancel`, `identify`, `handlers`, `opcode_map`, `trace`, `lift`, `pseudocode`, `recover_cfg`, `prove_predicates`, `invariants`, `iat_audit` |
@@ -751,18 +698,15 @@ operational guidance are returned by `tools/list`.
 | `notes` | `set_comment`, `get_comment`, `comments`, `bookmark_toggle`, `bookmarks` |
 | `emulate` | `run` |
 | `analyze` | `packer`, `signatures`, `diff` |
-| `network` | `status`, `capture_start`, `capture_stop`, `packets`, `dns`, `rules_add`, `rules_remove`, `rules_clear`, `stats`, `export_pcap`, `streams`, `stream_data`, `inject`, `mod_rule_add`, `mod_rule_remove`, `mod_rules_list`, `redirect_add`, `redirect_remove`, `redirect_rules_list`, `dns_spoof_add`, `dns_spoof_remove`, `dns_spoof_list`, `kill_conn`, `intercept_start`, `intercept_stop`, `intercept_list`, `intercept_release`, `bw_start`, `bw_stop`, `bw_stats`, `bw_processes`, `fingerprint_run`, `fingerprint_results`, `reassemble_stream`, `connections`, `deep_inspect`, `wfp_callouts`, `socket_handles`, `tcpip_dump`, `interfaces`, `block_ip`, `block_port`, `block_process` |
+| `network` | `status`, `capture_start`, `capture_stop`, `packets`, `dns`, `stats`, `export_pcap`, `streams`, `stream_data`, `reassemble_stream`, `connections`, `deep_inspect` |
 | `proxy` | `start`, `stop`, `status`, `entries`, `entry`, `replay` |
 | `persist` | `save`, `list`, `load`, `delete`, `kv_set`, `kv_get`, `hype_save`, `hype_load` |
 | `re` | `rtti_scan`, `vftable`, `danger`, `libsig` |
 | `decomp` | `function` |
-| `dotnet` | `status`, `tree`, `type`, `method`, `source`, `il` |
-| `detect` | `hidden_modules`, `minifilters`, `etw_sessions`, `kernel_callbacks` |
 | `fs` | `read_file`, `write_file`, `list_directory`, `create_directory`, `delete_path`, `search_files`, `grep_in_files` |
 | `web` | `fetch`, `post` |
 | `script` | `run` |
 | `guide` | `list`, `get` |
-| `frida` | `status`, `devices`, `remote_add`, `remote_remove`, `ps`, `find_process`, `applications`, `frontmost`, `spawn`, `spawn_output`, `resume`, `kill`, `input`, `spawn_gating`, `pending_spawn`, `pending_children`, `attach`, `detach`, `session_resume`, `child_gating`, `script_create`, `script_load`, `script_unload`, `script_destroy`, `script_post`, `script_debugger`, `messages`, `rpc`, `compile`, `compile_script`, `snapshot_script` |
 
 `app` is intentionally omitted from MCP `tools/list`; it is frontend plumbing
 available only through `/api`: `status`, `ping`, `output`, `output_clear`, `log`,
@@ -820,11 +764,11 @@ or changing entries.
 | app/                |  /api,/events  | src/core                 |
 +----------+----------+                +------------+-------------+
            |                                        |
-           | supervises                             +-- process/memory/debugger
-           v                                        +-- disasm/analysis/decomp
-+--------------------------+                        +-- driver/network/frida
-| headless engine          |                        +-- MCP/API/event bus
-| src/engine               |
+           | supervises                             +-- process/memory
+           v                                        +-- runtime (ps4 backend)
++--------------------------+                        +-- disasm/analysis/decomp
+| headless engine          |                        +-- network/proxy
+| src/engine               |                        +-- MCP/API/event bus
 +--------------------------+
 ```
 
@@ -833,12 +777,10 @@ Both native and headless hosts drive the shared lifecycle in
 
 1. Initialize application paths and worker/job queues.
 2. Start process and target services.
-3. Load/probe optional kernel bridge on a background thread.
-4. Load settings and persistence state.
-5. Bind MCP/API server and optionally onboard clients.
-6. Publish capabilities and enter periodic target/watch/event servicing.
-7. On shutdown, stop server/jobs/watches/targets, save settings, then quiesce and
-   unload driver if this instance owns it.
+3. Load settings and persistence state.
+4. Bind MCP/API server and optionally onboard clients.
+5. Publish capabilities and enter periodic target/watch/event servicing.
+6. On shutdown, stop server/jobs/watches/targets and save settings.
 
 Key directories:
 
@@ -853,14 +795,13 @@ src/
 │   ├── process/  Targets, processes, modules, threads, heaps, handles, dumps
 │   ├── memory/   Scanner, AOB, pointers, snapshots, watch service
 │   ├── disasm/   PE/Zydis indexes and Hyperion session bridge
-│   ├── debugger/ Debug loops, stepping, breakpoints, call stacks
-│   ├── runtime/  User/kernel backends, driver loading and communication
+│   ├── debugger/ Call-stack unwinding (used by ps4_* frame walks)
+│   ├── runtime/  PS4 (ps4debug-NG) backend + hidden user-mode test fixture
 │   ├── analysis/ Packer, signatures, xray, patches, devirt, Magicmida
 │   ├── emu/      Unicorn execution and taint propagation
-│   ├── network/  WFP capture, traffic store, proxy, WinHTTP
-│   ├── frida/    Isolated Frida Core DLL boundary
+│   ├── network/  Raw-socket capture, traffic store, proxy, WinHTTP
 │   ├── mcp/      MCP schemas, tool dispatcher, `/api`, `/events`
-│   └── ...       Types, RTTI, persistence, scripting, filesystem, detection
+│   └── ...       Types, RTTI, persistence, scripting, filesystem
 ├── target/       Deterministic live-analysis fixture
 ├── tests/        Core test harness
 └── live/         Live probes and integration utilities
@@ -868,10 +809,10 @@ app/              Tauri v2 supervisor and React/TypeScript frontend
 tools/            Build, Magicmida, and live-test scripts
 ```
 
-Frida lives in `slop_frida.dll` rather than `slop_core` because Frida's bundled
-GLib symbols conflict with Unicorn's compatibility layer. Tauri supervises a
-separate C++ engine instead of linking it into Rust, avoiding static/dynamic CRT
-mixing and providing crash isolation.
+Tauri supervises a separate C++ engine instead of linking it into Rust, avoiding
+static/dynamic CRT mixing and providing crash isolation. The PS4 backend lives
+in `slop_core` and speaks the ps4debug-NG wire protocol directly, so no payload
+or driver is loaded on the analysis PC.
 
 ## Runtime data
 
@@ -887,7 +828,6 @@ Application state lives under `%LOCALAPPDATA%\reverse-slop`:
 | `sessions\` | Session artifacts |
 | `crashes\` | Crash artifacts |
 | `tools\magicmida\...` | Optional Magicmida installation |
-| `DriverRuntime\` | Temporary kernel-loader runtime files |
 
 Do not publish `engine.json` if bearer token is configured.
 
@@ -914,22 +854,23 @@ $env:SLOP_TEST_FILTER = 'decomp'
 Remove-Item Env:SLOP_TEST_FILTER
 ```
 
-Test coverage includes infrastructure, memory, disassembly, debugger, MCP,
-analysis, emulation, network, persistence, RTTI/types, Lua, kernel abstractions,
-module dumping, Hyperion/decompilation, detection/filesystem, driver autoload,
-Xray/patching, Magicmida supervision, and Frida.
+Test coverage includes infrastructure, memory, disassembly, the PS4 backend
+(fake ps4debug-NG server) and its `ps4_*` MCP flows, MCP wire/schema, analysis,
+emulation, network capture store, persistence, RTTI/types, Lua, module dumping,
+Hyperion/decompilation, Mach-O/`.ipa` loading, Xray/patching, Magicmida
+supervision, and filesystem/web/PKI helpers.
 
 `tools/mcp_live_test.py` is a destructive-capable integration battery intended
 for a controlled local fixture with a running engine and loaded `SlopTarget`.
 Review paths and actions before running it; it exercises writes, patches,
-filesystem operations, and kernel/network calls.
+filesystem operations, and network calls.
 
 ## Troubleshooting
 
 ### Configure cannot download dependencies
 
-First configure requires HTTPS access to pinned upstream archives/repositories
-and the Frida devkit. Retry with network/proxy access available. Once populated,
+First configure requires HTTPS access to pinned upstream archives/repositories.
+Retry with network/proxy access available. Once populated,
 CMake uses `_ext/` with disconnected updates.
 
 ### `Visual Studio 2022 with C++ tools not found`
@@ -977,10 +918,9 @@ starting a job.
 - `/api` browser origins are restricted to Tauri and fixed Vite development
   origins. Non-browser local clients are still governed by loopback and bearer
   authentication.
-- Filesystem, web, script, debugger, patch, Frida, network, driver, and memory
-  tools can change host or target state. Expose MCP only to trusted clients.
-- Driver loading modifies kernel state and can trigger endpoint-security or
-  Windows protections. Prefer `--no-driver` unless kernel features are needed.
+- Filesystem, web, script, debugger (`ps4_*`), patch, network capture, proxy,
+  and memory tools can change analysis-host or console state. Expose MCP only
+  to trusted clients.
 - Keep analysis isolated from production and personal systems; use disposable
   virtual machines and snapshots for untrusted samples.
 
