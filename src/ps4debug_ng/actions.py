@@ -15,13 +15,27 @@ import json
 import threading
 import time
 from pathlib import Path
+from typing import Protocol
 
-from .client import Ps4DebugClient, Ps4DebugError
+from .client import Ps4DebugError
 
+
+class RuntimeClient(Protocol):
+    """Minimal client surface used here (tests fake this)."""
+
+    def write_memory(self, pid: int, address: int, data: bytes) -> None: ...
+    def set_watchpoint(self, index: int, address: int, length: int,
+                       breaktype: int, enabled: bool = True) -> None: ...
+    def continue_(self, stop: int) -> None: ...
+    def wait_event(self, timeout: float | None = None) -> dict | None: ...
+    def read_memory(self, pid: int, address: int, length: int) -> bytes: ...
+    def kernel_write(self, address: int, data: bytes) -> None: ...
+    def set_breakpoint(self, index: int, address: int,
+                       enabled: bool = True) -> None: ...
 
 # ------------------------------------------------------------- what writes
 
-def find_what_writes(client: Ps4DebugClient, address: int, length: int = 8,
+def find_what_writes(client: RuntimeClient, address: int, length: int = 8,
                      breaktype: int = 1, max_events: int = 20,
                      timeout: float = 10.0) -> list[dict]:
     """Set a hardware watchpoint on [address, +length) and capture each hit:
@@ -55,7 +69,7 @@ class Freeze:
     """Background poke loop: re-write `data` to `address` every `interval_ms`
     until stopped. Mirror of Cheat Engine's freeze."""
 
-    def __init__(self, client: Ps4DebugClient, pid: int, address: int,
+    def __init__(self, client: RuntimeClient, pid: int, address: int,
                  data: bytes, interval_ms: int = 250):
         self.client = client
         self.pid = pid
@@ -127,7 +141,7 @@ def cheat_import(path: str | Path) -> dict:
     return doc
 
 
-def cheat_apply_pokes(client: Ps4DebugClient, pokes: list[dict]) -> list[str]:
+def cheat_apply_pokes(client: RuntimeClient, pokes: list[dict]) -> list[str]:
     """Apply one-shot pokes from a cheat file. Returns per-poke results."""
     results = []
     for p in pokes:
@@ -139,7 +153,7 @@ def cheat_apply_pokes(client: Ps4DebugClient, pokes: list[dict]) -> list[str]:
 
 # ------------------------------------------------------------- audit replay
 
-def replay_audit(client: Ps4DebugClient, log_path: str | Path,
+def replay_audit(client: RuntimeClient, log_path: str | Path,
                  limit: int = 0) -> list[str]:
     """Re-apply the mutating actions recorded in an MCP audit JSONL log.
 

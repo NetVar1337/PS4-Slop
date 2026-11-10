@@ -31,7 +31,7 @@ MAX_SCAN_RESULTS = 100_000
 
 
 def _pack(value, value_type: str) -> bytes:
-    size, fmt = VALUE_TYPES[value_type]
+    _size, fmt = VALUE_TYPES[value_type]
     return struct.pack(fmt, value)
 
 

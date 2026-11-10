@@ -21,11 +21,12 @@ try:  # mcp 1.x
 except ImportError:  # mcp >= 2.0: FastMCP renamed to MCPServer (same .tool()/.run() API)
     from mcp.server.mcpserver import MCPServer as _MCPServer
 
+import hashlib
 from pathlib import Path
 
 from . import actions
 from .audit import AuditLog
-from .client import Ps4DebugClient
+from .client import Ps4DebugClient, Ps4DebugError
 
 mcp = _MCPServer("ps4debug-ng")
 
@@ -481,18 +482,20 @@ def ps4_pointer_rescan(pid: int, target: int, chains: list[dict]) -> list[dict]:
     still resolve to `target` and reports each chain's current value."""
     from . import workflows
     c = _connected()
-    valid = []
+    valid, dropped = [], 0
+    import struct
     for chain in chains:
         try:
             final = workflows.resolve_chain(c, pid, chain["address"],
                                             chain["offsets"])
             value = c.read_memory(pid, final, 8)
-            import struct
             (ptr,) = struct.unpack("<Q", value)
             if final == target or ptr == target:
                 valid.append({**chain, "current": final})
-        except Exception:  # noqa: BLE001 - dropped chains are just unmapped now
-            continue
+        except (Ps4DebugError, OSError, ConnectionError, struct.error):
+            dropped += 1  # chain root unmapped since the scan
+    if dropped:
+        print(f"pointer_rescan: {dropped} chains dropped (unmapped)")
     _record("ps4_pointer_rescan", {"pid": pid, "chains": len(chains)},
             f"{len(valid)} valid")
     return valid
@@ -532,9 +535,7 @@ def ps4_trace_calls(address: int, max_hits: int = 50,
 @mcp.tool()
 def ps4_memory_hash(pid: int, address: int, length: int) -> dict:
     """SHA-256 over a memory region - baseline for integrity verification."""
-    import hashlib
-    from . import client as client_mod
-    data = client_mod.Ps4DebugClient.read_memory(_connected(), pid, address, length)
+    data = _connected().read_memory(pid, address, length)
     _record("ps4_memory_hash", {"pid": pid, "address": hex(address)}, "ok")
     return {"sha256": hashlib.sha256(data).hexdigest(), "length": len(data)}
 
@@ -542,14 +543,10 @@ def ps4_memory_hash(pid: int, address: int, length: int) -> dict:
 @mcp.tool()
 def ps4_integrity_check(pid: int, address: int, length: int,
                         expected_sha256: str) -> dict:
-    """Verify a region against a baseline hash (ps4_memory_hash). Reports ok,
-    current hash, and up to the first 64 changed 8-byte offsets."""
-    import hashlib
-    import struct as _struct
-    from .client import Ps4DebugError
+    """Verify a region against a baseline hash (ps4_memory_hash). Reports ok and
+    the current hash; use ps4_snapshot_diff for exact changed offsets."""
     c = _connected()
-    changed: list[int] = []
-    current_hash = hashlib.sha256()
+    digest = hashlib.sha256()
     pos, end = address, address + length
     ok = True
     while pos < end:
@@ -559,26 +556,17 @@ def ps4_integrity_check(pid: int, address: int, length: int,
         except (Ps4DebugError, OSError, ConnectionError):
             ok = False
             break
-        current_hash.update(buf)
+        digest.update(buf)
         pos += take
-    digest = current_hash.hexdigest()
-    if ok and digest != expected_sha256:
+    current = digest.hexdigest()
+    if ok and current != expected_sha256:
         ok = False
-        # locate changed offsets (bounded)
-        pos = address
-        while pos < end and len(changed) < 64:
-            take = min(0x10000, end - pos)
-            a = c.read_memory(pid, pos, take)
-            for off in range(0, len(a) - 7, 8):
-                b = a[off:off + 8]
-                # cheap heuristic: re-hash per 8-byte window vs stored baseline is
-                # not available here; report region granularity instead
-            break
-        changed = [-1]  # marker: region differs, exact offsets need snapshot diff
     _record("ps4_integrity_check", {"pid": pid, "address": hex(address)},
             "ok" if ok else "MISMATCH")
-    return {"ok": ok, "sha256": digest, "expected": expected_sha256,
-            "changed": changed}
+    return {"ok": ok, "sha256": current, "expected": expected_sha256,
+            "hint": "use ps4_snapshot_save + ps4_snapshot_diff for changed offsets"}
+
+
 
 
 # ------------------------------------------------- execution / what-writes

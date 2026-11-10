@@ -77,8 +77,8 @@ def parse_elf(read, base: int) -> ElfInfo:
         raise ElfError(f"no ELF magic at {hex(base)}")
     if ehdr[4] != 2:
         raise ElfError("not a 64-bit ELF")
-    (e_type, e_machine, _ver, e_entry, e_phoff, e_shoff, _flags,
-     e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx) = \
+    (e_type, e_machine, _ver, e_entry, _e_phoff, e_shoff, _flags,
+     _e_ehsize, _e_phentsize, _e_phnum, e_shentsize, e_shnum, e_shstrndx) = \
         _unpack("<HHIQQQIHHHHHH", ehdr, 16)
     if e_machine != EM_X86_64:
         raise ElfError(f"not x86-64 (e_machine={e_machine})")

@@ -270,7 +270,7 @@ class Ps4DebugClient:
             try:
                 self._status("assemble")
             except Ps4DebugError as e:
-                ks_errno, msg_len = struct.unpack("<II", self._recv_exact(8))
+                _ks_errno, msg_len = struct.unpack("<II", self._recv_exact(8))
                 msg = self._recv_exact(msg_len).decode("ascii", "replace")
                 raise Ps4DebugError(e.status, f"assemble failed: {msg}") from None
             byte_len, insn_count = struct.unpack("<II", self._recv_exact(8))
@@ -311,7 +311,7 @@ class Ps4DebugClient:
         self._events_closed.clear()
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        listener.bind(("0.0.0.0", P.EVENT_PORT))  # noqa: S104 - must accept the console's outbound event connection on any interface
+        listener.bind(("0.0.0.0", P.EVENT_PORT))
         listener.listen(1)
         listener.settimeout(5.0)
         self._event_listener = listener

@@ -61,7 +61,7 @@ with Ps4DebugClient.discover() as host, Ps4DebugClient(host) as dbg:
     print([hex(h) for h in hits])
 ```
 
-## Tool surface (46 tools)
+## Tool surface (58 tools)
 
 | Group | Tools |
 |---|---|
@@ -75,7 +75,10 @@ with Ps4DebugClient.discover() as host, Ps4DebugClient(host) as dbg:
 | Modules | `ps4_list_modules`, `ps4_module_imports`, `ps4_module_exports` (ELF parsed live from memory) |
 | Pointer scan | `ps4_find_pointer_chains` (CE-style reverse scan), `ps4_pointer_rescan` (revalidate after restart) |
 | Snapshots/integrity | `ps4_snapshot_save`, `ps4_snapshot_diff`, `ps4_memory_hash`, `ps4_integrity_check` |
-| Tracing | `ps4_trace_calls` (breakpoint + auto-continue register capture) |
+| Tracing | `ps4_trace_calls` (breakpoint + auto-continue register capture), `ps4_find_what_writes` (watchpoint writer capture) |
+| Execution | `ps4_install_stub`, `ps4_call_function` (RPC into the target), `ps4_protect`, `ps4_load_elf` |
+| Freeze | `ps4_freeze_start`/`ps4_freeze_stop`/`ps4_freeze_list` (CE-style poke loop) |
+| Cheat/replay | `ps4_cheat_export`/`ps4_cheat_import`/`ps4_cheat_apply` (ps4cheat v1 JSON), `ps4_replay_audit` (re-apply audit-log actions) |
 
 Notes:
 - Scans run client-side over `proc_read`, so they need no scan auth
@@ -86,6 +89,31 @@ Notes:
 - Tested against the protocol documented in the payload's PROTOCOL.md; wire
   layouts unchanged by ps4debug-NG PR #2 (hardening limits only reject
   malformed input).
+
+## Web UI
+
+```sh
+python -m ps4debug_ng.ui          # http://127.0.0.1:8337
+```
+
+x64dbg-style single-page app: live hex memory view, disasm + registers +
+call stack, breakpoints/watchpoints (pause triggers) with a pause log
+(disasm+stack trace per pause), pointer scanner with restart revalidation,
+and a memory-integrity monitor. Every mutating action asks for confirmation
+in the browser before it reaches the console.
+
+## CLI / REPL
+
+```sh
+python -m ps4debug_ng.cli [host]  # then: help
+```
+
+Interactive shell over the same client library: `procs`, `use`, `regions`,
+`modules`, `imports`/`exports`, `read`/`write`, `scan aob|value`, `chains`/
+`rescan`, `attach`, `break`/`watch`, `cont`/`step`, `regs`/`stack`,
+`whatwrites`, `install`/`call` (RPC), `protect`, `loadelf`, `freeze`,
+`snapshot save|diff`, `cheat apply`, `notify`. Mutations ask for
+confirmation (or `--yes`).
 
 ## Development
 
