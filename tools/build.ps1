@@ -273,7 +273,7 @@ if (-not $NoFrontend) {
         } else {
             Write-Host '    app + webview (offline runtime embedded, no download at install)'
         }
-        Write-Host '    engine/reverse-slop-engine.exe, slop_frida.dll'
+        Write-Host '    engine/reverse-slop-engine.exe'
         Write-Host '    engine/tools/magicmida (themida unpacker)'
         Write-Host '    target machine needs: windows (internet if webview bootstrapper needs the runtime)'
     }

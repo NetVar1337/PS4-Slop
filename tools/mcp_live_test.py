@@ -193,29 +193,24 @@ test("devirt.identify at fn0", "devirt", {"action":"identify","addr":fn0})
 test("devirt.prove_predicates fn0", "devirt", {"action":"prove_predicates","addr":fn0,"runs":2}, timeout=120)
 test("devirt.invariants fn0", "devirt", {"action":"invariants","addr":fn0,"runs":2}, timeout=120)
 
-# network / proxy / detect
+# network / proxy (host-side capture store + MITM proxy)
 test("network.status", "network", {"action":"status"})
 test("network.packets", "network", {"action":"packets"})
 test("network.connections", "network", {"action":"connections"})
+test("network.deep_inspect", "network", {"action":"deep_inspect"})
+test("network.reassemble_stream", "network", {"action":"reassemble_stream"})
 test("network.stats", "network", {"action":"stats"})
 test("network.bad action", "network", {"action":"zzz"})
 test("proxy.status", "proxy", {"action":"status"})
 test("proxy.entries", "proxy", {"action":"entries"})
-test("detect.hidden_modules", "detect", {"action":"hidden_modules"})
-test("detect.minifilters", "detect", {"action":"minifilters"})
-test("detect.etw_sessions", "detect", {"action":"etw_sessions"})
-test("detect.kernel_callbacks", "detect", {"action":"kernel_callbacks"})
 
-# driver (backend reported kernel!)
-test("driver.status", "driver", {"action":"status"})
-test("driver.kernel_modules", "driver", {"action":"kernel_modules"})
-test("driver.symbols_load", "driver", {"action":"symbols_load"}, timeout=180)
-test("driver.ssdt", "driver", {"action":"ssdt"})
-test("driver.peb (no target)", "driver", {"action":"peb"})
-
-# debugger (no attach)
+# debugger (PS4-only build: status works, ps4_* refuse without a console)
 test("debugger.status", "debugger", {"action":"status"})
-test("debugger.regs (not paused)", "debugger", {"action":"regs"})
+r = call("debugger", {"action":"ps4_wait"})
+results.append({"label":"debugger.ps4_wait (no console)","tool":"debugger","params":{"action":"ps4_wait"},
+                "ok": (not r["ok"]) and "ps4" in json.dumps(r["payload"]), "dt": r["dt"], "note":"",
+                "brief": json.dumps(r["payload"])[:300]})
+print(("[PASS]" if not r["ok"] else "[FAIL]"), "debugger.ps4_wait (no console)")
 
 # fs
 test("fs.write_file", "fs", {"action":"write_file","path":"C:\\Users\\kozydot\\AppData\\Local\\Temp\\eni_test.txt","text":"hello from mcp"})
