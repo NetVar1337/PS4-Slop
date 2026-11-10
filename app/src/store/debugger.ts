@@ -34,6 +34,27 @@ export type Ps4Event = {
 
 export type SlotEntry = { addr: number; index: number };
 
+export type ScanHit = { addr: number; addr_hex?: string; value_hex?: string };
+
+export type ScanState = {
+  used: boolean;
+  count?: number;
+  base?: number;
+  base_hex?: string;
+  hits?: ScanHit[];
+  truncated?: boolean;
+  note?: string;
+};
+
+export type AppInfo = {
+  pid: number;
+  titleid?: string;
+  contentid?: string;
+  name?: string;
+  app_ver?: string;
+  running?: boolean;
+};
+
 const kIdle: Ps4Status = {
   backend: "user",
   ps4_connected: false,
@@ -50,6 +71,8 @@ type DebuggerStore = {
   events: Ps4Event[];
   breakpoints: SlotEntry[];
   watchpoints: SlotEntry[];
+  scan: ScanState | null;
+  app: AppInfo | null;
   error: string | null;
   busy: boolean;
 
@@ -65,6 +88,13 @@ type DebuggerStore = {
   wpClear: (addr: number) => Promise<void>;
   readRegs: (lwpid: number) => Promise<void>;
   readStack: (lwpid: number) => Promise<void>;
+  scanFirst: (a: { addr: number; len: number; value_type: string; compare: string; value?: number | string; hex?: string }) => Promise<void>;
+  scanRescan: (compare: string, value?: number | string) => Promise<void>;
+  scanAob: (addr: number, len: number, pattern: string) => Promise<void>;
+  scanReset: () => Promise<void>;
+  notify: (msg: string) => Promise<void>;
+  readApp: () => Promise<void>;
+  dumpModule: (name: string, path: string, load: boolean) => Promise<void>;
   reset: () => void;
 };
 
@@ -76,6 +106,8 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
   events: [],
   breakpoints: [],
   watchpoints: [],
+  scan: null,
+  app: null,
   error: null,
   busy: false,
 
@@ -213,6 +245,84 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
     }
   },
 
+  scanFirst: async (a) => {
+    set({ busy: true });
+    try {
+      await call("debugger", "ps4_scan", a);
+      await get().scanRefreshInternal();
+      set({ error: null });
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  scanRescan: async (compare, value) => {
+    set({ busy: true });
+    try {
+      const args: Record<string, unknown> = { action: undefined, compare };
+      if (value !== undefined) args.value = value;
+      await call("debugger", "ps4_rescan", args);
+      await get().scanRefreshInternal();
+      set({ error: null });
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  scanAob: async (addr, len, pattern) => {
+    set({ busy: true });
+    try {
+      const r = await call<{ found?: boolean; addr?: number; addr_hex?: string }>(
+        "debugger", "ps4_scan_aob", { addr, len, pattern });
+      set({ error: null });
+      return r;
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+      return null;
+    } finally {
+      set({ busy: false });
+    }
+  },
+
+  scanReset: async () => {
+    await call("debugger", "ps4_scan_reset").catch(() => undefined);
+    set({ scan: null });
+  },
+
+  notify: async (msg) => {
+    try {
+      await call("debugger", "ps4_notify", { msg });
+      set({ error: null });
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  readApp: async () => {
+    try {
+      const app = await call<AppInfo>("debugger", "ps4_app");
+      set({ app, error: null });
+    } catch {
+      set({ app: null });
+    }
+  },
+
+  dumpModule: async (name, path, load) => {
+    set({ busy: true });
+    try {
+      await call("target", "ps4_dump_module", { name, path, load });
+      set({ error: null });
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      set({ busy: false });
+    }
+  },
+
   reset: () =>
     set({
       status: kIdle,
@@ -222,5 +332,7 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
       events: [],
       breakpoints: [],
       watchpoints: [],
+      scan: null,
+      app: null,
     }),
 }));
