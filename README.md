@@ -41,7 +41,7 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Live process analysis:** processes, modules, threads, regions, handles,
   module dumping, memory scans, watchlists, snapshots, pointer scans, and AOB
   searches.
-- **Static analysis:** PE, Mach-O and iOS `.ipa` loading, x86/x64 assembly and
+- **Static analysis:** PE, ELF, Mach-O and iOS `.ipa` loading, x86/x64 assembly and
   x86/x64/ARM64 disassembly, function and cross-reference indexes, strings,
   globals, vtables, RTTI, signatures, binary diffing, packer detection, and
   security-focused reconnaissance.
@@ -341,6 +341,10 @@ output, inspector, theme/motion settings, and backend selection.
 - Background Hyperion recursive analysis with CFGs, globals, vtables, RTTI,
   names, PDB/FLIRT support, and progress/cancellation state.
 - x86/x64 disassembly and assembly.
+- PS4/Orbis ELF64 static analysis: ELF loading, segment-backed section mapping,
+  and SCE `PT_SCE_DYNLIBDATA` import extraction. The PS4 support is offline
+  analysis only; it does not attach to a console, deploy payloads, or inject
+  code into a running game.
 - iOS apps and Mach-O: `disasm.load`, `slop.image.load` and both Disassembly
   open dialogs accept an `.ipa`, a thin Mach-O or a FAT Mach-O, detected by
   content. For an `.ipa` the main executable is the `Payload/<Name>.app/`
