@@ -58,6 +58,82 @@ constexpr uint32_t CMD_DEBUG_PROCESS_STOP    = 0xBDBB0500;
 constexpr uint32_t CMD_PROC_INTALL = 0xBDAA0005;
 constexpr uint32_t CMD_PROC_CALL   = 0xBDAA0006;
 
+// ELF upload: CMD_PROC_ELF loads+relocates+jumps into the entry point,
+// CMD_PROC_ELF_RPC does the same but returns the entry address instead
+constexpr uint32_t CMD_PROC_ELF     = 0xBDAA0007;
+constexpr uint32_t CMD_PROC_ELF_RPC = 0xBDAA0010;
+
+// on-device code analysis (Zydis inside the payload)
+constexpr uint32_t CMD_PROC_DISASM_REGION      = 0xBDAA0020;
+constexpr uint32_t CMD_PROC_EXTRACT_CODE_XREFS = 0xBDAA0021;
+constexpr uint32_t CMD_PROC_FIND_XREFS_TO      = 0xBDAA0022;
+constexpr uint32_t CMD_PROC_READ_STACK         = 0xBDAA0023;
+constexpr uint32_t CMD_PROC_ASSEMBLE           = 0xBDAA0024;  // raw literal, no macro upstream
+
+// scan family; CMD_PROC_SCAN*/AOB* require auth bit 1 (CMD_PROC_AUTH first)
+constexpr uint32_t CMD_PROC_SCAN            = 0xBDAA0009;
+constexpr uint32_t CMD_PROC_SCAN_AOB        = 0xBDAA0501;
+constexpr uint32_t CMD_PROC_SCAN_AOB_MULTI  = 0xBDAA0502;
+constexpr uint32_t CMD_PROC_AUTH            = 0xBDAACCFF;
+constexpr uint32_t CMD_PROC_SCAN_START      = 0xBDAACC01;
+constexpr uint32_t CMD_PROC_SCAN_COUNT      = 0xBDAACC02;
+constexpr uint32_t CMD_PROC_SCAN_GET        = 0xBDAACC03;
+constexpr uint32_t CMD_PROC_AUTH_MAGIC      = 0xBB40E64D;
+
+// extra debug register sets / FS,GS base (raw literals 0xBDBB000E/0F upstream)
+constexpr uint32_t CMD_DEBUG_GETFPREGS   = 0xBDBB000A;
+constexpr uint32_t CMD_DEBUG_SETFPREGS   = 0xBDBB000B;
+constexpr uint32_t CMD_DEBUG_SETDBREGS   = 0xBDBB000D;
+constexpr uint32_t CMD_DEBUG_GETFSGSBASE = 0xBDBB000E;
+constexpr uint32_t CMD_DEBUG_SETFSGSBASE = 0xBDBB000F;
+
+// console commands (0xBDDD....); REBOOT/END are deliberately not exposed
+constexpr uint32_t CMD_CONSOLE_PRINT         = 0xBDDD0003;
+constexpr uint32_t CMD_CONSOLE_NOTIFY        = 0xBDDD0004;
+constexpr uint32_t CMD_CONSOLE_INFO          = 0xBDDD0005;
+constexpr uint32_t CMD_CONSOLE_FOREGROUND_APP = 0xBDDD0006;
+constexpr uint32_t kNotifyTypeGeneric        = 222;   // main.c's generic icon
+
+// scan value types (cmd_proc_scan_valuetype)
+constexpr uint8_t kValU8 = 0, kValI8 = 1, kValU16 = 2, kValI16 = 3;
+constexpr uint8_t kValU32 = 4, kValI32 = 5, kValU64 = 6, kValI64 = 7;
+constexpr uint8_t kValF32 = 8, kValF64 = 9, kValArrBytes = 10, kValString = 11;
+
+// scan compare types (cmd_proc_scan_comparetype)
+constexpr uint8_t kCmpExact = 0, kCmpFuzzy = 1, kCmpBigger = 2, kCmpSmaller = 3;
+constexpr uint8_t kCmpBetween = 4, kCmpIncreased = 5, kCmpIncreasedBy = 6;
+constexpr uint8_t kCmpDecreased = 7, kCmpDecreasedBy = 8, kCmpChanged = 9;
+constexpr uint8_t kCmpUnchanged = 10, kCmpUnknown = 11, kCmpUnknownLow = 12;
+
+// byte width of a scan value type (0 = variable: arrbytes/string use lenData)
+constexpr uint32_t scan_value_size(uint8_t vt) {
+    switch (vt) {
+        case kValU8: case kValI8:   return 1;
+        case kValU16: case kValI16: return 2;
+        case kValU32: case kValI32: case kValF32: return 4;
+        case kValU64: case kValI64: case kValF64: return 8;
+        default: return 0;
+    }
+}
+// does this compare type take a seed value in lenData?
+constexpr bool scan_cmp_needs_value(uint8_t ct) {
+    return ct == kCmpExact || ct == kCmpFuzzy || ct == kCmpBigger ||
+           ct == kCmpSmaller || ct == kCmpBetween || ct == kCmpIncreasedBy ||
+           ct == kCmpDecreasedBy || ct == kCmpUnknownLow;
+}
+// does this compare type read the previous value from the entry stream?
+constexpr bool scan_cmp_needs_previous(uint8_t ct) {
+    return ct >= kCmpIncreased && ct <= kCmpUnchanged;
+}
+
+constexpr uint32_t kReadStackMaxDepth  = 64;
+constexpr uint32_t kReadStackLocalsCap = 0x1000;
+constexpr uint32_t kReadStackCodeOff   = 10;
+constexpr uint32_t kReadStackCodeLen   = 200;
+constexpr uint32_t kDisasmEntrySize    = 32;
+constexpr uint32_t kFpregsSize         = 832;  // savefpu_ymm payload sent by GETFPREGS
+constexpr uint32_t kDbregsSize         = 128;  // __dbreg64 sent by GETDBREGS
+
 // limits enforced payload-side
 constexpr uint32_t kMaxSwBreakpoints = 30;   // software INT3 breakpoints
 constexpr uint32_t kMaxWatchpoints   = 4;    // hardware DR0-DR3
@@ -220,6 +296,124 @@ struct proc_call_packet_t {
 struct proc_call_response_t {
     uint32_t pid;
     uint64_t rax;
+};
+
+struct proc_elf_packet_t {
+    uint32_t pid;
+    uint32_t length;
+};
+
+struct proc_elf_rpc_response_t {
+    uint64_t entry;
+};
+
+struct proc_disasm_packet_t {
+    uint32_t pid;
+    uint64_t address;
+    uint32_t length;
+    uint32_t max_entries;
+};
+
+struct proc_xrefs_to_packet_t {
+    uint32_t pid;
+    uint64_t scan_address;
+    uint32_t scan_length;
+    uint64_t target_address;
+};
+
+// one decoded instruction from CMD_PROC_DISASM_REGION (32 bytes, packed);
+// kind bits: 0x01 call, 0x02 ret, 0x04 uncond branch, 0x08 cond branch,
+// 0x10 has memory operand, 0x20 rip-relative, 0x40 mem read, 0x80 mem write
+struct disasm_instr_entry_t {
+    uint64_t addr;
+    uint64_t rip_rel_target;
+    int64_t  mem_disp;
+    uint8_t  length;
+    uint8_t  kind;
+    uint8_t  mem_base_reg;
+    uint8_t  mem_index_reg;
+    uint8_t  mem_scale;
+    uint8_t  mnemonic_lo;
+    uint16_t pad;
+};
+
+struct proc_read_stack_packet_t {
+    uint32_t pid;
+    uint64_t rbp;
+    uint64_t rsp;
+    uint32_t depth;
+};
+
+struct proc_assemble_packet_t {
+    uint64_t base_addr;
+    uint32_t ks_opt_syntax;   // 0 default/Intel, 1 Intel, 2 ATT, 3 NASM, 4 MASM, 5 GAS
+};
+
+struct proc_assemble_ok_t {
+    uint32_t byte_len;
+    uint32_t insn_count;
+};
+
+struct proc_assemble_err_t {
+    uint32_t ks_errno;
+    uint32_t msg_len;
+};
+
+struct proc_scan_packet_t {
+    uint32_t pid;
+    uint8_t  valueType;
+    uint8_t  compareType;
+    uint32_t lenData;
+};
+
+struct proc_scan_start_packet_t {
+    uint32_t pid;
+    uint64_t address;
+    uint32_t length;
+    uint8_t  valueType;
+    uint8_t  compareType;
+    uint8_t  alignment;
+    uint32_t lenData;
+};
+
+struct proc_scan_count_packet_t {
+    uint32_t pid;
+    uint64_t base_address;
+    uint8_t  valueType;
+    uint8_t  compareType;
+    uint32_t lenData;
+};
+
+struct proc_scan_get_packet_t {
+    uint32_t pid;
+    uint32_t count;
+};
+
+struct proc_scan_aob_packet_t {
+    uint32_t pid;
+    uint64_t address;
+    uint32_t length;
+    uint8_t  max_matches;
+    uint8_t  stop_flag;   // 1 = invalidate if more than max_matches matches
+    uint32_t pattern_length;
+};
+
+struct proc_auth_packet_t {
+    uint32_t magic;   // CMD_PROC_AUTH_MAGIC
+    uint32_t flags;   // bits OR'd into the server's auth word on success
+};
+
+struct console_notify_packet_t {
+    uint32_t messageType;
+    uint32_t length;
+};
+
+struct console_foreground_app_response_t {
+    uint32_t pid;
+    char     titleid[16];
+    char     contentid[64];
+    char     name[40];
+    char     app_ver[8];
 };
 
 // struct __reg64 from debugger/include/debug.h; the server sends exactly 176
