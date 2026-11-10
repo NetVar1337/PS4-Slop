@@ -1,176 +1,413 @@
 // src/core/network/capture_service.cpp
+// host-side raw-socket capture (SIO_RCVALL promiscuous mode) feeding the
+// traffic store; replaces the old kernel/WFP front end. RCVALL needs admin.
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #include "core/network/capture_service.hpp"
 
-#include "core/runtime/backend_kernel.hpp"
-#include "core/runtime/backend_registry.hpp"
-#include "core/runtime/voyager_comm.h"
-
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 
 namespace slop::core::network {
-
+namespace capture {
 namespace {
 
-voyager::device_t* active_device() {
-    auto* k = dynamic_cast<runtime::backend_kernel_t*>(&runtime::active());
-    return k ? k->device() : nullptr;
+#pragma pack(push, 1)
+struct eth_hdr_t { uint8_t dst[6]; uint8_t src[6]; uint16_t type; };
+struct ipv4_hdr_t {
+    uint8_t  ver_ihl;
+    uint8_t  tos;
+    uint16_t total_len;
+    uint16_t id;
+    uint16_t frag_off;
+    uint8_t  ttl;
+    uint8_t  proto;
+    uint16_t checksum;
+    uint32_t src;
+    uint32_t dst;
+};
+struct tcp_hdr_t {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq;
+    uint32_t ack;
+    uint8_t  data_off;   // high nibble
+    uint8_t  flags;
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urg;
+};
+struct udp_hdr_t {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint16_t len;
+    uint16_t checksum;
+};
+#pragma pack(pop)
+
+struct state_t {
+    std::mutex mu;
+    SOCKET sock = INVALID_SOCKET;
+    std::thread th;
+    std::atomic<bool> stop_flag{false};
+    std::atomic<bool> active{false};
+
+    // filters
+    uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0;
+
+    // raw captured packets waiting to be pulled into the store
+    std::deque<packet_record_t> pending;
+    size_t pending_cap = 65536;
+
+    // parsed dns
+    std::deque<dns_record_t> dns;
+    size_t dns_cap = 4096;
+
+    // counters
+    std::atomic<uint64_t> total_captured{0};
+    std::atomic<uint64_t> total_dropped{0};
+    std::atomic<uint64_t> bytes_in{0};
+    std::atomic<uint64_t> bytes_out{0};
+};
+
+state_t& st() {
+    static state_t s;
+    return s;
 }
 
-int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
+std::string ip_str(uint32_t addr) {
+    in_addr a{};
+    a.s_addr = addr;
+    char buf[INET_ADDRSTRLEN]{};
+    return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : std::string{};
 }
 
-std::string ip_to_text(const uint8_t a[16], uint32_t family) {
-    char buf[64] = {};
-    if (family == 2) {   // AF_INET6 stored as 16 bytes
-        std::snprintf(buf, sizeof(buf),
-                      "%02x%02x:%02x%02x:%02x%02x:%02x%02x:"
-                      "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
-                      a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7],
-                      a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]);
-        return buf;
+// local addresses of this host, for direction classification
+std::vector<uint32_t> local_addrs() {
+    std::vector<uint32_t> out;
+    char host[256]{};
+    if (::gethostname(host, sizeof(host)) != 0) return out;
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* res = nullptr;
+    if (::getaddrinfo(host, nullptr, &hints, &res) == 0) {
+        for (addrinfo* p = res; p; p = p->ai_next) {
+            if (p->ai_addr && p->ai_addrlen >= sizeof(sockaddr_in)) {
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(p->ai_addr);
+                if (sin->sin_addr.s_addr != 0)
+                    out.push_back(sin->sin_addr.s_addr);
+            }
+        }
+        ::freeaddrinfo(res);
     }
-    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
-    return buf;
+    return out;
 }
 
-packet_record_t to_record(const voyager::device_t::captured_packet& p) {
-    packet_record_t r;
-    r.at_ms      = static_cast<int64_t>(p.timestamp / 1000);   // us -> ms best-effort
-    r.pid        = p.pid;
-    r.protocol   = p.protocol;
-    r.direction  = p.direction;
-    r.local_port = static_cast<uint16_t>(p.local_port);
-    r.remote_port= static_cast<uint16_t>(p.remote_port);
-    r.local_addr = ip_to_text(p.local_addr, p.address_family);
-    r.remote_addr= ip_to_text(p.remote_addr, p.address_family);
-    r.payload    = p.payload;
-    return r;
+// minimal dns message parser: collect QNAMEs of queries and A answers.
+// caller holds st().mu
+void parse_dns(const uint8_t* payload, size_t len, bool is_response,
+               std::deque<dns_record_t>& out, size_t dns_cap) {
+    if (len < 12) return;
+    const uint16_t flags = (payload[2] << 8) | payload[3];
+    const uint16_t qd = (payload[4] << 8) | payload[5];
+    const uint16_t an = (payload[6] << 8) | payload[7];
+    const bool qr = (flags >> 15) & 1;
+    if (qr != is_response) return;
+    size_t off = 12;
+    auto read_name = [&](size_t& o, std::string& name) -> bool {
+        name.clear();
+        int jumps = 0;
+        size_t pos = o;
+        size_t end = 0;
+        while (true) {
+            if (pos >= len) return false;
+            const uint8_t l = payload[pos];
+            if (l == 0) {
+                if (end == 0) end = pos + 1;
+                break;
+            }
+            if ((l & 0xC0) == 0xC0) {
+                if (pos + 1 >= len) return false;
+                const size_t ptr = ((l & 0x3F) << 8) | payload[pos + 1];
+                if (end == 0) end = pos + 2;
+                pos = ptr;
+                if (++jumps > 16) return false;
+                continue;
+            }
+            if (pos + 1 + l > len) return false;
+            if (!name.empty()) name += '.';
+            name.append(reinterpret_cast<const char*>(payload + pos + 1), l);
+            pos += 1 + l;
+        }
+        o = end;
+        return true;
+    };
+    auto now_ms = [] {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count());
+    };
+    std::string qname;
+    uint16_t qtype = 0;
+    for (uint16_t i = 0; i < qd && off < len; ++i) {
+        if (!read_name(off, qname)) return;
+        if (off + 4 > len) return;
+        qtype = (payload[off] << 8) | payload[off + 1];
+        off += 4;
+    }
+    if (qname.empty()) return;
+    if (!is_response) {
+        dns_record_t r{};
+        r.timestamp = now_ms();
+        r.query_type = qtype;
+        r.domain = qname;
+        out.push_back(r);
+        if (out.size() > dns_cap) out.pop_front();
+        return;
+    }
+    // response: walk answers for A records
+    const uint16_t rcode = flags & 0xF;
+    uint32_t ttl = 0;
+    std::string resolved;
+    for (uint16_t i = 0; i < an && off + 10 <= len; ++i) {
+        std::string aname;
+        if (!read_name(off, aname)) break;
+        const uint16_t type = (payload[off] << 8) | payload[off + 1];
+        ttl = (payload[off + 4] << 24) | (payload[off + 5] << 16) |
+              (payload[off + 6] << 8) | payload[off + 7];
+        const uint16_t rdlen = (payload[off + 8] << 8) | payload[off + 9];
+        off += 10;
+        if (off + rdlen > len) break;
+        if (type == 1 && rdlen == 4) {
+            resolved = ip_str((payload[off] << 24) | (payload[off + 1] << 16) |
+                              (payload[off + 2] << 8) | payload[off + 3]);
+            break;
+        }
+        off += rdlen;
+    }
+    dns_record_t r{};
+    r.timestamp = now_ms();
+    r.query_type = qtype;
+    r.domain = qname;
+    r.resolved_addr = resolved;
+    r.response_code = rcode;
+    r.ttl = ttl;
+    out.push_back(r);
+    if (out.size() > dns_cap) out.pop_front();
+}
+
+void handle_frame(const uint8_t* frame, size_t len) {
+    state_t& s = st();
+    if (len < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t)) return;
+    const auto* eth = reinterpret_cast<const eth_hdr_t*>(frame);
+    if (ntohs(eth->type) != 0x0800) return;   // ipv4 only
+    const auto* ip = reinterpret_cast<const ipv4_hdr_t*>(frame + sizeof(eth_hdr_t));
+    const size_t ihl = (ip->ver_ihl & 0x0F) * 4;
+    if (ihl < 20 || len < sizeof(eth_hdr_t) + ihl) return;
+    const uint8_t proto = ip->proto;
+    if (proto != 6 && proto != 17) return;
+    const uint8_t* l4 = frame + sizeof(eth_hdr_t) + ihl;
+    const size_t l4_len = len - sizeof(eth_hdr_t) - ihl;
+    uint16_t src_port = 0, dst_port = 0;
+    const uint8_t* payload = nullptr;
+    size_t payload_len = 0;
+    if (proto == 6) {
+        if (l4_len < sizeof(tcp_hdr_t)) return;
+        const auto* tcp = reinterpret_cast<const tcp_hdr_t*>(l4);
+        src_port = ntohs(tcp->src_port);
+        dst_port = ntohs(tcp->dst_port);
+        const size_t doff = (tcp->data_off >> 4) * 4;
+        if (doff < sizeof(tcp_hdr_t) || doff > l4_len) return;
+        payload = l4 + doff;
+        payload_len = l4_len - doff;
+        if (payload_len == 0) return;   // pure ack, no payload to store
+    } else {
+        if (l4_len < sizeof(udp_hdr_t)) return;
+        const auto* udp = reinterpret_cast<const udp_hdr_t*>(l4);
+        src_port = ntohs(udp->src_port);
+        dst_port = ntohs(udp->dst_port);
+        payload = l4 + sizeof(udp_hdr_t);
+        payload_len = l4_len - sizeof(udp_hdr_t);
+    }
+
+    static const auto locals = local_addrs();
+    const bool inbound = std::find(locals.begin(), locals.end(), ip->dst) != locals.end();
+
+    packet_record_t rec{};
+    rec.at_ms = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    rec.protocol = proto;
+    rec.direction = inbound ? 1 : 0;
+    rec.local_addr = inbound ? ip_str(ip->dst) : ip_str(ip->src);
+    rec.local_port = inbound ? dst_port : src_port;
+    rec.remote_addr = inbound ? ip_str(ip->src) : ip_str(ip->dst);
+    rec.remote_port = inbound ? src_port : dst_port;
+    rec.payload.assign(payload, payload + std::min<size_t>(payload_len, 1536));
+
+    s.total_captured.fetch_add(1);
+    if (inbound) s.bytes_in.fetch_add(len); else s.bytes_out.fetch_add(len);
+    {
+        std::lock_guard lk(s.mu);
+        if (proto == 17 && payload_len > 0 && (src_port == 53 || dst_port == 53))
+            parse_dns(payload, payload_len, src_port == 53, s.dns, s.dns_cap);
+        if (s.pending.size() >= s.pending_cap) {
+            s.pending.pop_front();
+            s.total_dropped.fetch_add(1);
+        }
+        s.pending.push_back(std::move(rec));
+    }
+}
+
+void capture_thread() {
+    state_t& s = st();
+    // RCVALL promiscuous mode: needs admin
+    DWORD rcvall = 1;
+    DWORD bytes = 0;
+    if (::WSAIoctl(s.sock, SIO_RCVALL, &rcvall, sizeof(rcvall), nullptr, 0,
+                   &bytes, nullptr, nullptr) == SOCKET_ERROR) {
+        s.active.store(false);
+        return;
+    }
+    uint8_t buf[65536];
+    while (!s.stop_flag.load()) {
+        const int n = ::recv(s.sock, reinterpret_cast<char*>(buf), sizeof(buf), 0);
+        if (n <= 0) {
+            if (s.stop_flag.load()) break;
+            const int err = ::WSAGetLastError();
+            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
+            break;
+        }
+        handle_frame(buf, static_cast<size_t>(n));
+    }
+    rcvall = 0;
+    ::WSAIoctl(s.sock, SIO_RCVALL, &rcvall, sizeof(rcvall), nullptr, 0, &bytes,
+               nullptr, nullptr);
+    s.active.store(false);
 }
 
 } // namespace
 
-bool capture::kernel_available() { return active_device() != nullptr; }
-
-std::string capture::start(uint32_t filter_pid, uint32_t filter_port,
-                           uint32_t filter_protocol) {
-    auto* dev = active_device();
-    if (!dev) return "kernel driver not active";
-    return dev->start_capture(filter_pid, filter_port, filter_protocol)
-               ? "" : "start_capture failed (driver rejected)";
+bool running() {
+    return st().active.load();
 }
 
-std::string capture::stop() {
-    auto* dev = active_device();
-    if (!dev) return "kernel driver not active";
-    return dev->stop_capture() ? "" : "stop_capture failed";
-}
-
-size_t capture::poll(traffic_store_t& sink, size_t max_packets) {
-    auto* dev = active_device();
-    if (!dev || max_packets == 0) return 0;
-    auto packets = dev->get_captured_packets_bounded(
-        static_cast<uint32_t>(std::min<size_t>(max_packets, 1024)), 250);
-    size_t n = 0;
-    for (auto& p : packets) {
-        sink.add(to_record(p));
-        ++n;
+std::string start(uint32_t filter_pid, uint32_t filter_port,
+                  uint32_t filter_protocol) {
+    state_t& s = st();
+    if (s.active.load()) return {};
+    {
+        WSADATA wsa{};
+        if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+            return "WSAStartup failed";
     }
-    return n;
+    SOCKET sock = ::socket(AF_INET, SOCK_RAW, IPPROTO_IP);
+    if (sock == INVALID_SOCKET)
+        return "raw socket failed (error " + std::to_string(::WSAGetLastError()) +
+               ") - run elevated for SIO_RCVALL capture";
+    // bind to any so we receive on all interfaces
+    sockaddr_in bind_addr{};
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+    bind_addr.sin_port = 0;
+    if (::bind(sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
+        const int e = ::WSAGetLastError();
+        ::closesocket(sock);
+        return "raw socket bind failed (error " + std::to_string(e) + ")";
+    }
+    // receive timeout so the thread notices stop_flag
+    DWORD tv = 500;
+    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv),
+                 sizeof(tv));
+    {
+        std::lock_guard lk(s.mu);
+        s.sock = sock;
+        s.filter_pid = filter_pid;
+        s.filter_port = filter_port;
+        s.filter_protocol = filter_protocol;
+    }
+    s.stop_flag.store(false);
+    s.active.store(true);
+    s.th = std::thread(capture_thread);
+    return {};
 }
 
-std::vector<dns_record_t> capture::dns_queries(uint32_t filter_pid) {
-    std::vector<dns_record_t> out;
-    auto* dev = active_device();
-    if (!dev) return out;
-    for (const auto& d : dev->get_dns_queries(filter_pid)) {
-        dns_record_t r;
-        r.timestamp     = d.timestamp;
-        r.pid           = d.pid;
-        r.query_type    = d.query_type;
-        r.domain        = d.domain;
-        r.resolved_addr = ip_to_text(d.resolved_addr, 2);
-        r.response_code = d.response_code;
-        r.ttl           = d.ttl;
-        out.push_back(std::move(r));
+std::string stop() {
+    state_t& s = st();
+    s.stop_flag.store(true);
+    if (s.th.joinable()) s.th.join();
+    {
+        std::lock_guard lk(s.mu);
+        if (s.sock != INVALID_SOCKET) {
+            ::closesocket(s.sock);
+            s.sock = INVALID_SOCKET;
+        }
     }
+    s.active.store(false);
+    ::WSACleanup();
+    return {};
+}
+
+size_t poll(traffic_store_t& sink, size_t max_packets) {
+    state_t& s = st();
+    size_t pulled = 0;
+    std::lock_guard lk(s.mu);
+    while (!s.pending.empty() && pulled < max_packets) {
+        packet_record_t rec = std::move(s.pending.front());
+        s.pending.pop_front();
+        // apply filters
+        if (s.filter_protocol != 0 && rec.protocol != s.filter_protocol) continue;
+        if (s.filter_port != 0 &&
+            rec.local_port != s.filter_port && rec.remote_port != s.filter_port)
+            continue;
+        sink.add(std::move(rec));
+        ++pulled;
+    }
+    return pulled;
+}
+
+std::vector<dns_record_t> dns_queries(uint32_t filter_pid) {
+    (void)filter_pid;   // raw capture has no pid attribution; return all
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    return {s.dns.begin(), s.dns.end()};
+}
+
+net_stats_t stats() {
+    state_t& s = st();
+    net_stats_t out{};
+    out.capture_active = s.active.load();
+    out.total_captured = static_cast<uint32_t>(s.total_captured.load());
+    out.total_dropped = static_cast<uint32_t>(s.total_dropped.load());
+    out.bytes_received = s.bytes_in.load();
+    out.bytes_sent = s.bytes_out.load();
+    out.packets_received = out.total_captured;
+    std::lock_guard lk(s.mu);
+    out.total_dns_logged = static_cast<uint32_t>(s.dns.size());
     return out;
 }
 
-std::string capture::add_filter_rule(const filter_rule_t& rule,
-                                     uint32_t* out_rule_id) {
-    auto* dev = active_device();
-    if (!dev) return "kernel driver not active";
-    uint32_t id = 0;
-    if (!dev->add_filter_rule(rule.action, rule.direction, rule.protocol,
-                              rule.pid, rule.port, nullptr, nullptr, &id))
-        return "add_filter_rule failed";
-    if (out_rule_id) *out_rule_id = id;
-    return "";
-}
-
-std::string capture::remove_filter_rule(uint32_t rule_id) {
-    auto* dev = active_device();
-    if (!dev) return "kernel driver not active";
-    return dev->remove_filter_rule(rule_id) ? "" : "remove_filter_rule failed";
-}
-
-std::string capture::clear_filter_rules() {
-    auto* dev = active_device();
-    if (!dev) return "kernel driver not active";
-    return dev->clear_filter_rules() ? "" : "clear_filter_rules failed";
-}
-
-std::optional<net_stats_t> capture::stats() {
-    auto* dev = active_device();
-    if (!dev) return std::nullopt;
-    voyager::device_t::network_stats s{};
-    if (!dev->get_network_stats(s)) return std::nullopt;
-    net_stats_t out;
-    out.bytes_sent          = s.bytes_sent;
-    out.bytes_received      = s.bytes_received;
-    out.packets_sent        = s.packets_sent;
-    out.packets_received    = s.packets_received;
-    out.active_connections  = s.active_connections;
-    out.capture_active      = s.capture_active != 0;
-    out.total_captured      = s.total_captured;
-    out.total_dropped       = s.total_dropped;
-    out.total_dns_logged    = s.total_dns_logged;
-    out.active_filter_rules = s.active_filter_rules;
-    return out;
-}
-
-std::string capture::export_pcap(const std::string& path, uint32_t filter_pid,
-                                 uint32_t max_packets) {
-    auto* dev = active_device();
-    if (!dev) return "kernel driver not active";
-    voyager::device_t::pcap_export_result out{};
-    if (!dev->export_pcap(filter_pid, 0, max_packets, &out))
-        return "export_pcap failed";
-
-    // the driver hands back ready made pcap records, wrap each frame as a
-    // payload only record
-    traffic_store_t tmp;
-    std::vector<packet_record_t> recs;
-    recs.reserve(out.packets.size());
-    for (const auto& p : out.packets) {
-        packet_record_t r;
-        r.at_ms = static_cast<int64_t>(p.ts_sec) * 1000ll +
-                  p.ts_usec / 1000;
-        r.protocol = 6;
-        r.local_addr  = "127.0.0.1";
-        r.remote_addr = "127.0.0.1";
-        r.payload     = p.data;
-        recs.push_back(std::move(r));
-    }
+std::string export_pcap(const traffic_store_t& store, const std::string& path,
+                        uint32_t max_packets) {
+    const auto page = store.packets(0, max_packets);
     std::string err;
-    if (!tmp.write_pcap(path, recs, &err))
-        return err;
-    return "";
+    if (!store.write_pcap(path, page.items, &err))
+        return err.empty() ? "pcap write failed" : err;
+    return {};
 }
 
+} // namespace capture
 } // namespace slop::core::network
-
-
