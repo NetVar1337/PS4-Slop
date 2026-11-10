@@ -130,7 +130,7 @@ TEST_CASE(mcp_unknown_action_errors_enumerate_actions) {
 
     payload = fx.call("debugger", {{"action", "brk"}}, is_error);
     REQUIRE(is_error);
-    REQUIRE(payload.at("error").get<std::string>().find("ps4_") !=
+    REQUIRE(payload.at("error").get<std::string>().find("bp_set") !=
             std::string::npos);
 
     payload = fx.call("fs", {{"action", "sve"}}, is_error);
@@ -155,23 +155,25 @@ TEST_CASE(mcp_tools_list_consolidated) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
     const auto& tools = res.at("result").at("tools");
-    REQUIRE_EQ(tools.size(), 20u);
+    REQUIRE_EQ(tools.size(), 25u);
 
     bool seen_target = false, seen_memory = false, seen_disasm = false,
-         seen_debugger = false,
+         seen_debugger = false, seen_driver = false, seen_inject = false,
          seen_emulate = false, seen_analyze = false,
          seen_network = false, seen_proxy = false,
          seen_persist = false, seen_re = false, seen_script = false,
-         seen_decomp = false, seen_xray = false,
+         seen_frida = false, seen_decomp = false, seen_xray = false,
          seen_patch = false,
          seen_types = false, seen_notes = false, seen_devirt = false,
-         seen_guide = false;
+         seen_dotnet = false, seen_guide = false;
     for (const auto& t : tools) {
         const std::string n = t.at("name").get<std::string>();
         if (n == "target")   seen_target = true;
         if (n == "memory")   seen_memory = true;
         if (n == "disasm")   seen_disasm = true;
         if (n == "debugger") seen_debugger = true;
+        if (n == "driver")   seen_driver = true;
+        if (n == "inject")   seen_inject = true;
         if (n == "emulate")  seen_emulate = true;
         if (n == "analyze")  seen_analyze = true;
         if (n == "network")  seen_network = true;
@@ -179,12 +181,14 @@ TEST_CASE(mcp_tools_list_consolidated) {
         if (n == "persist")  seen_persist = true;
         if (n == "re")       seen_re = true;
         if (n == "script")   seen_script = true;
+        if (n == "frida")    seen_frida = true;
         if (n == "decomp")   seen_decomp = true;
         if (n == "xray")     seen_xray = true;
         if (n == "patch")    seen_patch = true;
         if (n == "types")    seen_types = true;
         if (n == "notes")    seen_notes = true;
         if (n == "devirt")   seen_devirt = true;
+        if (n == "dotnet")   seen_dotnet = true;
         if (n == "guide")    seen_guide = true;
         REQUIRE(t.contains("inputSchema"));
         REQUIRE(t.contains("description"));
@@ -202,6 +206,8 @@ TEST_CASE(mcp_tools_list_consolidated) {
     REQUIRE(seen_memory);
     REQUIRE(seen_disasm);
     REQUIRE(seen_debugger);
+    REQUIRE(seen_driver);
+    REQUIRE(seen_inject);
     REQUIRE(seen_emulate);
     REQUIRE(seen_analyze);
     REQUIRE(seen_network);
@@ -209,14 +215,35 @@ TEST_CASE(mcp_tools_list_consolidated) {
     REQUIRE(seen_persist);
     REQUIRE(seen_re);
     REQUIRE(seen_script);
+    REQUIRE(seen_frida);
     REQUIRE(seen_decomp);
     REQUIRE(seen_xray);
     REQUIRE(seen_patch);
     REQUIRE(seen_types);
     REQUIRE(seen_notes);
     REQUIRE(seen_devirt);
+    REQUIRE(seen_dotnet);
     REQUIRE(seen_guide);
 }
+
+TEST_CASE(mcp_dotnet_actions_and_no_image) {
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // A mistyped action enumerates the valid set for one-round-trip recovery.
+    json payload = fx.call("dotnet", {{"action", "treee"}}, is_error);
+    REQUIRE(is_error);
+    const std::string err = payload.at("error").get<std::string>();
+    REQUIRE(err.find("tree") != std::string::npos);
+    REQUIRE(err.find("method") != std::string::npos);
+
+    // With no image loaded, the guarded actions fail fast pointing at the flow.
+    is_error = false;
+    payload = fx.call("dotnet", {{"action", "status"}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.at("error").get<std::string>().find("image") != std::string::npos);
+}
+
 TEST_CASE(mcp_devirt_exposes_themida_sidecars) {
     server_fixture_t fx;
     bool is_error = false;
@@ -249,14 +276,14 @@ TEST_CASE(mcp_tool_descriptions_expose_workflow_context) {
         return it->at("description").get<std::string>();
     };
 
-    REQUIRE(description("target").find("ps4_auto") != std::string::npos);
+    REQUIRE(description("target").find("action='status'") != std::string::npos);
     REQUIRE(description("memory").find("attached") != std::string::npos);
     REQUIRE(description("disasm").find("hype.ready") != std::string::npos);
-    REQUIRE(description("debugger").find("ps4_wait") != std::string::npos);
-    REQUIRE(description("network").find("capture_start") != std::string::npos);
-    REQUIRE(description("guide").find("PS4") != std::string::npos);
+    REQUIRE(description("debugger").find("wait_halt") != std::string::npos);
+    REQUIRE(description("driver").find("structured errors") != std::string::npos);
     REQUIRE(description("patch").find("does not patch live target memory") != std::string::npos);
     REQUIRE(description("decomp").find("function-start addr") != std::string::npos);
+    REQUIRE(description("frida").find("session handle") != std::string::npos);
 }
 
 TEST_CASE(mcp_unknown_method_and_tool) {
@@ -296,12 +323,24 @@ TEST_CASE(mcp_tool_errors_without_target) {
     payload = fx.call("debugger", {{"action", "regs"}}, is_error);
     REQUIRE(is_error);
 }
+
+TEST_CASE(mcp_driver_status_shape) {
+    server_fixture_t fx;
+    bool is_error = true;
+    json payload = fx.call("driver", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(payload.contains("kernel_active"));
+    REQUIRE(payload.contains("hwbp_supported"));
+    REQUIRE(payload.contains("device"));
+}
+
 TEST_CASE(mcp_target_status_shape) {
     server_fixture_t fx;
     bool is_error = true;
     json payload = fx.call("target", {{"action", "status"}}, is_error);
     REQUIRE(!is_error);
     REQUIRE(payload.contains("backend"));
+    REQUIRE(payload.contains("kernel"));
     REQUIRE(payload.contains("attached"));
     REQUIRE_EQ(payload.value("attached", true), false);
 
@@ -631,6 +670,101 @@ TEST_CASE(mcp_target_attach_populates_shared_session) {
                             {"pid", static_cast<uint64_t>(GetCurrentProcessId())}},
                            is_error);
     if (is_error) return;   // locked-down environment: nothing further to assert
+
+    REQUIRE_EQ(payload.value("attached", false), true);
+    // Main module was readable from disk -> shared session auto-populated
+    REQUIRE_EQ(payload.value("image_auto_loaded", false), true);
+    REQUIRE(payload.contains("image"));
+    REQUIRE_EQ(payload.at("image").value("ready", false), true);
+    REQUIRE_GT(payload.at("image").value("functions", 0u), 0u);
+
+    // Static tools now see it with zero arguments, no explicit 'path'
+    payload = fx.call("disasm", {{"action", "functions"}, {"limit", 10}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!payload.at("functions").empty());
+    REQUIRE(!std::string(payload.value("image", "")).empty());
+
+    // Never leak the session into later tests
+    payload = fx.call("target", {{"action", "detach"}}, is_error);
+    REQUIRE(!is_error);
+    slop::core::disasm::binary_state::unload();
+}
+
+TEST_CASE(mcp_debugger_hwbp_requires_kernel_backend) {
+    server_fixture_t fx;
+    bool is_error = false;
+    // User-mode backend active in tests: hw path must refuse cleanly
+    json payload = fx.call("debugger",
+                           {{"action", "bp_set"}, {"addr", 0x41414141},
+                            {"hw", true}, {"type", 3}, {"len", 1}},
+                           is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.contains("error"));
+
+    // Bad len rejected even before backend checks would matter
+    payload = fx.call("debugger", {{"action", "bp_set"}, {"addr", 1}, {"hw", true},
+                                   {"len", 3}}, is_error);
+    // Kernel check fires first without a driver, either way it's an error,
+    // never a silent success
+    REQUIRE(is_error);
+}
+
+TEST_CASE(mcp_debugger_status_reports_stealth_context) {
+    server_fixture_t fx;
+    bool is_error = true;
+    const json payload = fx.call("debugger", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    // Stealth context fields ride status so agents can see which engine
+    // flavor and anti-debug posture is live
+    REQUIRE(payload.contains("mode"));
+    REQUIRE(payload.contains("backend"));
+    REQUIRE(payload.contains("stealth_peb_spoof"));
+    REQUIRE(payload.contains("stealth_kernel_debug"));
+    REQUIRE(payload.contains("hwbp_supported"));
+    REQUIRE(payload.contains("veh_page"));
+}
+
+TEST_CASE(mcp_debugger_suspend_resume_require_attachment) {
+    server_fixture_t fx;
+    bool is_error = false;
+    // Without an attached debugger both freeze/thaw actions must refuse
+    // cleanly (never a silent success that suspends nothing)
+    json payload = fx.call("debugger", {{"action", "suspend_all"}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.contains("error"));
+
+    payload = fx.call("debugger", {{"action", "resume_all"}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.contains("error"));
+}
+
+TEST_CASE(mcp_driver_backend_preference_roundtrip) {
+    server_fixture_t fx;
+    bool is_error = true;
+    // Query: reports preference + active badge without touching the driver
+    json payload = fx.call("driver", {{"action", "backend"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(payload.contains("preference"));
+    REQUIRE(payload.contains("active"));
+    REQUIRE(payload.contains("kernel_active"));
+
+    // Set: valid values round-trip; invalid values refuse
+    payload = fx.call("driver", {{"action", "backend"}, {"pref", "user"}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.at("preference").get<std::string>(), "user");
+
+    payload = fx.call("driver", {{"action", "backend"}, {"pref", "auto"}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.at("preference").get<std::string>(), "auto");
+
+    payload = fx.call("driver", {{"action", "backend"}, {"pref", "bogus"}},
+                      is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.contains("error"));
+}
+
 TEST_CASE(mcp_schemas_expose_new_actions) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
@@ -673,16 +807,13 @@ TEST_CASE(mcp_schemas_expose_new_actions) {
     const json tgt = enum_of(tools, "target");
     REQUIRE(std::find(tgt.begin(), tgt.end(), "handles") != tgt.end());
 
-    // PS4 live-debug + host-side capture surfaces are declared
+    // Stealth-debugger + backend-switching surfaces are declared
     const json dbg = enum_of(tools, "debugger");
-    REQUIRE(std::find(dbg.begin(), dbg.end(), "ps4_attach") != dbg.end());
-    REQUIRE(std::find(dbg.begin(), dbg.end(), "ps4_bp_set") != dbg.end());
-    REQUIRE(std::find(dbg.begin(), dbg.end(), "ps4_wait") != dbg.end());
-    REQUIRE(std::find(dbg.begin(), dbg.end(), "ps4_find_write") != dbg.end());
+    REQUIRE(std::find(dbg.begin(), dbg.end(), "suspend_all") != dbg.end());
+    REQUIRE(std::find(dbg.begin(), dbg.end(), "resume_all") != dbg.end());
 
-    const json net = enum_of(tools, "network");
-    REQUIRE(std::find(net.begin(), net.end(), "capture_start") != net.end());
-    REQUIRE(std::find(net.begin(), net.end(), "deep_inspect") != net.end());
+    const json drv = enum_of(tools, "driver");
+    REQUIRE(std::find(drv.begin(), drv.end(), "backend") != drv.end());
 
     const json dis = enum_of(tools, "disasm");
     bool ok = false;
@@ -917,17 +1048,24 @@ TEST_CASE(mcp_analyze_signatures_on_loaded_image) {
 
 // === network / proxy / persist / re / script surfaces ===
 
-TEST_CASE(mcp_network_shape_host_side_store) {
+TEST_CASE(mcp_network_shape_without_kernel) {
     server_fixture_t fx;
     bool is_error = false;
 
     json payload = fx.call("network", {{"action", "status"}}, is_error);
     REQUIRE(!is_error);
-    REQUIRE(payload.contains("capture_running"));
+    REQUIRE(payload.contains("kernel_available"));
     REQUIRE(payload.contains("store_packets"));
     REQUIRE(payload.contains("proxy_running"));
 
-    // Store-backed actions work with no capture running
+    // Kernel capture paths refuse cleanly when the driver is absent
+    payload = fx.call("network", {{"action", "capture_start"}}, is_error);
+    if (payload.value("kernel_available", true) == false) {
+        REQUIRE(is_error);
+        REQUIRE(payload.contains("error"));
+    }
+
+    // Store-backed actions work without any kernel
     payload = fx.call("network", {{"action", "packets"}}, is_error);
     REQUIRE(!is_error);
     REQUIRE_EQ(payload.value("count", -1), 0);
@@ -940,29 +1078,126 @@ TEST_CASE(mcp_network_shape_host_side_store) {
                       {{"action", "stream_data"}, {"id", 999}}, is_error);
     REQUIRE(is_error);   // unknown stream
 
-    payload = fx.call("network", {{"action", "dns"}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE(payload.contains("count"));
-
-    payload = fx.call("network", {{"action", "stats"}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE(payload.contains("capture_active"));
-    REQUIRE(payload.contains("store_packets"));
-
-    payload = fx.call("network", {{"action", "reassemble_stream"}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("packets", -1u), 0u);
-
-    payload = fx.call("network", {{"action", "connections"}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("count", -1), 0);
-
-    payload = fx.call("network", {{"action", "deep_inspect"}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("count", -1), 0);
-
     payload = fx.call("network", {{"action", "frobnicate"}}, is_error);
     REQUIRE(is_error);
+}
+
+TEST_CASE(mcp_network_kernel_query_kit_surface) {
+    server_fixture_t fx;
+
+    // The AiDA-parity query/inspect actions are registered in the schema and
+    // degrade to structured errors when the kernel driver is absent
+    static const char* kQueryActions[] = {
+        "connections", "deep_inspect", "wfp_callouts", "socket_handles",
+        "tcpip_dump", "interfaces", "dns_spoof_list",
+        "block_ip", "block_port", "block_process",
+    };
+    json res = fx.rpc("tools/list");
+    const auto& tools = res.at("result").at("tools");
+    std::string network_schema;
+    for (const auto& t : tools)
+        if (t.at("name").get<std::string>() == "network")
+            network_schema = t.at("inputSchema").dump();
+    REQUIRE(!network_schema.empty());
+    for (const char* a : kQueryActions)
+        REQUIRE_NE(network_schema.find(std::string("\"") + a + "\""),
+                   std::string::npos);
+
+    // Machine-independent: probe whether slopdrvr is live, then assert the
+    // matching contract (structured refusal without it)
+    bool is_error = false;
+    json status = fx.call("network", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    const bool kernel_live = status.value("kernel_available", false) == true;
+
+    for (const char* a : kQueryActions) {
+        json args = {{"action", a}};
+        if (std::string(a) == "block_ip")
+            args["ip"] = "192.0.2.1";      // valid arg; failure is driver-side
+        json payload = fx.call("network", args, is_error);
+        if (!kernel_live) {
+            REQUIRE(is_error);
+            REQUIRE(payload.contains("error"));
+        }
+    }
+
+    // block_ip rejects a malformed address before touching the driver
+    is_error = false;
+    json payload = fx.call("network",
+                           {{"action", "block_ip"}, {"ip", "not-an-ip"}},
+                           is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.contains("error"));
+}
+
+TEST_CASE(mcp_driver_kernel_extras_surface) {
+    server_fixture_t fx;
+
+    // read_teb / peb_modules / integrity_checks / sniff_buffers are registered
+    // in the driver tool schema
+    json res = fx.rpc("tools/list");
+    const auto& tools = res.at("result").at("tools");
+    std::string driver_schema;
+    for (const auto& t : tools)
+        if (t.at("name").get<std::string>() == "driver")
+            driver_schema = t.at("inputSchema").dump();
+    REQUIRE(!driver_schema.empty());
+    for (const char* a : {"log_config", "read_teb", "peb_modules",
+                          "integrity_checks", "sniff_buffers"})
+        REQUIRE_NE(driver_schema.find(std::string("\"") + a + "\""),
+                   std::string::npos);
+
+    // log_config validates its range before touching the driver
+    bool is_error = false;
+    json payload = fx.call("driver",
+                           {{"action", "log_config"}, {"level", 9}},
+                           is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.contains("error"));
+
+    is_error = false;
+    payload = fx.call("driver",
+                      {{"action", "log_config"}, {"cap_mb", 0}},
+                      is_error);
+    REQUIRE(is_error);
+
+    // Argument validation runs ahead of the kernel work in every reachable
+    // state (no driver / driver without target / attached), so these all
+    // refuse with a structured error
+    payload = fx.call("driver", {{"action", "read_teb"}}, is_error);
+    REQUIRE(is_error);                       // missing tid (or no driver)
+    REQUIRE(payload.contains("error"));
+
+    payload = fx.call("driver",
+                      {{"action", "peb_modules"}, {"order", "bogus"}},
+                      is_error);
+    REQUIRE(is_error);                       // bad order (or no driver/pid)
+
+    payload = fx.call("driver",
+                      {{"action", "sniff_buffers"}, {"op", "start"}},
+                      is_error);
+    REQUIRE(is_error);                       // missing addr
+    REQUIRE(payload.contains("error"));
+}
+
+TEST_CASE(mcp_proxy_lifecycle_and_entries) {
+    server_fixture_t fx;
+    bool is_error = false;
+
+    json payload = fx.call("proxy", {{"action", "start"}, {"port", 0}},
+                           is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("running", false), true);
+    const uint64_t port = payload.value("port", 0u);
+    REQUIRE_GT(port, 0);
+
+    payload = fx.call("proxy", {{"action", "entries"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(payload.contains("entries"));
+
+    payload = fx.call("proxy", {{"action", "stop"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("running", true), false);
 }
 
 TEST_CASE(mcp_persist_roundtrip) {
@@ -1388,38 +1623,44 @@ TEST_CASE(mcp_devirt_and_full_pass_over_wire) {
     REQUIRE(is_error);   // image unloaded
 }
 
-TEST_CASE(mcp_debugger_ps4_actions_refuse_without_console) {
+TEST_CASE(mcp_debugger_new_action_error_paths) {
     server_fixture_t fx;
     bool is_error = false;
 
-    // Without a connected PS4 every ps4_* action refuses with a structured
-    // error, and a local-debug action name points at the ps4_* set
-    for (const char* action : {"ps4_attach", "ps4_bp_set", "ps4_continue",
-                               "ps4_wait", "ps4_regs", "ps4_events",
-                               "ps4_find_write"}) {
-        json payload = fx.call("debugger",
-                               {{"action", action}, {"addr", 0x41414141},
-                                {"pid", 1234}}, is_error);
+    // All require a paused debugger; clean structured errors without one
+    for (const char* action : {"callstack", "seh", "trace_run"}) {
+        json payload = fx.call("debugger", {{"action", action}}, is_error);
         REQUIRE(is_error);
         REQUIRE(payload.contains("error"));
     }
 
-    json payload = fx.call("debugger", {{"action", "wait_halt"}}, is_error);
+    json payload = fx.call("debugger",
+                           {{"action", "set_register"}, {"name", "rax"},
+                            {"value", 1}},
+                           is_error);
     REQUIRE(is_error);
-    REQUIRE(payload.at("error").get<std::string>().find("ps4_") !=
-            std::string::npos);
 
-    payload = fx.call("debugger", {{"action", "status"}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("ps4_connected", true), false);
-    REQUIRE_EQ(payload.value("debug_attached", true), false);
-    REQUIRE(payload.contains("backend"));
+    payload = fx.call("debugger",
+                      {{"action", "watchpoint_set"}, {"addr", 0x41414141}},
+                      is_error);
+    REQUIRE(is_error);   // user backend in tests -> kernel required
+
+    payload = fx.call("debugger",
+                      {{"action", "bp_set"}, {"addr", 0x42424242},
+                       {"condition", "rax == 123"}, {"auto_continue", true},
+                       {"log", "hit"}},
+                      is_error);
+    // No target attached in this environment: set itself fails first
+    REQUIRE(is_error);
 
     payload = fx.call("memory",
                       {{"action", "live_crypto"},
                        {"begin", 0x41414141}, {"end", 0x41414241}},
                       is_error);
     REQUIRE(is_error);   // no target
+
+    payload = fx.call("network", {{"action", "intercept_list"}}, is_error);
+    REQUIRE(is_error);   // no kernel driver
 }
 
 
@@ -1683,4 +1924,93 @@ TEST_CASE(mcp_disasm_load_unload_shared_session) {
     payload = fx.call("disasm", {{"action", "unload"}}, is_error);
     REQUIRE(!is_error);
     REQUIRE_FALSE(ds::has_binary());
+}
+
+// End-to-end over the wire: load a real managed assembly, wait for analysis,
+// then drive every dotnet action and assert the shapes an agent / the UI relies
+// on. Skips cleanly when no .NET Framework assembly is present on the machine.
+TEST_CASE(mcp_dotnet_over_loaded_managed_image) {
+    namespace ds = slop::core::disasm::binary_state;
+    const char* cands[] = {
+        R"(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\sysglobl.dll)",
+        R"(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\System.Configuration.dll)",
+        R"(C:\Windows\Microsoft.NET\Framework\v4.0.30319\System.Configuration.dll)",
+        R"(C:\Windows\Microsoft.NET\Framework64\v4.0.30319\mscorlib.dll)",
+    };
+    std::string path;
+    for (const char* c : cands) {
+        std::ifstream probe(c, std::ios::binary);
+        if (probe.good()) { path = c; break; }
+    }
+    if (path.empty()) return;   // no managed assembly on this box: skip
+
+    REQUIRE(ds::load_file(path));
+    REQUIRE(wait_hype_ready_mcp());
+
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // status: the loaded image is recognized as managed with a populated model.
+    json st = fx.call("dotnet", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(st.value("managed", false), true);
+    REQUIRE_GT(st.value("types", 0u), 0u);
+    REQUIRE_GT(st.value("methods", 0u), 0u);
+    REQUIRE_GT(st.value("fields", 0u), 0u);
+
+    // tree: namespaces -> types, each carrying a resolved kind + counts.
+    json tree = fx.call("dotnet", {{"action", "tree"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(tree.contains("namespaces"));
+    REQUIRE_GT(tree.at("namespaces").size(), 0u);
+
+    // Walk types until one exposes a method with an IL body; exercise type,
+    // source, method and il against it.
+    uint32_t any_type = 0, body_method = 0, body_type = 0;
+    for (const auto& ns : tree.at("namespaces")) {
+        for (const auto& tnode : ns.at("types")) {
+            uint32_t tok = tnode.at("token").get<uint32_t>();
+            if (!any_type) any_type = tok;
+            json ty = fx.call("dotnet", {{"action", "type"}, {"token", tok}}, is_error);
+            REQUIRE(!is_error);
+            REQUIRE(ty.at("kind").is_string());
+            REQUIRE(ty.contains("fields"));
+            REQUIRE(ty.contains("methods"));
+            for (const auto& mm : ty.at("methods")) {
+                if (mm.value("has_body", false)) {
+                    body_method = mm.at("token").get<uint32_t>();
+                    body_type = tok;
+                    break;
+                }
+            }
+            if (body_method) break;
+        }
+        if (body_method) break;
+    }
+    REQUIRE(any_type != 0);
+
+    // source: dnSpy-style C# for a type opens a brace block.
+    json src = fx.call("dotnet",
+                       {{"action", "source"}, {"token", body_type ? body_type : any_type}},
+                       is_error);
+    REQUIRE(!is_error);
+    REQUIRE_GT(src.value("csharp", std::string{}).size(), 0u);
+    REQUIRE(src.at("csharp").get<std::string>().find('{') != std::string::npos);
+
+    // method: signature + resolved IL listing + a C# body.
+    REQUIRE(body_method != 0);
+    json m = fx.call("dotnet", {{"action", "method"}, {"token", body_method}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(m.contains("il"));
+    REQUIRE_GT(m.at("il").size(), 0u);
+    REQUIRE_GT(m.value("signature", std::string{}).size(), 0u);
+    REQUIRE(m.at("il_text").get<std::string>().find("IL_") != std::string::npos);
+    REQUIRE(m.contains("csharp"));
+
+    // il: the whole-assembly ILDASM listing is non-empty.
+    json il = fx.call("dotnet", {{"action", "il"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(il.at("il_text").get<std::string>().find(".method") != std::string::npos);
+
+    ds::unload();
 }
