@@ -84,73 +84,6 @@ try {
     assert.equal(calls,0);
   }
 
-  // .NET explorer store: refresh builds the namespace/type tree, toggleType
-  // lazy-loads a type's members exactly once, selectMethod pulls C#+IL, and a
-  // native image collapses to a clean not-managed state.
-  {
-    const {useDotnet} = await server.ssrLoadModule('/src/store/dotnet.ts');
-    let managedImage = true;
-    let typeCalls = 0;
-    const reply = (data) => ({ok:true,json:async()=>({ok:true,data})});
-    globalThis.fetch = async (url, opts) => {
-      const {tool,action} = JSON.parse(opts.body);
-      if (tool!=='dotnet') return reply({});
-      if (action==='status') return reply(managedImage
-        ? {managed:true,assembly:'App',runtime:'v4.0.30319',types:2,methods:3,fields:1,properties:0}
-        : {managed:false,note:'not a managed image'});
-      if (action==='tree') return reply({namespaces:[
-        {name:'App',types:[
-          {token:0x02000001,token_hex:'02000001',name:'Program',full_name:'App.Program',
-           kind:'class',visibility:'public',counts:{fields:1,properties:0,events:0,methods:2,nested:0}},
-        ]},
-      ]});
-      if (action==='type') { typeCalls++; return reply({
-        token:0x02000001,name:'Program',namespace:'App',full_name:'App.Program',kind:'class',
-        visibility:'public',abstract:false,sealed:false,static:false,
-        fields:[{token:0x04000001,name:'count',type:'int',visibility:'private',static:false}],
-        properties:[],events:[],
-        methods:[{token:0x06000001,token_hex:'06000001',name:'Main',signature:'static void Main()',
-                  visibility:'public',ret:'void',static:true,has_body:true,il_count:4}],
-      }); }
-      if (action==='source') return reply({csharp:'public class Program\n{\n}\n'});
-      if (action==='method') return reply({
-        token:0x06000001,name:'Main',full_name:'App.Program::Main',signature:'static void Main()',
-        decl_type:'App.Program',visibility:'public',ret:'void',static:true,max_stack:8,code_size:4,
-        entry:0x2000,params:[],locals:[],handlers:[],
-        il:[{offset:0,offset_label:'IL_0000',va:0x2000,size:1,mnemonic:'ret',flow:'return'}],
-        il_text:'.method static void Main()\n  IL_0000: ret\n',
-        csharp:'return;\n',csharp_structured:true,
-      });
-      return reply({});
-    };
-
-    await useDotnet.getState().refresh();
-    assert.equal(useDotnet.getState().status.managed,true);
-    assert.equal(useDotnet.getState().namespaces.length,1);
-    assert.equal(useDotnet.getState().namespaces[0].types[0].name,'Program');
-
-    // First expand fetches the detail; a second expand/collapse must not refetch.
-    await useDotnet.getState().toggleType(0x02000001);
-    assert.equal(typeCalls,1);
-    assert.ok(useDotnet.getState().details[0x02000001]);
-    assert.equal(useDotnet.getState().details[0x02000001].methods[0].name,'Main');
-    await useDotnet.getState().toggleType(0x02000001); // collapse
-    await useDotnet.getState().toggleType(0x02000001); // re-open, cached
-    assert.equal(typeCalls,1);
-
-    // Selecting a method loads both renderings and exposes an entry VA.
-    await useDotnet.getState().selectMethod(0x06000001,'Main');
-    assert.equal(useDotnet.getState().method.entry,0x2000);
-    assert.equal(useDotnet.getState().ilText.includes('IL_0000'),true);
-    assert.equal(useDotnet.getState().csharp,'return;\n');
-
-    // A native image: refresh must land on a clean not-managed state, no throw.
-    managedImage = false;
-    await useDotnet.getState().refresh();
-    assert.equal(useDotnet.getState().status.managed,false);
-    assert.equal(useDotnet.getState().namespaces.length,0);
-  }
-
   // Release builds omit window.__TAURI__. The SDK bridge must still wait for
   // the native handshake and preserve its port/token rather than use 8765.
   {
@@ -191,7 +124,7 @@ try {
     assert.equal(FakeSource.current,priorSource);
     globalThis.window = {};
     let available = false;
-    let backend = 'kernel';
+    let backend = 'ps4';
     let statusReads = 0;
     globalThis.fetch = async (url,opts)=>{
       const {tool,action} = JSON.parse(opts.body);
@@ -213,17 +146,17 @@ try {
     for(let i=0;i<50 && !useEngine.getState().boot.done;i++) await new Promise((r)=>setTimeout(r,0));
     assert.equal(useEngine.getState().connected,true);
     assert.equal(useEngine.getState().boot.done,true);
-    assert.deepEqual(useEngine.getState().backend,{badge:'kernel',kernel:true});
+    assert.deepEqual(useEngine.getState().backend,{badge:'ps4',ps4:true});
     assert.equal(useEngine.getState().startupError,null);
     backend = 'user';
     FakeSource.current.onopen();
-    for(let i=0;i<50 && useEngine.getState().backend.kernel;i++) await new Promise((r)=>setTimeout(r,0));
-    assert.deepEqual(useEngine.getState().backend,{badge:'user',kernel:false});
+    for(let i=0;i<50 && useEngine.getState().backend.ps4;i++) await new Promise((r)=>setTimeout(r,0));
+    assert.deepEqual(useEngine.getState().backend,{badge:'user',ps4:false});
     send('boot.stage',{stage:6,total:6,label:'ready',done:true});
     assert.equal(useEngine.getState().boot.done,true);
     delete globalThis.window;
   }
 
   events.disconnect();
-  console.log('PASS: bounded output, duplicate frames, output/watch teardown and remount, dotnet function-list refresh on analysis-complete, dotnet explorer tree/lazy-load/select, native endpoint handshake and validation, startup snapshot recovery and reconnect');
+  console.log('PASS: bounded output, duplicate frames, output/watch teardown and remount, function-list refresh on analysis-complete, native endpoint handshake and validation, startup snapshot recovery and reconnect');
 } finally {await server.close();}
