@@ -1,0 +1,21 @@
+# ninja log v7
+4	64	8160023331684666	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-mkdir	e273a34f89516bfa
+4	64	8160023331684666	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-mkdir	e273a34f89516bfa
+65	2848	8160023359547773	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-download	804bef5bda7e41fc
+65	2848	8160023359547773	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-download	804bef5bda7e41fc
+2849	2909	8160023360152165	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-update_disconnected	d976bc39c5c35ff9
+2849	2909	8160023360152165	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-update_disconnected	d976bc39c5c35ff9
+2914	2978	8160023360833452	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-patch_disconnected	40a7a93e303e6e97
+2914	2978	8160023360833452	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-patch_disconnected	40a7a93e303e6e97
+2978	3035	8160023361395164	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-configure	7a5bcc65822aeaf5
+2978	3035	8160023361395164	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-configure	7a5bcc65822aeaf5
+3035	3093	8160023361984881	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-build	35bf36c2d443c426
+3035	3093	8160023361984881	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-build	35bf36c2d443c426
+3093	3154	8160023362592829	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-install	60a8d1df5fbf7b92
+3093	3154	8160023362592829	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-install	60a8d1df5fbf7b92
+3154	3214	8160023363208636	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-test	8ea4d2536cf2f201
+3154	3214	8160023363208636	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-test	8ea4d2536cf2f201
+3214	3303	8160023364030638	CMakeFiles/sqlite-populate-complete	c3db7b836954809a
+3214	3303	8160023364030638	sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-done	c3db7b836954809a
+3214	3303	8160023364030638	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/CMakeFiles/sqlite-populate-complete	c3db7b836954809a
+3214	3303	8160023364030638	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/sqlite-populate-done	c3db7b836954809a

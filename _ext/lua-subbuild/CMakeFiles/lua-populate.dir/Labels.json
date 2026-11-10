@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/CMakeFiles/lua-populate"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/CMakeFiles/lua-populate.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/CMakeFiles/lua-populate-complete.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-build.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-configure.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-download.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-install.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-mkdir.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-patch_disconnected.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-test.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/lua-subbuild/lua-populate-prefix/src/lua-populate-stamp/lua-populate-update_disconnected.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"lua-populate"
+		],
+		"name" : "lua-populate"
+	}
+}

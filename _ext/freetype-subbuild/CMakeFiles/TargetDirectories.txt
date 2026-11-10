@@ -1,0 +1,3 @@
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/CMakeFiles/freetype-populate.dir
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/CMakeFiles/edit_cache.dir
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/CMakeFiles/rebuild_cache.dir

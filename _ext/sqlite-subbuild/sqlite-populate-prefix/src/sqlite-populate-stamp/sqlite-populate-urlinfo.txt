@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/download-sqlite-populate.cmake;COMMAND;C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/verify-sqlite-populate.cmake;COMMAND;C:/Program Files/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/CMake/bin/cmake.exe;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-subbuild/sqlite-populate-prefix/src/sqlite-populate-stamp/extract-sqlite-populate.cmake
+source_dir=C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/sqlite-src
+work_dir=C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext
+url(s)=https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip
+hash=
+      no_extract=
+

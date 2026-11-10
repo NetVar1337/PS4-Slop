@@ -1,0 +1,21 @@
+# ninja log v7
+2	47	8160022217995110	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-mkdir	89972cb40de1e629
+2	47	8160022217995110	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-mkdir	89972cb40de1e629
+48	1954	8160022237042746	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-download	a959019a7aab0ce9
+48	1954	8160022237042746	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-download	a959019a7aab0ce9
+1954	2009	8160022237593637	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-update_disconnected	a43e376f8b49f4c0
+1954	2009	8160022237593637	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-update_disconnected	a43e376f8b49f4c0
+2010	2082	8160022238315275	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-patch_disconnected	7e298ae2ae07acb9
+2010	2082	8160022238315275	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-patch_disconnected	7e298ae2ae07acb9
+2082	2132	8160022238827001	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-configure	36f361224a89924a
+2082	2132	8160022238827001	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-configure	36f361224a89924a
+2133	2194	8160022239469249	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-build	d5d765d942ae5ad9
+2133	2194	8160022239469249	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-build	d5d765d942ae5ad9
+2194	2275	8160022240263659	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-install	801bfc439c902c06
+2194	2275	8160022240263659	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-install	801bfc439c902c06
+2275	2338	8160022240919324	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-test	f59ccb2eeafeb9af
+2275	2338	8160022240919324	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-test	f59ccb2eeafeb9af
+2338	2411	8160022241626966	CMakeFiles/freetype-populate-complete	2640cddb73b88310
+2338	2411	8160022241626966	freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-done	2640cddb73b88310
+2338	2411	8160022241626966	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/CMakeFiles/freetype-populate-complete	2640cddb73b88310
+2338	2411	8160022241626966	C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/freetype-subbuild/freetype-populate-prefix/src/freetype-populate-stamp/freetype-populate-done	2640cddb73b88310

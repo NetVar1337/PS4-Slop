@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/CMakeFiles/httplib-populate"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/CMakeFiles/httplib-populate.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/CMakeFiles/httplib-populate-complete.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-build.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-configure.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-download.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-install.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-mkdir.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-patch_disconnected.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-test.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/httplib-subbuild/httplib-populate-prefix/src/httplib-populate-stamp/httplib-populate-update_disconnected.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"httplib-populate"
+		],
+		"name" : "httplib-populate"
+	}
+}

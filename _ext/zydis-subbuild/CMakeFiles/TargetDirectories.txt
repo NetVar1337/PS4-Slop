@@ -1,0 +1,3 @@
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate.dir
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/edit_cache.dir
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/rebuild_cache.dir

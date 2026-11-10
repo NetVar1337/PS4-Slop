@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate-complete.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-build.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-configure.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-download.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-install.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-mkdir.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-patch_disconnected.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-test.rule"
+		},
+		{
+			"file" : "C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-update_disconnected.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"zydis-populate"
+		],
+		"name" : "zydis-populate"
+	}
+}

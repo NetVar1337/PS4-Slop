@@ -1,0 +1,14 @@
+# Target labels
+ zydis-populate
+# Source files and their labels
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/CMakeFiles/zydis-populate-complete.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-build.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-configure.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-download.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-install.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-mkdir.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-patch_disconnected.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-test.rule
+C:/Users/Admin/Desktop/GithubProjects/reverse-slap/_ext/zydis-subbuild/zydis-populate-prefix/src/zydis-populate-stamp/zydis-populate-update_disconnected.rule
