@@ -780,21 +780,15 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "symbols") return "User renames only; analyzer names live in functions[].name. Rename with symbol_set (empty name clears).";
         if (action == "load") return "Loads PE, Mach-O (thin/FAT), or an .ipa main executable. Poll disasm.loaded until hype.ready=true before decomp/DB queries; encrypted images must be decrypted first.";
     } else if (tool == "debugger") {
-        if (action == "status") return "state idle|running|paused. Only paused state allows regs/callstack/seh/set_register. hwbp_supported=false means hw breakpoints will refuse.";
-        if (action == "bp_set") return "After continue/step actions, call wait_halt(timeout_ms) then regs/callstack. type 0=exec 1=write 3=read_write (see type_str).";
-        if (action == "continue" || action == "step_into" || action == "step_over" || action == "step_out") return "This only resumes; follow with wait_halt then regs to learn where it stopped and why.";
-        if (action == "wait_halt") return "halted=false is a timeout, not a stop. On halted=true read regs + callstack + events for reason.";
-        if (action == "regs") return "rip is the stop VA (see rip_hex/rip_name); flags_str decodes RFLAGS. Mutate with set_register while paused.";
-        if (action == "callstack") return "ret_addr entries carry *_hex/*_name; scanned=true frames are heuristic. Symbolize rip via disasm.functions first.";
-        if (action == "trace_run") return "trace is bounded (256 steps); text may be absent for unreadable bytes. Disassemble rip for fuller context.";
-        if (action.rfind("ps4_", 0) == 0) return "PS4 console live debugging via ps4debug-NG. Flow: target.ps4_connect {host} -> ps4_attach {pid} -> ps4_bp_set {addr} -> ps4_continue -> ps4_wait {timeout_ms} (stop event with rip/regs) -> ps4_regs/ps4_callstack -> ps4_step or ps4_continue again. ps4_call {addr, args} runs a function in the console process and returns rax. ps4_* actions fail with a clear error when no console is connected.";
+        if (action == "status") return "PS4-only build: reports the console debug state (ps4_connected, debug_attached, debug_pid, pending_events).";
+        if (action.rfind("ps4_", 0) == 0) return "PS4 console live debugging via ps4debug-NG. Flow: target.ps4_connect {host} (or ps4_auto {host}) -> ps4_attach {pid} -> ps4_bp_set {addr} / ps4_watch_set {addr,type,len} -> ps4_continue -> ps4_wait {timeout_ms} (stop event with rip/regs) -> ps4_regs/ps4_callstack/ps4_events -> ps4_step or ps4_continue again. ps4_call {addr, args} runs a function in the console process and returns rax. One-call power actions: ps4_until, ps4_find_write, ps4_trace_calls, ps4_trace_steps. ps4_* actions fail with a clear error when no console is connected.";
     } else if (tool == "xray") {
         if (action == "cfg" || action == "complexity") return "Pass a function-start VA from disasm.functions. block_count/edge_count/back_edges feed cyclomatic=edges-blocks+2. Cross-check entry with decomp.function.";
         if (action == "cff") return "flattened=false carries no dispatcher (no score). flattened=true lists dispatcher + state_blocks; recover with devirt.recover_cfg.";
         if (action == "obfuscation") return "score_pct is 0-100. warning means addr did not decode (data, not code). Confirm with disasm.disassemble first.";
         if (action == "anti_analysis") return "score_pct is 0-100; detections[].type/detail name the check. Verify INT3/timing hits by disassembling address.";
         if (action == "hooks") return "functions_checked is min(index,max_functions); hooks carry address_hex/target_hex. Compare prologue_bytes against a clean image.";
-        if (action == "syscalls") return "syscall_number is the SSN; resolve NT names via driver.symbols_lookup on ntoskrnl.";
+        if (action == "syscalls") return "syscall_number is the SSN; resolve SSNs against your own ntoskrnl dump (fs/web + disasm.load).";
         if (action == "apihash") return "Searches THIS image's imports only (bare API and DLL!API forms), not a global dictionary. unresolved = total_queried-resolved_count.";
         if (action == "entropy") return "overall>7.5 or verdict encrypted_or_compressed suggests packing. windows[] capped by window_limit (0=summary only).";
         if (action == "gadgets") return "text is the gadget disassembly; count is capped by limit. Filter ret/jmp/call endings for ROP/JOP chains.";
@@ -1012,15 +1006,12 @@ void enrich_error(const std::string& tool, const json& args, json& payload) {
                  err.find("not-ready") != std::string::npos ||
                  err.find("hype.ready") != std::string::npos)
             fix = "Poll disasm.loaded until image.hype.ready=true, then retry.";
-        else if (err.find("kernel") != std::string::npos ||
-                 err.find("driver") != std::string::npos ||
-                 err.find("DTB") != std::string::npos ||
-                 err.find("slopdrvr") != std::string::npos)
-            fix = "Check driver.status; kernel-read actions need slopdrvr active with a resolved kernel context.";
+        else if (err.find("ps4") != std::string::npos)
+            fix = "Connect a console first: target.ps4_connect {host} (or the one-call target.ps4_auto {host}); see guide get ps4_setup.";
         else if (err.find("debugger") != std::string::npos ||
                  err.find("paused") != std::string::npos ||
                  err.find("wait_halt") != std::string::npos)
-            fix = "Attach with debugger.attach {pid}, continue/step, then wait_halt(timeout_ms) and regs/callstack while paused.";
+            fix = "Live debugging is remote on the PS4: debugger ps4_attach {pid}, ps4_bp_set, ps4_continue, ps4_wait, ps4_regs, ps4_events.";
         else if (err.find("unknown action") != std::string::npos)
             fix = "The error already enumerates valid actions; retry with one of those (see tools/list schema).";
         else if (err.find("address not mapped") != std::string::npos ||
@@ -1285,7 +1276,7 @@ json tool_target(const json& args) {
         const uint64_t pid = parse_addr(args, "pid");
         if (pid == 0 || pid > 0xFFFFFFFFull) fail("bad pid");
         if (!process::target_attach(static_cast<uint32_t>(pid)))
-            fail("attach failed (process gone, access denied, or kernel DTB resolve failed)");
+            fail("attach failed (process gone or access denied)");
         g_scan.engine.reset();
         g_scan.used = false;
         g_scan.pid = 0;
@@ -1507,7 +1498,14 @@ json tool_target(const json& args) {
         } else {
             out["attached"] = false;
         }
-        out["debugger_state"] = g_dbg ? debugger_state_name(g_dbg->state()) : "idle";
+        if (runtime::registry_ps4_active())
+            if (auto* p4 = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active()); p4) {
+                out["debugger"]           = "ps4";
+                out["ps4_debug_attached"] = p4->ps4_debug_attached();
+                out["ps4_debug_pid"]      = p4->ps4_debug_pid();
+            }
+        if (!out.contains("debugger"))
+            out["debugger"] = "ps4 (debugger ps4_* actions; connect a console via target.ps4_connect)";
         out["image"]          = loaded_image_json();
         return out;
     }
@@ -2065,7 +2063,7 @@ json tool_memory(const json& args) {
         uint32_t old = 0;
         auto io = runtime::active().protect_memory(s.handle(), static_cast<uintptr_t>(addr),
                                                    static_cast<size_t>(len), prot, &old);
-        if (!io.ok) fail("protect failed (kernel backend required for cross-process protect)");
+        if (!io.ok) fail("protect failed");
         return {{"addr", addr}, {"len", len}, {"old_protect", old}};
     }
 
@@ -2075,14 +2073,14 @@ json tool_memory(const json& args) {
         uintptr_t out = 0;
         auto io = runtime::active().allocate_memory(s.handle(), 0, static_cast<size_t>(len),
                                                     0x40 /*PAGE_EXECUTE_READWRITE*/, &out);
-        if (!io.ok) fail("alloc failed (kernel backend required for cross-process alloc)");
+        if (!io.ok) fail("alloc failed");
         return {{"addr", static_cast<uint64_t>(out)}, {"len", len}};
     }
 
     if (action == "free") {
         const uint64_t addr = parse_addr(args, "addr");
         auto io = runtime::active().free_memory(s.handle(), static_cast<uintptr_t>(addr));
-        if (!io.ok) fail("free failed (kernel backend required for cross-process free)");
+        if (!io.ok) fail("free failed");
         return {{"freed", true}};
     }
 
@@ -4269,29 +4267,6 @@ json packet_to_json(const network::packet_record_t& p) {
     return o;
 }
 
-// kernel network helpers
-
-std::string ip_to_string(const uint8_t* addr, uint32_t af) {
-    char buf[64] = "";
-    if (af == 23) InetNtopA(AF_INET6, addr, buf, sizeof(buf));
-    else          InetNtopA(AF_INET, addr, buf, sizeof(buf));
-    return buf;
-}
-
-std::string ip_port_to_string(const uint8_t* addr, uint32_t af, uint32_t port) {
-    return ip_to_string(addr, af) + ":" + std::to_string(port);
-}
-
-const char* http_method_name(uint32_t m) {
-    switch (m) {
-        case 1: return "GET";     case 2: return "POST";
-        case 3: return "PUT";     case 4: return "DELETE";
-        case 5: return "HEAD";    case 6: return "OPTIONS";
-        case 7: return "PATCH";   case 8: return "CONNECT";
-        case 9: return "TRACE";   default: return "UNKNOWN";
-    }
-}
-
 const char* tls_version_name(uint32_t ver) {
     switch (ver) {
         case 0x0300: return "SSL 3.0"; case 0x0301: return "TLS 1.0";
@@ -4417,124 +4392,159 @@ json tool_network(const json& args) {
         return out;
     }
 
-    // kernel network manipulation through wfp
-    // everything bails with a structured error when the driver is down
-    // op 0 adds or starts, op 1 removes or stops
-
-    auto need_device = []() -> voyager::device_t& {
-        auto* k = dynamic_cast<runtime::backend_kernel_t*>(&runtime::active());
-        if (!k || !k->device()) fail("kernel driver not active");
-        return *k->device();
-    };
-    auto parse_ip = [&](const json& a, const char* key,
-                        std::array<uint8_t, 16>& out, uint32_t* af) {
-        const std::string s2 = a.value(key, std::string{});
-        if (s2.empty()) { *af = 2; return; }                 // AF_INET wildcard
-        IN_ADDR v4{};
-        if (InetPtonA(AF_INET, s2.c_str(), &v4) == 1) {
-            std::memcpy(out.data(), &v4, 4);
-            *af = 2;
-            return;
-        }
-        IN6_ADDR v6{};
-        if (InetPtonA(AF_INET6, s2.c_str(), &v6) == 1) {
-            std::memcpy(out.data(), &v6, 16);
-            *af = 23;                                        // AF_INET6
-            return;
-        }
-        fail("bad ip in '" + std::string(key) + "'");
-    };
-
     if (action == "reassemble_stream") {
-        auto& dev = need_device();
+        // host-side reassembly over the capture store (TCP payloads in capture order)
+        network::capture::poll(g_traffic, 512);
+        const uint32_t pid      = static_cast<uint32_t>(args.value("pid", 0u));
+        const uint32_t src_port = static_cast<uint32_t>(args.value("src_port", 0u));
+        const uint32_t dst_port = static_cast<uint32_t>(args.value("dst_port", 0u));
         std::vector<uint8_t> data;
-        uint32_t packets = 0, truncated = 0;
-        const bool ok = dev.stream_reassemble_op(
-            static_cast<uint32_t>(args.value("op", 0u)),
-            static_cast<uint32_t>(args.value("src_port", 0u)),
-            static_cast<uint32_t>(args.value("dst_port", 0u)),
-            static_cast<uint32_t>(args.value("pid", 0u)),
-            nullptr, nullptr, &data, &packets, &truncated);
-        if (!ok) fail("stream reassemble failed");
+        uint32_t packets = 0;
+        bool truncated = false;
+        uint64_t from = 0;
+        for (;;) {
+            auto page = g_traffic.packets(from, 1000);
+            if (page.items.empty()) break;
+            from = page.items.back().id;
+            for (const auto& p : page.items) {
+                if (p.protocol != 6 || p.payload.empty()) continue;   // TCP with payload
+                if (pid && p.pid != pid) continue;
+                if (src_port && p.local_port != src_port && p.remote_port != src_port) continue;
+                if (dst_port && p.local_port != dst_port && p.remote_port != dst_port) continue;
+                if (data.size() + p.payload.size() > (16u << 20)) { truncated = true; break; }
+                data.insert(data.end(), p.payload.begin(), p.payload.end());
+                ++packets;
+            }
+            if (truncated || !page.truncated) break;
+        }
         const size_t text_len = std::min<size_t>(data.size(), 4096);
         std::string text(reinterpret_cast<const char*>(data.data()), text_len);
         for (char& ch : text)
-            if (static_cast<unsigned char>(ch) < 0x20 && ch != '\n' &&
-                ch != '\r' && ch != '\t')
+            if (static_cast<unsigned char>(ch) < 0x20 && ch != '\n' && ch != '\r' && ch != '\t')
                 ch = '.';
         return {{"bytes", data.size()}, {"packets", packets},
-                {"truncated", truncated != 0},
+                {"truncated", truncated},
                 {"hex", to_hex(data.data(), text_len)}, {"text", text}};
     }
 
-    // system wide network views over the driver
-    // connections, dpi, callouts, socket handles, tcpip internals
-
     if (action == "connections") {
-        auto& dev = need_device();
-        json arr = json::array();
-        for (const auto& c : dev.enumerate_connections(
-                 static_cast<uint32_t>(args.value("pid", 0u)),
-                 static_cast<uint32_t>(args.value("protocol", 0u)))) {
-            arr.push_back({{"pid", c.pid},
-                           {"protocol", c.protocol},
-                           {"state", c.state},
-                           {"local", ip_port_to_string(c.local_addr,
-                                                       c.address_family,
-                                                       c.local_port)},
-                           {"remote", ip_port_to_string(c.remote_addr,
-                                                        c.address_family,
-                                                        c.remote_port)},
-                           {"path", c.process_path}});
+        // unique 4-tuples seen in the capture store
+        network::capture::poll(g_traffic, 512);
+        const uint32_t pid      = static_cast<uint32_t>(args.value("pid", 0u));
+        const uint32_t protocol = static_cast<uint32_t>(args.value("protocol", 0u));
+        struct conn_t { uint32_t pid; uint32_t protocol; std::string local, remote; uint64_t packets; uint64_t bytes; };
+        std::map<std::string, conn_t> by_key;
+        uint64_t from = 0;
+        for (;;) {
+            auto page = g_traffic.packets(from, 1000);
+            if (page.items.empty()) break;
+            from = page.items.back().id;
+            for (const auto& p : page.items) {
+                if (pid && p.pid != pid) continue;
+                if (protocol && p.protocol != protocol) continue;
+                const std::string local  = p.local_addr  + ":" + std::to_string(p.local_port);
+                const std::string remote = p.remote_addr + ":" + std::to_string(p.remote_port);
+                auto& c = by_key[std::to_string(p.pid) + "|" + std::to_string(p.protocol) + "|" + local + "|" + remote];
+                c.pid = p.pid; c.protocol = p.protocol; c.local = local; c.remote = remote;
+                c.packets += 1; c.bytes += p.payload.size();
+            }
+            if (!page.truncated) break;
         }
+        json arr = json::array();
+        for (const auto& kv : by_key)
+            arr.push_back({{"pid", kv.second.pid}, {"protocol", kv.second.protocol},
+                           {"local", kv.second.local}, {"remote", kv.second.remote},
+                           {"packets", kv.second.packets}, {"bytes", kv.second.bytes}});
         return {{"connections", arr}, {"count", arr.size()}};
     }
+
     if (action == "deep_inspect") {
-        // dpi results straight from the kernel classifier
-        auto& dev = need_device();
+        // per-packet application classification over the capture store
+        network::capture::poll(g_traffic, 512);
+        const uint32_t pid      = static_cast<uint32_t>(args.value("pid", 0u));
+        const uint32_t protocol = static_cast<uint32_t>(args.value("protocol", 0u));
+        const uint32_t port     = static_cast<uint32_t>(args.value("port", 0u));
+        const size_t limit      = std::min<size_t>(args.value("limit", 200u), 2000u);
+        static const char* kMethods[] = {"GET","POST","PUT","DELETE","HEAD",
+                                         "OPTIONS","PATCH","CONNECT","TRACE"};
         json arr = json::array();
-        for (const auto& d : dev.get_dpi_results(
-                 static_cast<uint32_t>(args.value("pid", 0u)),
-                 static_cast<uint32_t>(args.value("protocol", 0u)),
-                 static_cast<uint32_t>(args.value("port", 0u)))) {
-            json o = {{"timestamp", d.timestamp},
-                      {"direction", d.direction},
-                      {"protocol", d.protocol},
-                      {"src", ip_port_to_string(d.src_addr, d.af, d.src_port)},
-                      {"dst", ip_port_to_string(d.dst_addr, d.af, d.dst_port)},
-                      {"pid", d.pid},
-                      {"payload_size", d.payload_size}};
-            if (d.protocol == 6) {
-                o["tcp_flags"] = d.tcp_flags;
-                o["tcp_window"] = d.tcp_window;
+        uint64_t from = 0;
+        for (;;) {
+            auto page = g_traffic.packets(from, 1000);
+            if (page.items.empty()) break;
+            from = page.items.back().id;
+            for (const auto& p : page.items) {
+                if (arr.size() >= limit) break;
+                if (pid && p.pid != pid) continue;
+                if (protocol && p.protocol != protocol) continue;
+                if (port && p.local_port != port && p.remote_port != port) continue;
+                if (p.payload.empty()) continue;
+                json o = {{"timestamp", p.at_ms}, {"direction", p.direction},
+                          {"protocol", p.protocol},
+                          {"src", p.local_addr  + ":" + std::to_string(p.local_port)},
+                          {"dst", p.remote_addr + ":" + std::to_string(p.remote_port)},
+                          {"pid", p.pid}, {"payload_size", p.payload.size()}};
+                const auto& b = p.payload;
+                if (p.protocol == 17 && (p.local_port == 53 || p.remote_port == 53)) {
+                    o["app_protocol"] = "DNS";
+                } else if (p.protocol == 6) {
+                    // HTTP request line?
+                    size_t sp = 0;
+                    while (sp < b.size() && sp < 16 && b[sp] != ' ') ++sp;
+                    if (sp > 0 && sp < b.size()) {
+                        const std::string method(reinterpret_cast<const char*>(b.data()), sp);
+                        bool is_method = false;
+                        for (const char* m : kMethods) if (method == m) { is_method = true; break; }
+                        const size_t head_end = std::min<size_t>(b.size(), 256);
+                        const std::string head(reinterpret_cast<const char*>(b.data()), head_end);
+                        if (is_method && head.find("HTTP/") != std::string::npos) {
+                            o["app_protocol"] = "HTTP";
+                            o["http_method"]  = method;
+                            const size_t sp2 = head.find(' ', sp);
+                            if (sp2 != std::string::npos)
+                                o["http_path"] = head.substr(sp + 1, sp2 - sp - 1);
+                            const size_t host = head.find("\r\nHost:");
+                            if (host != std::string::npos) {
+                                size_t hs = host + 8;
+                                while (hs < head.size() && head[hs] == ' ') ++hs;
+                                const size_t he = head.find("\r\n", hs);
+                                if (he != std::string::npos) o["http_host"] = head.substr(hs, he - hs);
+                            }
+                        }
+                    }
+                    // TLS record?
+                    if (!o.contains("app_protocol") && b.size() >= 5 &&
+                        (b[0] == 20 || b[0] == 21 || b[0] == 22 || b[0] == 23) && b[1] == 0x03) {
+                        o["app_protocol"]    = "TLS";
+                        o["tls_version"]     = tls_version_name((uint32_t(b[1]) << 8) | b[2]);
+                        o["tls_content_type"] = tls_content_type_name(b[0]);
+                        // server_name extension scan (handshake records only)
+                        if (b[0] == 22) {
+                            const size_t scan_end = std::min<size_t>(b.size(), 1024);
+                            for (size_t k = 5; k + 7 < scan_end; ++k) {
+                                if (b[k] == 0x00 && b[k + 1] == 0x00) {
+                                    const size_t list_len = (size_t(b[k + 2]) << 8) | b[k + 3];
+                                    if (k + 4 + list_len <= b.size() && b[k + 4] == 0x00) {
+                                        const size_t name_len = (size_t(b[k + 5]) << 8) | b[k + 6];
+                                        if (k + 7 + name_len <= b.size()) {
+                                            o["tls_sni"] = std::string(
+                                                reinterpret_cast<const char*>(b.data() + k + 7), name_len);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                arr.push_back(std::move(o));
             }
-            if (d.is_http) {
-                o["app_protocol"] = "HTTP";
-                o["http_method"] = http_method_name(d.http_method);
-                if (!d.http_host.empty()) o["http_host"] = d.http_host;
-                if (!d.http_path.empty()) o["http_path"] = d.http_path;
-            }
-            if (d.is_tls) {
-                o["app_protocol"] = "TLS";
-                o["tls_version"] = tls_version_name(d.tls_version);
-                o["tls_content_type"] = tls_content_type_name(d.tls_content_type);
-                if (!d.tls_sni.empty()) o["tls_sni"] = d.tls_sni;
-            }
-            if (d.is_dns) o["app_protocol"] = "DNS";
-            arr.push_back(std::move(o));
+            if (arr.size() >= limit || !page.truncated) break;
         }
         return {{"results", arr}, {"count", arr.size()}};
     }
-    fail("network: unknown action (status|capture_start|capture_stop|packets|"
-         "dns|rules_add|rules_remove|rules_clear|stats|export_pcap|streams|"
-         "stream_data|inject|mod_rule_add|mod_rule_remove|mod_rules_list|"
-         "redirect_add|redirect_remove|redirect_rules_list|dns_spoof_add|"
-         "dns_spoof_remove|dns_spoof_list|kill_conn|intercept_start|"
-         "intercept_stop|intercept_list|intercept_release|bw_start|bw_stop|"
-         "bw_stats|bw_processes|fingerprint_run|fingerprint_results|"
-         "reassemble_stream|connections|deep_inspect|wfp_callouts|"
-         "socket_handles|tcpip_dump|interfaces|block_ip|block_port|"
-         "block_process)");
+    fail("network: unknown action (status|capture_start|capture_stop|packets|dns|"
+         "stats|export_pcap|streams|stream_data|reassemble_stream|connections|deep_inspect)");
 }
 
 // tool: proxy
@@ -6687,8 +6697,6 @@ json tool_devirt(const json& args) {
          "pseudocode|recover_cfg|prove_predicates|invariants|iat_audit)");
 }
 
-// tool: frida
-
 json tool_script(const json& args) {
     const std::string action = require_action(args);
     if (action != "run") fail("script: unknown action");
@@ -6845,16 +6853,16 @@ json tool_guide(const json& args) {
           {"memory", "scan", R"({"kind":"decreased","width":"u32"})", "after taking damage, rescan narrowed set"},
           {"memory", "rescan", R"({"kind":"exact","width":"u32","value":87})", "pin the exact value"},
           {"memory", "watch_add", R"({"addr":<hit>,"width":"u32"})", "watch the address"},
-          {"debugger", "watchpoint_set", R"({"addr":<hit>,"len":4})", "kernel page-guard watch (driver) or debugger ps4_find_write on PS4"},
-          {"debugger", "callstack", "{}", "who wrote it (paused at the watch)"}}},
+          {"debugger", "ps4_watch_set", R"({"addr":<hit>,"type":1,"len":4})", "hardware DR watchpoint on the PS4; ps4_find_write returns the stop event plus the writer callstack"},
+          {"debugger", "ps4_find_write", R"({"addr":<hit>})", "on PS4: watchpoint -> stop event + writer callstack in one call"}}},
         {"find_damage_source", "Find the function that applies damage",
          "Watch the health address for writes while attacking, then break on the writer and walk up the callstack to the damage logic.",
-         {{"memory", "watch_add", R"({"addr":<health>,"width":"i32","freeze":false})", "track value changes"},
-          {"debugger", "ps4_find_write", R"({"addr":<health>})", "on PS4: watchpoint -> event + callstack"},
-          {"debugger", "watchpoint_set", R"({"addr":<health>})", "on local: page-guard watchpoint (slopdrvr)"},
-          {"debugger", "bp_set", R"({"addr":<writer>,"condition":"rcx<100"})", "break at the writer, optionally conditional"},
-          {"debugger", "wait_halt", R"({"timeout_ms":60000})", "wait for the hit"},
-          {"debugger", "callstack", "{}", "full stack at the hit"}}},
+         {{"memory", "watch_add", R"({"addr":<health>,"width":"i32","freeze":false})", "track value changes over the wire"},
+          {"debugger", "ps4_find_write", R"({"addr":<health>})", "watchpoint -> stop event + writer callstack in one call"},
+          {"debugger", "ps4_bp_set", R"({"addr":<writer>})", "then break on the writer"},
+          {"debugger", "ps4_continue", "{}", "resume on the console"},
+          {"debugger", "ps4_wait", R"({"timeout_ms":60000})", "wait for the hit"},
+          {"debugger", "ps4_callstack", R"({"lwpid":101})", "full stack at the hit"}}},
         {"pointer_chain", "Follow a pointer chain from a static/global to a live object",
          "pointerscan walks static roots and reads pointer chains out of live memory, returning the address path for each hit.",
          {{"memory", "pointerscan", R"({"target":<value>,"depth":5,"max_results":32})", "find chains ending at the value"},
@@ -6864,31 +6872,30 @@ json tool_guide(const json& args) {
          "Games decrypt strings in place. Scan for the encrypted blob, watch the decrypted buffer region for a write, break on the writer, read the plaintext.",
          {{"memory", "aob", R"({"pattern":"48 8d 0d ?? ?? ?? ?? e8"})", "find lea+call sites referencing the blob"},
           {"memory", "watch_add", R"({"addr":<buffer>,"len":64,"width":"u8"})", "watch the destination buffer"},
-          {"debugger", "bp_set", R"({"addr":<decrypt_call>,"log":"decrypt called"})", "log every call to the decrypt routine"},
-          {"debugger", "wait_halt", "{}", "stop at the call"},
+          {"debugger", "ps4_trace_calls", R"({"addr":<decrypt_call>,"count":64})", "log every call to the decrypt routine with its args"},
+          {"debugger", "ps4_bp_set", R"({"addr":<decrypt_call>})", "or a plain stop at the call"},
+          {"debugger", "ps4_wait", "{}", "wait for the hit on the console"},
           {"memory", "read", R"({"addr":<buffer>,"len":64,"format":"utf8"})", "plaintext after the call"},
           {"patch", "decode_strings", R"({"addr":<func>})", "or statically decode in the loaded image"}}},
-        {"api_monitor_local", "Monitor calls to a Win32/game API in a local process",
-         "Attach the debugger, set a breakpoint on the import thunk with a log string or condition, continue, then read the event log and registers.",
-         {{"target", "attach", R"({"pid":1234})", "attach the game"},
-          {"target", "modules", "{}", "find the module base"},
-          {"disasm", "disassemble", R"({"addr":<iat_thunk>,"count":4})", "resolve the API's thunk"},
-          {"debugger", "attach", R"({"pid":1234})", "start the debug loop"},
-          {"debugger", "bp_set", R"({"addr":<thunk>,"log":"CreateFileW","condition":""})", "bp with log = tracepoint"},
-          {"debugger", "continue", "{}", "run"},
-          {"debugger", "wait_halt", R"({"timeout_ms":30000})", "until next stop"},
-          {"debugger", "events", "{}", "logged hits"},
-          {"debugger", "regs", "{}", "rcx/rdx/r8/r9 = Win64 args"}}},
+        {"ps4_api_monitor", "Monitor calls to any function on the PS4 (args in, hit count)",
+         "Arm a breakpoint on the function entry / import stub, then loop continue+wait recording registers at every hit. ps4_trace_calls runs the whole loop in one call.",
+         {{"target", "ps4_auto", R"({"host":"192.168.1.50"})", "connect + pick game + attach + debug attach"},
+          {"target", "modules", "{}", "find the module base on the console"},
+          {"debugger", "ps4_trace_calls", R"({"addr":<thunk>,"count":500,"timeout_ms":10000})", "hits[] with rip + rdi/rsi/rdx/rcx/r8/r9 per hit"},
+          {"debugger", "ps4_bp_set", R"({"addr":<thunk>})", "or arm a manual bp"},
+          {"debugger", "ps4_continue", "{}", "run"},
+          {"debugger", "ps4_wait", R"({"timeout_ms":30000})", "until next stop"},
+          {"debugger", "ps4_regs", R"({"lwpid":101})", "x86-64 args at the stop"}}},
         {"snapshot_diff", "See exactly what memory a game action changed",
          "snapshot before, do the action, diff the two snapshots — every changed byte with old/new values.",
          {{"memory", "snapshot", R"({"label":"a"})", "before"},
           {"memory", "snapshot", R"({"label":"b"})", "after the action"},
           {"memory", "diff", R"({"a":<id_a>,"b":<id_b>})", "changed ranges with old/new"}}},
         {"emulate_function", "Emulate a function offline with stubbed imports",
-         "emulate.run executes target_addr code in Unicorn with IAT stubs returning api_ret/api_returns, TEB/PEB, page-in from live memory, trace and taint. Ideal for crypto, checksum, decrypt routines.",
-         {{"target", "attach", R"({"pid":1234})", "so target_addr reads live memory"},
-          {"debugger", "ps4_regs", R"({"lwpid":101})", "on PS4: grab live regs first"},
-          {"emulate", "run", R"({"target_addr":4202496,"code_len":256,"regs":{"rcx":1234},"api_returns":{"kernel32.dll!VirtualAlloc":4096},"trace":true,"trace_max":128})", "run the slice"},
+         "emulate.run executes target_addr code in Unicorn with page-in from the live source (console memory on PS4), trace and taint; on PE images IAT stubs return api_ret/api_returns with TEB/PEB. Ideal for crypto, checksum, decrypt routines.",
+         {{"target", "ps4_auto", R"({"host":"192.168.1.50"})", "so target_addr reads live console memory"},
+          {"debugger", "ps4_regs", R"({"lwpid":101})", "grab live regs from the console first"},
+          {"emulate", "run", R"({"target_addr":4202496,"code_len":256,"regs":{"rdi":1234},"trace":true,"trace_max":128})", "run the slice against live console memory"},
           {"emulate", "run", R"({"hex":"...","count":100000,"until":<ret_addr>})", "or raw bytes"}}},
         {"devirt_cflow", "Recover a flattened/obfuscated control flow",
          "xray.cff finds the dispatcher and state blocks; devirt.recover_cfg rebuilds the CFG; decomp then shows readable code.",
@@ -6896,21 +6903,22 @@ json tool_guide(const json& args) {
           {"xray", "cff", R"({"addr":<func>})", "dispatcher + state_blocks"},
           {"devirt", "recover_cfg", R"({"addr":<func>})", "rebuild the CFG"},
           {"decomp", "function", R"({"function_va":<func>})", "decompile after recovery"}}},
-        {"unpack_runtime", "Unpack a packed binary by dumping memory, or analyze statically",
-         "Packed code unpacks itself at runtime: attach early, break at the OEP (entry entropy spike), dump_module the live image, then load the dump for static analysis.",
-         {{"analyze", "packer", R"({"path":"game.exe"})", "is it packed? entropy/sections"},
-          {"target", "attach", R"({"pid":1234})", "attach at start"},
-          {"debugger", "bp_set", R"({"addr":<oep>})", "break at the unpacked entry"},
-          {"debugger", "wait_halt", R"({"timeout_ms":60000})", "wait for unpack"},
-          {"target", "dump_module", R"({"base":<image_base>,"path":"dump.exe","load":true})", "dump live unpacked image and load it"},
-          {"xray", "entropy", R"({"path":"dump.exe"})", "verify unpacked"}}},
-        {"hw_breakpoints", "Hardware breakpoints without touching target memory",
-         "With slopdrvr loaded, DR0-DR3 breakpoints catch execution/reads/writes without an INT3 byte, invisible to memory scans. debugger bp_set hw=true uses them; on PS4 use ps4_watch_set (the payload programs DR registers).",
-         {{"driver", "status", "{}", "is slopdrvr active?"},
-          {"debugger", "attach", R"({"pid":1234})", "attach"},
-          {"debugger", "bp_set", R"({"addr":<addr>,"hw":true,"type":0,"len":8})", "type 0=exec 1=write 3=rdwr"},
-          {"debugger", "continue", "{}", "go"},
-          {"debugger", "ps4_watch_set", R"({"addr":<addr>,"type":3,"len":8})", "PS4 equivalent via ps4debug DR slots"}}},
+        {"ps4_unpack_runtime", "Dump the unpacked game from the PS4 after it unpacks in memory",
+         "Packed code unpacks itself at runtime on the console: break at the OEP (entry entropy spike), then read the whole module range over the wire and save it on the host for static analysis.",
+         {{"target", "modules", "{}", "game module base + size on the console"},
+          {"debugger", "ps4_bp_set", R"({"addr":<oep>})", "break at the unpacked entry"},
+          {"debugger", "ps4_continue", "{}", "let it unpack"},
+          {"debugger", "ps4_wait", R"({"timeout_ms":60000})", "wait for the OEP hit"},
+          {"memory", "read", R"({"addr":<image_base>,"len":<module_size>,"format":"hex"})", "pull the unpacked image over the ps4debug wire"},
+          {"fs", "write_file", R"({"path":"unpacked.bin","hex":"<hex>"})", "save it on the host"},
+          {"analyze", "packer", R"({"path":"unpacked.bin"})", "verify it is unpacked now"}}},
+        {"ps4_hw_watchpoints", "Hardware watchpoints on the PS4 without modifying code",
+         "ps4debug programs the DR0-DR3 registers on the console, so watchpoints catch execution/reads/writes with no INT3 byte in memory - invisible to in-game integrity scans.",
+         {{"debugger", "ps4_watch_set", R"({"addr":<addr>,"type":0,"len":8})", "type 0=exec 1=write 3=rdwr, len 1/2/4/8"},
+          {"debugger", "ps4_continue", "{}", "go"},
+          {"debugger", "ps4_wait", R"({"timeout_ms":30000})", "wait for the DR trap"},
+          {"debugger", "ps4_watch_list", "{}", "armed slots"},
+          {"debugger", "ps4_watch_clear", R"({"addr":<addr>})", "release the slot"}}},
     };
 
     const std::string action = require_action(args);
@@ -6955,7 +6963,7 @@ void list_tools(json& out) {
     const char* disasm_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"}},"required":["action"]})";
     const char* debugger_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["attach","detach","status","suspend_all","resume_all","bp_set","bp_clear","continue","step_into","step_over","step_out","wait_halt","regs","events","callstack","seh","set_register","watchpoint_set","watchpoint_clear","watchpoints","trace_run","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","until"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"hw":{"type":"boolean"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"condition":{"type":"string"},"log":{"type":"string"},"auto_continue":{"type":"boolean"},"one_shot":{"type":"boolean"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{"type":"integer"},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{"type":"integer"},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}}},"required":["action"]})";
     const char* xray_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["cfg","complexity","cff","obfuscation","strings_recon","indirect_calls","anti_analysis","hooks","syscalls","apihash","entropy","pages","crypto_range","gadgets"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"size":{"type":"integer"},"len":{"type":"integer"},"length":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"window_size":{"type":"integer"},"window":{"type":"integer"},"window_limit":{"type":"integer"},"page_size":{"type":"integer"},"max_functions":{"type":"integer"},"hash":{},"hashes":{"type":"array"},"algorithm":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
     const char* patch_schema =
@@ -6971,7 +6979,7 @@ void list_tools(json& out) {
     const char* analyze_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["packer","signatures","diff","diff_start","diff_job","diff_cancel"]},"path":{"type":"string"},"path_a":{"type":"string"},"path_b":{"type":"string"},"limit":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_pairs":{"type":"integer"},"id":{"type":"integer"}},"required":["action"]})";
     const char* network_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","capture_start","capture_stop","packets","dns","rules_add","rules_remove","rules_clear","stats","export_pcap","streams","stream_data","inject","mod_rule_add","mod_rule_remove","mod_rules_list","redirect_add","redirect_remove","redirect_rules_list","dns_spoof_add","dns_spoof_remove","dns_spoof_list","kill_conn","intercept_start","intercept_stop","intercept_list","intercept_release","bw_start","bw_stop","bw_stats","bw_processes","fingerprint_run","fingerprint_results","reassemble_stream","connections","deep_inspect","wfp_callouts","socket_handles","tcpip_dump","interfaces","block_ip","block_port","block_process"]},"pid":{"type":"integer"},"port":{"type":"integer"},"protocol":{"type":"integer"},"from":{"type":"integer"},"filter":{"type":"string"},"limit":{"type":"integer"},"rule_id":{"type":"integer"},"direction":{"type":["integer","string"]},"path":{"type":"string"},"max_packets":{"type":"integer"},"id":{"type":"integer"},"offset":{"type":"integer"},"len":{"type":"integer"},"payload_hex":{"type":"string"},"pattern_hex":{"type":"string"},"replacement_hex":{"type":"string"},"src_ip":{"type":"string"},"dst_ip":{"type":"string"},"match_ip":{"type":"string"},"redirect_ip":{"type":"string"},"ip":{"type":"string"},"domain":{"type":"string"},"ttl":{"type":"integer"},"hold_id":{"type":"integer"},"exclude_pid":{"type":"integer"},"window_ms":{"type":"integer"},"src_port":{"type":"integer"},"dst_port":{"type":"integer"},"module":{"type":"string"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","capture_start","capture_stop","packets","dns","stats","export_pcap","streams","stream_data","reassemble_stream","connections","deep_inspect"]},"pid":{"type":"integer"},"port":{"type":"integer"},"protocol":{"type":"integer"},"from":{"type":"integer"},"filter":{"type":"string"},"limit":{"type":"integer"},"path":{"type":"string"},"max_packets":{"type":"integer"},"id":{"type":"integer"},"offset":{"type":"integer"},"len":{"type":"integer"},"src_port":{"type":"integer"},"dst_port":{"type":"integer"}},"required":["action"]})";
     const char* proxy_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["start","stop","status","entries","entry","replay"]},"port":{"type":"integer"},"limit":{"type":"integer"},"id":{"type":"integer"}},"required":["action"]})";
     const char* persist_schema =
@@ -6988,16 +6996,16 @@ void list_tools(json& out) {
         R"({"type":"object","properties":{"action":{"type":"string","enum":["fetch","post"]},"url":{"type":"string"},"body":{"type":"string"},"content_type":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["action"]})";
 
     out.push_back({{"name", "target"},
-                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image. Remote consoles: ps4_connect {host, port=744, pid?} connects to a PS4 running ps4debug-NG and makes the console the active target (list/attach/memory/regions/threads then go over the wire); ps4_disconnect drops it. ps4_auto {host} is the one-call setup: it connects, auto-picks the game process (the one with /app0/ modules), attaches, debug-attaches via the debugger, and returns modules/threads. On a PS4 the backend badge reads PS4 and PS4 modules are ELF/SELF, so dump_module/load are PE-only - analyze live addresses instead."},
+                   {"description", "PS4 toolkit target control. Connect a console with ps4_connect {host, port=744, pid?} (ps4debug-NG running on the PS4) or the one-call ps4_auto {host}, which connects, picks the game process (the one with /app0/ modules), attaches and debug-attaches; then list/attach/memory/regions/threads go over the wire. ps4_disconnect drops the console; status reads the active backend. A hidden local user-mode backend remains for automated tests (list/attach/modules/threads/regions/handles/dump_module/icon). PS4 modules are ELF/SELF, so dump_module is PE-only - read live console memory with the memory tool instead."},
                    {"inputSchema", json::parse(target_schema)}, {"read_only", false}});
     out.push_back({{"name", "memory"},
-                   {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active user/kernel backend is chosen automatically. Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. Kernel mode uses slopdrvr DTB reads and driver region enumeration."},
+                   {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active backend is chosen automatically (ps4 when a console is connected). Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. On a PS4 every action runs over the ps4debug-NG wire against the attached console process."},
                    {"inputSchema", json::parse(memory_schema)}, {"read_only", false}});
     out.push_back({{"name", "disasm"},
                    {"description", "Primary static-analysis and instruction tool for the shared binary session. Call action='loaded' first: image.ready means a PE, Mach-O (thin/FAT), or .ipa executable is loaded; image.format/arch describe its code, and encrypted/warning identify FairPlay-encrypted code that must be decrypted before analysis. image.hype.ready means background Hyperion analysis is complete; image.hype.progress/error explain pending or failed analysis. Use load(path) for PE, Mach-O (thin/FAT), or .ipa and unload to manage the same session as the UI, and analyze_stop to cancel analysis. pe/strings support the shared image or an explicit path; functions/xrefs with path support x86/x64 only, so load ARM images first. symbols use the shared image; blocks/globals/vtables require hype.ready. disassemble reads attached-process memory first and otherwise decodes the loaded file's architecture. assemble converts x86/x64 text to bytes. symbol_set renames a VA persistently (empty name clears) and updates the UI. Strings paginate with limit and omit executable sections unless include_exec=true. Runtime-base loads make static and live VAs directly comparable."},
                    {"inputSchema", json::parse(disasm_schema)}, {"read_only", false}});
     out.push_back({{"name", "debugger"},
-                   {"description", "Control a live debugging session. Call status first; attach(pid) starts kernel-stealth VEH debugging when slopdrvr is available, otherwise the classic Win32 debug loop. Set software or hardware breakpoints with bp_set(addr, hw); optional condition, log, auto_continue, and one_shot fields create conditional stops or tracepoints. After continue or a step action, use wait_halt(timeout_ms), then inspect regs, events, callstack, or seh; set_register mutates paused state. watchpoint_set/clear/list manage page-guard access watches, and trace_run records a bounded instruction trace. suspend_all/resume_all freeze or thaw target threads. Hardware DR0-DR3 breakpoints and handle-free thread control require the driver. On a PS4 console (target.ps4_connect), the ps4_* actions drive the console's ps4debug-NG debug session live instead: ps4_attach {pid} attaches the payload's debugger, ps4_bp_set/ps4_bp_clear arm software INT3 breakpoints (index auto-allocated 0-29), ps4_watch_set/ps4_watch_clear arm hardware DR watchpoints (type 0=exec 1=write 3=rdwr, len 1/2/4/8), ps4_continue {stop} resumes (stop 0=resume 1=SIGSTOP 2=SIGKILL), ps4_step {lwpid?} single-steps, ps4_suspend/ps4_resume freeze one thread, ps4_process_stop {state} signals the process, ps4_regs/ps4_set_reg/ps4_dbregs read or write register state, ps4_wait {timeout_ms} blocks for the next stop event on the console's port-755 stream (breakpoint hit, watchpoint hit, step, signal; signal 9 tears the session down) and ps4_events drains the queued ones, ps4_callstack {lwpid, depth} walks the rbp frame chain through live memory reads, and ps4_call {addr, args[6]} installs the payload's rpc stub (once per pid) and calls an arbitrary address in the console process returning rax. One-call power actions: until {addr} (local: temp bp + go + wait_halt + clear) and ps4_until {addr} do the same on the console; ps4_find_write {addr, len} arms a write watchpoint and returns the stop event plus the writer's callstack; ps4_trace_calls {addr, count} logs rdi/rsi/rdx/rcx/r8/r9 at every breakpoint hit; ps4_trace_steps {lwpid, count} single-steps and disassembles each rip; ps4_bp_list/ps4_watch_list show the armed slots. For whole workflows (find health, damage source, API trace, unpacking), call guide: guide list / guide get {topic}."},
+                   {"description", "PS4 live debugging over ps4debug-NG (connect first: target.ps4_connect / ps4_auto). status shows the console debug state. ps4_attach {pid} attaches the payload debugger; ps4_bp_set/ps4_bp_clear arm software INT3 breakpoints (index auto-allocated 0-29); ps4_watch_set/ps4_watch_clear arm hardware DR watchpoints (type 0=exec 1=write 3=rdwr, len 1/2/4/8); ps4_continue {stop} resumes (0=resume 1=SIGSTOP 2=SIGKILL); ps4_step {lwpid?} single-steps; ps4_suspend/ps4_resume freeze one thread; ps4_process_stop {state} signals the process; ps4_regs/ps4_set_reg/ps4_dbregs read or write register state; ps4_wait {timeout_ms} blocks for the next stop event (breakpoint, watchpoint, step, signal; signal 9 tears the session down) and ps4_events drains the queue; ps4_callstack {lwpid, depth} walks the frame chain through live memory reads; ps4_call {addr, args[6]} installs the rpc stub once per pid and calls an arbitrary address in the console process, returning rax. Power actions: ps4_until {addr} (temp bp + continue + wait), ps4_find_write {addr, len} (write watchpoint, returns stop event plus writer callstack), ps4_trace_calls {addr, count} (logs arg registers at every bp hit), ps4_trace_steps {lwpid, count} (single-step + disasm each rip), ps4_bp_list/ps4_watch_list show armed slots. Whole workflows (find health, damage source, API trace, unpacking): guide list / guide get {topic}."},
                    {"inputSchema", json::parse(debugger_schema)}, {"read_only", false}});
     out.push_back({{"name", "xray"},
                    {"description", "Run focused read-only static-analysis queries on the shared image or an explicit PE, Mach-O, or .ipa path. entropy and apihash are architecture-neutral; all other actions require x86/x64, and Windows syscalls/anti_analysis require PE. For cfg, complexity, cff, obfuscation, strings_recon, indirect_calls, and anti_analysis, pass addr as a function-start VA; known functions use indexed bounds and unknown addresses fall back to linear decode. Whole-image actions detect hooks, direct syscalls and SSNs, imported-API hashes, entropy windows, page classes, crypto constants (including instruction immediates), and ROP gadgets. For raw crypto constants on ARM use analyze.signatures. apihash only searches imports of this image, including bare API and 'DLL!API' forms; it is not a global hash dictionary. Use disasm.loaded/functions first to establish image state and valid function VAs."},
@@ -7024,7 +7032,7 @@ void list_tools(json& out) {
                    {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call; for huge binaries use async diff_start(path_a,path_b) then poll diff_job(id) for stage/progress and stop with diff_cancel(id). Check disasm.loaded before shared-session actions."},
                    {"inputSchema", json::parse(analyze_schema)}, {"read_only", true}});
     out.push_back({{"name", "network"},
-                   {"description", "Capture, query, and manipulate Windows network traffic through slopdrvr/WFP. Call status first. A common read flow is capture_start -> packets/dns/streams/stats -> capture_stop; packets filter syntax includes port=80;host:1.2.3.4;text:foo;pid:1234;proto:tcp, and stream_data reads payload by id/offset/len. Mutation actions cover WFP rules, injection, pattern replacement, redirects, DNS spoofing, connection kill, hold/modify/release interception, bandwidth controls, and block_ip/block_port/block_process (direction in|out|both, default both). System inspection includes connections, DPI, callouts, socket handles, TCB dump, interfaces, fingerprints, and reassembly. Driver-dependent actions return structured errors when slopdrvr is unavailable."},
+                   {"description", "Host-side network capture and inspection on the analysis PC (raw socket with SIO_RCVALL - run as admin; pid/port/protocol act as capture filters). Read flow: capture_start -> packets (from/limit/filter, filter syntax port=80;host:1.2.3.4;text:foo;pid:1234;proto:tcp) | dns | streams | stream_data (payload by id/offset/len) | stats -> capture_stop. export_pcap writes the store to a .pcap. reassemble_stream concatenates stored TCP payloads for a pid/port tuple, connections lists the 4-tuples seen in the store, deep_inspect classifies stored packets (HTTP method/host/path, TLS version/SNI/content-type, DNS). For interactive MITM of the analysis PC traffic use the proxy tool."},
                    {"inputSchema", json::parse(network_schema)}, {"read_only", false}});
     out.push_back({{"name", "proxy"},
                    {"description", "Run the built-in localhost HTTP/1.1 inspection proxy. Use start(port) -> status -> entries(limit); fetch one captured exchange with entry(id), and replay a logged plain-HTTP request with replay(id). CONNECT tunnels record SNI and metadata but encrypted tunnel bodies are not decrypted, so replay applies only to captured plain HTTP. stop releases the listener. This proxy is independent of the kernel network capture tool."},

@@ -8,7 +8,6 @@ import logoUrl from "@/assets/reverse-slop-icon.png";
 const kStageLabels = [
   "runtime pool & job queue",
   "process / target services",
-  "kernel bridge (slopdrvr)",
   "settings & session store",
   "mcp server",
   "interface",
@@ -25,7 +24,7 @@ export default function Splash() {
         <img className="splash-logo" src={logoUrl} alt="reverse-slop" draggable={false} />
         <div className="splash-title">reverse-slop</div>
         <div className="faint" style={{ fontSize: "var(--type-small)" }}>
-          windows reverse-engineering workbench, booting
+          ps4 reverse-engineering workbench, booting
         </div>
 
         <div className="splash-rows">
@@ -60,7 +59,7 @@ export default function Splash() {
           {startupError ? (
             <span role="alert">Startup failed: {startupError}</span>
           ) : connected
-            ? "first launch: windows asks for administrator consent so the kernel bridge can load"
+            ? "tip: connect a ps4 (ps4debug-ng) from the targets panel to start live debugging"
             : "waiting for the engine to accept connections…"}
         </div>
       </div>

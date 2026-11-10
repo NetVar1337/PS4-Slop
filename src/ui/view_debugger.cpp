@@ -1,11 +1,10 @@
 // src/ui/view_debugger.cpp
-// debugger workspace, controls, registers, breakpoints and the event log
+// PS4 live-debug workspace: breakpoints, watchpoints, registers, event feed
+// and remote calls against a console running ps4debug-NG (TCP 744 + events 755)
 
 #include "ui/views_core.hpp"
 
-#include "core/debugger/debugger.hpp"
 #include "core/process/target_service.hpp"
-#include "core/runtime/backend_kernel.hpp"
 #include "core/runtime/backend_ps4.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/ps4_protocol.hpp"
@@ -25,19 +24,8 @@ namespace slop::ui {
 
 namespace runtime = slop::core::runtime;
 namespace process = slop::core::process;
-namespace dbg     = slop::core::debugger;
 
 namespace {
-
-dbg::debugger_t g_dbg;
-
-const char* StateName(dbg::dbg_state_t s) noexcept {
-    switch (s) {
-    case dbg::dbg_state_t::running: return "running";
-    case dbg::dbg_state_t::paused:  return "paused";
-    default:                        return "idle";
-    }
-}
 
 void DrawRegisters(const runtime::thread_context_t& c) {
     if (!ImGui::BeginTable("regs", 4,
@@ -86,7 +74,11 @@ uint32_t Ps4AllocSlot(const std::map<uint64_t, uint32_t>& used, uint32_t max) {
 void DrawPs4Panel() {
     auto* p = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active());
     if (!p || !p->connected()) {
-        ImGui::TextDisabled("no PS4 console connected (see the Targets view).");
+        ImGui::TextDisabled("no PS4 console connected.");
+        ImGui::TextDisabled("Connect one from the Targets view (ps4 connect / ps4_auto),");
+        ImGui::TextDisabled("or over MCP: target.ps4_auto {\"host\":\"<ps4 ip>\"}.");
+        ImGui::TextDisabled("Then this panel drives the live ps4debug-NG session:");
+        ImGui::TextDisabled("breakpoints, DR watchpoints, registers, events, remote calls.");
         return;
     }
     const auto session = process::active_session();
@@ -324,144 +316,8 @@ void Draw() {
     const bool pushed = mono != nullptr;
     if (pushed) ImGui::PushFont(mono);
 
-    // PS4 consoles get their own live-debug panel (ps4debug-NG); the local
-    // Windows debug loop below does not apply there
-    if (runtime::active_kind() == runtime::backend_kind_t::ps4) {
-        DrawPs4Panel();
-        if (pushed) ImGui::PopFont();
-        return;
-    }
-
-    // Backend / driver status card
-    {
-        const bool kernel_live = runtime::active_kind() == runtime::backend_kind_t::kernel;
-        ImGui::Text("backend:");
-        ImGui::SameLine();
-        if (kernel_live)
-            ImGui::TextColored(ImVec4(0.95f, 0.65f, 0.25f, 1.0f), "KERNEL (slopdrvr)");
-        else
-            ImGui::TextDisabled("USER-MODE");
-        ImGui::SameLine();
-
-        if (ImGui::SmallButton(kernel_live ? "switch to USER" : "switch to KERNEL")) {
-            const bool ok = kernel_live
-                ? runtime::set_backend_preference(runtime::backend_pref_t::force_user)
-                : runtime::set_backend_preference(runtime::backend_pref_t::auto_detect);
-            panels::AppendBootLog(ok ? "backend switched"
-                                     : "kernel backend unavailable (driver not loaded)");
-        }
-        if (!kernel_live) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("load: slop_mapper.exe load build\\driver\\slopdrvr.sys");
-        }
-        ImGui::Separator();
-    }
-
-    // Attach / detach debugger
-    const auto session = process::active_session();
-    if (!session || !session->valid()) {
-        if (pushed) ImGui::PopFont();
-        ImGui::TextDisabled("attach a target first.");
-        return;
-    }
-
-    const auto state = g_dbg.state();
-    if (state == dbg::dbg_state_t::idle) {
-        if (ImGui::Button("debug attach")) {
-            if (!g_dbg.attach(session->pid()))
-                panels::AppendBootLog("debugger: DebugActiveProcess failed (elevated required?)");
-        }
-    } else {
-        if (ImGui::Button("debug detach")) g_dbg.detach();
-        ImGui::SameLine();
-        ImGui::Text("state: %s", StateName(state));
-
-        // Controls
-        if (state == dbg::dbg_state_t::paused) {
-            ImGui::SameLine();
-            if (ImGui::Button("Go"))          g_dbg.go();
-            ImGui::SameLine();
-            if (ImGui::Button("Step Into"))   g_dbg.step_into();
-            ImGui::SameLine();
-            if (ImGui::Button("Step Over"))   g_dbg.step_over();
-            ImGui::SameLine();
-            if (ImGui::Button("Step Out"))    g_dbg.step_out();
-        }
-    }
-    ImGui::Separator();
-
-    // Registers
-    if (ImGui::CollapsingHeader("registers", ImGuiTreeNodeFlags_DefaultOpen)) {
-        uint32_t tid = 0;
-        if (auto ctx = g_dbg.paused_context(&tid)) {
-            ImGui::Text("thread %u", tid);
-            DrawRegisters(*ctx);
-        } else {
-            ImGui::TextDisabled("(paused context only)");
-        }
-    }
-
-    // Breakpoints
-    if (ImGui::CollapsingHeader("breakpoints", ImGuiTreeNodeFlags_DefaultOpen)) {
-        static char bp_buf[24] = {};
-        ImGui::SetNextItemWidth(160.0f);
-        ImGui::InputTextWithHint("##bpaddr", "va (hex)", bp_buf, sizeof(bp_buf));
-        ImGui::SameLine();
-        if (ImGui::SmallButton("int3") && state != dbg::dbg_state_t::idle) {
-            uint64_t addr = 0;
-            sscanf_s(bp_buf, "%llX", &addr);
-            if (addr && g_dbg.set_sw_breakpoint(addr))
-                panels::AppendBootLog("bp armed @ " + std::to_string(addr));
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("hw (kernel)") &&
-            runtime::active_kind() == runtime::backend_kind_t::kernel) {
-            uint64_t addr = 0;
-            sscanf_s(bp_buf, "%llX", &addr);
-            if (addr) {
-                // DR0 exec breakpoint on every thread of the target
-                auto* k = static_cast<runtime::backend_kernel_t*>(&runtime::active());
-                k->set_hw_breakpoint(session->pid(), 0, 0, addr, 1);
-                panels::AppendBootLog("hw bp DR0 @ " + std::to_string(addr));
-            }
-        }
-
-        for (const auto& bp : g_dbg.breakpoints()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "%011llX  %s  hits=%u",
-                          static_cast<unsigned long long>(bp.addr),
-                          bp.armed ? "armed" : "disarmed", bp.hits);
-            ImGui::Selectable(line);
-            ImGui::SameLine();
-            ImGui::PushID(static_cast<int>(bp.addr & 0xFFFFFF));
-            if (ImGui::SmallButton("del")) g_dbg.clear_breakpoint(bp.addr);
-            ImGui::PopID();
-        }
-    }
-
-    // Event log
-    if (ImGui::CollapsingHeader("events", ImGuiTreeNodeFlags_DefaultOpen)) {
-        for (const auto& e : g_dbg.events_snapshot(128)) {
-            const char* tag = "?";
-            switch (e.kind) {
-            case dbg::event_kind_t::attached:     tag = "attached"; break;
-            case dbg::event_kind_t::detached:     tag = "detached"; break;
-            case dbg::event_kind_t::bp_hit:       tag = "BP HIT"; break;
-            case dbg::event_kind_t::single_step:  tag = "step"; break;
-            case dbg::event_kind_t::exception:    tag = "exception"; break;
-            case dbg::event_kind_t::thread_create:tag = "thread+"; break;
-            case dbg::event_kind_t::thread_exit:  tag = "thread-"; break;
-            case dbg::event_kind_t::dll_load:     tag = "dll+"; break;
-            case dbg::event_kind_t::dll_unload:   tag = "dll-"; break;
-            case dbg::event_kind_t::process_exit: tag = "exit"; break;
-            default:                              tag = "note"; break;
-            }
-            ImGui::Text("[%s] tid %u @ %011llX %s",
-                        tag, e.tid,
-                        static_cast<unsigned long long>(e.address),
-                        e.text.c_str());
-        }
-    }
+    // PS4-only build: the debugger view is the ps4debug-NG live panel
+    DrawPs4Panel();
 
     if (pushed) ImGui::PopFont();
 }

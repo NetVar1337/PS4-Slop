@@ -1,10 +1,9 @@
 // src/tests/test_detect_fs.cpp
-// Detection suite (user-mode paths), deferred manager, fs utilities,
-// webfetch over a loopback origin, and PKI lifecycle
+// Deferred manager, fs utilities, webfetch over a loopback origin, and PKI
+// lifecycle (host-side suites that survived the PS4-only cut)
 
 #include "harness.hpp"
 
-#include "core/detect/security.hpp"
 #include "core/infra/deferred.hpp"
 #include "core/network/web_fetch.hpp"
 #include "core/network/mitm_pki.hpp"
@@ -20,42 +19,8 @@
 #include <string>
 #include <thread>
 
-using namespace slop::core::detect;
 namespace util = slop::core::util;
 namespace infra = slop::core::infra;
-
-TEST_CASE(hidden_modules_crosscheck_runs) {
-    std::string err;
-    auto r = detect_hidden_modules(&err);
-    // On a healthy machine the two enumerations mostly agree, but small
-    // legitimate drift exists (dynamically loaded/filter-listed drivers)
-    // Shape assertions only: entries must be named and non-degenerate
-    if (err.empty()) {
-        for (const auto& m : r.psapi_only) REQUIRE(!m.name.empty());
-        for (const auto& m : r.sysinfo_only) REQUIRE(!m.name.empty());
-    } else {
-        REQUIRE(!err.empty());   // privilege-restricted environment
-    }
-}
-
-TEST_CASE(minifilter_enumeration_shape) {
-    auto filters = enumerate_minifilters(nullptr);
-    // Registered filters carry an altitude string
-    for (const auto& f : filters) {
-        REQUIRE(!f.name.empty());
-    }
-}
-
-TEST_CASE(etw_sessions_enumeration_runs) {
-    std::string err;
-    auto sessions = enumerate_etw_sessions(&err);
-    (void)err;   // may fail without trace admin rights, shape only
-    for (const auto& s : sessions) {
-        REQUIRE(s.handle != 0ull || true);   // handles may be zeroed
-        REQUIRE_GE(sessions.size(), 0u);
-        break;
-    }
-}
 
 TEST_CASE(deferred_manager_roundtrip) {
     auto& m = infra::deferred_manager_t::get();

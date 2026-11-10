@@ -36,8 +36,7 @@
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
     "resources": {
-      "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe",
-      "../../build/src/engine/slop_frida.dll": "engine/slop_frida.dll"
+      "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe"
     },
     "windows": {
       "nsis": {

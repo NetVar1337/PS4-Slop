@@ -16,7 +16,7 @@ export type EngineEvent =
       type: "target.changed";
       data: { attached: boolean; pid?: number; name?: string };
     }
-  | { type: "backend.changed"; data: { badge: string; kernel: boolean } }
+  | { type: "backend.changed"; data: { badge: string; ps4: boolean } }
   | {
       type: "hype.progress";
       data: {

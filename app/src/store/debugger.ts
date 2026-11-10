@@ -1,104 +1,109 @@
 // app/src/store/debugger.ts
-// Debugger control surface, attach/detach, breakpoints, stepping, registers,
-// callstack. Port of what src/ui/view_debugger.cpp drove directly
+// PS4 live-debug control surface over the ps4debug-NG wire: attach/detach,
+// run control, breakpoints/watchpoints, registers, callstack, event feed.
+// Every call maps to a debugger ps4_* MCP action
 
 import { create } from "zustand";
 import { call } from "@/lib/rpc";
 
-export type DbgStatus = {
-  state: string;
-  pid: number;
-  mode: string;
+export type Ps4Status = {
   backend: string;
-  hwbp_supported: boolean;
-  kernel_active: boolean;
+  ps4_connected: boolean;
+  debug_attached: boolean;
+  debug_pid: number;
+  pending_events: number;
 };
 
-export type Regs = Record<string, number> & { tid: number };
+export type Regs = Record<string, number>;
 
-// Field names come straight from mcp_tools.cpp, the callstack unwinder reports
-// return addresses, not program counters, and events carry `address`/`text`
-// rather than the `addr`/`symbol` an IDE-shaped API would use
 export type Frame = {
-  ret_addr: number;
-  frame_ptr: number;
+  ret_addr?: number;
+  frame_ptr?: number;
   snippet?: string;
   scanned?: boolean;
 };
 
-export type DbgEvent = {
-  kind: string;
-  tid: number;
-  address: number;
-  exc_code: number;
-  text?: string;
+export type Ps4Event = {
+  lwpid: number;
+  signal: number;
+  status?: number;
+  thread?: string;
+  rip?: number;
+  dr?: number[];
 };
 
-export type Breakpoint = { addr: number; hw: boolean; oneShot: boolean };
+export type SlotEntry = { addr: number; index: number };
 
-const kIdle: DbgStatus = {
-  state: "detached",
-  pid: 0,
-  mode: "-",
+const kIdle: Ps4Status = {
   backend: "user",
-  hwbp_supported: false,
-  kernel_active: false,
+  ps4_connected: false,
+  debug_attached: false,
+  debug_pid: 0,
+  pending_events: 0,
 };
 
 type DebuggerStore = {
-  status: DbgStatus;
+  status: Ps4Status;
   regs: Regs | null;
+  regsLwpid: number;
   frames: Frame[];
-  events: DbgEvent[];
-  breakpoints: Breakpoint[];
+  events: Ps4Event[];
+  breakpoints: SlotEntry[];
+  watchpoints: SlotEntry[];
   error: string | null;
   busy: boolean;
 
   refresh: () => Promise<void>;
   attach: (pid: number) => Promise<void>;
   detach: () => Promise<void>;
-  setBreakpoint: (addr: number, hw: boolean) => Promise<void>;
-  clearBreakpoint: (addr: number) => Promise<void>;
-  step: (kind: "step_into" | "step_over" | "step_out" | "continue") => Promise<void>;
+  cont: () => Promise<void>;
+  step: (lwpid: number) => Promise<void>;
   waitHalt: (timeoutMs: number) => Promise<void>;
+  bpSet: (addr: number) => Promise<void>;
+  bpClear: (addr: number) => Promise<void>;
+  wpSet: (addr: number, type: number, len: number) => Promise<void>;
+  wpClear: (addr: number) => Promise<void>;
+  readRegs: (lwpid: number) => Promise<void>;
+  readStack: (lwpid: number) => Promise<void>;
   reset: () => void;
 };
-
-/** Paused is the only state where registers and a callstack exist. */
-export const isPaused = (s: DbgStatus): boolean =>
-  s.state === "paused" || s.state === "halted" || s.state === "suspended";
 
 export const useDebugger = create<DebuggerStore>((set, get) => ({
   status: kIdle,
   regs: null,
+  regsLwpid: 0,
   frames: [],
   events: [],
   breakpoints: [],
+  watchpoints: [],
   error: null,
   busy: false,
 
   refresh: async () => {
     try {
-      const status = await call<DbgStatus>("debugger", "status");
+      const status = await call<Ps4Status>("debugger", "status");
       set({ status, error: null });
-
-      // Registers and the callstack only exist while paused; asking otherwise
-      // returns a tool error that would show up as a spurious red banner
-      if (isPaused(status)) {
-        const [regs, stack, events] = await Promise.allSettled([
-          call<Regs>("debugger", "regs"),
-          call<{ frames?: Frame[] }>("debugger", "callstack", { max_frames: 64 }),
-          call<{ events: DbgEvent[] }>("debugger", "events"),
-        ]);
-        set({
-          regs: regs.status === "fulfilled" ? regs.value : null,
-          frames: stack.status === "fulfilled" ? (stack.value.frames ?? []) : [],
-          events: events.status === "fulfilled" ? (events.value.events ?? []) : get().events,
-        });
-      } else {
-        const events = await call<{ events: DbgEvent[] }>("debugger", "events")
-          .catch(() => ({ events: [] as DbgEvent[] }));
-        set({ regs: null, frames: [], events: events.events ?? [] });
+      if (!status.ps4_connected || !status.debug_attached) {
+        set({ regs: null, frames: [], breakpoints: [], watchpoints: [] });
+        return;
+      }
+      const [bps, wps, evs] = await Promise.allSettled([
+        call<{ breakpoints?: SlotEntry[] }>("debugger", "ps4_bp_list"),
+        call<{ watchpoints?: SlotEntry[] }>("debugger", "ps4_watch_list"),
+        call<{ events?: Ps4Event[] }>("debugger", "ps4_events", { max: 64, clear: true }),
+      ]);
+      const events =
+        evs.status === "fulfilled" ? (evs.value.events ?? []) : [];
+      set({
+        breakpoints: bps.status === "fulfilled" ? (bps.value.breakpoints ?? []) : [],
+        watchpoints: wps.status === "fulfilled" ? (wps.value.watchpoints ?? []) : [],
+        events: [...events.reverse(), ...get().events].slice(0, 200),
+      });
+      // after a stop event, pull registers + callstack of the stopped thread
+      const last = events[0];
+      if (last !== undefined) {
+        await get().readRegs(last.lwpid);
+        await get().readStack(last.lwpid);
       }
     } catch (e) {
       set({ status: kIdle, error: e instanceof Error ? e.message : String(e) });
@@ -108,7 +113,7 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
   attach: async (pid) => {
     set({ busy: true, error: null });
     try {
-      await call("debugger", "attach", { pid });
+      await call("debugger", "ps4_attach", { pid });
       await get().refresh();
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -118,33 +123,26 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
   },
 
   detach: async () => {
-    await call("debugger", "detach").catch(() => undefined);
-    set({ regs: null, frames: [], breakpoints: [] });
+    await call("debugger", "ps4_detach").catch(() => undefined);
+    set({ regs: null, frames: [], breakpoints: [], watchpoints: [] });
     await get().refresh();
   },
 
-  setBreakpoint: async (addr, hw) => {
+  cont: async () => {
+    set({ busy: true });
     try {
-      await call("debugger", "bp_set", { addr, hw });
-      set((s) => ({
-        breakpoints: [...s.breakpoints.filter((b) => b.addr !== addr), { addr, hw, oneShot: false }],
-        error: null,
-      }));
+      await call("debugger", "ps4_continue", { stop: 0 });
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      set({ busy: false });
     }
   },
 
-  clearBreakpoint: async (addr) => {
-    await call("debugger", "bp_clear", { addr }).catch(() => undefined);
-    set((s) => ({ breakpoints: s.breakpoints.filter((b) => b.addr !== addr) }));
-  },
-
-  step: async (kind) => {
+  step: async (lwpid) => {
     set({ busy: true });
     try {
-      await call("debugger", kind);
-      await get().refresh();
+      await call("debugger", "ps4_step", { lwpid });
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
     } finally {
@@ -155,7 +153,7 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
   waitHalt: async (timeoutMs) => {
     set({ busy: true });
     try {
-      await call("debugger", "wait_halt", { timeout_ms: timeoutMs });
+      await call("debugger", "ps4_wait", { timeout_ms: timeoutMs });
       await get().refresh();
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -164,5 +162,65 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
     }
   },
 
-  reset: () => set({ status: kIdle, regs: null, frames: [], events: [], breakpoints: [] }),
+  bpSet: async (addr) => {
+    try {
+      await call("debugger", "ps4_bp_set", { addr });
+      set({ error: null });
+      await get().refresh();
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  bpClear: async (addr) => {
+    await call("debugger", "ps4_bp_clear", { addr }).catch(() => undefined);
+    set((s) => ({ breakpoints: s.breakpoints.filter((b) => b.addr !== addr) }));
+  },
+
+  wpSet: async (addr, type, len) => {
+    try {
+      await call("debugger", "ps4_watch_set", { addr, type, len });
+      set({ error: null });
+      await get().refresh();
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  wpClear: async (addr) => {
+    await call("debugger", "ps4_watch_clear", { addr }).catch(() => undefined);
+    set((s) => ({ watchpoints: s.watchpoints.filter((w) => w.addr !== addr) }));
+  },
+
+  readRegs: async (lwpid) => {
+    try {
+      const regs = await call<Regs>("debugger", "ps4_regs", { lwpid });
+      set({ regs, regsLwpid: lwpid, error: null });
+    } catch {
+      set({ regs: null });
+    }
+  },
+
+  readStack: async (lwpid) => {
+    try {
+      const stack = await call<{ frames?: Frame[] }>("debugger", "ps4_callstack", {
+        lwpid,
+        depth: 32,
+      });
+      set({ frames: stack.frames ?? [] });
+    } catch {
+      set({ frames: [] });
+    }
+  },
+
+  reset: () =>
+    set({
+      status: kIdle,
+      regs: null,
+      regsLwpid: 0,
+      frames: [],
+      events: [],
+      breakpoints: [],
+      watchpoints: [],
+    }),
 }));

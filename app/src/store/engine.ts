@@ -30,7 +30,7 @@ export type HypeState = {
 type EngineStore = {
   connected: boolean;
   boot: BootStage;
-  backend: { badge: string; kernel: boolean };
+  backend: { badge: string; ps4: boolean };
   target: TargetState;
   hype: HypeState;
   quitting: string | null;
@@ -53,7 +53,7 @@ let starting: Promise<void> | undefined;
 export const useEngine = create<EngineStore>((set) => ({
   connected: false,
   boot: kInitialBoot,
-  backend: { badge: "user", kernel: false },
+  backend: { badge: "user", ps4: false },
   target: { attached: false },
   hype: kInitialHype,
   quitting: null,
@@ -67,7 +67,7 @@ export const useEngine = create<EngineStore>((set) => ({
       try {
         const status = await call<{ backend: string; target: TargetState }>("app", "status");
         set({
-          backend: { badge: status.backend, kernel: status.backend === "kernel" },
+          backend: { badge: status.backend, ps4: status.backend === "ps4" },
           target: status.target,
           boot: { stage: 6, total: 6, label: "ready", done: true },
           startupError: null,

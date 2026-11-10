@@ -9,7 +9,6 @@ import Splitter from "@/components/Splitter";
 import StatusBar from "@/components/StatusBar";
 import TitleBar from "@/components/TitleBar";
 import TooltipLayer from "@/components/TooltipLayer";
-import FridaPanel from "@/components/panels/FridaPanel";
 import InspectorPanel from "@/components/panels/InspectorPanel";
 import ModulesPanel from "@/components/panels/ModulesPanel";
 import OutputPanel from "@/components/panels/OutputPanel";
@@ -53,8 +52,6 @@ export default function App() {
         return <ModulesPanel key="modules" />;
       case "scripts":
         return <ScriptsPanel key="scripts" />;
-      case "frida":
-        return <FridaPanel key="frida" />;
     }
   };
 

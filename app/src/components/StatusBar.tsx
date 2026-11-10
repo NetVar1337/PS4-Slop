@@ -49,7 +49,7 @@ export default function StatusBar() {
 
       <div className="spacer" />
 
-      <Pill label={`Backend: ${backend.badge}`} state={backend.kernel ? "ok" : "busy"} />
+      <Pill label={`Backend: ${backend.badge}`} state={backend.ps4 ? "ok" : "idle"} />
       <Pill label={connected ? "Engine: Connected" : "Engine: Offline"} state={connected ? "ok" : "bad"} />
       <Pill label={target.attached ? "Memory: Ready" : "Memory: Idle"} state={target.attached ? "ok" : "idle"} />
       <Pill label={hype.has_image ? `Image: ${hype.image}` : "Image: none"} state={hype.has_image ? "ok" : "idle"} />

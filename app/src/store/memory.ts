@@ -1,6 +1,6 @@
 // app/src/store/memory.ts
 // Live memory browsing for the hex editor, regions plus paged reads and writes
-// through the active backend (kernel path when slopdrvr is loaded)
+// through the active backend (ps4 wire when a console is connected)
 
 import { create } from "zustand";
 import { call } from "@/lib/rpc";

@@ -323,7 +323,7 @@ int l_mem_scan(lua_State* L) {
     infra::cancel_token_t tok;
     lua_reader_t reader(sess);
 
-    // Region set from the active backend (driver ER path under slopdrvr)
+    // Region set from the active backend (ps4 wire reads on a console)
     auto regions = runtime::target_scan_regions(sess.handle());
 
     memory::memscan_t engine;

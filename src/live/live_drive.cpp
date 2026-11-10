@@ -199,7 +199,7 @@ int main() {
         die("read current health");
     ok("read current health", std::to_string(cur_hp));
 
-    // Region set from the backend (driver ER path under the kernel badge)
+    // Region set from the active backend (ps4 wire reads on a console)
     auto regions = slop::core::runtime::target_scan_regions(g_handle);
     if (regions.empty()) die("region enumeration");
 

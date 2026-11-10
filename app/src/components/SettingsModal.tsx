@@ -11,13 +11,6 @@ import { useEngine } from "@/store/engine";
 import { kMotionOptions, osPrefersReduced, useMotion } from "@/store/motion";
 import { kThemes, useTheme, type ThemeName } from "@/store/theme";
 
-type DriverStatus = {
-  device?: string;
-  kernel_active?: boolean;
-  hwbp_supported?: boolean;
-  preference?: string;
-};
-
 type Props = { onClose: () => void };
 
 export default function SettingsModal({ onClose }: Props) {
@@ -26,17 +19,10 @@ export default function SettingsModal({ onClose }: Props) {
   const motion = useMotion((s) => s.motion);
   const setMotion = useMotion((s) => s.setMotion);
   const { backend, target } = useEngine();
-  const [driver, setDriver] = useState<DriverStatus>({});
   const [status, setStatus] = useState<string | null>(null);
   const [copiedMcp, setCopiedMcp] = useState(false);
   const copiedReset = useRef<ReturnType<typeof setTimeout> | null>(null);
   const endpoint = getEndpoint();
-
-  useEffect(() => {
-    void call<DriverStatus>("driver", "status")
-      .then(setDriver)
-      .catch(() => undefined);
-  }, []);
 
   useEffect(
     () => () => {
@@ -55,19 +41,6 @@ export default function SettingsModal({ onClose }: Props) {
       setCopiedMcp(true);
       if (copiedReset.current !== null) clearTimeout(copiedReset.current);
       copiedReset.current = setTimeout(() => setCopiedMcp(false), 1600);
-    } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
-    }
-  };
-
-  // Switching backends tears down the live connection, so the engine refuses
-  // while anything is attached. Surface that instead of failing silently
-  const setPref = async (pref: string) => {
-    setStatus(null);
-    try {
-      const res = await call<DriverStatus>("driver", "backend", { pref });
-      setDriver(res);
-      setStatus(`backend preference set to ${pref}`);
     } catch (e) {
       setStatus(e instanceof Error ? e.message : String(e));
     }
@@ -133,27 +106,18 @@ export default function SettingsModal({ onClose }: Props) {
           </div>
 
           <div className="settings-group">
-            <div className="settings-label">Backend</div>
-            <div style={{ display: "flex", gap: "var(--pad-sm)", alignItems: "center" }}>
-              {["auto", "kernel", "user"].map((p) => (
-                <button
-                  key={p}
-                  className="row-action"
-                  data-active={driver.preference === p}
-                  onClick={() => void setPref(p)}
-                >
-                  {p}
-                </button>
-              ))}
-              <span className="faint" style={{ fontSize: 11 }}>
-                active: {backend.badge}
-                {target.attached ? " · detach the target to switch" : ""}
-              </span>
-            </div>
+            <div className="settings-label">Target</div>
             <div className="settings-rows mono">
-              <div>device: {driver.device ?? "n/a"}</div>
-              <div>kernel bridge: {driver.kernel_active === true ? "loaded" : "not loaded"}</div>
-              <div>hardware breakpoints: {driver.hwbp_supported === true ? "yes" : "no"}</div>
+              <div>backend: {backend.badge}{backend.ps4 ? " (ps4 console)" : ""}</div>
+              <div>
+                ps4:{" "}
+                {backend.ps4
+                  ? "connected - connect another from the Targets panel or MCP target.ps4_auto"
+                  : "not connected - use the Targets panel (ps4 connect) or MCP target.ps4_auto with a host"}
+              </div>
+              <div>
+                target: {target.attached ? `attached pid ${target.pid ?? 0} (${target.name ?? "?"})` : "none"}
+              </div>
             </div>
           </div>
 

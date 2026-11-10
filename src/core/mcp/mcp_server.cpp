@@ -46,11 +46,11 @@ constexpr const char* kInstructions =
     "response). Open every session with target.status and disasm.loaded. "
     "Static flow: disasm.load(path) -> poll disasm.loaded until "
     "image.hype.ready=true -> functions/xrefs/strings -> decomp.function. "
-    "Live flow: target.list -> target.attach(pid) -> memory.scan. Actions "
-    "fail fast with structured errors when a precondition is missing (target "
-    "attached, image.ready, image.hype.ready), re-check state rather than "
-    "retrying. driver.status reports whether the slopdrvr kernel backend is "
-    "active; kernel-only actions return structured errors when it is not. "
+    "Live flow on a PS4: target.ps4_connect {host} (or the one-call "
+    "target.ps4_auto {host}) -> memory.scan / debugger ps4_* over the wire. "
+    "Actions fail fast with structured errors when a precondition is missing "
+    "(console connected, image.ready, image.hype.ready), re-check state "
+    "rather than retrying. "
     "Annotations (disasm.symbol_set, notes, types) persist per binary hash "
     "and are shared with the UI.";
 

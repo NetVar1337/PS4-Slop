@@ -109,7 +109,6 @@ export default function TitleBar() {
               ["targets", "Targets"],
               ["modules", "Modules"],
               ["scripts", "Scripts"],
-              ["frida", "Frida"],
             ] as const
           ).map(([id, label]) => (
             <button key={id} className="menu-item" onClick={() => setRail(id)}>
