@@ -84,7 +84,8 @@ def main() -> int:
                      lambda: c.scan_aob(pid, 0, 0x7FFF00000000, pattern,
                                         regions=[readable]))
         if isinstance(hits, list):
-            assert readable["start"] in hits, "probe address missing from scan results"
+            if readable["start"] not in hits:
+                raise RuntimeError("probe address missing from scan results")
 
     print("6. kernel (read-only)")
     kbase = check("kernel_base", lambda: hex(c.kernel_base()))

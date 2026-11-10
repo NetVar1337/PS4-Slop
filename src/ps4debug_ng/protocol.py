@@ -155,16 +155,22 @@ def parse_reg64(buf: bytes) -> dict:
 
 
 def pack_reg64(regs: dict) -> bytes:
-    vals = [regs.get(f, 0) for f in REG64_FIELDS]
+    def _as_int(v, name):
+        try:
+            return int(v)
+        except (TypeError, ValueError) as e:
+            raise TypeError(f"register {name} must be an integer, got {v!r}") from e
+
+    vals = [_as_int(regs.get(f, 0), f) for f in REG64_FIELDS]
     vals += [
-        int(regs.get("trapno", 0)) & 0xFFFFFFFF,
-        int(regs.get("fs", 0)) & 0xFFFF,
-        int(regs.get("gs", 0)) & 0xFFFF,
-        int(regs.get("err", 0)) & 0xFFFFFFFF,
-        int(regs.get("es", 0)) & 0xFFFF,
-        int(regs.get("ds", 0)) & 0xFFFF,
+        _as_int(regs.get("trapno", 0), "trapno") & 0xFFFFFFFF,
+        _as_int(regs.get("fs", 0), "fs") & 0xFFFF,
+        _as_int(regs.get("gs", 0), "gs") & 0xFFFF,
+        _as_int(regs.get("err", 0), "err") & 0xFFFFFFFF,
+        _as_int(regs.get("es", 0), "es") & 0xFFFF,
+        _as_int(regs.get("ds", 0), "ds") & 0xFFFF,
     ]
-    vals += [regs.get(f, 0) for f in REG64_TRAIL]
+    vals += [_as_int(regs.get(f, 0), f) for f in REG64_TRAIL]
     return REG64_STRUCT.pack(*vals)
 
 

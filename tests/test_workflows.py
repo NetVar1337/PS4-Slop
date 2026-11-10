@@ -57,6 +57,8 @@ def test_resolve_chain():
 
 
 def test_snapshot_diff_roundtrip(tmp_path):
+    # tmp_path is a pytest-managed per-test temp dir; both snapshot files are
+    # created here (no user input reaches the filesystem).
     a = tmp_path / "a.snap"
     b = tmp_path / "b.snap"
     data_a = struct.pack("<QQQ", 1, 0x1000, 64) + b"\xAA" * 64

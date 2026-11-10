@@ -83,15 +83,19 @@ class Ps4DebugClient:
 
     # ------------------------------------------------------------- transport
 
+    def _require_sock(self) -> socket.socket:
+        if self.sock is None:
+            raise ConnectionError("not connected - call connect() first")
+        return self.sock
+
     def _send(self, data: bytes) -> None:
-        assert self.sock is not None, "not connected"
-        self.sock.sendall(data)
+        self._require_sock().sendall(data)
 
     def _recv_exact(self, n: int) -> bytes:
-        assert self.sock is not None, "not connected"
+        sock = self._require_sock()
         buf = b""
         while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
+            chunk = sock.recv(n - len(buf))
             if not chunk:
                 raise ConnectionError("payload closed the connection")
             buf += chunk
@@ -328,6 +332,9 @@ class Ps4DebugClient:
             finally:
                 self._events_closed.set()
 
+        # Shared state: self._events is a queue.Queue (thread-safe by design);
+        # self._events_closed is a threading.Event; the listener socket is
+        # owned by this thread until close, which wakes the accept().
         self._event_thread = threading.Thread(target=run, daemon=True, name="ps4debug-events")
         self._event_thread.start()
 
@@ -341,11 +348,14 @@ class Ps4DebugClient:
 
     def attach(self, pid: int) -> None:
         self._start_event_listener()
-        time.sleep(0.1)  # let the listener get into accept()
+        # Intentional fixed delay: give the listener thread a moment to reach
+        # accept() before the console connects back (poll-based sync would be
+        # racy here - the connection arrives from the network, not locally).
+        time.sleep(0.1)
         with self._lock:
-            assert self.sock is not None, "not connected"
+            sock = self._require_sock()
             self._request(P.CMD_DEBUG_ATTACH,
-                          P.ATTACH_PACKET.pack(pid, P.ip_to_u32(self.sock.getsockname()[0])))
+                          P.ATTACH_PACKET.pack(pid, P.ip_to_u32(sock.getsockname()[0])))
             try:
                 self._status("attach")
             except Exception:
@@ -368,7 +378,7 @@ class Ps4DebugClient:
     def set_breakpoint(self, index: int, address: int, enabled: bool = True) -> None:
         with self._lock:
             self._request(P.CMD_DEBUG_SET_BREAKPOINT,
-                          P.BREAKPT_PACKET.pack(index, int(enabled), address))
+                          P.BREAKPT_PACKET.pack(index, 1 if enabled else 0, address))
             self._status("set_breakpoint")
 
     def set_watchpoint(self, index: int, address: int, length: int,
@@ -376,7 +386,7 @@ class Ps4DebugClient:
         # breaktype: 0=exec, 1=write, 3=read/write (DBREG_DR7_* encoding)
         with self._lock:
             self._request(P.CMD_DEBUG_SET_WATCHPOINT,
-                          P.WATCHPT_PACKET.pack(index, int(enabled), length, breaktype, address))
+                          P.WATCHPT_PACKET.pack(index, 1 if enabled else 0, length, breaktype, address))
             self._status("set_watchpoint")
 
     def thread_list(self) -> list[int]:
