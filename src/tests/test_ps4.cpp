@@ -1253,9 +1253,11 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     // guide tool: list + get
     {
         bool e2 = false;
+        std::fprintf(stderr, "G1\n");
         json l = slop::core::mcp::call_tool("guide", {{"action", "list"}}, e2);
         CHECK(!e2);
         CHECK(l.value("count", 0) >= 10);
+        std::fprintf(stderr, "G2\n");
         json gt = slop::core::mcp::call_tool(
             "guide", {{"action", "get"}, {"topic", "ps4_setup"}}, e2);
         CHECK(!e2);
@@ -1263,6 +1265,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
         CHECK(gt["steps"][0].value("tool", "") == "target");
         CHECK(gt["steps"][0].contains("params"));
         bool e3 = false;
+        std::fprintf(stderr, "G3\n");
         json bad = slop::core::mcp::call_tool(
             "guide", {{"action", "get"}, {"topic", "nope"}}, e3);
         CHECK(e3);

@@ -9507,6 +9507,7 @@ json tool_guide(const json& args) {
     };
 
     const std::string action = require_action(args);
+    std::fprintf(stderr, "GD-start\n");
     if (action == "list") {
         json arr = json::array();
         for (const auto& t : kTopics)
@@ -9521,10 +9522,16 @@ json tool_guide(const json& args) {
         for (const auto& t : kTopics) {
             if (want == t.id) {
                 json steps = json::array();
-                for (const auto& s : t.steps)
+                for (const auto& s : t.steps) {
+    std::fprintf(stderr, "GD-step\n");
+                    json pp = json::parse(s.params, nullptr, false);
+    std::fprintf(stderr, "GD-parsed\n");
                     steps.push_back({{"tool", s.tool}, {"action", s.action},
-                                     {"params", json::parse(s.params, nullptr, false)},
+                                     {"params", std::move(pp)},
                                      {"why", s.why}});
+    std::fprintf(stderr, "GD-pushed\n");
+                }
+    std::fprintf(stderr, "GD-done\n");
                 return {{"topic", t.id}, {"title", t.title},
                         {"summary", t.summary}, {"steps", steps}};
             }
