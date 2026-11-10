@@ -1154,15 +1154,13 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     };
     bool e = false;
 
-    std::fprintf(stderr, "MARK attach
-");
+    std::fprintf(stderr, "MARK attach\n");
     // debug attach
     json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
     CHECK(!e);
     CHECK(r.value("attached", false) == true);
 
-    std::fprintf(stderr, "MARK until
-");
+    std::fprintf(stderr, "MARK until\n");
     // ps4_until: one-call run-until, bp auto-armed and auto-cleared
     r = dbg({{"action", "ps4_bp_list"}}, e);
     CHECK(!e);
@@ -1177,8 +1175,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     CHECK(!e);
     CHECK(r.value("count", 999) == 0);
 
-    std::fprintf(stderr, "MARK trace_calls
-");
+    std::fprintf(stderr, "MARK trace_calls\n");
     // ps4_trace_calls: 3 hits, each carrying the arg registers
     r = dbg({{"action", "ps4_trace_calls"}, {"addr", 0x400600}, {"count", 3}, {"timeout_ms", 2000}}, e);
     CHECK(!e);
@@ -1194,8 +1191,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     CHECK(!e);
     CHECK(r.value("count", 999) == 0);
 
-    std::fprintf(stderr, "MARK find_write
-");
+    std::fprintf(stderr, "MARK find_write\n");
     // ps4_find_write: watchpoint -> event -> callstack, watchpoint auto-cleared
     r = dbg({{"action", "ps4_find_write"}, {"addr", 0x7FFF00001000}, {"len", 8}, {"timeout_ms", 3000}}, e);
     CHECK(!e);
@@ -1208,8 +1204,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     CHECK(!e);
     CHECK(r.value("count", 999) == 0);
 
-    std::fprintf(stderr, "MARK trace_steps
-");
+    std::fprintf(stderr, "MARK trace_steps\n");
     // ps4_trace_steps: rip advances by one per step
     r = dbg({{"action", "ps4_trace_steps"}, {"lwpid", 101}, {"count", 4}, {"timeout_ms", 2000}}, e);
     CHECK(!e);
@@ -1219,8 +1214,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     for (size_t i = 1; i < 4; ++i)
         CHECK(r["steps"][i].value("rip", 0) == r["steps"][i - 1].value("rip", 0) + 1);
 
-    std::fprintf(stderr, "MARK ps4_auto
-");
+    std::fprintf(stderr, "MARK ps4_auto\n");
     // ps4_auto: already connected; picks the /app0/ game process (1234), not 42
     {
         bool e2 = false;
@@ -1255,8 +1249,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
         CHECK(saw_system);
     }
 
-    std::fprintf(stderr, "MARK guide
-");
+    std::fprintf(stderr, "MARK guide\n");
     // guide tool: list + get
     {
         bool e2 = false;
@@ -1276,8 +1269,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     }
 
     // ps4_detach at the end
-    std::fprintf(stderr, "MARK detach
-");
+    std::fprintf(stderr, "MARK detach\n");
     r = dbg({{"action", "ps4_detach"}}, e);
     CHECK(!e);
 }
