@@ -3522,12 +3522,257 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
                 {"rpcstub", stub}, {"rax", rax}};
     }
 
+    // ---- console-side tooling (ps4debug-NG native scan / disasm / elf / console) ----
+
+    if (action == "ps4_auth") {
+        std::string aerr;
+        const bool ok = p.ps4_auth(0x3, aerr);
+        return {{"authed", ok}, {"scan_unlocked", ok},
+                {"error", ok ? std::string{} : aerr},
+                {"note", "auth is per-connection and runs automatically on "
+                         "ps4_connect; bit 1 unlocks the CMD_PROC_SCAN* family"}};
+    }
+
+    if (action == "ps4_scan" || action == "ps4_rescan" ||
+        action == "ps4_scan_state" || action == "ps4_scan_reset" ||
+        action == "ps4_scan_all" || action == "ps4_scan_aob") {
+        return tool_ps4_scan(action, args, p);
+    }
+
+    if (action == "ps4_disasm") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint32_t len = static_cast<uint32_t>(parse_addr(args, "len"));
+        const uint32_t max = static_cast<uint32_t>(args.value("max", 4096u));
+        std::vector<runtime::backend_ps4_t::ps4_disasm_entry_t> ents;
+        auto io = p.ps4_disasm_region(pid, addr, len, max, ents);
+        if (!io.ok) fail("ps4_disasm failed (error " + std::to_string(io.error) +
+                         (p.ps4_authed() ? ")" : "; scan/auth family needs ps4_auth)"));
+        json arr = json::array();
+        for (const auto& e : ents) {
+            json kinds = json::array();
+            if (e.kind & 0x01) kinds.push_back("call");
+            if (e.kind & 0x02) kinds.push_back("ret");
+            if (e.kind & 0x04) kinds.push_back("jmp");
+            if (e.kind & 0x08) kinds.push_back("jcc");
+            if (e.kind & 0x10) kinds.push_back("mem");
+            if (e.kind & 0x20) kinds.push_back("rip-rel");
+            if (e.kind & 0x40) kinds.push_back("read");
+            if (e.kind & 0x80) kinds.push_back("write");
+            json o = {{"addr", e.addr}, {"addr_hex", addr_hex_str(e.addr)},
+                      {"len", e.length}, {"kind", kinds},
+                      {"mnemonic_lo", e.mnemonic_lo}};
+            if (e.kind & 0x10)
+                o["mem"] = {{"base", e.mem_base_reg}, {"index", e.mem_index_reg},
+                            {"scale", e.mem_scale}, {"disp", e.mem_disp}};
+            if (e.kind & 0x20) {
+                o["rip_rel_target"] = e.rip_rel_target;
+                o["rip_rel_target_hex"] = addr_hex_str(e.rip_rel_target);
+            }
+            arr.push_back(o);
+        }
+        return {{"addr", addr}, {"len", len}, {"count", arr.size()},
+                {"instructions", arr},
+                {"note", "decoded on-console by the payload's Zydis; mnemonic_lo is "
+                         "the low byte of the Zydis mnemonic enum - read the code "
+                         "bytes with memory.read and disasm.disassemble for full text"}};
+    }
+
+    if (action == "ps4_xrefs" || action == "ps4_xrefs_to") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint32_t len = static_cast<uint32_t>(parse_addr(args, "len"));
+        json arr = json::array();
+        if (action == "ps4_xrefs") {
+            const uint32_t max = static_cast<uint32_t>(args.value("max", 1000000u));
+            std::vector<uint64_t> targets;
+            auto io = p.ps4_extract_xrefs(pid, addr, len, max, targets);
+            if (!io.ok) fail("ps4_xrefs failed (error " + std::to_string(io.error) + ")");
+            for (uint64_t t : targets) {
+                arr.push_back({{"target", t}, {"target_hex", addr_hex_str(t)}});
+            }
+            return {{"addr", addr}, {"len", len}, {"count", arr.size()},
+                    {"targets", arr},
+                    {"note", "deduplicated RIP-relative call/branch targets inside the range"}};
+        }
+        const uint64_t target = parse_addr(args, "target");
+        std::vector<uint64_t> addrs;
+        auto io = p.ps4_find_xrefs_to(pid, addr, len, target, addrs);
+        if (!io.ok) fail("ps4_xrefs_to failed (error " + std::to_string(io.error) + ")");
+        for (uint64_t a : addrs)
+            arr.push_back({{"addr", a}, {"addr_hex", addr_hex_str(a)}});
+        return {{"addr", addr}, {"len", len}, {"target", target},
+                {"target_hex", addr_hex_str(target)}, {"count", arr.size()},
+                {"xrefs", arr}};
+    }
+
+    if (action == "ps4_stack") {
+        const uint32_t pid = ps4_pid_arg(args);
+        uint32_t lwpid = 0;
+        if (args.contains("lwpid")) lwpid = static_cast<uint32_t>(parse_addr(args, "lwpid"));
+        else {
+            auto thr = p.enum_threads(pid);
+            if (!thr.ok || thr.items.empty())
+                fail("ps4_stack: cannot list threads (need lwpid)");
+            lwpid = thr.items.front().tid;
+        }
+        uint64_t rbp = 0, rsp = 0;
+        if (args.contains("rbp")) rbp = parse_addr(args, "rbp");
+        if (args.contains("rsp")) rsp = parse_addr(args, "rsp");
+        if (rbp == 0 || rsp == 0) {
+            runtime::thread_context_t ctx{};
+            auto io = p.get_thread_context(lwpid, ctx);
+            if (!io.ok) fail("ps4_stack: cannot read thread context for lwpid " +
+                              std::to_string(lwpid));
+            if (rbp == 0) rbp = ctx.rbp;
+            if (rsp == 0) rsp = ctx.rsp;
+        }
+        const uint32_t depth = static_cast<uint32_t>(args.value("depth", 16u));
+        std::vector<runtime::backend_ps4_t::ps4_stack_frame_t> frames;
+        auto io = p.ps4_read_stack(pid, rbp, rsp, depth, frames);
+        if (!io.ok) fail("ps4_stack failed (error " + std::to_string(io.error) + ")");
+        json arr = json::array();
+        for (size_t i = 0; i < frames.size(); ++i) {
+            const auto& f = frames[i];
+            arr.push_back({{"index", i},
+                           {"rbp", f.rbp}, {"rsp", f.rsp},
+                           {"saved_rbp", f.saved_rbp},
+                           {"ret_addr", f.ret_addr},
+                           {"ret_addr_hex", addr_hex_str(f.ret_addr)},
+                           {"locals_omitted", (f.flags & 1) != 0},
+                           {"locals_hex", ps4_hex_str(f.locals)},
+                           {"code_hex", ps4_hex_str(f.code)}});
+        }
+        return {{"pid", pid}, {"lwpid", lwpid}, {"rbp", rbp}, {"rsp", rsp},
+                {"count", arr.size()}, {"frames", arr},
+                {"note", "server-side rbp-chain walk on the console; code is the "
+                         "200-byte window at ret_addr-10"}};
+    }
+
+    if (action == "ps4_assemble") {
+        if (!args.contains("asm") || !args.at("asm").is_string())
+            fail("ps4_assemble requires 'asm' (x86-64 text, Intel syntax by default)");
+        const std::string text = args.at("asm").get<std::string>();
+        const uint64_t base = args.contains("base") ? parse_addr(args, "base") : 0;
+        const uint32_t syntax = static_cast<uint32_t>(args.value("syntax", 0u));
+        std::vector<uint8_t> bytes;
+        uint32_t count = 0;
+        std::string aerr;
+        auto io = p.ps4_assemble(base, syntax, text, bytes, count, aerr);
+        if (!io.ok)
+            fail("ps4_assemble failed: " +
+                 (aerr.empty() ? "error " + std::to_string(io.error) : aerr));
+        return {{"assembled", true}, {"bytes_hex", ps4_hex_str(bytes)},
+                {"byte_len", bytes.size()}, {"insn_count", count},
+                {"note", "assembled on-console by the payload's Keystone; patch with "
+                         "memory.write (ps4debug-NG writes are unauthenticated)"}};
+    }
+
+    if (action == "ps4_elf_rpc" || action == "ps4_elf_load") {
+        const uint32_t pid = ps4_pid_arg(args);
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("ps4_elf_* requires 'path' to a local ELF file");
+        const std::string path = args.at("path").get<std::string>();
+        std::ifstream f(path, std::ios::binary);
+        if (!f) fail("cannot open " + path);
+        std::vector<uint8_t> elf((std::istreambuf_iterator<char>(f)),
+                                 std::istreambuf_iterator<char>());
+        if (elf.size() < 4 || std::memcmp(elf.data(), "\x7f""ELF", 4) != 0)
+            fail("not an ELF file (PS4 payloads must be raw ELF64, not SELF)");
+        if (action == "ps4_elf_rpc") {
+            uint64_t entry = 0;
+            auto io = p.ps4_elf_rpc(pid, elf, entry);
+            if (!io.ok) fail("ps4_elf_rpc failed (error " + std::to_string(io.error) + ")");
+            return {{"loaded", true}, {"pid", pid}, {"entry", entry},
+                    {"entry_hex", addr_hex_str(entry)},
+                    {"note", "ELF loaded+relocated in the console process; call its "
+                             "entry with ps4_call or run it with ps4_elf_load"}};
+        }
+        auto io = p.ps4_elf_load(pid, elf);
+        if (!io.ok) fail("ps4_elf_load failed (error " + std::to_string(io.error) + ")");
+        return {{"executed", true}, {"pid", pid},
+                {"note", "the payload jumped into the ELF entry point"}};
+    }
+
+    if (action == "ps4_notify" || action == "ps4_print") {
+        if (!args.contains("msg") || !args.at("msg").is_string())
+            fail("ps4_notify/ps4_print requires 'msg'");
+        const std::string msg = args.at("msg").get<std::string>();
+        if (action == "ps4_notify") {
+            const uint32_t type = static_cast<uint32_t>(args.value("type", 222u));
+            auto io = p.ps4_console_notify(type, msg);
+            if (!io.ok) fail("ps4_notify failed (error " + std::to_string(io.error) + ")");
+            return {{"notified", true}, {"type", type},
+                    {"note", "system notification shown on the PS4 UI"}};
+        }
+        auto io = p.ps4_console_print(msg);
+        if (!io.ok) fail("ps4_print failed (error " + std::to_string(io.error) + ")");
+        return {{"printed", true}, {"note", "written to the console kernel log ([ps4debug-ng] prefix in dmesg)"}};
+    }
+
+    if (action == "ps4_app") {
+        runtime::backend_ps4_t::ps4_app_info_t app;
+        auto io = p.ps4_foreground_app(app);
+        if (!io.ok) fail("ps4_app failed (error " + std::to_string(io.error) + ")");
+        return {{"pid", app.pid}, {"titleid", app.titleid}, {"contentid", app.contentid},
+                {"name", app.name}, {"app_ver", app.app_ver},
+                {"running", app.pid != 0}};
+    }
+
+    if (action == "ps4_fpregs" || action == "ps4_set_fpregs" ||
+        action == "ps4_set_dbregs" || action == "ps4_fsgs" || action == "ps4_set_fsgs") {
+        if (!p.ps4_debug_attached())
+            fail("ps4 register actions require ps4_attach first");
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        if (action == "ps4_fpregs") {
+            uint8_t buf[runtime::ps4::kFpregsSize]{};
+            auto io = p.ps4_get_fpregs(lwpid, buf);
+            if (!io.ok) fail("ps4_fpregs failed (error " + std::to_string(io.error) + ")");
+            return {{"lwpid", lwpid}, {"hex", ps4_hex_str({buf, buf + sizeof(buf)})},
+                    {"size", sizeof(buf)}};
+        }
+        if (action == "ps4_set_fpregs" || action == "ps4_set_dbregs") {
+            if (!args.contains("hex") || !args.at("hex").is_string())
+                fail("ps4_set_fpregs/ps4_set_dbregs requires 'hex'");
+            auto bytes = hex_decode(args.at("hex").get<std::string>());
+            if (action == "ps4_set_fpregs") {
+                if (bytes.empty() || bytes.size() > 848)
+                    fail("ps4_set_fpregs: hex must decode to 1..848 bytes");
+                auto io = p.ps4_set_fpregs(lwpid, bytes.data(),
+                                           static_cast<uint32_t>(bytes.size()));
+                if (!io.ok) fail("ps4_set_fpregs failed (error " + std::to_string(io.error) + ")");
+            } else {
+                if (bytes.size() != runtime::ps4::kDbregsSize)
+                    fail("ps4_set_dbregs: hex must decode to exactly 128 bytes");
+                auto io = p.ps4_set_dbregs(lwpid, bytes.data());
+                if (!io.ok) fail("ps4_set_dbregs failed (error " + std::to_string(io.error) + ")");
+            }
+            return {{"ok", true}, {"lwpid", lwpid}};
+        }
+        if (action == "ps4_fsgs") {
+            uint64_t fs = 0, gs = 0;
+            auto io = p.ps4_get_fsgsbase(lwpid, fs, gs);
+            if (!io.ok) fail("ps4_fsgs failed (error " + std::to_string(io.error) + ")");
+            return {{"lwpid", lwpid}, {"fs_base", fs}, {"fs_base_hex", addr_hex_str(fs)},
+                    {"gs_base", gs}, {"gs_base_hex", addr_hex_str(gs)}};
+        }
+        const uint64_t fs = parse_addr(args, "fs_base");
+        const uint64_t gs = parse_addr(args, "gs_base");
+        auto io = p.ps4_set_fsgsbase(lwpid, fs, gs);
+        if (!io.ok) fail("ps4_set_fsgs failed (error " + std::to_string(io.error) + ")");
+        return {{"ok", true}, {"lwpid", lwpid}, {"fs_base", fs}, {"gs_base", gs}};
+    }
+
     fail("debugger: unknown ps4 action (ps4_attach|ps4_detach|ps4_status|"
          "ps4_bp_set|ps4_bp_clear|ps4_bp_list|ps4_watch_set|ps4_watch_clear|"
          "ps4_watch_list|ps4_continue|ps4_step|ps4_suspend|ps4_resume|"
          "ps4_process_stop|ps4_regs|ps4_set_reg|ps4_dbregs|ps4_wait|"
          "ps4_events|ps4_callstack|ps4_call|ps4_until|ps4_find_write|"
-         "ps4_trace_calls|ps4_trace_steps)");
+         "ps4_trace_calls|ps4_trace_steps|ps4_auth|ps4_scan|ps4_rescan|"
+         "ps4_scan_state|ps4_scan_reset|ps4_scan_all|ps4_scan_aob|"
+         "ps4_disasm|ps4_xrefs|ps4_xrefs_to|ps4_stack|ps4_assemble|"
+         "ps4_elf_rpc|ps4_elf_load|ps4_notify|ps4_print|ps4_app|"
+         "ps4_fpregs|ps4_set_fpregs|ps4_set_dbregs|ps4_fsgs|ps4_set_fsgs)");
 }
 
 } // namespace
