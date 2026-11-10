@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import contextlib
 import queue
-from typing import Any
 import socket
 import struct
 import threading
 import time
+from typing import Any
 
 from . import protocol as P
 
@@ -377,6 +377,18 @@ class Ps4DebugClient:
         except queue.Empty:
             return None
 
+    def wait_events(self, max_events: int = 64) -> list[dict]:
+        """Batch-drain events already queued on the 755 channel. No payload
+        change needed: the listener decodes packets as they arrive; this
+        empties the queue in one call, which is what a live trace UI wants."""
+        out = []
+        while len(out) < max_events:
+            try:
+                out.append(self._events.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
     def set_breakpoint(self, index: int, address: int, enabled: bool = True) -> None:
         with self._lock:
             self._request(P.CMD_DEBUG_SET_BREAKPOINT,
@@ -474,6 +486,45 @@ class Ps4DebugClient:
             self._status("kern_base")
             (base,) = struct.unpack("<Q", self._recv_exact(8))
         return base
+
+    # -------------------------------------------------------------- execution
+
+    def proc_install(self, pid: int) -> int:
+        """Inject the RPC stub into the process; returns the stub address
+        required by proc_call."""
+        with self._lock:
+            self._request(P.CMD_PROC_INTALL, P.INSTALL_PACKET.pack(pid))
+            self._status("proc_install")
+            (stub,) = struct.unpack("<Q", self._recv_exact(8))
+        return stub
+
+    def proc_call(self, pid: int, rpcstub: int, address: int,
+                  args: tuple = ()) -> int:
+        """Call a function in the target via the injected stub (SysV args,
+        max 6). Blocks until the stub reports done. Returns rax."""
+        regs = list(args[:6]) + [0] * (6 - len(args))
+        body = P.CALL_PACKET.pack(pid, rpcstub, address, *regs)
+        with self._lock:
+            self._request(P.CMD_PROC_CALL, body)
+            self._status("proc_call")
+            _pid, rax = struct.unpack("<IQ", self._recv_exact(12))
+        return rax
+
+    def proc_protect(self, pid: int, address: int, length: int, prot: int) -> None:
+        """Change page protections (FreeBSD VM_PROT_* bits)."""
+        with self._lock:
+            self._request(P.CMD_PROC_PROTECT,
+                          P.PROTECT_PACKET.pack(pid, address, length, prot))
+            self._status("proc_protect")
+
+    def proc_elf(self, pid: int, elf: bytes) -> None:
+        """Load an ELF image into the process (full load + relocation +
+        jump to entry)."""
+        with self._lock:
+            self._request(P.CMD_PROC_ELF, P.ELF_PACKET.pack(pid, len(elf)))
+            self._status("proc_elf ack")
+            self._send(elf)
+            self._status("proc_elf")
 
     def kernel_read(self, address: int, length: int) -> bytes:
         with self._lock:

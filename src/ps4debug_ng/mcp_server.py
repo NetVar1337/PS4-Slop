@@ -21,6 +21,9 @@ try:  # mcp 1.x
 except ImportError:  # mcp >= 2.0: FastMCP renamed to MCPServer (same .tool()/.run() API)
     from mcp.server.mcpserver import MCPServer as _MCPServer
 
+from pathlib import Path
+
+from . import actions
 from .audit import AuditLog
 from .client import Ps4DebugClient
 
@@ -576,6 +579,155 @@ def ps4_integrity_check(pid: int, address: int, length: int,
             "ok" if ok else "MISMATCH")
     return {"ok": ok, "sha256": digest, "expected": expected_sha256,
             "changed": changed}
+
+
+# ------------------------------------------------- execution / what-writes
+
+# rpcstub per pid (installed once per session, reused by proc_call)
+_rpcstubs: dict[int, int] = {}
+_freezes: dict[str, actions.Freeze] = {}
+
+
+@mcp.tool()
+def ps4_install_stub(pid: int, confirm: bool = False) -> int:
+    """Inject the RPC stub into a process; returns the stub address used by
+    ps4_call_function. Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"inject RPC stub into pid {pid}"):
+        raise RuntimeError(refuse)
+    c = _connected()
+    stub = c.proc_install(pid)
+    _rpcstubs[pid] = stub
+    _record("ps4_install_stub", {"pid": pid}, "ok")
+    return stub
+
+
+@mcp.tool()
+def ps4_call_function(pid: int, address: int, args: list[int] | None = None,
+                      confirm: bool = False) -> int:
+    """Call a function inside the target via the injected RPC stub (SysV args,
+    max 6). Returns rax. Auto-installs the stub on first use. Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"call function @ {hex(address)} in pid {pid}"):
+        raise RuntimeError(refuse)
+    c = _connected()
+    if pid not in _rpcstubs:
+        _rpcstubs[pid] = c.proc_install(pid)
+    rax = c.proc_call(pid, _rpcstubs[pid], address, tuple(args or ()))
+    _record("ps4_call_function", {"pid": pid, "address": hex(address)}, "ok")
+    return rax
+
+
+@mcp.tool()
+def ps4_protect(pid: int, address: int, length: int, prot: int,
+                confirm: bool = False) -> str:
+    """Change page protections (FreeBSD VM_PROT_*: READ=1 WRITE=2 EXEC=4).
+    Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"protect pid {pid} @ {hex(address)}"):
+        return refuse
+    _connected().proc_protect(pid, address, length, prot)
+    _record("ps4_protect", {"pid": pid, "address": hex(address), "prot": prot}, "ok")
+    return f"protect pid {pid} @ {hex(address)} len {length} prot {prot}"
+
+
+@mcp.tool()
+def ps4_load_elf(pid: int, elf_path: str, confirm: bool = False) -> str:
+    """Load an ELF payload into the process (full load + relocation + entry).
+    Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"load ELF into pid {pid}"):
+        return refuse
+    data = Path(elf_path).read_bytes()
+    _connected().proc_elf(pid, data)
+    _record("ps4_load_elf", {"pid": pid, "path": elf_path, "bytes": len(data)}, "ok")
+    return f"loaded {len(data)}-byte ELF into pid {pid}"
+
+
+@mcp.tool()
+def ps4_find_what_writes(address: int, length: int = 8, breaktype: int = 1,
+                         max_events: int = 20, timeout: float = 10.0,
+                         confirm: bool = False) -> list[dict] | str:
+    """THE classic RE question: capture what code writes (breaktype=1) or
+    accesses (3) an address. Requires an attached session (ps4_attach).
+    Returns each hit with rip + full register context. Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"watchpoint @ {hex(address)}"):
+        return refuse
+    events = actions.find_what_writes(_connected(), address, length, breaktype,
+                                      max_events, timeout)
+    _record("ps4_find_what_writes", {"address": hex(address)}, f"{len(events)} hits")
+    return events
+
+
+@mcp.tool()
+def ps4_freeze_start(pid: int, address: int, hex_bytes: str,
+                     interval_ms: int = 250, confirm: bool = False) -> str:
+    """Cheat Engine-style freeze: re-write hex_bytes to address continuously.
+    Returns a freeze id for ps4_freeze_stop. Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"freeze pid {pid} @ {hex(address)}"):
+        return refuse
+    freeze_id = f"{pid}:{hex(address)}"
+    if freeze_id in _freezes:
+        return f"already frozen: {freeze_id}"
+    fz = actions.Freeze(_connected(), pid, address, bytes.fromhex(hex_bytes),
+                       interval_ms)
+    fz.start()
+    _freezes[freeze_id] = fz
+    _record("ps4_freeze_start", {"pid": pid, "address": hex(address)}, "ok")
+    return freeze_id
+
+
+@mcp.tool()
+def ps4_freeze_stop(freeze_id: str, confirm: bool = False) -> dict | str:
+    """Stop a freeze started by ps4_freeze_start; returns write stats."""
+    if refuse := _need_confirm(confirm, f"stop freeze {freeze_id}"):
+        return refuse
+    fz = _freezes.pop(freeze_id, None)
+    if not fz:
+        return f"no such freeze: {freeze_id}"
+    fz.stop()
+    _record("ps4_freeze_stop", {"id": freeze_id}, "ok")
+    return {"freeze": freeze_id, "writes": fz.writes, "errors": fz.errors[:5]}
+
+
+@mcp.tool()
+def ps4_freeze_list() -> list[str]:
+    """List active freezes."""
+    return sorted(_freezes)
+
+
+@mcp.tool()
+def ps4_cheat_export(path: str, pokes: list[dict], chains: list[dict],
+                     note: str = "") -> str:
+    """Export a ps4cheat v1 JSON file: pokes [{name,pid,address,hex}] and
+    pointer chains [{name,pid,address,offsets,value_hex}]."""
+    actions.cheat_export(path, pokes, chains, note)
+    _record("ps4_cheat_export", {"path": path}, "ok")
+    return f"cheat file written: {path}"
+
+
+@mcp.tool()
+def ps4_cheat_import(path: str) -> dict:
+    """Parse a ps4cheat v1 file (returns its pokes/chains without applying)."""
+    return actions.cheat_import(path)
+
+
+@mcp.tool()
+def ps4_cheat_apply(path: str, confirm: bool = False) -> list[str] | str:
+    """Apply the one-shot pokes from a ps4cheat file. Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"apply cheat file {path}"):
+        return refuse
+    doc = actions.cheat_import(path)
+    results = actions.cheat_apply_pokes(_connected(), doc["pokes"])
+    _record("ps4_cheat_apply", {"path": path}, f"{len(results)} pokes")
+    return results
+
+
+@mcp.tool()
+def ps4_replay_audit(log_path: str, limit: int = 0, confirm: bool = False) -> list[str] | str:
+    """Replay the mutating actions from an MCP audit log (ps4_write_memory,
+    ps4_kernel_write, ps4_set_breakpoint). limit=0 replays all. Requires confirm=True."""
+    if refuse := _need_confirm(confirm, f"replay audit log {log_path}"):
+        return refuse
+    done = actions.replay_audit(_connected(), log_path, limit)
+    _record("ps4_replay_audit", {"path": log_path}, f"{len(done)} actions")
+    return done
 
 
 # --------------------------------------------------------------------- main
