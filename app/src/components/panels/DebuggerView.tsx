@@ -89,7 +89,7 @@ export default function DebuggerView() {
             <button className="row-action" disabled={busy} onClick={() => void cont()} data-tip="continue">
               <Play size={11} />
             </button>
-            <button className="row-action" disabled={busy} onClick={() => void step(0)} data-tip="step all threads">
+            <button className="row-action" disabled={busy} onClick={() => void step(lwpNum)} data-tip="step one lwp (0 = all threads)">
               <StepForward size={11} />
             </button>
             <button className="row-action" disabled={busy} onClick={() => void waitHalt(5000)} data-tip="wait for a stop event (5s)">

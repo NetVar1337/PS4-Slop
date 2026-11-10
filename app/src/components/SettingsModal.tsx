@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, X } from "lucide-react";
 import logoUrl from "@/assets/reverse-slop-icon.png";
-import { call, getEndpoint } from "@/lib/rpc";
+import { getEndpoint } from "@/lib/rpc";
 import { copyText } from "@/lib/clipboard";
 import { useEngine } from "@/store/engine";
 import { kMotionOptions, osPrefersReduced, useMotion } from "@/store/motion";
