@@ -8,7 +8,6 @@ param(
     [switch]$FrontendOnly,
     [switch]$BundleOnly,
     [switch]$FastBundle,
-    [switch]$SkipDriver,
     [switch]$OnlineWebview,
     [string]$CmakeExtra = '',
     [string]$Preset = 'ninja-msvc-release',
@@ -50,7 +49,7 @@ Write-Host "==> logs:     $logDir"
     $vsCMake = 'cmake'
 }
 if ($Full) {
-    Write-Host '==> full installer mode: driver, magicmida and the webview2 runtime are all required' -ForegroundColor Cyan
+    Write-Host '==> full installer mode: magicmida and the webview2 runtime are all required' -ForegroundColor Cyan
 }
 
 if (-not $FrontendOnly) {
@@ -137,20 +136,6 @@ Write-Host "==> engine: $($summary.engine)"
 # depend on). The engine must already be built, tauri.conf.json bundles it as a
 # resource from build\src\engine
 if (-not $NoFrontend) {
-    # The driver needs the WDK, which is not installed on every dev box. Build
-    # it when possible; the tauri resource filter below skips it when absent.
-    # -SkipDriver is for CI frontend job where slopdrvr.sys already comes from
-    # the parallel driver job artifact (saves WDK install + rebuild there).
-    if (-not $SkipDriver) {
-    & powershell -NoProfile -File (Join-Path $PSScriptRoot 'build_slopdrvr.ps1')
-    if ($LASTEXITCODE -ne 0) {
-        if ($Full) { throw 'driver build failed, the full installer bundles slopdrvr.sys (install the WDK)' }
-        Write-Host '==> driver build failed (WDK missing?), bundling app without driver' -ForegroundColor Yellow
-    }
-    } else {
-        Write-Host '==> skipping driver build (sys staged from driver job artifact)'
-    }
-
     # Magicmida (Themida/WinLicense unpacker). The engine resolves it next to
     # itself (engine\tools\magicmida\<version>) before falling back to
     # %LOCALAPPDATA%. Keep the LOCALAPPDATA install as the source of truth
@@ -207,9 +192,9 @@ if (-not $NoFrontend) {
     $tauriCli = Join-Path $appDir 'node_modules\@tauri-apps\cli\tauri.js'
     try {
         # tauri hard-fails on missing resource files, so filter the bundle map
-        # to what exists (e.g. slopdrvr.sys without the WDK). The override
+        # to what exists. The override
         # carries the complete filtered resources map; the committed
-        # tauri.conf.json stays authoritative for WDK machines
+        # tauri.conf.json stays authoritative
         $confPath = Join-Path $appDir 'src-tauri\tauri.conf.json'
         $conf = Get-Content -LiteralPath $confPath -Raw | ConvertFrom-Json
         $resources = [ordered]@{}
@@ -218,17 +203,6 @@ if (-not $NoFrontend) {
             if (Test-Path -LiteralPath $src) { $resources[$prop.Name] = $prop.Value }
             elseif ($Full) { throw "resource missing: $($prop.Name), the full installer bundles everything" }
             else { Write-Host "==> resource missing, skipping: $($prop.Name)" }
-        }
-        # The driver stays out of tauri.conf.json (tauri-build hard-fails on
-        # missing resource files and not every box has the WDK); add it back
-        # through the override whenever it did build
-        $driverSys = Join-Path $repoRoot 'build\driver\slopdrvr.sys'
-        if (Test-Path -LiteralPath $driverSys) {
-            $resources['../../build/driver/slopdrvr.sys'] = 'engine/slopdrvr.sys'
-        } elseif ($Full) {
-            throw 'slopdrvr.sys absent, the full installer bundles the kernel driver (WDK required)'
-        } else {
-            Write-Host '==> slopdrvr.sys absent, bundling without kernel driver'
         }
         if (Test-Path -LiteralPath $magicmidaStaged) {
             $resources['../../build/tools/magicmida'] = 'engine/tools/magicmida'
@@ -299,8 +273,7 @@ if (-not $NoFrontend) {
         } else {
             Write-Host '    app + webview (offline runtime embedded, no download at install)'
         }
-        Write-Host '    engine/reverse-slop-engine.exe, slop_frida.dll, slop_mapper.exe'
-        Write-Host '    engine/slopdrvr.sys (kernel driver)'
+        Write-Host '    engine/reverse-slop-engine.exe, slop_frida.dll'
         Write-Host '    engine/tools/magicmida (themida unpacker)'
         Write-Host '    target machine needs: windows (internet if webview bootstrapper needs the runtime)'
     }

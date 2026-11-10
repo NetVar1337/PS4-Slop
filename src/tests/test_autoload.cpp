@@ -5,6 +5,7 @@
 #include "harness.hpp"
 
 #include "core/runtime/driver_autoload.hpp"
+#include "core/infra/lifecycle.hpp"
 
 #include <windows.h>
 
@@ -214,3 +215,7 @@ TEST_CASE(unload_reports_service_refusal) {
     REQUIRE(rep.error.find("C0000034") != std::string::npos);
 }
 
+
+TEST_CASE(autoload_defaults_to_loading_kernel_bridge) {
+    REQUIRE(slop::core::infra::lifecycle::config_t{}.load_driver);
+}

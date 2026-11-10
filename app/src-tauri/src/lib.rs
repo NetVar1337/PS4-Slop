@@ -51,7 +51,7 @@ impl Engine {
     }
 
     /// waits for the handshake, the timeout is long because a human might be
-    /// clicking through the mapper's uac prompt
+    /// clicking through an elevation prompt
     fn wait(&self, timeout: Duration) -> Result<Endpoint, String> {
         let mut inner = self.inner.lock().expect("engine state poisoned");
         let deadline = std::time::Instant::now() + timeout;

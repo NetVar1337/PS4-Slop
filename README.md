@@ -14,9 +14,8 @@ control.
 > [!WARNING]
 > Use reverse-slop only on systems and software you own or are authorized to
 > test. Live memory writes, debugging, network manipulation, and the optional
-> kernel bridge can destabilize processes or Windows. The mapper loads a kernel
-> driver and requires administrator privileges. Start with the user-mode engine
-> when kernel access is unnecessary.
+> kernel bridge can destabilize processes or Windows and needs administrator
+> privileges. Start with the user-mode engine when kernel access is unnecessary.
 
 ## Inspiration and attribution
 
@@ -60,7 +59,7 @@ The strings view with search, UTF-16 flagging and xref counts:
   spawning, attaching, scripts, messages, RPC, compile, and snapshots.
 - **Emulation:** isolated x86-64 Unicorn execution with register/memory setup,
   tracing, byte-level taint propagation, and watched output ranges.
-- **Network tooling:** WFP capture and manipulation through the optional driver,
+- **Network tooling:** WFP capture and manipulation through the optional kernel bridge,
   PCAP export, stream reconstruction, connection inspection, and an independent
   localhost HTTP inspection proxy.
 - **Unpacking and devirtualization:** Magicmida Themida sidecars, VM handler and
@@ -93,14 +92,8 @@ the Frida Core 17.17.0 Windows x86-64 devkit (about 53 MB) on first configure.
 | Component | Additional requirements |
 |---|---|
 | Tauri desktop shell | Node.js/npm, Rust toolchain with Cargo, WebView2 runtime |
-| Kernel driver and mapper | Visual Studio C++ tools, Windows Driver Kit 10.0.26100.0, administrator rights |
 | Themida unpacking | Separately installed Magicmida x86/x64 sidecars |
 | Frida TypeScript project bundling | A usable `frida-compile` setup for the requested project |
-
-The main CMake build currently expects the WDK 10.0.26100.0 `ntdll.lib` when
-linking `slop_mapper`. If that exact WDK library is absent, CMake warns and the
-mapper target will not link. The app and headless engine still support a
-user-mode backend without the driver.
 
 ## Build
 
@@ -128,7 +121,7 @@ powershell -File tools/build.ps1 -PlanOnly
 # Select another preset if one has been added to CMakePresets.json
 powershell -File tools/build.ps1 -Preset ninja-msvc-release
 
-# Full installer: bundle the kernel driver, Magicmida, and the WebView2
+# Full installer: bundle Magicmida and the WebView2
 # runtime so the target machine needs nothing but Windows (no internet,
 # no WebView2, no dev tools). Fails instead of skipping a missing component
 powershell -File tools/build.ps1 -Full
@@ -141,19 +134,11 @@ Default CMake options are all enabled:
 | `SLOP_BUILD_ENGINE` | `ON` | Headless engine host |
 | `SLOP_BUILD_TEST_TARGET` | `ON` | `SlopTarget.exe` fixture |
 | `SLOP_BUILD_TESTS` | `ON` | Core test harness |
-| `SLOP_BUILD_MAPPER` | `ON` | Kernel-driver loader utility |
 
 For manual configuration, first enter an x64 Visual Studio developer shell:
 
 ```powershell
 cmake --preset ninja-msvc-release -S .
-cmake --build --preset ninja-msvc-release
-```
-
-Example user-mode-only configuration when mapper artifacts are not needed:
-
-```powershell
-cmake --preset ninja-msvc-release -S . -DSLOP_BUILD_MAPPER=OFF
 cmake --build --preset ninja-msvc-release
 ```
 
@@ -183,10 +168,9 @@ downloads it when missing.
 
 Run the same command with `-Full` for a self-contained release installer: the
 setup exe embeds the WebView2 runtime (offline install, no download on the
-target machine) and hard-requires every optional component, so `slopdrvr.sys`,
-the Magicmida sidecars, and `slop_frida.dll` are always inside. The build fails
-loudly instead of silently shipping a degraded bundle when the WDK, network, or
-Magicmida is missing.
+target machine) and hard-requires every optional component, so the Magicmida
+sidecars and `slop_frida.dll` are always inside. The build fails loudly instead
+of silently shipping a degraded bundle when the network or Magicmida is missing.
 
 Use `-NoFrontend` for a fast C++-only loop (skips Rust, npm, and the bundle).
 
@@ -217,53 +201,6 @@ npm run build
 # Requires a running engine; validates frontend calls against tools/list
 npm run check:api -- 8765
 ```
-
-### Kernel driver
-
-The CMake build creates `slop_mapper.exe`, but `slopdrvr.sys` has a separate WDK
-build script:
-
-```powershell
-powershell -File tools/build_slopdrvr.ps1
-```
-
-Outputs:
-
-```text
-build\mapper\slop_mapper.exe
-build\driver\slopdrvr.sys
-```
-
-Clean driver objects before rebuilding:
-
-```powershell
-powershell -File tools/build_slopdrvr.ps1 -Clean
-```
-
-Use another installed WDK version only if corresponding headers and libraries
-exist and the mapper link configuration is updated consistently:
-
-```powershell
-powershell -File tools/build_slopdrvr.ps1 -WdkVersion 10.0.26100.0
-```
-
-Both build scripts support `vswhere` discovery and a `PRODUCT VS22` installation
-on the repository's drive (with `E:\PRODUCT VS22` as a legacy fallback).
-
-On startup, an elevated shell searches for mapper and driver artifacts beside
-the executable or in the build-tree layout. It loads `slopdrvr`, probes
-`\\.\slopdrvr`, selects the kernel backend when available, and falls back to
-user mode on failure. Normal shutdown quiesces and unloads the driver and
-removes its service key. Avoid force-killing the process while kernel work is
-active.
-
-The mapper preserves bundled driver inputs; only its runtime copies are cleaned
-up, so a failed load does not remove `engine\slopdrvr.sys` from the portable app.
-A duplicate WFP object (`0xC0220009`) defers network capture without aborting the
-independent kernel bridge. Capture retries on explicit use and reports the WFP
-error until the conflicting callout is released. WFP registration objects use a
-dynamic session; early registration failures log their exact step to
-`C:\Users\Public\Desktop\slop_kernel.log` even at the default log level.
 
 ### Magicmida Themida sidecars
 
@@ -839,9 +776,7 @@ src/
 ├── tests/        Core test harness
 └── live/         Live probes and integration utilities
 app/              Tauri v2 supervisor and React/TypeScript frontend
-mapper/           Driver loader utility
-driver/slopdrvr/  Kernel driver sources
-tools/            Build, driver, Magicmida, and live-test scripts
+tools/            Build, Magicmida, and live-test scripts
 ```
 
 Frida lives in `slop_frida.dll` rather than `slop_core` because Frida's bundled
@@ -912,28 +847,6 @@ CMake uses `_ext/` with disconnected updates.
 
 Install Desktop development with C++, verify `vswhere.exe` exists under Visual
 Studio Installer, and ensure x64 C++ tools are selected.
-
-### `slop_mapper` does not link
-
-Install WDK 10.0.26100.0 or disable mapper for a user-mode build:
-
-```powershell
-cmake --preset ninja-msvc-release -S . -DSLOP_BUILD_MAPPER=OFF
-cmake --build --preset ninja-msvc-release
-```
-
-### Driver stays unavailable
-
-Check these files exist:
-
-```text
-build\mapper\slop_mapper.exe
-build\driver\slopdrvr.sys
-```
-
-Run elevated, inspect `build\mapper\slop_mapper_last.log`, and query
-`driver.status`. User-mode fallback is expected when mapper, driver, privilege,
-or compatible kernel support is unavailable.
 
 ### Port 8765 is busy
 

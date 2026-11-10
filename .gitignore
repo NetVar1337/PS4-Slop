@@ -1,0 +1,12 @@
+# Build output and downloaded dependencies (cmake populates _ext/ at configure
+# time; see README) must never be committed — a `git add -A` once swept in a
+# 314 MB frida-core.lib and GitHub's pre-receive hook rejected the push.
+/build/
+/_ext/
+/dist/
+
+# Tauri/React/Rust generated output
+app/node_modules/
+app/dist/
+app/src-tauri/target/
+app/src-tauri/tauri.build.conf.json

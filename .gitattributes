@@ -38,3 +38,9 @@
 *.ttf   binary
 *.woff  binary
 *.woff2 binary
+
+# Vendored deps and build output: leave the bytes alone. These trees are
+# downloaded/generated with their own line endings; forcing eol=lf on them
+# is what produced the CRLF warnings on every git operation.
+/_ext/  -text
+/build/ -text

@@ -1,13 +1,8 @@
 // src/tests/test_driver_abi.cpp
-// ABI parity between the user-mode voyager comm structs and the kernel
-// driver's request structs. The driver side is pinned at driver-build time
-// by static_asserts in driver/slopdrvr/src/function/Struct.h (the .sys link
-// fails if they drift); this file pins the user-mode side to the same
-// numbers so a UM edit can never silently desync the IOCTL wire format.
-//
-// The expected values below are transcribed from the driver's own
-// static_asserts and dispatcher constants — when a struct legitimately
-// changes, both sides change together or these tests fail loudly.
+// ABI pinning for the user-mode voyager comm structs: the expected values
+// below are transcribed from the driver-side static_asserts and dispatcher
+// constants — when a struct legitimately changes, the driver side changes
+// together with these numbers or these tests fail loudly.
 
 #include "harness.hpp"
 

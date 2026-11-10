@@ -57,10 +57,4 @@ if(SLOP_BUILD_TESTS)
     add_subdirectory(src/tests)
 endif()
 
-option(SLOP_BUILD_MAPPER "Build slop_mapper loader utility" ON)
-
-if(SLOP_BUILD_MAPPER)
-    add_subdirectory(mapper)
-endif()
-
 add_subdirectory(src/live)

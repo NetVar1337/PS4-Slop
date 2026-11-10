@@ -25,7 +25,7 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  # C++ engine + mapper only, no tests, no frontend.
+  # C++ engine only, no tests, no frontend.
   # Critical path: ~2-4 min warm (sccache + _ext hit) vs 5-8 min cold.
   cxx:
     runs-on: windows-2022
@@ -55,7 +55,7 @@ jobs:
 
       - name: build cxx (no tests, no frontend)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "reverse-slop-engine,slop_mapper" -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF"
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF"
 
       - name: sccache stats
         shell: pwsh
@@ -69,55 +69,6 @@ jobs:
           path: |
             build/src/engine/reverse-slop-engine.exe
             build/src/engine/slop_frida.dll
-            build/mapper/slop_mapper.exe
-          if-no-files-found: error
-
-  # Kernel driver only. Parallel with cxx (~1-2 min + kits).
-  driver:
-    runs-on: windows-2022
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-
-      - name: cache windows kits 26100
-        id: kits-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:/Program Files (x86)/Windows Kits/10/Include/10.0.26100.0
-            C:/Program Files (x86)/Windows Kits/10/Lib/10.0.26100.0
-            C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0
-          key: kits-26100-${{ runner.os }}-v1
-
-      - name: install windows sdk 26100
-        if: steps.kits-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          curl.exe -L -o sdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2338977"
-          $p = Start-Process -FilePath ".\sdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -WindowStyle Hidden -Wait -PassThru
-          if ($p.ExitCode -notin @(0, 3010)) { throw "sdksetup failed: $($p.ExitCode)" }
-
-      - name: install wdk 26100
-        if: steps.kits-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: |
-          curl.exe -L -o wdksetup.exe "https://go.microsoft.com/fwlink/?linkid=2335869"
-          $p = Start-Process -FilePath ".\wdksetup.exe" -ArgumentList "/q","/norestart","/ceip","off" -WindowStyle Hidden -Wait -PassThru
-          if ($p.ExitCode -notin @(0, 3010)) { throw "wdksetup failed: $($p.ExitCode)" }
-
-      - name: build driver
-        shell: pwsh
-        run: powershell -NoProfile -File tools\build_slopdrvr.ps1
-
-      - name: upload driver
-        uses: actions/upload-artifact@v4
-        with:
-          name: driver-artifact
-          path: build/driver/slopdrvr.sys
           if-no-files-found: error
 
   # Tests run parallel, never block the bundle.
@@ -237,7 +188,7 @@ jobs:
   frontend:
     runs-on: windows-2022
     timeout-minutes: 30
-    needs: [cxx, driver, frontend-build]
+    needs: [cxx, frontend-build]
     permissions:
       # write so a tag build can publish its release
       contents: write
@@ -285,16 +236,10 @@ jobs:
           name: cxx-artifacts
           path: _staging/cxx
 
-      - name: download driver artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: driver-artifact
-          path: _staging/driver
-
       - name: stage build tree for tauri resource map
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path build/src/engine, build/mapper, build/driver | Out-Null
+          New-Item -ItemType Directory -Force -Path build/src/engine | Out-Null
           # upload-artifact preserves subdirs (build/...) on some versions and
           # flattens on others — search recursively so both layouts work.
           function Find-Staged($root, $name) {
@@ -304,13 +249,11 @@ jobs:
           }
           Copy-Item -LiteralPath (Find-Staged _staging/cxx 'reverse-slop-engine.exe') -Destination build/src/engine/reverse-slop-engine.exe -Force
           Copy-Item -LiteralPath (Find-Staged _staging/cxx 'slop_frida.dll') -Destination build/src/engine/slop_frida.dll -Force
-          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'slop_mapper.exe') -Destination build/mapper/slop_mapper.exe -Force
-          Copy-Item -LiteralPath (Find-Staged _staging/driver 'slopdrvr.sys') -Destination build/driver/slopdrvr.sys -Force
-          Get-ChildItem build/src/engine, build/mapper, build/driver
+          Get-ChildItem build/src/engine
 
       - name: bundle precompiled frontend and native artifacts
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -BundleOnly -FastBundle -SkipDriver -Full -OnlineWebview
+        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -BundleOnly -FastBundle -Full -OnlineWebview
 
       - name: upload the portable app
         uses: actions/upload-artifact@v4
