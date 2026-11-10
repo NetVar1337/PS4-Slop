@@ -15,11 +15,3 @@ target_link_libraries(reverse-slop-engine PRIVATE slop_core)
 if(MSVC)
     target_compile_options(reverse-slop-engine PRIVATE /W4)
 endif()
-
-# slop_frida.dll is loaded from the exe's own directory, so every consumer exe
-# needs a copy beside it (same rule as src/app and tests)
-add_custom_command(TARGET reverse-slop-engine POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:slop_frida> $<TARGET_FILE_DIR:reverse-slop-engine>
-    COMMENT "copying slop_frida.dll next to reverse-slop-engine"
-)
