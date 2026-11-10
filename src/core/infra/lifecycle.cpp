@@ -76,23 +76,6 @@ void remove_endpoint() {
     std::filesystem::remove(path, ec);
 }
 
-// the mapper logs multi line, split it up
-std::vector<std::string> split_lines(const std::string& text) {
-    std::vector<std::string> out;
-    size_t begin = 0;
-    while (begin <= text.size()) {
-        const size_t nl = text.find('\n', begin);
-        std::string line = text.substr(
-            begin, nl == std::string::npos ? std::string::npos : nl - begin);
-        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
-            line.pop_back();
-        if (!line.empty()) out.push_back(std::move(line));
-        if (nl == std::string::npos) break;
-        begin = nl + 1;
-    }
-    return out;
-}
-
 void set_stage(stage_t s) {
     st().stage.store(static_cast<int>(s), std::memory_order_release);
     bus::publish("boot.stage",

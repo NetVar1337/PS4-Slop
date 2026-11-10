@@ -46,8 +46,12 @@
 #include "core/network/traffic_store.hpp"
 #include "core/persist/session_store.hpp"
 #include "core/process/heap_list.hpp"
+#include "core/process/handle_table.hpp"
 #include "core/process/module_dump.hpp"
+#include "core/process/module_table.hpp"
 #include "core/process/process_icon.hpp"
+#include "core/process/process_list.hpp"
+#include "core/process/thread_table.hpp"
 #include "core/re/rtti.hpp"
 #include "core/script/lua_engine.hpp"
 #include "core/util/fs_tools.hpp"
@@ -560,13 +564,21 @@ std::string resolve_enrich_name(uint64_t va, const enrich_ctx_t& ctx) {
 }
 
 std::string modoff_str(uint64_t va, const enrich_ctx_t& ctx) {
-    if (!ctx.have_image || ctx.image_name.empty()) return {};
-    if (va < ctx.image_base) return {};
-    if (ctx.image_size && va >= ctx.image_base + ctx.image_size) return {};
     char buf[32] = "";
-    std::snprintf(buf, sizeof(buf), "+0x%llX",
-                  static_cast<unsigned long long>(va - ctx.image_base));
-    return ctx.image_name + buf;
+    if (ctx.have_image && !ctx.image_name.empty() && va >= ctx.image_base &&
+        (!ctx.image_size || va < ctx.image_base + ctx.image_size)) {
+        std::snprintf(buf, sizeof(buf), "+0x%llX",
+                      static_cast<unsigned long long>(va - ctx.image_base));
+        return ctx.image_name + buf;
+    }
+    // outside the loaded image: resolve through the attached target's module
+    // table (warmed by target.modules / target.attach)
+    if (const auto* m = process::va_to_module(static_cast<uintptr_t>(va))) {
+        std::snprintf(buf, sizeof(buf), "+0x%llX",
+                      static_cast<unsigned long long>(va - m->base));
+        return std::string(m->name) + buf;
+    }
+    return {};
 }
 
 bool is_addr_key(const std::string& k) {
@@ -758,6 +770,8 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "dump_module") return "complete=false means unreadable spans were zero-filled (strict=false); verify imports with disasm.pe on the dumped file.";
         if (action == "threads") return "start is a VA (see start_hex); resolve owner function with disasm.functions or decomp.function.";
         if (action == "handles") return "count is returned rows, total is the full table; granted_access is a raw mask.";
+        if (action == "heaps") return "Local targets only. base is the heap base for heap_blocks; size is the heap segment size.";
+        if (action == "heap_blocks") return "heap_base comes from target.heaps; blocks are allocation records (address/size/flags), capped by max_blocks.";
         if (action == "ps4_connect") return "Connected to the console: target.list lists PS4 processes, then target.attach {pid}. Memory/disasm tools then read the console over ps4debug-NG.";
         if (action == "ps4_disconnect") return "Console connection dropped; backend is local again. Use target.list/attach for local processes.";
     } else if (tool == "memory") {
@@ -770,7 +784,8 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "live_crypto") return "Scans committed live memory (default is the loaded module range). Matches carry va_hex; cross-check constants with analyze.signatures.";
         if (action == "watch_add" || action == "watch_list") return "Poll watch_list to sample values; width is bytes. frozen_bits only applies when freeze=true.";
     } else if (tool == "disasm") {
-        if (action == "loaded") return "image.ready=false: load first. hype.ready=false: poll loaded until progress=1; blocks/globals/vtables/decomp all wait on it.";
+        if (action == "loaded") return "image.ready=false: load first. hype.ready=false: poll loaded until progress=1; blocks/globals/vtables/decomp all wait on it. hype.managed=true means a .NET assembly: disasm.managed lists types/methods/IL.";
+        if (action == "managed") return "managed=false: not a .NET/CLI image. Otherwise types_list (type_filter narrows), type={name} renders dnSpy-style C#, method_token=0x06xxxxxx renders the IL listing.";
         if (action == "functions") return "Pass a function-start va (see va_hex) to decomp.function, xray.cfg, or disasm.xrefs. total is the full index; returned==limit means truncated, raise limit to 10000.";
         if (action == "xrefs") return "from is the referencing instruction VA (see from_hex). kind call>jump>write>read>offset. Verify callers by disassembling from.";
         if (action == "strings") return "total_scanned is bytes scanned, not hits; truncated=true means limit was hit. Set include_exec=true to also scan code sections.";
@@ -1170,6 +1185,7 @@ json loaded_image_json() {
         hype["ready"]     = rdy;
         hype["progress"]  = bin.hype->progress();
         hype["arch"]      = arch_from_hype(bin.hype->db().arch);
+        hype["managed"]   = bin.hype->is_dotnet();
         if (rdy) {
             hype["functions"]       = bin.hype->db().funcs.size();
             hype["instructions"]    = bin.hype->db().insns.size();
@@ -1213,6 +1229,7 @@ json tool_target(const json& args) {
     const std::string action = require_action(args);
 
     if (action == "list") {
+        process::refresh_processes(); // warm the cached snapshot the ui reads (0 = rejected, ignore)
         auto res = runtime::active().enum_processes();
         if (!res.ok) fail("process enumeration failed");
         json arr = json::array();
@@ -1513,6 +1530,7 @@ json tool_target(const json& args) {
 
     if (action == "modules") {
         auto& s = need_session();
+        process::refresh_modules(); // warm cache for va_to_module + the ui (0 = rejected, ignore)
         auto res = runtime::active().enum_modules(s.handle());
         if (!res.ok) fail("module enumeration failed");
         json arr = json::array();
@@ -1580,6 +1598,7 @@ json tool_target(const json& args) {
         uint32_t pid = 0;
         if (args.contains("pid")) pid = static_cast<uint32_t>(parse_addr(args, "pid"));
         if (pid == 0) pid = need_session().pid();
+        process::refresh_threads(); // warm the cached snapshot the ui reads (0 = rejected, ignore)
         auto res = runtime::active().enum_threads(pid);
         if (!res.ok) fail("thread enumeration failed");
         json arr = json::array();
@@ -1612,6 +1631,7 @@ json tool_target(const json& args) {
 
     if (action == "handles") {
         auto& s = need_session();
+        process::refresh_handles(); // warm the cached snapshot the ui reads (0 = rejected, ignore)
         auto res = runtime::active().enum_handles(s.pid());
         if (!res.ok) fail("handle enumeration failed");
         json arr = json::array();
@@ -1625,6 +1645,43 @@ json tool_target(const json& args) {
             arr.push_back(std::move(o));
         }
         return {{"handles", arr}, {"count", arr.size()}, {"total", res.items.size()}};
+    }
+
+    if (action == "heaps" || action == "heap_blocks") {
+        // Toolhelp snapshots are a local user-mode API; the PS4 backend has no heaps
+        if (runtime::registry_ps4_active())
+            fail(action + " is local-only (Toolhelp heap snapshots); no PS4 backend support");
+        auto& s = need_session();
+        std::string err;
+        if (action == "heaps") {
+            auto heaps = process::list_heaps(s.pid(), &err);
+            if (heaps.empty() && !err.empty()) fail("heap enumeration failed: " + err);
+            json arr = json::array();
+            for (const auto& h : heaps) {
+                arr.push_back({{"base", h.base},
+                               {"size", h.size},
+                               {"flags", h.flags},
+                               {"entries_used_hint", h.entries_used_hint}});
+            }
+            return {{"heaps", arr}, {"count", arr.size()}};
+        }
+        if (!args.contains("heap_base")) fail("heap_blocks requires heap_base (from target.heaps)");
+        const uint64_t heap_base = parse_addr(args, "heap_base");
+        size_t max_blocks = 4096;
+        if (args.contains("max_blocks")) {
+            const uint64_t mb = parse_addr(args, "max_blocks");
+            if (mb == 0 || mb > 1048576) fail("max_blocks out of range (1..1048576)");
+            max_blocks = static_cast<size_t>(mb);
+        }
+        auto blocks = process::walk_heap_blocks(s.pid(), heap_base, &err, max_blocks);
+        if (blocks.empty() && !err.empty()) fail("heap block walk failed: " + err);
+        json arr = json::array();
+        for (const auto& b : blocks) {
+            arr.push_back({{"address", b.address},
+                           {"size", b.size},
+                           {"flags", b.flags}});
+        }
+        return {{"heap_base", heap_base}, {"blocks", arr}, {"count", arr.size()}};
     }
 
     if (action == "ps4_dump_module") {
@@ -1708,7 +1765,7 @@ json tool_target(const json& args) {
     }
 
     fail("target: unknown action (list|attach|detach|status|modules|"
-         "dump_module|ps4_dump_module|threads|regions|handles|icon|"
+         "dump_module|ps4_dump_module|threads|regions|handles|heaps|heap_blocks|icon|"
          "ps4_connect|ps4_disconnect|ps4_auto)");
 }
 
@@ -1847,6 +1904,7 @@ json tool_memory(const json& args) {
         return {{"active", g_scan.used},
                 {"pid", g_scan.pid},
                 {"width", g_scan.width},
+                {"engine_width", width_name(g_scan.engine.last_width())},
                 {"kind", g_scan.kind},
                 {"total", g_scan.engine.results().size()},
                 {"region_scan_active", g_scan.engine.region_scan_active()},
@@ -2441,7 +2499,7 @@ json tool_disasm(const json& args) {
         if (!known)
             fail("disasm: unknown action (assemble|disassemble|loaded|pe|functions|"
                  "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|unload|"
-                 "analyze_stop)");
+                 "analyze_stop|managed)");
     }
 
     if (action == "disassemble") {
@@ -2651,6 +2709,76 @@ json tool_disasm(const json& args) {
         return {{"stopped", true}, {"progress_at_stop", at},
                 {"note", "analysis cancelled, decompiler/analyzer actions "
                  "report not-ready; re-run disasm.load to restart analysis"}};
+    }
+
+    if (action == "managed") {
+        // .NET/CLI model of the loaded image, populated by hyperion when the
+        // PE carries a COR20 header (see hype.managed in disasm.loaded)
+        std::lock_guard lk(ds::state_mutex());
+        auto& bin = ds::get();
+        if (!bin.ready) fail("no image loaded (see disasm.loaded)");
+        if (!bin.hype)  fail("hyperion engine unavailable for this image");
+        if (!bin.hype->ready())
+            fail("analysis still running (poll disasm.loaded -> hype.ready)");
+        if (!bin.hype->is_dotnet())
+            return {{"managed", false},
+                    {"note", "loaded image is not a .NET/CLI assembly (no COR20 header)"}};
+        const auto& dn = bin.hype->dotnet().image();
+        json out = {{"managed", true},
+                    {"runtime_version", dn.runtime_version},
+                    {"assembly", dn.assembly_name},
+                    {"il_only", dn.il_only},
+                    {"entry_point_token", dn.entry_point_token},
+                    {"types", dn.types.size()},
+                    {"methods", dn.methods.size()},
+                    {"fields", dn.fields.size()},
+                    {"properties", dn.properties.size()},
+                    {"events", dn.events.size()}};
+        const uint64_t method_token =
+            args.contains("method_token") ? parse_addr(args, "method_token") : 0;
+        const std::string want_type = args.value("type", std::string{});
+        if (method_token != 0) {
+            const auto* m = dn.method_by_token(static_cast<uint32_t>(method_token));
+            if (!m) fail("method_token is not in the MethodDef table");
+            out["method"] = {{"token", m->token}, {"full_name", m->full_name},
+                             {"signature", m->signature}, {"entry", m->entry}};
+            out["il"] = bin.hype->dotnet().render_method(*m);
+        } else if (!want_type.empty()) {
+            const hype::DnType* t = nullptr;
+            for (const auto& c : dn.types)
+                if (icontains(c.full_name, want_type) || icontains(c.name, want_type)) {
+                    t = &c;
+                    break;
+                }
+            if (!t) fail("no TypeDef matches '" + want_type + "' (see types_list)");
+            out["type"] = {{"token", t->token}, {"full_name", t->full_name},
+                           {"kind", t->kind}, {"base_type", t->base_type},
+                           {"methods", t->method_tokens.size()},
+                           {"fields", t->field_tokens.size()},
+                           {"properties", t->property_tokens.size()},
+                           {"events", t->event_tokens.size()}};
+            out["csharp"] = bin.hype->dotnet().render_type_csharp(*t);
+        } else {
+            const std::string filter = args.value("type_filter", std::string{});
+            const size_t limit = std::min<size_t>(args.value("limit", 200u), 2000u);
+            json arr = json::array();
+            for (const auto& t : dn.types) {
+                if (!filter.empty() && !icontains(t.full_name, filter) &&
+                    !icontains(t.name, filter))
+                    continue;
+                arr.push_back({{"token", t.token},
+                               {"full_name", t.full_name},
+                               {"kind", t.kind},
+                               {"base_type", t.base_type},
+                               {"methods", t.method_tokens.size()},
+                               {"fields", t.field_tokens.size()}});
+                if (arr.size() >= limit) break;
+            }
+            out["types_list"] = arr;
+            out["count"]      = arr.size();
+            if (dn.types.size() > arr.size()) out["truncated"] = true;
+        }
+        return out;
     }
 
     // static actions over an image file
@@ -3058,7 +3186,7 @@ json tool_disasm(const json& args) {
 
     fail("disasm: unknown action (assemble|disassemble|loaded|pe|functions|"
          "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|unload|"
-         "analyze_stop)");
+         "analyze_stop|managed)");
 }
 
 // tool: debugger — PS4 live debugging (ps4debug-NG debug session on the console)
@@ -5600,116 +5728,6 @@ std::string assemble_one(const std::string& text, uint64_t addr,
     return "";
 }
 
-// ---- tool: dotnet ------------------------------------------------------
-// Structured view over the managed (.NET/CLI) model the analyzer builds:
-// the namespace/type/member tree, per-type and per-method detail, the IL
-// listing and the dnSpy-style C# rendering. All actions are read-only and
-// operate on the shared image; they require a managed image with completed
-// Hyperion analysis (disasm.loaded -> image.hype.ready=true).
-
-namespace {
-
-// A metadata token as both a decimal int and the conventional 8-hex-digit form.
-json token_json(uint32_t tok) {
-    return {{"token", tok}, {"token_hex", fmt::format("{:08X}", tok)}};
-}
-
-// Accept a token as an integer or a hex/decimal string ("0x06000001", "06000001", 100663297).
-uint32_t parse_token(const json& args) {
-    if (!args.contains("token")) fail("missing 'token' (a metadata token; see dotnet.tree / dotnet.type)");
-    const auto& t = args.at("token");
-    if (t.is_number_unsigned()) return t.get<uint32_t>();
-    if (t.is_number_integer())  return static_cast<uint32_t>(t.get<int64_t>());
-    if (t.is_string()) {
-        const std::string s = t.get<std::string>();
-        const bool hexish = s.rfind("0x", 0) == 0 || s.rfind("0X", 0) == 0 ||
-                            s.find_first_of("abcdefABCDEF") != std::string::npos;
-        return static_cast<uint32_t>(std::strtoul(s.c_str(), nullptr, hexish ? 16 : 10));
-    }
-    fail("'token' must be an integer or hex string");
-}
-
-const char* il_flow_name(hype::ILFlow f) {
-    switch (f) {
-    case hype::ILFlow::Branch: return "branch";
-    case hype::ILFlow::Cond:   return "cond";
-    case hype::ILFlow::Call:   return "call";
-    case hype::ILFlow::Return: return "return";
-    case hype::ILFlow::Throw:  return "throw";
-    case hype::ILFlow::Meta:   return "meta";
-    default:                   return "next";
-    }
-}
-
-// Compact member counts for a type (used by the tree without expanding it).
-json type_counts(const hype::DnType& t) {
-    return {{"fields", t.field_tokens.size()},
-            {"properties", t.property_tokens.size()},
-            {"events", t.event_tokens.size()},
-            {"methods", t.method_tokens.size()},
-            {"nested", t.nested_tokens.size()}};
-}
-
-// One node in the tree: identity + kind + counts + its nested types, recursively.
-json type_node(const hype::DnImage& im, const hype::DnType& t) {
-    json node = token_json(t.token);
-    node["name"]       = t.name;
-    node["full_name"]  = t.full_name;
-    node["kind"]       = t.kind;
-    node["visibility"] = t.visibility;
-    if (!t.base_type.empty()) node["base"] = t.base_type;
-    if (!t.interfaces.empty()) node["interfaces"] = t.interfaces;
-    node["counts"] = type_counts(t);
-    json nested = json::array();
-    for (uint32_t ntok : t.nested_tokens)
-        if (const hype::DnType* nt = im.type_by_token(ntok))
-            nested.push_back(type_node(im, *nt));
-    if (!nested.empty()) node["nested"] = std::move(nested);
-    return node;
-}
-
-// Wait (bounded, lock-free between checks) for analysis to land, then return the
-// locked binary. Fails soft so an agent can poll. Mirrors tool_decomp's guard.
-void dotnet_wait_ready() {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    for (;;) {
-        {
-            std::lock_guard lk(ds::state_mutex());
-            auto& bin0 = ds::get();
-            if (!bin0.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
-            if (bin0.format != disasm::image_format_t::pe) return;
-            if (!bin0.hype)  fail("hyperion engine unavailable for this image");
-            if (bin0.hype->ready()) break;
-            const std::string herr = bin0.hype->error();
-            if (!herr.empty())
-                fail("hyperion analysis not running, " + herr + " (re-run disasm.load)");
-        }
-        if (std::chrono::steady_clock::now() >= deadline)
-            fail("hyperion analysis still in progress, retry shortly (see disasm.loaded)");
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-}
-
-json method_summary(const hype::DnMethod& m) {
-    json o = token_json(m.token);
-    o["name"]       = m.name;
-    o["signature"]  = m.signature;
-    o["visibility"] = m.visibility;
-    o["ret"]        = m.ret_type;
-    o["static"]     = m.is_static;
-    if (m.is_abstract) o["abstract"] = true;
-    if (m.is_virtual)  o["virtual"]  = true;
-    if (m.is_ctor)     o["ctor"]     = true;
-    if (m.is_pinvoke)  o["pinvoke"]  = true;
-    const bool special = (m.flags & 0x0800) != 0;
-    if (special) o["special"] = true;
-    o["has_body"] = (m.rva != 0 && !m.il.empty());
-    o["il_count"] = m.il.size();
-    if (m.entry) { o["entry"] = m.entry; o["entry_hex"] = hex64(m.entry); }
-    return o;
-}
-
-} // anon
 
 json tool_decomp(const json& args) {
     const std::string action = require_action(args);
@@ -6075,23 +6093,7 @@ json tool_re(const json& args) {
         // plus limit/total so 600-class dumps stop truncating the session.
         const std::string filter = args.value("filter", std::string{});
         auto match_filter = [&](const std::string& a, const std::string& b) {
-            if (filter.empty()) return true;
-            auto contains_ci = [&](const std::string& hay) {
-                if (hay.size() < filter.size()) return false;
-                for (size_t i = 0; i + filter.size() <= hay.size(); ++i) {
-                    bool m = true;
-                    for (size_t k = 0; k < filter.size(); ++k) {
-                        if (std::tolower(static_cast<unsigned char>(hay[i + k])) !=
-                            std::tolower(static_cast<unsigned char>(filter[k]))) {
-                            m = false;
-                            break;
-                        }
-                    }
-                    if (m) return true;
-                }
-                return false;
-            };
-            return contains_ci(a) || contains_ci(b);
+            return filter.empty() || icontains(a, filter) || icontains(b, filter);
         };
         const size_t rtti_limit =
             std::min<size_t>(args.value("limit", 500u), 10000u);
@@ -7670,11 +7672,11 @@ json tool_guide(const json& args) {
 
 void list_tools(json& out) {
     const char* target_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","icon","ps4_connect","ps4_disconnect","ps4_auto","ps4_dump_module"]},"pid":{"type":"integer"},"host":{"type":"string"},"port":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"load":{"type":"boolean"},"strict":{"type":"boolean"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","heaps","heap_blocks","icon","ps4_connect","ps4_disconnect","ps4_auto","ps4_dump_module"]},"pid":{"type":"integer"},"host":{"type":"string"},"port":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"heap_base":{"type":"integer"},"max_blocks":{"type":"integer","minimum":1,"maximum":1048576},"load":{"type":"boolean"},"strict":{"type":"boolean"}},"required":["action"]})";
     const char* memory_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","aob","pointerscan","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"]},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"}},"required":["action"]})";
     const char* disasm_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop","managed"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"},"method_token":{"type":"integer"},"type":{"type":"string"},"type_filter":{"type":"string"}},"required":["action"]})";
     const char* debugger_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer"},"unique":{"type":"boolean"},"asm":{"type":"string"},"syntax":{"type":"string"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"}},"required":["action"]})";
     const char* xray_schema =

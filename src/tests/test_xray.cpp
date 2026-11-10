@@ -564,15 +564,6 @@ struct synth_pe {
         REQUIRE_LE(d, 127);
         return {0xEB, static_cast<uint8_t>(d)};
     }
-    // jz rel8 variant
-    std::vector<uint8_t> jz_rel8(uint64_t from_site, uint64_t target) {
-        const int64_t d = static_cast<int64_t>(target) -
-                          static_cast<int64_t>(from_site + 2);
-        REQUIRE_GE(d, -128);
-        REQUIRE_LE(d, 127);
-        return {0x74, static_cast<uint8_t>(d)};
-    }
-
     bool probe(uint64_t va, uint8_t* dst, size_t len) const {
         if (!pe.ok || va < base) return false;
         auto off = pe.rva_to_offset(static_cast<uint32_t>(va - base));

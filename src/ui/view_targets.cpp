@@ -4,6 +4,8 @@
 #include "ui/views_core.hpp"
 
 #include "core/infra/clock.hpp"
+#include "core/process/module_table.hpp"
+#include "core/process/process_list.hpp"
 #include "core/process/target_service.hpp"
 #include "core/process/module_dump.hpp"
 #include "core/disasm/binary_state.hpp"
@@ -34,11 +36,14 @@ using runtime::module_info_t;
 std::vector<process_info_t> g_procs;
 char                        g_filter_buf[64] = {};
 int64_t                     g_last_refresh_ms = 0;
+int64_t                     g_procs_sampled_ms = -1;
+uint32_t                    g_procs_inaccessible = 0;
 bool                        g_dirty           = true;
 uint32_t                    g_selected_pid    = 0;
 std::vector<module_info_t>  g_modules;
 uint32_t                    g_modules_pid = 0;
 int64_t                     g_modules_refresh_ms = 0;
+int64_t                     g_modules_sampled_ms = -1;
 
 std::string DumpPath(const module_info_t& module) {
     OPENFILENAMEA dialog{};
@@ -158,11 +163,21 @@ void Draw() {
 
     if (attached) {
         const int64_t now = infra::steady_ms();
-        if (g_modules_pid != session->pid() || now - g_modules_refresh_ms > 3000) {
-            auto modules = runtime::active().enum_modules(session->handle());
-            if (modules.ok) g_modules = std::move(modules.items);
+        if (g_modules_pid != session->pid()) {
+            // new target: drop the old table until its snapshot lands
+            g_modules.clear();
+            g_modules_sampled_ms = -1;
             g_modules_pid = session->pid();
+            g_modules_refresh_ms = 0;
+        }
+        if (now - g_modules_refresh_ms > 3000) {
+            process::refresh_modules(); // background job publishes into the shared cache
             g_modules_refresh_ms = now;
+        }
+        if (auto snap = process::cached_modules();
+            snap && snap->sampled_ms != g_modules_sampled_ms) {
+            g_modules = snap->items; // already sorted by base
+            g_modules_sampled_ms = snap->sampled_ms;
         }
 
         if (ImGui::Button("Refresh modules")) g_modules_refresh_ms = 0;
@@ -216,19 +231,23 @@ void Draw() {
         return;
     }
 
-    // Refresh logic
+    // Refresh logic: submit a background refresh on the 2s cadence, then adopt
+    // whatever immutable snapshot the job published (shared with the mcp tools)
     const int64_t now = infra::steady_ms();
     if (g_dirty || now - g_last_refresh_ms > 2000) {
-        auto res = runtime::active().enum_processes();
-        if (res.ok) {
-            g_procs = std::move(res.items);
-            std::sort(g_procs.begin(), g_procs.end(),
-                      [](const process_info_t& a, const process_info_t& b) {
-                          return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
-                      });
-        }
+        process::refresh_processes(true);
         g_last_refresh_ms = now;
         g_dirty = false;
+    }
+    if (auto snap = process::cached_processes();
+        snap && snap->sampled_ms != g_procs_sampled_ms) {
+        g_procs.assign(snap->items.begin(), snap->items.end());
+        std::sort(g_procs.begin(), g_procs.end(),
+                  [](const process_info_t& a, const process_info_t& b) {
+                      return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
+                  });
+        g_procs_sampled_ms = snap->sampled_ms;
+        g_procs_inaccessible = snap->inaccessible_count;
     }
 
     if (ImGui::Button("Refresh")) g_dirty = true;
@@ -237,15 +256,20 @@ void Draw() {
     ImGui::InputTextWithHint("##procfilter", "filter name or pid",
                              g_filter_buf, sizeof(g_filter_buf));
     ImGui::SameLine();
-    ImGui::TextDisabled("%d processes", static_cast<int>(g_procs.size()));
+    if (g_procs_inaccessible > 0)
+        ImGui::TextDisabled("%d processes (%u inaccessible)",
+                            static_cast<int>(g_procs.size()), g_procs_inaccessible);
+    else
+        ImGui::TextDisabled("%d processes", static_cast<int>(g_procs.size()));
 
-    if (ImGui::BeginTable("procs", 4,
+    if (ImGui::BeginTable("procs", 5,
                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("pid", ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableSetupColumn("name", ImGuiTableColumnFlags_WidthStretch, 3.0f);
         ImGui::TableSetupColumn("arch", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+        ImGui::TableSetupColumn("elev", ImGuiTableColumnFlags_WidthFixed, 55.0f);
         ImGui::TableSetupColumn("attach", ImGuiTableColumnFlags_WidthFixed, 70.0f);
         ImGui::TableHeadersRow();
 
@@ -260,6 +284,8 @@ void Draw() {
                 ImGui::SetTooltip("%s", p.path.c_str());
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", ArchName(p.arch));
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", ElevName(p.elevation));
             ImGui::TableNextColumn();
             ImGui::PushID(static_cast<int>(p.pid));
             if (ImGui::SmallButton("attach")) {

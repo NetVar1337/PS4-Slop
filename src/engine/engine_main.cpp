@@ -33,14 +33,6 @@ struct options_t {
     uint32_t parent_pid     = 0;       // watch this pid and exit when it dies
 };
 
-std::string exe_dir() {
-    char path[MAX_PATH]{};
-    ::GetModuleFileNameA(nullptr, path, MAX_PATH);
-    std::string p(path);
-    const size_t slash = p.find_last_of("\\/");
-    return slash == std::string::npos ? std::string(".") : p.substr(0, slash);
-}
-
 BOOL WINAPI ctrl_handler(DWORD type) {
     switch (type) {
     case CTRL_C_EVENT:

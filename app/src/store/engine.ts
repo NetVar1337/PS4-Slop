@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import * as events from "@/lib/events";
 import { call } from "@/lib/rpc";
-import { resolveEndpoint } from "@/lib/endpoint";
+import { resolveEndpoint, waitForEngine } from "@/lib/endpoint";
 import { useDisasm } from "@/store/disasm";
 
 export type BootStage = {
@@ -62,6 +62,10 @@ export const useEngine = create<EngineStore>((set) => ({
   start: () => starting ??= (async () => {
     set({ startupError: null });
     await resolveEndpoint();
+    // the endpoint can resolve before the engine accepts connections; gate the
+    // event stream on /health so the first connect does not race the listener
+    if (!(await waitForEngine(60_000)))
+      throw new Error("engine did not answer /health within 60s");
 
     const refreshStatus = async () => {
       try {

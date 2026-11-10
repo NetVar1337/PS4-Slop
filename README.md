@@ -319,7 +319,7 @@ wire; a hidden local user-mode backend remains for the automated test fixture.
 - Enumerate processes with icons and architecture/elevation metadata.
 - Attach/detach a shared target session.
 - Enumerate modules, threads, virtual-memory regions, heaps, heap blocks, and
-  handles.
+  handles (`target.heaps` / `target.heap_blocks` over MCP, local targets only).
 - Reconstruct a conventional PE from a mapped module (local Windows targets
   only; PS4 modules are ELF/SELF); strict mode rejects unreadable spans, while
   best-effort mode zero-fills them.
@@ -448,6 +448,10 @@ actions drive the payload's debug session live, no local target needed:
 - Fast synchronous Zydis function, xref, string, and PE indexes.
 - Background Hyperion recursive analysis with CFGs, globals, vtables, RTTI,
   names, PDB/FLIRT support, and progress/cancellation state.
+- .NET/CLI assemblies: `disasm.loaded` reports `hype.managed`, and
+  `disasm.managed` lists TypeDefs (`type_filter`), renders one type as
+  dnSpy-style C# (`type`), or dumps one method's ILDASM-style listing
+  (`method_token`).
 - x86/x64 disassembly and assembly.
 - PS4/Orbis ELF64 (SELF) static analysis: ELF loading, segment-backed section
   mapping, and SCE `PT_SCE_DYNLIBDATA` import extraction, so a dumped
@@ -716,9 +720,9 @@ operational guidance are returned by `tools/list`.
 
 | Tool | Actions |
 |---|---|
-| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_auto` |
+| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_auto`, `ps4_dump_module` |
 | `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set` |
-| `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop` |
+| `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed` |
 | `debugger` | `status`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call`, `ps4_bp_list`, `ps4_watch_list`, `ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps` |
 | `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
 | `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |

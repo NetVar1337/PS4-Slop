@@ -41,14 +41,6 @@ namespace {
 
 namespace lifecycle = slop::core::infra::lifecycle;
 
-std::string exe_dir_path() {
-    char path[MAX_PATH]{};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    std::string p(path);
-    const size_t slash = p.find_last_of("\\/");
-    return slash == std::string::npos ? "." : p.substr(0, slash);
-}
-
 void draw_loading_screen() {
     ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0));
