@@ -26,7 +26,6 @@
 #include "core/memory/watch_service.hpp"
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
-#include "core/runtime/driver_autoload.hpp"
 
 namespace slop::core::infra::lifecycle {
 
@@ -41,9 +40,7 @@ struct state_t {
     boot_result_t     result;
     std::atomic<int>  stage{0};
     std::atomic<bool> started{false};
-    std::atomic<bool> kernel_done{false};
     std::atomic<bool> torn_down{false};
-    std::thread       kernel_thread;
     int64_t           last_tick_ms = 0;
 };
 
@@ -161,7 +158,6 @@ const char* stage_label(stage_t s) noexcept {
     switch (s) {
     case stage_t::runtime_pool:     return "runtime pool & job queue";
     case stage_t::process_services: return "process / target services";
-    case stage_t::kernel_bridge:    return "kernel bridge (slopdrvr)";
     case stage_t::settings:         return "settings & session store";
     case stage_t::mcp_server:       return "mcp server";
     case stage_t::frontend:         return "interface";
@@ -205,77 +201,12 @@ void begin(config_t cfg) {
     set_stage(stage_t::process_services);
 
     process::target_init();
-    set_stage(stage_t::kernel_bridge);
-
-    bool want_driver = false;
-    std::string exe_dir;
-    {
-        std::lock_guard lk(s.mu);
-        want_driver = s.cfg.load_driver;
-        exe_dir     = s.cfg.exe_dir;
-    }
-
-    if (!want_driver) {
-        {
-            std::lock_guard lk(s.mu);
-            s.result.kernel_detail = "kernel bridge skipped by request";
-        }
-        runtime::registry_init();
-        s.kernel_done.store(true, std::memory_order_release);
-        return;
-    }
-
-    s.kernel_thread = std::thread([&s, exe_dir] {
-        auto report = runtime::driver_autoload::ensure_loaded_real(exe_dir);
-
-        // boot race where the old app unloads the driver right as we probe it, run the mapper again if the device vanished
-        if (report.was_loaded) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            if (!runtime::driver_autoload::ensure_loaded_real(exe_dir).was_loaded)
-                report = runtime::driver_autoload::ensure_loaded_real(exe_dir);
-        }
-
-        {
-            std::lock_guard lk(s.mu);
-            s.result.kernel_attempted = report.attempted;
-            if (report.was_loaded) {
-                s.result.kernel_detail = "slopdrvr already loaded";
-            } else if (report.ok) {
-                s.result.kernel_detail =
-                    "mapper run complete, device \\\\.\\slopdrvr present";
-            } else if (!report.error.empty()) {
-                s.result.kernel_detail = report.error;
-                if (!report.log_tail.empty())
-                    s.result.kernel_detail += "\n" + report.log_tail;
-            } else {
-                s.result.kernel_detail = "kernel bridge unavailable";
-            }
-            s.result.kernel_ok = report.ok || report.was_loaded;
-        }
-
-        // reprobe now that the device exists
-        runtime::registry_init();
-        s.kernel_done.store(true, std::memory_order_release);
-    });
+    runtime::registry_init();
+    set_stage(stage_t::settings);
 }
 
 stage_t advance() {
     state_t& s = st();
-
-    if (stage() == stage_t::kernel_bridge) {
-        if (!s.kernel_done.load(std::memory_order_acquire)) return stage();
-        std::string detail;
-        {
-            std::lock_guard lk(s.mu);
-            detail = s.result.kernel_detail;
-        }
-        for (const auto& line : split_lines(detail)) bus::output(line);
-        bus::output(std::string("backend: ") +
-                    (runtime::active_kind() == runtime::backend_kind_t::kernel
-                         ? "KERNEL (slopdrvr present)"
-                         : "USER-MODE (driver not loaded)"));
-        set_stage(stage_t::settings);
-    }
 
     if (stage() == stage_t::settings) {
         // probe before load creates the file or every run looks like the first
@@ -298,8 +229,8 @@ stage_t advance() {
         bus::output("disasm suite ready (zydis / functions / xrefs / strings / pe)");
         bus::output("analysis suites ready (emulation+taint / packer / signatures / decompiler)");
         bus::output("recon ready (rtti / vtables / danger imports / libsig / symbols)");
-        bus::output("network ready (wfp capture / proxy / pcap), persistence + scripting live");
-        bus::output("ready.");
+        bus::output("network ready (raw-socket capture / proxy / pcap), persistence + scripting live");
+        bus::output("ps4 toolkit ready: connect a console with target ps4_auto, then debugger ps4_* / guide get ps4_setup.");
         set_stage(stage_t::done);
     }
 
@@ -328,8 +259,7 @@ void tick() {
 
     bus::publish_changed("backend.changed",
                          json{{"badge", runtime::active_badge()},
-                              {"kernel", runtime::active_kind() ==
-                                             runtime::backend_kind_t::kernel}});
+                              {"ps4", runtime::registry_ps4_active()}});
 
     const auto hs = disasm::binary_state::hype_status();
     bus::publish_changed("hype.progress",
@@ -346,8 +276,6 @@ void shutdown() {
     state_t& s = st();
     if (s.torn_down.exchange(true)) return;
 
-    if (s.kernel_thread.joinable()) s.kernel_thread.join();
-
     remove_endpoint();
     mcp::stop();
     jobs::shutdown(1000);
@@ -355,26 +283,6 @@ void shutdown() {
     memory::watch::shutdown();
     process::target_shutdown();
     settings::save();
-
-    // unload the driver only if we are the one who loaded it
-    bool owns_driver = false;
-    {
-        std::lock_guard lk(s.mu);
-        owns_driver = s.cfg.load_driver;
-    }
-    if (!owns_driver) {
-        bus::output("kernel driver left loaded (not owned by this instance)");
-        bus::shutdown();
-        return;
-    }
-
-    // best effort, a failed unload just means the next boot finds it loaded
-    const auto rep = runtime::driver_autoload::request_driver_unload();
-    if (rep.was_loaded && rep.ok)
-        bus::output("kernel driver unloaded cleanly (service key removed)");
-    else if (rep.was_loaded)
-        bus::output("kernel driver unload failed: " + rep.error +
-                    ", driver stays loaded");
 
     bus::shutdown();
 }

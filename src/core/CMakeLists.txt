@@ -1,41 +1,3 @@
-# frida service DLL
-# frida-core's statically bundled GLib collides with unicorn's glib_compat
-# shim (duplicate g_* symbols) if both are linked into the same binary, so
-# the whole frida embed is isolated in its own DLL. Only the exported
-# frida_service_t API crosses the boundary
-add_library(slop_frida SHARED
-    frida/frida_service.hpp
-    frida/frida_service.cpp
-)
-target_include_directories(slop_frida PUBLIC "${CMAKE_SOURCE_DIR}/src")
-target_compile_definitions(slop_frida PRIVATE
-    SLOP_FRIDA_BUILD
-    NOMINMAX
-    WIN32_LEAN_AND_MEAN
-    _CRT_SECURE_NO_WARNINGS
-)
-# frida-core.h emits #pragma comment(lib, ...) defaultlib records, give the
-# linker a search path so the bare "frida-core.lib" name resolves
-target_link_directories(slop_frida PRIVATE "${SLOP_FRIDA_DIR}")
-target_link_libraries(slop_frida PRIVATE frida::core setupapi nlohmann_json::nlohmann_json)
-if(MSVC)
-    target_compile_options(slop_frida PRIVATE /W4 /EHsc)
-endif()
-# The DLL must sit next to every consumer exe (Windows loads from the exe's
-# directory, not the DLL's build dir)
-add_custom_command(TARGET slop_frida POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/src/app"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/tests"
-    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/live"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:slop_frida> "${CMAKE_BINARY_DIR}/src/app"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:slop_frida> "${CMAKE_BINARY_DIR}/tests"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            $<TARGET_FILE:slop_frida> "${CMAKE_BINARY_DIR}/live"
-    COMMENT "copying slop_frida.dll next to consumer exes"
-)
-
 add_library(slop_core STATIC
     infra/capability.hpp
     infra/published.hpp
@@ -103,8 +65,6 @@ add_library(slop_core STATIC
     re/rtti.cpp
     re/type_catalog.hpp
     re/type_catalog.cpp
-    detect/security.hpp
-    detect/security.cpp
     process/heap_list.hpp
     process/heap_list.cpp
     infra/deferred.hpp
@@ -117,14 +77,6 @@ add_library(slop_core STATIC
     network/web_fetch.cpp
     network/mitm_pki.hpp
     network/mitm_pki.cpp
-    runtime/kernel_symbols.hpp
-    runtime/kernel_symbols.cpp
-    runtime/driver_autoload.hpp
-    runtime/driver_autoload.cpp
-    runtime/kernel_service.hpp
-    runtime/kernel_service.cpp
-    runtime/kernel_injector.hpp
-    runtime/kernel_injector.cpp
     script/lua_engine.hpp
     script/lua_engine.cpp
     emu/taint.hpp
@@ -151,33 +103,21 @@ add_library(slop_core STATIC
     disasm/binary_state.cpp
     disasm/hyperion_session.hpp
     disasm/hyperion_session.cpp
-    debugger/debugger.hpp
-    debugger/debugger.cpp
     debugger/callstack.hpp
     debugger/callstack.cpp
     runtime/context.hpp
-    runtime/nt_api.hpp
-    runtime/nt_api.cpp
     runtime/backend.hpp
     runtime/backend_usermode.hpp
     runtime/backend_usermode.cpp
     runtime/backend_registry.hpp
     runtime/backend_registry.cpp
-    runtime/backend_kernel.hpp
-    runtime/backend_kernel.cpp
     runtime/ps4_protocol.hpp
     runtime/backend_ps4.hpp
     runtime/backend_ps4.cpp
     runtime/scan_bridge.hpp
     runtime/scan_bridge.cpp
-    runtime/voyager_comm.cpp
-    runtime/voyager_syscall.asm
-    runtime/identity.hpp
-    runtime/identity.cpp
     runtime/session.hpp
     runtime/session.cpp
-    runtime/privilege.hpp
-    runtime/privilege.cpp
     process/process_list.hpp
     process/process_list.cpp
     process/process_icon.hpp
@@ -200,11 +140,6 @@ add_library(slop_core STATIC
     infra/mcp_onboard.cpp
 )
 
-set_source_files_properties(runtime/voyager_syscall.asm PROPERTIES
-    COMPILE_OPTIONS ""
-    COMPILE_DEFINITIONS ""
-)
-
 target_include_directories(slop_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
 
 # Deliberately NOT slop_imgui, core must never see ImGui headers
@@ -222,7 +157,6 @@ target_link_libraries(slop_core PRIVATE
     slop_sqlite
     slop_lua
     ws2_32
-    slop_frida
 )
 
 target_compile_definitions(slop_core PUBLIC

@@ -28,7 +28,6 @@ namespace control   = slop::core::infra::app_control;
 namespace bus       = slop::core::infra::event_bus;
 
 struct options_t {
-    bool     load_driver    = true;
     bool     mcp_onboarding = true;
     bool     quiet          = false;   // quiet the mirrored output
     uint32_t parent_pid     = 0;       // watch this pid and exit when it dies
@@ -68,8 +67,7 @@ options_t parse_args(int argc, char** argv) {
     options_t o;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
-        if (std::strcmp(a, "--no-driver") == 0)        o.load_driver = false;
-        else if (std::strcmp(a, "--no-onboard") == 0)  o.mcp_onboarding = false;
+        if (std::strcmp(a, "--no-onboard") == 0)  o.mcp_onboarding = false;
         else if (std::strcmp(a, "--quiet") == 0)       o.quiet = true;
         else if (std::strcmp(a, "--port") == 0 && i + 1 < argc)
             ::SetEnvironmentVariableA("SLOP_MCP_PORT", argv[++i]);
@@ -94,7 +92,7 @@ int main(int argc, char** argv) {
 
     ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
-    // the parent holds a driver open through us so a dead ui still needs the clean exit, the job object is just the backstop
+    // exit when the parent ui dies, the job object is just the backstop
     HANDLE parent = nullptr;
     if (opts.parent_pid != 0) {
         parent = ::OpenProcess(SYNCHRONIZE, FALSE, opts.parent_pid);
@@ -104,8 +102,6 @@ int main(int argc, char** argv) {
     }
 
     lifecycle::config_t cfg;
-    cfg.exe_dir        = exe_dir();
-    cfg.load_driver    = opts.load_driver;
     cfg.mcp_onboarding = opts.mcp_onboarding;
     lifecycle::begin(std::move(cfg));
 

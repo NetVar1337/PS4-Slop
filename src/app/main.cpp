@@ -107,33 +107,6 @@ void draw_loading_screen() {
     const auto boot = lifecycle::result();
     const auto cur  = lifecycle::stage();
 
-    auto kernel_row = [&]() -> const char* {
-        if (static_cast<int>(cur) > static_cast<int>(lifecycle::stage_t::kernel_bridge))
-            return boot.kernel_ok ? "ok" : "fail";
-        return lifecycle::stage_status(lifecycle::stage_t::kernel_bridge);
-    };
-
-    row(lifecycle::stage_label(lifecycle::stage_t::runtime_pool),
-        lifecycle::stage_status(lifecycle::stage_t::runtime_pool));
-    row(lifecycle::stage_label(lifecycle::stage_t::process_services),
-        lifecycle::stage_status(lifecycle::stage_t::process_services));
-
-    {
-        const char* st = kernel_row();
-        char label[160];
-        std::snprintf(label, sizeof(label), "kernel bridge (slopdrvr)%s",
-                      boot.kernel_attempted ? ", running mapper..." : "");
-        if (std::strcmp(st, "ok") == 0)
-            ImGui::TextColored(ImVec4(0.45f, 0.85f, 0.50f, 1.0f),
-                               "[ ok ] %s", label);
-        else if (std::strcmp(st, "fail") == 0)
-            ImGui::TextColored(ImVec4(0.90f, 0.40f, 0.38f, 1.0f),
-                               "[ !! ] %s", label);
-        else
-            ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.35f, 1.0f),
-                               "[ .. ] %s", label);
-    }
-
     row(lifecycle::stage_label(lifecycle::stage_t::settings),
         lifecycle::stage_status(lifecycle::stage_t::settings));
     row(lifecycle::stage_label(lifecycle::stage_t::mcp_server),
@@ -142,22 +115,12 @@ void draw_loading_screen() {
         lifecycle::stage_status(lifecycle::stage_t::frontend));
 
     ImGui::Spacing();
-    if (!boot.kernel_detail.empty()) {
-        ImGui::PushFont(mono);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.65f, 0.65f, 0.68f, 1.0f));
-        ImGui::TextWrapped("%s", boot.kernel_detail.c_str());
-        ImGui::PopStyleColor();
-        ImGui::PopFont();
-    }
-
     const float frac = static_cast<float>(static_cast<int>(cur)) /
                        static_cast<float>(lifecycle::kStageCount);
     ImGui::SetCursorPosY(size.y - 46.0f);
     ImGui::ProgressBar(frac, ImVec2(-1, 0), "");
     if (boot.first_run)
-        ImGui::TextDisabled(
-            "first launch: windows asks for administrator consent so the "
-            "kernel bridge can load");
+        ImGui::TextDisabled("first launch: mcp endpoint registered into ai clients");
     else
         ImGui::TextDisabled("loading...");
 
@@ -403,7 +366,6 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int n_cmd_show) {
 
     {
         slop::core::infra::lifecycle::config_t cfg;
-        cfg.exe_dir = exe_dir_path();
         slop::core::infra::lifecycle::begin(std::move(cfg));
     }
 

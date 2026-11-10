@@ -2,7 +2,6 @@
 
 // src/core/infra/lifecycle.hpp
 // the boot and shutdown state machine, any shell can drive it
-// boot is staged because the driver mapper pops uac and takes a while
 
 #include <cstdint>
 #include <string>
@@ -12,7 +11,6 @@ namespace slop::core::infra::lifecycle {
 enum class stage_t : int {
     runtime_pool = 0,
     process_services,
-    kernel_bridge,
     settings,
     mcp_server,
     // not interface because windows.h defines it as a macro and it wrecks the enum
@@ -29,26 +27,17 @@ const char* stage_label(stage_t s) noexcept;
 const char* stage_status(stage_t row) noexcept;
 
 struct config_t {
-    // where the mapper and driver live
-    std::string exe_dir;
-
-    // skip the kernel bridge when knowingly unelevated, no point stalling on uac
-    bool load_driver = true;
-
     // register the mcp endpoint into ai clients on first run
     bool mcp_onboarding = true;
 };
 
 struct boot_result_t {
-    bool        kernel_attempted = false;   // mapper actually ran
-    bool        kernel_ok        = false;   // \\.\slopdrvr present afterwards
-    std::string kernel_detail;              // mapper story for the splash
     bool        mcp_ok           = false;
     uint16_t    mcp_port         = 0;
     bool        first_run        = false;   // no prior settings on disk
 };
 
-// starts the sequence, the kernel stage keeps going on its own thread
+// starts the sequence
 void begin(config_t cfg);
 
 // call once per loop, done means booted

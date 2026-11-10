@@ -1,7 +1,7 @@
 #pragma once
 
 // src/core/runtime/backend.hpp
-// one interface, two implementations, user mode and kernel
+// one interface: local user mode (test lab) and the remote PS4 console
 
 #include <cstdint>
 #include <string>
@@ -12,9 +12,8 @@ namespace slop::core::runtime {
 // enums
 
 enum class backend_kind_t : uint8_t {
-    user_mode,
-    kernel,
-    ps4   // remote console over ps4debug-NG
+    user_mode,   // local process (internal test lab only)
+    ps4          // remote console over ps4debug-NG
 };
 
 enum class arch_t : uint8_t {
