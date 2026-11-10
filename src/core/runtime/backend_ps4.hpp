@@ -100,6 +100,106 @@ public:
     bool                     ps4_wait_event(ps4_event_t& out, int timeout_ms);
     std::vector<ps4_event_t> ps4_drain_events(size_t max, bool clear);
 
+    // ---- console-side capabilities (ps4debug-NG) ---------------------------
+
+    // CMD_PROC_AUTH challenge-response (the payload's keystream is four LFSRs
+    // seeded 200/300/400/500 - see debugger/source/proc.c auth_lfsr_next).
+    // Run automatically on connect; bit 1 (0x2) unlocks the scan family.
+    bool ps4_auth(uint32_t flags, std::string& err);
+    bool ps4_authed() const noexcept;
+
+    // one scan hit: absolute address plus the raw value bytes found there
+    struct ps4_scan_hit_t {
+        uint64_t              addr = 0;
+        std::vector<uint8_t>  value;
+    };
+    // SCAN_START: seed scan of [addr, addr+len). compare/data per the
+    // kVal*/kCmp* constants in ps4_protocol.hpp; data carries lenData bytes
+    // (two values for kCmpBetween). Fills hits; ok=false on wire/protocol error
+    io_result_t ps4_scan_first(uint32_t pid, uint64_t addr, uint32_t len,
+                               uint8_t valtype, uint8_t cmptype, uint8_t alignment,
+                               const std::vector<uint8_t>& data,
+                               std::vector<ps4_scan_hit_t>& hits);
+    // SCAN_COUNT: narrow previous hits (offsets relative to base) with a new
+    // comparison. prev entries carry the value bytes when the compare type
+    // needs the previous value
+    io_result_t ps4_scan_next(uint32_t pid, uint64_t base,
+                              uint8_t valtype, uint8_t cmptype,
+                              const std::vector<ps4_scan_hit_t>& prev,
+                              const std::vector<uint8_t>& data,
+                              std::vector<ps4_scan_hit_t>& hits);
+    // legacy whole-memory single-pass scan (CMD_PROC_SCAN)
+    io_result_t ps4_scan_all(uint32_t pid, uint8_t valtype, uint8_t cmptype,
+                             const std::vector<uint8_t>& data,
+                             std::vector<uint64_t>& addrs);
+    // array-of-bytes scan over [addr, addr+len); mask byte 1 = exact, 0 = wildcard.
+    // Returns the max_matches-th match (0 if none / invalidated)
+    io_result_t ps4_scan_aob(uint32_t pid, uint64_t addr, uint32_t len,
+                             const std::vector<uint8_t>& pattern,
+                             const std::vector<uint8_t>& mask,
+                             uint8_t max_matches, uint8_t stop_flag,
+                             uint64_t& out_addr);
+
+    // one on-device decoded instruction (CMD_PROC_DISASM_REGION)
+    struct ps4_disasm_entry_t {
+        uint64_t addr = 0;
+        uint64_t rip_rel_target = 0;
+        int64_t  mem_disp = 0;
+        uint8_t  length = 0;
+        uint8_t  kind = 0;          // ps4::disasm_instr_entry_t kind bits
+        uint8_t  mem_base_reg = 0;
+        uint8_t  mem_index_reg = 0;
+        uint8_t  mem_scale = 0;
+        uint8_t  mnemonic_lo = 0;
+    };
+    io_result_t ps4_disasm_region(uint32_t pid, uint64_t addr, uint32_t len,
+                                  uint32_t max_entries,
+                                  std::vector<ps4_disasm_entry_t>& out);
+    // RIP-relative branch/call targets inside [addr, addr+len)
+    io_result_t ps4_extract_xrefs(uint32_t pid, uint64_t addr, uint32_t len,
+                                  uint32_t max_instrs, std::vector<uint64_t>& targets);
+    // addresses inside [addr, addr+len) that branch/call target
+    io_result_t ps4_find_xrefs_to(uint32_t pid, uint64_t addr, uint32_t len,
+                                  uint64_t target, std::vector<uint64_t>& addrs);
+
+    // one server-side stack frame from CMD_PROC_READ_STACK
+    struct ps4_stack_frame_t {
+        uint64_t rbp = 0, rsp = 0, saved_rbp = 0, ret_addr = 0;
+        uint32_t flags = 0;                 // bit0: frame locals omitted
+        std::vector<uint8_t> locals;        // rsp..rbp bytes when present
+        std::vector<uint8_t> code;          // window around ret_addr
+    };
+    io_result_t ps4_read_stack(uint32_t pid, uint64_t rbp, uint64_t rsp,
+                               uint32_t depth, std::vector<ps4_stack_frame_t>& frames);
+
+    // on-device Keystone assemble (0xBDAA0024); syntax 0 = default (Intel)
+    io_result_t ps4_assemble(uint64_t base_addr, uint32_t syntax,
+                             const std::string& asm_text,
+                             std::vector<uint8_t>& out_bytes, uint32_t& insn_count,
+                             std::string& asm_err);
+
+    // upload an ELF to the console process: load+run (entry jump) or RPC
+    // (returns entry address without jumping)
+    io_result_t ps4_elf_load(uint32_t pid, const std::vector<uint8_t>& elf);
+    io_result_t ps4_elf_rpc(uint32_t pid, const std::vector<uint8_t>& elf, uint64_t& entry);
+
+    // console feedback: on-screen notification / kernel log print /
+    // foreground game metadata
+    io_result_t ps4_console_notify(uint32_t message_type, const std::string& text);
+    io_result_t ps4_console_print(const std::string& text);
+    struct ps4_app_info_t {
+        uint32_t pid = 0;
+        std::string titleid, contentid, name, app_ver;
+    };
+    io_result_t ps4_foreground_app(ps4_app_info_t& out);
+
+    // extra register sets while a debug session is attached
+    io_result_t ps4_get_fpregs(uint32_t lwpid, uint8_t out[832]);
+    io_result_t ps4_set_fpregs(uint32_t lwpid, const uint8_t* data, uint32_t len);
+    io_result_t ps4_set_dbregs(uint32_t lwpid, const uint8_t dr[128]);
+    io_result_t ps4_get_fsgsbase(uint32_t lwpid, uint64_t& fs_base, uint64_t& gs_base);
+    io_result_t ps4_set_fsgsbase(uint32_t lwpid, uint64_t fs_base, uint64_t gs_base);
+
 private:
     struct impl_t;
     std::unique_ptr<impl_t> m_impl;
