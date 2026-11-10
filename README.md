@@ -66,7 +66,7 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Unpacking and devirtualization:** Magicmida Themida sidecars, VM handler and
   opcode-map recovery, trace/lift/pseudocode flows, CFG recovery, predicate
   proofs, invariants, and IAT auditing.
-- **Agent-native control:** 20 MCP-visible domain tools with consolidated
+- **Agent-native control:** 25 MCP-visible domain tools with consolidated
   `action` parameters, task playbooks via `guide`, plus an `/api`-only
   application-control tool and SSE events.
 

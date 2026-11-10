@@ -19,6 +19,7 @@ add_executable(slop_tests
     test_re.cpp
     test_script.cpp
     test_module_dump.cpp
+    test_process_tables.cpp
     test_decomp.cpp
     test_hyperion.cpp
     test_detect_fs.cpp

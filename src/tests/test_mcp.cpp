@@ -817,9 +817,26 @@ TEST_CASE(mcp_emulate_file_addr_runs_past_the_slice_on_rebased_image) {
     REQUIRE_STR_EQ(preferred.value("stopped_reason", "").c_str(),
                    rebased.value("stopped_reason", "?").c_str());
 
-    // per-import returns, unmatched keys reported back
+    // per-import returns, unmatched keys reported back. The CRT's security
+    // cookie init calls a critical-section import whose exact name depends on
+    // the toolset (InitializeCriticalSectionAndSpinCount on older CRTs,
+    // InitializeCriticalSectionEx on current ones), so take the name from the
+    // image's own import table instead of hard-coding it
+    std::string cs_init = "InitializeCriticalSectionEx";
+    {
+        REQUIRE(ds::load_file(SLOP_TARGET_EXE_PATH, kBase));
+        {
+            std::lock_guard lk(ds::state_mutex());
+            for (const auto& dll : ds::get().pe.imports)
+                for (const auto& fn : dll.functions)
+                    if (!fn.by_ordinal &&
+                        fn.name.find("InitializeCriticalSection") != std::string::npos)
+                        cs_init = fn.name;
+        }
+        ds::unload();
+    }
     const auto [b2, tuned] = run_entry(kBase, {{"api_returns",
-        {{"InitializeCriticalSectionAndSpinCount", 1}, {"nope.dll!Missing", -1}}}});
+        {{cs_init, 1}, {"nope.dll!Missing", -1}}}});
     REQUIRE_EQ(tuned.at("api_returns_unmatched").size(), 1u);
     REQUIRE_STR_EQ(tuned.at("api_returns_unmatched").at(0).get<std::string>().c_str(),
                    "nope.dll!missing");

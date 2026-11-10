@@ -1,6 +1,8 @@
 #include "core/runtime/session.hpp"
 #include "core/runtime/backend_registry.hpp"
 
+#include "core/infra/clock.hpp"
+
 namespace slop::core::runtime {
 
 session_t::~session_t() {
@@ -39,7 +41,7 @@ bool session_t::open(uint32_t pid) {
         }
         m_info.pid = pid;
     }
-    m_epoch_ms = 0; // TODO: use steady_ms()
+    m_epoch_ms = infra::steady_ms();
     return true;
 }
 
