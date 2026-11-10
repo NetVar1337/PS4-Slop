@@ -1007,25 +1007,23 @@ TEST_CASE(ps4_mcp_debugger_flow) {
     auto s = slop::core::process::active_session();
     REQUIRE(s && s->valid());
 
-    // seed an rbp frame chain at the default rbp 0x7FFF00007FF0:
-    //   [0x7FFF00007FF0] = 0x7FFF00007F00   [0x7FFF00007FF8] = ret 0x400111
-    //   [0x7FFF00007F00] = 0                [0x7FFF00007F08] = ret 0x400222
+    // seed an rbp frame chain at the default rbp 0x7FFF00007FF0 (caller frames
+    // live at higher addresses, the chain must ascend):
+    //   [0x7FFF00007FF0] = 0x7FFF00008100   [0x7FFF00007FF8] = ret 0x400111
+    //   [0x7FFF00008100] = 0                [0x7FFF00008108] = ret 0x400222
     {
-        uint64_t v = 0x7FFF00007F00ull;
+        uint64_t v = 0x7FFF00008100ull;
         REQUIRE(s->write(0x7FFF00007FF0, &v, sizeof(v)).ok);
         v = 0x400111;
         REQUIRE(s->write(0x7FFF00007FF8, &v, sizeof(v)).ok);
         v = 0;
-        REQUIRE(s->write(0x7FFF00007F00, &v, sizeof(v)).ok);
+        REQUIRE(s->write(0x7FFF00008100, &v, sizeof(v)).ok);
         v = 0x400222;
-        REQUIRE(s->write(0x7FFF00007F08, &v, sizeof(v)).ok);
+        REQUIRE(s->write(0x7FFF00008108, &v, sizeof(v)).ok);
     }
 
     auto dbg = [](const json& args, bool& is_err) {
-        std::fprintf(stderr, "  [trace] debugger.%s\n", args.value("action", "?").c_str());
-        auto r = slop::core::mcp::call_tool("debugger", args, is_err);
-        std::fprintf(stderr, "  [trace]   -> err=%d %s\n", (int)is_err, is_err ? r.dump().c_str() : "ok");
-        return r;
+        return slop::core::mcp::call_tool("debugger", args, is_err);
     };
     bool e = false;
 

@@ -287,7 +287,13 @@ private:
             uint8_t buf[0x8000];
             while (!stop_) {
                 int n = ::recv(c, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-                if (n <= 0) break;
+                if (n == 0) break;   // server closed the event connection
+                if (n < 0) {
+                    // the recv timeout exists only to notice stop_; keep the
+                    // connection open so later events from the payload arrive
+                    if (WSAGetLastError() == WSAETIMEDOUT) continue;
+                    break;
+                }
                 events_.fetch_add(1);
                 acc.insert(acc.end(), buf, buf + n);
                 while (acc.size() >= ps4::kDebugEventSize) {

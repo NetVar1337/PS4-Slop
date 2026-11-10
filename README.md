@@ -41,7 +41,10 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Remote PS4 targets:** connect directly to a console running the
   [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload (TCP 744) and
   use the same process list, attach, memory read/write/scan, regions, modules,
-  threads, and register tools against the console as against a local process.
+  threads, and register tools against the console as against a local process —
+  plus live remote debugging: breakpoints, watchpoints, continue/step, stop
+  events, register get/set, callstacks, and remote function calls on the
+  console via the `debugger` tool's `ps4_*` actions.
 - **Live process analysis:** processes, modules, threads, regions, handles,
   module dumping, memory scans, watchlists, snapshots, pointer scans, and AOB
   searches.
@@ -362,6 +365,36 @@ callback) through a dedicated `PS4` backend:
   session is attached.
 - PS4 modules are ELF/SELF, not PE, so `dump_module`/PE loading stay local-only;
   analyze live addresses with `disasm.disassemble` and `memory.read` instead.
+
+### Live debugging on the PS4 (ps4debug-NG)
+
+With a console connected (`target.ps4_connect`), the `debugger` tool's `ps4_*`
+actions drive the payload's debug session live, no local target needed:
+
+- `ps4_attach {pid}` / `ps4_detach` / `ps4_status` manage the debug session
+  (the engine accepts the payload's port-755 event connection automatically).
+- `ps4_bp_set {addr, index?}` / `ps4_bp_clear {addr|index}` arm software INT3
+  breakpoints (slots 0-29 auto-allocated client-side, since the payload has no
+  query command); `ps4_watch_set {addr, len=1|2|4|8, type=0|1|3, index?}` /
+  `ps4_watch_clear` arm hardware DR0-DR3 watchpoints (type 0=exec, 1=write,
+  3=read/write).
+- `ps4_continue {stop}` resumes the debuggee (stop 0=resume, 1=SIGSTOP,
+  2=SIGKILL); `ps4_step {lwpid?}` single-steps (0/absent = all threads);
+  `ps4_suspend`/`ps4_resume {lwpid}` freeze one thread; `ps4_process_stop
+  {state}` signals the whole process.
+- Every stop (breakpoint hit, watchpoint hit, step, signal) arrives as a
+  0x4A0-byte event packet on port 755 and is queued: `ps4_wait {timeout_ms}`
+  blocks for the next one (returns the full register set, signal, thread
+  name, and DR registers), `ps4_events {max, clear}` drains the queue.
+- `ps4_regs {lwpid}` / `ps4_set_reg {lwpid, name, value}` read or write one
+  register (`rax`..`r15`, `rip`, `rsp`, `rbp`, `flags`); `ps4_dbregs {lwpid}`
+  dumps DR0-DR7+; `ps4_callstack {lwpid, depth}` walks the rbp frame chain via
+  live memory reads.
+- `ps4_call {addr, args[6]}` installs the payload's RPC stub once per process
+  (`CMD_PROC_INTALL`) and calls any address in the console process with up to
+  six arguments (rdi, rsi, rdx, rcx, r8, r9), returning `rax` — remote function
+  calls for dynamic analysis, e.g. resolving a function live and calling it
+  with crafted arguments.
 
 ### Static analysis and decompilation
 
@@ -688,7 +721,7 @@ operational guidance are returned by `tools/list`.
 | `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon`, `ps4_connect`, `ps4_disconnect` |
 | `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set` |
 | `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop` |
-| `debugger` | `attach`, `detach`, `status`, `suspend_all`, `resume_all`, `bp_set`, `bp_clear`, `continue`, `step_into`, `step_over`, `step_out`, `wait_halt`, `regs`, `events`, `callstack`, `seh`, `set_register`, `watchpoint_set`, `watchpoint_clear`, `watchpoints`, `trace_run` |
+| `debugger` | `attach`, `detach`, `status`, `suspend_all`, `resume_all`, `bp_set`, `bp_clear`, `continue`, `step_into`, `step_over`, `step_out`, `wait_halt`, `regs`, `events`, `callstack`, `seh`, `set_register`, `watchpoint_set`, `watchpoint_clear`, `watchpoints`, `trace_run`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call` |
 | `driver` | `status`, `backend`, `kernel_modules`, `dump_driver`, `kernel_read`, `kernel_write`, `kernel_search`, `call`, `v2p`, `ssdt`, `peb`, `resolve_export`, `windows`, `find_references`, `heap_walk`, `heap_blocks`, `defer_call`, `defer_list`, `defer_execute`, `defer_results`, `defer_cancel`, `symbols_load`, `symbols_lookup`, `symbols_nearest`, `anti_debug_spoof`, `sandbox_protect`, `sandbox_unprotect`, `log_config`, `read_teb`, `peb_modules`, `integrity_checks`, `sniff_buffers` |
 | `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
 | `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |

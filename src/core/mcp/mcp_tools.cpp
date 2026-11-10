@@ -2905,7 +2905,9 @@ json ps4_ctx_json(const runtime::thread_context_t& c) {
 json ps4_event_json(const runtime::ps4_event_t& e) {
     json o = {{"lwpid", e.lwpid}, {"signal", e.signal}, {"status", e.status},
               {"thread", e.thread_name}};
-    for (auto& kv : ps4_ctx_json(e.ctx).items()) o[kv.key()] = kv.value();
+    // name the context json first: items() on a temporary dangles
+    json cx = ps4_ctx_json(e.ctx);
+    for (auto& kv : cx.items()) o[kv.key()] = kv.value();
     json dr = json::array();
     for (uint64_t d : e.dr) dr.push_back(d);
     o["dr"] = dr;
