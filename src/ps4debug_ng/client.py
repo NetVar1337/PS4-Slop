@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import queue
+from typing import Any
 import socket
 import struct
 import threading
@@ -35,7 +36,8 @@ class Ps4DebugClient:
         self.host = host
         self.port = port
         self.timeout = timeout
-        self.sock: socket.socket | None = None
+        # Any: tests inject a FakeSocket; production sets a real socket.socket.
+        self.sock: Any = None
         self._lock = threading.Lock()
         self._event_listener: socket.socket | None = None
         self._event_thread: threading.Thread | None = None
