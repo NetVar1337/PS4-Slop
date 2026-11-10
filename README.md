@@ -61,7 +61,7 @@ with Ps4DebugClient.discover() as host, Ps4DebugClient(host) as dbg:
     print([hex(h) for h in hits])
 ```
 
-## Tool surface (32 tools)
+## Tool surface (46 tools)
 
 | Group | Tools |
 |---|---|
@@ -72,6 +72,10 @@ with Ps4DebugClient.discover() as host, Ps4DebugClient(host) as dbg:
 | Debug | `ps4_attach`, `ps4_detach` (confirm), `ps4_wait_event`, `ps4_set_breakpoint` (confirm), `ps4_set_watchpoint` (confirm), `ps4_list_threads`, `ps4_thread_info`, `ps4_suspend_thread`/`ps4_resume_thread` (confirm), `ps4_get_registers`, `ps4_set_registers` (confirm), `ps4_get_debug_registers`, `ps4_get_fsgsbase`, `ps4_continue` (confirm), `ps4_step`/`ps4_step_thread` (confirm), `ps4_stop_process` (confirm) |
 | Kernel | `ps4_kernel_base`, `ps4_kernel_read`, `ps4_kernel_write` (confirm) |
 | Console | `ps4_notify` (confirm) |
+| Modules | `ps4_list_modules`, `ps4_module_imports`, `ps4_module_exports` (ELF parsed live from memory) |
+| Pointer scan | `ps4_find_pointer_chains` (CE-style reverse scan), `ps4_pointer_rescan` (revalidate after restart) |
+| Snapshots/integrity | `ps4_snapshot_save`, `ps4_snapshot_diff`, `ps4_memory_hash`, `ps4_integrity_check` |
+| Tracing | `ps4_trace_calls` (breakpoint + auto-continue register capture) |
 
 Notes:
 - Scans run client-side over `proc_read`, so they need no scan auth

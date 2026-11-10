@@ -33,7 +33,7 @@ class FakeSocket:
 def make_client(script: bytes = b"") -> tuple[Ps4DebugClient, FakeSocket]:
     c = Ps4DebugClient("10.0.0.5")
     fake = FakeSocket(script)
-    c.sock = fake  # type: ignore[assignment]  (test stub)
+    c.sock = fake  # type: ignore[assignment]
     return c, fake
 
 
@@ -102,8 +102,8 @@ def test_scan_aob_regions_skips_unreadable():
     c, _ = make_client()
     reads = []
 
-    def fake_read(pid, address, length):
-        reads.append(address)
+    def fake_read(pid, addr, length):
+        reads.append(addr)
         return b"\x48\x8B\x05\xAA\xBB\xCC\xDD"
 
     c.read_memory = fake_read  # type: ignore[method-assign]

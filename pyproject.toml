@@ -24,7 +24,3 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
-
-[tool.pyright]
-executionEnvironments = [{ root = ".", extraPaths = ["src"] }]
