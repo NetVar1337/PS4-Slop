@@ -68,7 +68,6 @@ jobs:
           compression-level: 0
           path: |
             build/src/engine/reverse-slop-engine.exe
-            build/src/engine/slop_frida.dll
           if-no-files-found: error
 
   # Tests run parallel, never block the bundle.
@@ -248,7 +247,6 @@ jobs:
             return $f.FullName
           }
           Copy-Item -LiteralPath (Find-Staged _staging/cxx 'reverse-slop-engine.exe') -Destination build/src/engine/reverse-slop-engine.exe -Force
-          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'slop_frida.dll') -Destination build/src/engine/slop_frida.dll -Force
           Get-ChildItem build/src/engine
 
       - name: bundle precompiled frontend and native artifacts
