@@ -80,6 +80,62 @@ constexpr uint32_t CMD_PROC_SCAN_COUNT      = 0xBDAACC02;
 constexpr uint32_t CMD_PROC_SCAN_GET        = 0xBDAACC03;
 constexpr uint32_t CMD_PROC_AUTH_MAGIC      = 0xBB40E64D;
 
+// bulk write (capability level 1.0+, not auth-gated). Raw literal upstream:
+// proc.c dispatches 0xBDAACC04u with no CMD_* macro
+constexpr uint32_t CMD_PROC_WRITE_MULTI          = 0xBDAACC04;
+constexpr uint32_t kWriteMultiFlagStatus         = 0x1;       // PROC_WRITE_MULTI_F_STATUS
+constexpr uint32_t kWriteMultiMaxCount           = 0xFFFF;    // PROC_WRITE_MULTI_MAX_COUNT
+constexpr uint32_t kWriteMultiMaxEntry           = 0x100000;  // PROC_WRITE_MULTI_MAX_ENTRY
+constexpr uint8_t  kWriteStatusOk                = 0;
+constexpr uint8_t  kWriteStatusInvalid           = 1;
+constexpr uint8_t  kWriteStatusVerifyFailed      = 3;
+constexpr uint8_t  kWriteStatusRwFailed          = 4;
+
+// Turbo Scan family (scan_turbo.c, raw literals upstream). Every opcode but
+// CAPS requires auth bit 1. Sessions are per payload connection; CANCEL must
+// arrive on a second, separately authed connection
+constexpr uint32_t CMD_TURBO_CAPS    = 0xBDAACC10;
+constexpr uint32_t CMD_TURBO_START   = 0xBDAACC11;
+constexpr uint32_t CMD_TURBO_COUNT   = 0xBDAACC12;
+constexpr uint32_t CMD_TURBO_GET     = 0xBDAACC13;
+constexpr uint32_t CMD_TURBO_END     = 0xBDAACC14;
+constexpr uint32_t CMD_TURBO_CONFIG  = 0xBDAACC15;
+constexpr uint32_t CMD_TURBO_REGIONS = 0xBDAACC16;
+constexpr uint32_t CMD_TURBO_CANCEL  = 0xBDAACC17;
+
+// TSE_* engine bits reported by CAPS
+constexpr uint32_t kTseSimdCompare      = 0x001;
+constexpr uint32_t kTseAliasing         = 0x002;
+constexpr uint32_t kTseServerResident   = 0x004;
+constexpr uint32_t kTseSnapshot         = 0x008;
+constexpr uint32_t kTseSnapshotSegments = 0x010;
+constexpr uint32_t kTseSnapshotConfig   = 0x020;
+constexpr uint32_t kTseSnapshotFirst    = 0x040;
+constexpr uint32_t kTseSnapshotPrevious = 0x080;
+constexpr uint32_t kTseParallelCompare  = 0x100;
+constexpr uint32_t kTseRescanAliasing   = 0x200;
+constexpr uint32_t kTseFloatPolicy      = 0x400;
+constexpr uint32_t kTseCompactSimpleSnapshot = 0x800;
+
+// TS_* per-request flags for START / COUNT
+constexpr uint32_t kTsUseAliasing          = 0x001;
+constexpr uint32_t kTsServerResident       = 0x002;
+constexpr uint32_t kTsSnapshot             = 0x004;
+constexpr uint32_t kTsSnapshotIncludeZeros = 0x008;
+constexpr uint32_t kTsSnapshotSegments     = 0x010;
+constexpr uint32_t kTsSnapshotKeepFirst    = 0x020;
+constexpr uint32_t kTsSnapshotKeepPrevious = 0x040;
+constexpr uint32_t kTsParallelCompare      = 0x080;
+constexpr uint32_t kTsRescanAliasing       = 0x100;
+constexpr uint32_t kTsFloatSimple          = 0x200;
+constexpr uint32_t kTsFloatExact           = 0x400;
+constexpr uint32_t kTsFloatExponentShift   = 16;
+constexpr uint32_t kTsFloatExponentMask    = 0x007F0000;
+
+constexpr uint32_t kTurboMaxSegments  = 1u << 20;   // TS_SNAP_MAX_SEGS
+constexpr uint32_t kTurboGetHasFirst  = 0x80000000; // GET hdr bit 31
+constexpr uint64_t kTurboSentinel     = 0xFFFFFFFFFFFFFFFFull;
+
 // extra debug register sets / FS,GS base (raw literals 0xBDBB000E/0F upstream)
 constexpr uint32_t CMD_DEBUG_GETFPREGS   = 0xBDBB000A;
 constexpr uint32_t CMD_DEBUG_SETFPREGS   = 0xBDBB000B;
@@ -158,6 +214,7 @@ constexpr uint32_t CMD_ERROR         = 0xF0000001;
 constexpr uint32_t CMD_TOO_MUCH_DATA = 0xF0000002;
 constexpr uint32_t CMD_DATA_NULL     = 0xF0000003;
 constexpr uint32_t CMD_ALREADY_DEBUG = 0xF0000004;
+constexpr uint32_t CMD_INVALID_INDEX = 0xF0000005;
 
 // FreeBSD VM_PROT_* flags used by CMD_PROC_PROTECT (not Windows PAGE_*)
 constexpr uint32_t kVmProtNone  = 0;
@@ -398,6 +455,91 @@ struct proc_scan_aob_packet_t {
     uint32_t pattern_length;
 };
 
+struct proc_write_multi_packet_t {
+    uint32_t pid;
+    uint32_t count;
+    uint32_t flags;   // kWriteMultiFlagStatus
+};
+// streamed after the server's ack, once per entry, followed by `length` bytes
+struct proc_write_multi_entry_t {
+    uint64_t address;
+    uint32_t length;
+};
+
+struct turbo_start_packet_t {
+    uint32_t pid;
+    uint64_t address;
+    uint32_t length;
+    uint8_t  valueType;
+    uint8_t  compareType;
+    uint8_t  alignment;
+    uint32_t lenData;
+    uint32_t flags;
+};
+
+struct turbo_count_packet_t {
+    uint32_t pid;
+    uint64_t base_address;
+    uint8_t  valueType;
+    uint8_t  compareType;
+    uint32_t lenData;
+    uint32_t flags;
+};
+
+struct turbo_get_packet_t {
+    uint32_t start_index;
+    uint32_t count;
+    uint32_t flags;
+};
+
+struct turbo_config_packet_t {
+    uint32_t ram_thresh_mb;
+    uint32_t spill_path_len;   // followed by that many path bytes
+};
+
+struct turbo_caps_response_t {
+    uint32_t version;
+    uint32_t engines;       // kTse* bits
+    uint32_t max_threads;
+    uint32_t reserved;
+};
+
+struct turbo_regions_packet_t {
+    uint32_t pid;
+    uint32_t max;
+    uint32_t probe_bytes;
+    uint32_t reserved;
+};
+
+struct turbo_region_info_t {
+    uint64_t start;
+    uint64_t end;
+    uint32_t prot;
+    uint32_t flags;   // bit0: leaf PTE PCD=1 (uncached / slow)
+    uint32_t mbps;    // measured probe throughput
+    uint32_t reserved;
+};
+
+struct turbo_resident_summary_t {
+    uint32_t resident_stored;
+    uint64_t count;
+};
+
+struct turbo_snap_segment_t {
+    uint64_t address;
+    uint32_t length;
+};
+
+struct turbo_snap_plan_t {
+    uint64_t slot_count;
+    uint64_t total_bytes;
+};
+
+struct turbo_snap_summary_t {
+    uint32_t snapshot_ok;
+    uint64_t survivor_count;
+};
+
 struct proc_auth_packet_t {
     uint32_t magic;   // CMD_PROC_AUTH_MAGIC
     uint32_t flags;   // bits OR'd into the server's auth word on success
@@ -482,6 +624,19 @@ static_assert(sizeof(proc_scan_count_packet_t) == 18);
 static_assert(sizeof(proc_scan_get_packet_t) == 8);
 static_assert(sizeof(proc_scan_aob_packet_t) == 22);
 static_assert(sizeof(proc_auth_packet_t) == 8);
+static_assert(sizeof(proc_write_multi_packet_t) == 12);
+static_assert(sizeof(proc_write_multi_entry_t) == 12);
+static_assert(sizeof(turbo_start_packet_t) == 27);
+static_assert(sizeof(turbo_count_packet_t) == 22);
+static_assert(sizeof(turbo_get_packet_t) == 12);
+static_assert(sizeof(turbo_config_packet_t) == 8);
+static_assert(sizeof(turbo_caps_response_t) == 16);
+static_assert(sizeof(turbo_regions_packet_t) == 16);
+static_assert(sizeof(turbo_region_info_t) == 32);
+static_assert(sizeof(turbo_resident_summary_t) == 12);
+static_assert(sizeof(turbo_snap_segment_t) == 12);
+static_assert(sizeof(turbo_snap_plan_t) == 16);
+static_assert(sizeof(turbo_snap_summary_t) == 12);
 static_assert(sizeof(console_notify_packet_t) == 8);
 static_assert(sizeof(console_foreground_app_response_t) == 132);
 static_assert(sizeof(reg64_t) == 176);

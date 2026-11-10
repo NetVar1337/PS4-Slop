@@ -6,6 +6,7 @@
 // on the console exactly like on a local process
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -139,6 +140,93 @@ public:
                              const std::vector<uint8_t>& mask,
                              uint8_t max_matches, uint8_t stop_flag,
                              uint64_t& out_addr);
+
+    // capability level string the payload appends after a NUL in its
+    // branding ("1.0" adds bulk write, "1.1" verified writes); "" when absent
+    std::string ps4_capability_level() const;
+
+    // ---- bulk write (0xBDAACC04) ------------------------------------------
+    struct ps4_write_entry_t {
+        uint64_t             addr = 0;
+        std::vector<uint8_t> bytes;
+    };
+    // apply up to 0xFFFF writes in one exchange. With want_status the server
+    // returns one status byte per entry (ps4::kWriteStatus*) and ok reflects
+    // the transport only; without it, ok=false if any entry failed.
+    // Non-atomic: failed entries do not stop the rest
+    io_result_t ps4_write_multi(uint32_t pid, const std::vector<ps4_write_entry_t>& writes,
+                                bool want_status, std::vector<uint8_t>& status);
+
+    // ---- Turbo Scan (0xBDAACC10-17) ----------------------------------------
+    struct ps4_turbo_caps_t {
+        uint32_t version = 0;
+        uint32_t engines = 0;       // ps4::kTse* bits
+        uint32_t max_threads = 0;
+    };
+    // false (error set) when the payload predates Turbo Scan
+    io_result_t ps4_turbo_caps(ps4_turbo_caps_t& out);
+
+    struct ps4_turbo_segment_t {
+        uint64_t addr = 0;
+        uint32_t len = 0;
+    };
+    struct ps4_turbo_start_t {
+        uint32_t pid = 0;
+        uint64_t addr = 0;          // single range when segments is empty
+        uint32_t len = 0;
+        uint8_t  valtype = 0;
+        uint8_t  cmptype = 0;
+        uint8_t  alignment = 0;
+        uint32_t flags = 0;         // ps4::kTs* bits
+        std::vector<uint8_t> data;  // seed value(s); two values for between
+        std::vector<uint8_t> mask;  // arrbytes only: 1 = compare, 0 = wildcard
+        std::vector<ps4_turbo_segment_t> segments;  // sets kTsSnapshotSegments
+    };
+    struct ps4_turbo_result_t {
+        bool     resident = false;      // survivors kept on the console (fetch with get)
+        bool     snapshot = false;      // phase-B snapshot session
+        bool     snapshot_ok = false;
+        uint64_t count = 0;             // survivor count
+        uint64_t slot_count = 0;        // snapshot plan
+        uint64_t total_bytes = 0;
+        std::vector<ps4_scan_hit_t> hits;  // streamed (non-resident) results
+    };
+    // progress callback for snapshot passes: (bytes_or_slots_done, total)
+    using ps4_progress_fn = std::function<void(uint64_t, uint64_t)>;
+    io_result_t ps4_turbo_start(const ps4_turbo_start_t& req, ps4_turbo_result_t& out,
+                                const ps4_progress_fn& progress = {});
+
+    // narrow. Resident/snapshot sessions narrow server-side and return just a
+    // count; otherwise prev (with values when the compare needs them) is
+    // streamed and the surviving hits come back
+    io_result_t ps4_turbo_count(uint32_t pid, uint64_t base, uint8_t valtype,
+                                uint8_t cmptype, uint32_t flags,
+                                const std::vector<uint8_t>& data,
+                                const std::vector<uint8_t>& mask,
+                                const std::vector<ps4_scan_hit_t>& prev,
+                                ps4_turbo_result_t& out,
+                                const ps4_progress_fn& progress = {});
+
+    struct ps4_turbo_record_t {
+        uint64_t             addr = 0;
+        std::vector<uint8_t> current, previous, first;  // first empty unless kept
+    };
+    // fetch resident survivors [start, start+count); value_len is the
+    // session's value width
+    io_result_t ps4_turbo_get(uint32_t start, uint32_t count, uint32_t value_len,
+                              std::vector<ps4_turbo_record_t>& out);
+    io_result_t ps4_turbo_end();
+    io_result_t ps4_turbo_config(uint32_t ram_thresh_mb, const std::string& spill_dir);
+
+    struct ps4_turbo_region_t {
+        uint64_t start = 0, end = 0;
+        uint32_t prot = 0, flags = 0, mbps = 0;
+    };
+    io_result_t ps4_turbo_regions(uint32_t pid, uint32_t max, uint32_t probe_bytes,
+                                  std::vector<ps4_turbo_region_t>& out);
+    // opens a short-lived second connection (the first is busy streaming)
+    // and arms the payload's cancel flag for pid
+    io_result_t ps4_turbo_cancel(uint32_t pid, std::string& err);
 
     // one on-device decoded instruction (CMD_PROC_DISASM_REGION)
     struct ps4_disasm_entry_t {

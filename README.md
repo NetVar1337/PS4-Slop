@@ -417,6 +417,23 @@ actions drive the payload's debug session live, no local target needed:
     unknown), `ps4_scan_state` / `ps4_scan_reset` manage it, `ps4_scan_all`
     scans every readable map, and `ps4_scan_aob {addr, len, pattern}` scans for
     a byte pattern with `??` wildcards.
+  - Turbo Scan (payload opcodes `0xBDAACC10`-`17`): the fast path when
+    `ps4_turbo_caps` reports `supported: true`. Survivors stay on the console
+    between passes, memory is read through the payload's page-table aliasing
+    path with SIMD/parallel compares, and unknown-initial-value scans use a
+    console-side snapshot. `ps4_turbo_scan {addr, len | regions:
+    writable|readable, value_type, compare, value}` (compare `unknown` switches
+    to a snapshot; `keep_first`, `keep_previous`, `include_zeros`, `float:
+    exact|simple` tune it), `ps4_turbo_rescan {compare, value?}`,
+    `ps4_turbo_results {start, count}` (current/previous/first values),
+    `ps4_turbo_regions` (flags uncached/slow regions), `ps4_turbo_config
+    {ram_mb, spill_path}` (snapshot RAM threshold and disk spill directory),
+    `ps4_turbo_cancel {pid}` (stops a running scan from a second connection)
+    and `ps4_turbo_end`.
+  - Bulk write (`0xBDAACC04`, payload capability 1.0+): `ps4_write_multi
+    {writes: [{addr, hex} | {addr, value, value_type}], status?}` applies up to
+    65535 pokes in one round-trip; each entry is read back on the console and
+    failures come back per entry (`invalid`, `verify_failed`, `rw_failed`).
   - On-device code analysis: `ps4_disasm {addr, len, max}` (payload-side Zydis:
     kind flags, mem operands, rip-relative targets), `ps4_xrefs {addr, len}`
     (all branch/call targets in a range), `ps4_xrefs_to {addr, len, target}`,
