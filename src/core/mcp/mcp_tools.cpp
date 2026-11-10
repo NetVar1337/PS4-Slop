@@ -859,6 +859,9 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "packets") return "protocol/direction are raw ints, read *_str (6=tcp 17=udp; 0=outbound 1=inbound). payload_hex capped at 96B; fetch full bytes via stream_data.";
         if (action == "stream_data") return "bytes is returned length, not the stream total; offset/len page through it. text substitutes '.' for non-printables.";
         return "Capture flow: capture_start -> packets/dns/streams/stats -> capture_stop. Kernel actions need slopdrvr (see driver.status); store actions work without it.";
+    } else if (tool == "guide") {
+        if (action == "list") return "Topics are workflow playbooks: guide get {topic} returns the exact ordered tool calls (tool/action/params/why) for that task.";
+        if (action == "get") return "steps[] is a ready-to-run sequence; copy tool+action+params into real calls, filling in addresses/pids from target/memory/disasm results.";
     } else if (tool == "frida") {
         return "Handles are opaque: session/script ids come from attach/script_create, never OS pids. script_unload is terminal. Drain async output with messages(), call exports with rpc().";
     } else if (tool == "persist") {
@@ -1395,6 +1398,129 @@ json tool_target(const json& args) {
                 {"backend", runtime::active_badge()}};
     }
 
+    if (action == "ps4_auto") {
+        // one-call console setup: connect, find the game process (the one with
+        // /app0/ in its executable path), attach a session, debug-attach, and
+        // return a full summary
+        if (!args.contains("host") || !args.at("host").is_string())
+            fail("ps4_auto requires string 'host' (the PS4 IP)");
+        const std::string host = args.at("host").get<std::string>();
+        if (host.empty()) fail("ps4_auto: 'host' is empty");
+        const uint64_t port = args.contains("port") ? parse_addr(args, "port")
+                                                    : runtime::ps4::kDefaultPort;
+        if (port == 0 || port > 0xFFFF) fail("ps4_auto: bad port");
+        std::string err;
+        if (!runtime::registry_ps4_active() &&
+            !process::target_connect_ps4(host, static_cast<uint16_t>(port), 0, err))
+            fail("ps4_auto: connect failed: " + err);
+        auto* p = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active());
+        if (!p || !p->connected())
+            fail("ps4_auto: no PS4 console connected");
+
+        // candidates: processes whose executable path lives under /app0/
+        auto procs = p->enum_processes();
+        if (!procs.ok) fail("ps4_auto: cannot list console processes (error " +
+                            std::to_string(procs.error) + ")");
+        struct cand_t {
+            uint32_t pid = 0;
+            std::string name, path;
+            size_t image_size = 0;
+            bool game = false;
+        };
+        std::vector<cand_t> cands;
+        uint32_t fallback_pid = 0;
+        size_t fallback_size = 0;
+        for (const auto& pr : procs.items) {
+            auto h = p->attach(pr.pid);
+            if (!h.valid()) continue;
+            cand_t c;
+            c.pid  = pr.pid;
+            c.name = pr.name;
+            auto mods = p->enum_modules(h);
+            for (const auto& m : mods.items) {
+                c.image_size += m.size;
+                if (m.path.find("/app0/") != std::string::npos ||
+                    m.path.find("\\app0\\") != std::string::npos) {
+                    c.game = true;
+                    if (c.path.empty()) c.path = m.path;
+                }
+            }
+            p->detach(h);
+            if (c.image_size > fallback_size) {
+                fallback_size = c.image_size;
+                fallback_pid  = c.pid;
+            }
+            cands.push_back(std::move(c));
+        }
+        uint32_t pick = 0;
+        std::string pick_name;
+        bool heuristic = false;
+        for (const auto& c : cands) {
+            if (!c.game) continue;
+            if (pick == 0 || c.name.find("eboot") != std::string::npos) {
+                pick = c.pid;
+                pick_name = c.name;
+                if (c.name.find("eboot") != std::string::npos) break;
+            }
+        }
+        if (pick == 0) {
+            pick = fallback_pid;
+            heuristic = true;
+            for (const auto& c : cands)
+                if (c.pid == pick) pick_name = c.name;
+        }
+        if (pick == 0) fail("ps4_auto: no processes on the console");
+
+        if (!process::target_attach(pick))
+            fail("ps4_auto: attached console but session attach to pid " +
+                 std::to_string(pick) + " failed");
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid = 0;
+
+        std::string derr;
+        const bool dbg_ok = p->ps4_debug_attach(pick, derr);
+
+        auto s = process::active_session();
+        json out = {{"connected", true},
+                    {"endpoint", runtime::registry_ps4_endpoint()},
+                    {"branding", runtime::registry_ps4_branding()},
+                    {"pid", pick},
+                    {"name", pick_name},
+                    {"debug_attached", dbg_ok},
+                    {"heuristic_pick", heuristic},
+                    {"hint", "Ready: target.modules/threads, memory.*, disasm.disassemble on "
+                             "live addresses, debugger ps4_* for breakpoints/steps/calls. "
+                             "guide get ps4_setup shows the full flow."}};
+        if (!dbg_ok) out["debug_error"] = derr;
+        json cands_json = json::array();
+        for (const auto& c : cands)
+            cands_json.push_back({{"pid", c.pid}, {"name", c.name},
+                                  {"game", c.game}, {"image_size", c.image_size},
+                                  {"path", c.path}});
+        out["candidates"] = cands_json;
+        if (s && s->valid()) {
+            auto mods = p->enum_modules(s->handle());
+            json mods_json = json::array();
+            for (size_t i = 0; i < mods.items.size() && i < 32; ++i)
+                mods_json.push_back({{"base", static_cast<uint64_t>(mods.items[i].base)},
+                                     {"size", mods.items[i].size},
+                                     {"name", mods.items[i].name},
+                                     {"path", mods.items[i].path}});
+            out["modules"] = mods_json;
+            out["module_count"] = mods.items.size();
+            auto thr = p->enum_threads(pick);
+            json thr_json = json::array();
+            for (const auto& t : thr.items)
+                thr_json.push_back({{"lwpid", t.tid}, {"priority", t.priority}});
+            out["threads"] = thr_json;
+            out["thread_count"] = thr.items.size();
+            auto regs = p->enum_regions(s->handle());
+            out["region_count"] = regs.ok ? regs.items.size() : 0;
+        }
+        return out;
+    }
+
     if (action == "status") {
         json out;
         out["backend"]  = runtime::active_badge();
@@ -1537,7 +1663,7 @@ json tool_target(const json& args) {
     }
 
     fail("target: unknown action (list|attach|detach|status|modules|"
-         "dump_module|threads|regions|handles|icon|ps4_connect|ps4_disconnect)");
+         "dump_module|threads|regions|handles|icon|ps4_connect|ps4_disconnect|ps4_auto)");
 }
 
 // tool: memory
@@ -2956,6 +3082,24 @@ uint32_t ps4_alloc_slot(const std::map<uint64_t, uint32_t>& used, uint32_t max) 
     fail("no free slot (all " + std::to_string(max) + " in use)");
 }
 
+// walk the rbp frame chain through live session reads; frame 0 is rip itself
+json ps4_frames_json(runtime::session_t& s, uint32_t lwpid,
+                     const runtime::thread_context_t& ctx, size_t depth) {
+    json arr = json::array();
+    arr.push_back({{"index", 0}, {"ret_addr", ctx.rip}, {"frame_ptr", ctx.rbp}});
+    uint64_t rbp = ctx.rbp;
+    for (size_t i = 1; i < depth && rbp != 0; ++i) {
+        uint64_t next = 0, ret = 0;
+        auto io1 = s.read(static_cast<uintptr_t>(rbp), &next, sizeof(next));
+        auto io2 = s.read(static_cast<uintptr_t>(rbp + 8), &ret, sizeof(ret));
+        if (!io1.ok || !io2.ok) break;
+        arr.push_back({{"index", i}, {"ret_addr", ret}, {"frame_ptr", rbp}});
+        if (next == 0 || next <= rbp) break;   // 0 = top; chain must ascend
+        rbp = next;
+    }
+    return arr;
+}
+
 uint64_t* ps4_reg_ptr(runtime::thread_context_t& c, const std::string& n) {
     if (n == "rip") return &c.rip;
     if (n == "rsp") return &c.rsp;
@@ -3188,19 +3332,193 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         runtime::thread_context_t ctx{};
         if (!p.get_thread_context(lwpid, ctx).ok)
             fail("ps4_callstack: cannot read regs of lwpid " + std::to_string(lwpid));
-        json arr = json::array();
-        arr.push_back({{"index", 0}, {"ret_addr", ctx.rip}, {"frame_ptr", ctx.rbp}});
-        uint64_t rbp = ctx.rbp;
-        for (size_t i = 1; i < depth && rbp != 0; ++i) {
-            uint64_t next = 0, ret = 0;
-            auto io1 = s.read(static_cast<uintptr_t>(rbp), &next, sizeof(next));
-            auto io2 = s.read(static_cast<uintptr_t>(rbp + 8), &ret, sizeof(ret));
-            if (!io1.ok || !io2.ok) break;
-            arr.push_back({{"index", i}, {"ret_addr", ret}, {"frame_ptr", rbp}});
-            if (next == 0 || next <= rbp) break;   // 0 = top; chain must ascend
-            rbp = next;
-        }
+        json arr = ps4_frames_json(s, lwpid, ctx, depth);
         return {{"lwpid", lwpid}, {"frames", arr}, {"count", arr.size()}};
+    }
+    if (action == "ps4_bp_list" || action == "ps4_watch_list") {
+        std::lock_guard lk(ps4_slot_mu());
+        const bool bp = action == "ps4_bp_list";
+        const auto& m = bp ? ps4_bp_slots() : ps4_wp_slots();
+        json arr = json::array();
+        for (const auto& [addr, index] : m)
+            arr.push_back({{"addr", addr}, {"index", index}});
+        return {{bp ? "breakpoints" : "watchpoints", arr},
+                {"count", arr.size()},
+                {"note", "client-side record of slots armed through this tool; the payload has no query command"}};
+    }
+    if (action == "ps4_until") {
+        // one-call "run until addr": arm a one-shot bp, continue, wait, clear
+        const uint64_t addr = parse_addr(args, "addr");
+        const int timeout_ms = std::min(args.value("timeout_ms", 30000), 60000);
+        if (!p.ps4_debug_attached())
+            fail("ps4_until requires ps4_attach first");
+        uint32_t index = 0;
+        bool owned = false;
+        {
+            std::lock_guard lk(ps4_slot_mu());
+            auto it = ps4_bp_slots().find(addr);
+            if (it != ps4_bp_slots().end()) index = it->second;
+            else {
+                index = ps4_alloc_slot(ps4_bp_slots(), 30);
+                owned = true;
+            }
+        }
+        auto io = p.ps4_set_breakpoint(index, true, static_cast<uintptr_t>(addr));
+        if (!io.ok) fail("ps4_until: cannot arm breakpoint (error " +
+                         std::to_string(io.error) + ")");
+        if (owned) {
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_bp_slots()[addr] = index;
+        }
+        if (!p.ps4_continue(runtime::ps4::kStopResume).ok) {
+            p.ps4_set_breakpoint(index, false, static_cast<uintptr_t>(addr));
+            if (owned) { std::lock_guard lk(ps4_slot_mu()); ps4_bp_slots().erase(addr); }
+            fail("ps4_until: continue failed");
+        }
+        runtime::ps4_event_t ev{};
+        const bool halted = p.ps4_wait_event(ev, timeout_ms);
+        p.ps4_set_breakpoint(index, false, static_cast<uintptr_t>(addr));
+        if (owned) {
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_bp_slots().erase(addr);
+        }
+        if (!halted)
+            return {{"halted", false}, {"until", addr}, {"timeout_ms", timeout_ms}};
+        json o = ps4_event_json(ev);
+        o["halted"] = true;
+        o["until"] = addr;
+        return o;
+    }
+    if (action == "ps4_find_write") {
+        // one-call "who writes here": write watchpoint, continue, wait, callstack
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = args.contains("len") ? parse_addr(args, "len") : 8;
+        const int timeout_ms = std::min(args.value("timeout_ms", 30000), 60000);
+        if (!p.ps4_debug_attached())
+            fail("ps4_find_write requires ps4_attach first");
+        uint32_t index = 0;
+        bool owned = false;
+        {
+            std::lock_guard lk(ps4_slot_mu());
+            auto it = ps4_wp_slots().find(addr);
+            if (it != ps4_wp_slots().end()) index = it->second;
+            else {
+                index = ps4_alloc_slot(ps4_wp_slots(), 4);
+                owned = true;
+            }
+        }
+        auto io = p.ps4_set_watchpoint(index, true, static_cast<uint32_t>(len),
+                                       runtime::ps4::kWpWrite,
+                                       static_cast<uintptr_t>(addr));
+        if (!io.ok) fail("ps4_find_write: cannot arm watchpoint (error " +
+                         std::to_string(io.error) + ")");
+        if (owned) {
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_wp_slots()[addr] = index;
+        }
+        p.ps4_continue(runtime::ps4::kStopResume);
+        runtime::ps4_event_t ev{};
+        const bool halted = p.ps4_wait_event(ev, timeout_ms);
+        p.ps4_set_watchpoint(index, false, 8, runtime::ps4::kWpRdWr, 0);
+        if (owned) {
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_wp_slots().erase(addr);
+        }
+        json out = {{"halted", halted}, {"addr", addr}, {"len", len},
+                    {"timeout_ms", timeout_ms}};
+        if (halted) {
+            out["event"] = ps4_event_json(ev);
+            auto& s = need_session();
+            const size_t depth = std::min<size_t>(args.value("depth", 32u), 64u);
+            json frames = ps4_frames_json(s, ev.lwpid, ev.ctx, depth);
+            out["callstack"] = frames;
+            out["writer_rip"] = ev.ctx.rip;
+        }
+        return out;
+    }
+    if (action == "ps4_trace_calls") {
+        // breakpoint arg logger: continue+wait loop recording the 6 arg regs
+        const uint64_t addr = parse_addr(args, "addr");
+        const size_t count = std::min<size_t>(args.value("count", 64u), 4096u);
+        const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
+        if (!p.ps4_debug_attached())
+            fail("ps4_trace_calls requires ps4_attach first");
+        uint32_t index = 0;
+        bool owned = false;
+        {
+            std::lock_guard lk(ps4_slot_mu());
+            auto it = ps4_bp_slots().find(addr);
+            if (it != ps4_bp_slots().end()) index = it->second;
+            else {
+                index = ps4_alloc_slot(ps4_bp_slots(), 30);
+                owned = true;
+            }
+        }
+        auto io = p.ps4_set_breakpoint(index, true, static_cast<uintptr_t>(addr));
+        if (!io.ok) fail("ps4_trace_calls: cannot arm breakpoint (error " +
+                         std::to_string(io.error) + ")");
+        if (owned) {
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_bp_slots()[addr] = index;
+        }
+        json hits = json::array();
+        std::string stop_reason = "count_reached";
+        for (size_t i = 0; i < count; ++i) {
+            if (!p.ps4_continue(runtime::ps4::kStopResume).ok) {
+                stop_reason = "continue_failed";
+                break;
+            }
+            runtime::ps4_event_t ev{};
+            if (!p.ps4_wait_event(ev, timeout_ms)) {
+                stop_reason = "timeout";
+                break;
+            }
+            hits.push_back({{"index", i}, {"lwpid", ev.lwpid},
+                            {"thread", ev.thread_name}, {"signal", ev.signal},
+                            {"rip", ev.ctx.rip}, {"rdi", ev.ctx.rdi},
+                            {"rsi", ev.ctx.rsi}, {"rdx", ev.ctx.rdx},
+                            {"rcx", ev.ctx.rcx}, {"r8", ev.ctx.r8},
+                            {"r9", ev.ctx.r9}});
+        }
+        p.ps4_set_breakpoint(index, false, static_cast<uintptr_t>(addr));
+        if (owned) {
+            std::lock_guard lk(ps4_slot_mu());
+            ps4_bp_slots().erase(addr);
+        }
+        return {{"addr", addr}, {"hits", hits}, {"hits_count", hits.size()},
+                {"stop_reason", stop_reason},
+                {"note", "target stays stopped at the last hit; ps4_continue resumes"}};
+    }
+    if (action == "ps4_trace_steps") {
+        // console-side single-step execution trace with disassembly
+        auto& s = need_session();
+        const uint32_t lwpid = ps4_lwpid_arg(p, args);
+        const size_t count = std::min<size_t>(args.value("count", 64u), 4096u);
+        const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
+        if (!p.ps4_debug_attached())
+            fail("ps4_trace_steps requires ps4_attach first");
+        auto& eng = shared_engine();
+        if (!eng.ok() && !eng.init()) fail("zydis engine init failed");
+        json steps = json::array();
+        std::string stop_reason = "count_reached";
+        for (size_t i = 0; i < count; ++i) {
+            if (!p.ps4_step(lwpid).ok) { stop_reason = "step_failed"; break; }
+            runtime::ps4_event_t ev{};
+            if (!p.ps4_wait_event(ev, timeout_ms)) {
+                stop_reason = "timeout";
+                break;
+            }
+            json rec = {{"index", i}, {"lwpid", ev.lwpid}, {"rip", ev.ctx.rip}};
+            uint8_t buf[16]{};
+            auto io = s.read(static_cast<uintptr_t>(ev.ctx.rip), buf, sizeof(buf));
+            if (io.ok) {
+                if (auto in = eng.decode(ev.ctx.rip, buf, sizeof(buf)))
+                    rec["text"] = in->text;
+            }
+            steps.push_back(std::move(rec));
+        }
+        return {{"lwpid", lwpid}, {"steps", steps}, {"steps_count", steps.size()},
+                {"stop_reason", stop_reason}};
     }
     if (action == "ps4_call") {
         const uint64_t addr = parse_addr(args, "addr");
@@ -3241,9 +3559,11 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
 
     fail("debugger: unknown ps4 action (ps4_attach|ps4_detach|ps4_status|"
-         "ps4_bp_set|ps4_bp_clear|ps4_watch_set|ps4_watch_clear|ps4_continue|"
-         "ps4_step|ps4_suspend|ps4_resume|ps4_process_stop|ps4_regs|"
-         "ps4_set_reg|ps4_dbregs|ps4_wait|ps4_events|ps4_callstack|ps4_call)");
+         "ps4_bp_set|ps4_bp_clear|ps4_bp_list|ps4_watch_set|ps4_watch_clear|"
+         "ps4_watch_list|ps4_continue|ps4_step|ps4_suspend|ps4_resume|"
+         "ps4_process_stop|ps4_regs|ps4_set_reg|ps4_dbregs|ps4_wait|"
+         "ps4_events|ps4_callstack|ps4_call|ps4_until|ps4_find_write|"
+         "ps4_trace_calls|ps4_trace_steps)");
 }
 
 } // namespace
@@ -3525,6 +3845,46 @@ json tool_debugger(const json& args) {
         if (!dbg.clear_breakpoint(static_cast<uintptr_t>(addr))) fail("bp_clear failed");
         return {{"cleared", true}, {"addr", addr}, {"hw", was_hw}};
     }
+    if (action == "until") {
+        // one-call "run until addr": temp bp + go + wait + clear
+        const uint64_t addr = parse_addr(args, "addr");
+        const bool hw = args.value("hw", false);
+        const int timeout_ms = std::min(args.value("timeout_ms", 10000), 60000);
+        if (dbg.state() == debugger::dbg_state_t::idle)
+            fail("until requires the debugger attached (attach first)");
+        const bool preexisting = std::any_of(
+            dbg.breakpoints().begin(), dbg.breakpoints().end(),
+            [addr](const debugger::breakpoint_t& b) {
+                return b.addr == static_cast<uintptr_t>(addr);
+            });
+        if (!preexisting) {
+            const bool ok = hw ? dbg.set_hw_breakpoint(static_cast<uintptr_t>(addr), 1, 0)
+                               : dbg.set_sw_breakpoint(static_cast<uintptr_t>(addr));
+            if (!ok) fail("until: cannot arm breakpoint at " + hex64(addr));
+        }
+        dbg.go();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        bool halted = dbg.state() == debugger::dbg_state_t::paused;
+        while (!halted && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+            halted = dbg.state() == debugger::dbg_state_t::paused;
+        }
+        if (!preexisting) dbg.clear_breakpoint(static_cast<uintptr_t>(addr));
+        json out = {{"halted", halted}, {"until", addr},
+                    {"state", debugger_state_name(dbg.state())}};
+        uint32_t tid = 0;
+        auto ctx = dbg.paused_context(&tid);
+        if (halted && ctx) {
+            out["tid"] = tid;
+            out["rip"] = ctx->rip;
+            out["rsp"] = ctx->rsp;
+            out["rax"] = ctx->rax;
+            out["rcx"] = ctx->rcx;
+            out["rdx"] = ctx->rdx;
+        }
+        return out;
+    }
     if (action == "continue") { dbg.go();       return {{"state", debugger_state_name(dbg.state())}}; }
     if (action == "step_into") { dbg.step_into(); return {{"state", debugger_state_name(dbg.state())}}; }
     if (action == "step_over") { dbg.step_over(); return {{"state", debugger_state_name(dbg.state())}}; }
@@ -3567,7 +3927,7 @@ json tool_debugger(const json& args) {
     fail("debugger: unknown action (attach|detach|status|suspend_all|"
          "resume_all|bp_set|bp_clear|continue|step_into|step_over|step_out|"
          "wait_halt|regs|events|callstack|seh|set_register|watchpoint_set|"
-         "watchpoint_clear|watchpoints|trace_run|ps4_*)");
+         "watchpoint_clear|watchpoints|trace_run|until|ps4_*)");
 }
 
 // tool: driver
@@ -9025,15 +9385,166 @@ json tool_app(const json& args) {
 
 } // namespace
 
+// tool: guide — task-oriented recipes so an agent (or user) can drive whole
+// game-RE workflows instead of discovering tool combinations one by one
+
+json tool_guide(const json& args) {
+    struct step_t { const char* tool; const char* action; const char* params; const char* why; };
+    struct topic_t {
+        const char* id; const char* title; const char* summary;
+        std::initializer_list<step_t> steps;
+    };
+    static const std::vector<topic_t> kTopics = {
+        {"ps4_setup", "Connect to a PS4 and start debugging the game in one call",
+         "ps4_auto connects, finds the game process (the one with /app0/ modules), attaches a session and the ps4debug debugger, and returns modules+threads. Everything else (memory, disasm, debugger ps4_*) then works against the console.",
+         {{"target", "ps4_auto", R"({"host":"192.168.1.50"})", "one-call console setup: connect + pick game + attach + debug attach"},
+          {"target", "modules", "{}", "see the game's modules and runtime bases"},
+          {"target", "threads", "{}", "lwpids for ps4_regs/ps4_step"},
+          {"debugger", "ps4_status", "{}", "confirm the debug session"}}},
+        {"ps4_breakpoint", "Break at an address on the PS4 and inspect the stop",
+         "Arm a software breakpoint, continue, wait for the 0x4A0 event on port 755, then read registers and the callstack. ps4_until does all of it in one call.",
+         {{"debugger", "ps4_bp_set", R"({"addr":4198912})", "arm INT3 bp (index auto-allocated)"},
+          {"debugger", "ps4_continue", R"({"stop":0})", "resume the debuggee"},
+          {"debugger", "ps4_wait", R"({"timeout_ms":10000})", "block for the stop event (rip/regs/signal)"},
+          {"debugger", "ps4_regs", R"({"lwpid":101})", "full register set of the stopped thread"},
+          {"debugger", "ps4_callstack", R"({"lwpid":101})", "rbp frame chain via live reads"},
+          {"debugger", "ps4_bp_clear", R"({"addr":4198912})", "remove the bp"},
+          {"debugger", "ps4_until", R"({"addr":4198912,"timeout_ms":30000})", "all of the above in one call"}}},
+        {"ps4_api_trace", "Log every call to a function/import on the PS4 (args in, hit count)",
+         "ps4_trace_calls arms a bp, then loops continue+wait and records rdi/rsi/rdx/rcx/r8/r9 at every hit. Use it on an import stub or any function entry to see who calls it with what.",
+         {{"debugger", "ps4_trace_calls", R"({"addr":4202496,"count":200,"timeout_ms":5000})", "returns hits[] with rip + 6 arg registers per hit"},
+          {"debugger", "ps4_bp_list", "{}", "see armed slots"},
+          {"disasm", "disassemble", R"({"addr":4202496,"count":8})", "what the traced code looks like (live memory)"}}},
+        {"ps4_find_write", "Find what code writes to an address on the PS4",
+         "ps4_find_write arms a hardware write watchpoint (DR slot), continues, and on the trap returns the event plus the callstack of the writer — the answer to 'who changed this value'.",
+         {{"debugger", "ps4_find_write", R"({"addr":2147483648,"len":8,"timeout_ms":30000})", "watchpoint + continue + wait + callstack in one call"},
+          {"debugger", "ps4_callstack", R"({"lwpid":101})", "walk frames yourself"},
+          {"debugger", "ps4_bp_set", R"({"addr":4198912})", "then break on the writer"}}},
+        {"ps4_step_trace", "Single-step execution trace on the PS4",
+         "ps4_trace_steps loops step+wait and records rip plus the disassembled instruction at each step — a console-side equivalent of local trace_run.",
+         {{"debugger", "ps4_trace_steps", R"({"lwpid":101,"count":64,"timeout_ms":5000})", "steps[] with rip + insn text"},
+          {"debugger", "ps4_step", R"({"lwpid":101})", "manual single step"},
+          {"debugger", "ps4_wait", R"({"timeout_ms":3000})", "catch the step event"}}},
+        {"ps4_remote_call", "Call any function in the console process and get rax back",
+         "ps4_call installs the payload RPC stub once per process (CMD_PROC_INTALL) and calls addr with up to 6 args (rdi,rsi,rdx,rcx,r8,r9). Use it to invoke game functions, resolve exports via module base + offset, or run shellcode you wrote with memory.write+alloc.",
+         {{"memory", "alloc", R"({"len":4096,"prot":64})", "RWX page on the console for shellcode"},
+          {"memory", "write", R"({"addr":<alloc>,"hex":"..."})", "write shellcode"},
+          {"debugger", "ps4_call", R"({"addr":<alloc>,"args":[1,2,3,0,0,0]})", "execute it, get rax"},
+          {"memory", "read", R"({"addr":<alloc>+0x100,"len":16})", "read results the callee wrote"}}},
+        {"find_health", "Find a game's health/ammo value in live memory (CE workflow)",
+         "Classic Cheat-Engine flow: snapshot, change the value in-game, rescan for changed/decreased, narrow, then watch the address to find the code that writes it.",
+         {{"memory", "snapshot", R"({"label":"before"})", "baseline all committed memory"},
+          {"memory", "scan", R"({"kind":"exact","width":"u32","value":100})", "initial scan for the known value"},
+          {"memory", "scan", R"({"kind":"decreased","width":"u32"})", "after taking damage, rescan narrowed set"},
+          {"memory", "rescan", R"({"kind":"exact","width":"u32","value":87})", "pin the exact value"},
+          {"memory", "watch_add", R"({"addr":<hit>,"width":"u32"})", "watch the address"},
+          {"debugger", "watchpoint_set", R"({"addr":<hit>,"len":4})", "kernel page-guard watch (driver) or debugger ps4_find_write on PS4"},
+          {"debugger", "callstack", "{}", "who wrote it (paused at the watch)"}}},
+        {"find_damage_source", "Find the function that applies damage",
+         "Watch the health address for writes while attacking, then break on the writer and walk up the callstack to the damage logic.",
+         {{"memory", "watch_add", R"({"addr":<health>,"width":"i32","freeze":false})", "track value changes"},
+          {"debugger", "ps4_find_write", R"({"addr":<health>})", "on PS4: watchpoint -> event + callstack"},
+          {"debugger", "watchpoint_set", R"({"addr":<health>})", "on local: page-guard watchpoint (slopdrvr)"},
+          {"debugger", "bp_set", R"({"addr":<writer>,"condition":"rcx<100"})", "break at the writer, optionally conditional"},
+          {"debugger", "wait_halt", R"({"timeout_ms":60000})", "wait for the hit"},
+          {"debugger", "callstack", "{}", "full stack at the hit"}}},
+        {"pointer_chain", "Follow a pointer chain from a static/global to a live object",
+         "pointerscan walks static roots and reads pointer chains out of live memory, returning the address path for each hit.",
+         {{"memory", "pointerscan", R"({"target":<value>,"depth":5,"max_results":32})", "find chains ending at the value"},
+          {"memory", "read", R"({"addr":<root>,"len":8,"format":"u64"})", "re-verify each hop"},
+          {"types", "format_at", R"({"addr":<object>,"name":"<struct>"})", "render the object with a declared struct"}}},
+        {"runtime_decrypt", "Catch string decryption at runtime instead of reversing the routine",
+         "Games decrypt strings in place. Scan for the encrypted blob, watch the decrypted buffer region for a write, break on the writer, read the plaintext.",
+         {{"memory", "aob", R"({"pattern":"48 8d 0d ?? ?? ?? ?? e8"})", "find lea+call sites referencing the blob"},
+          {"memory", "watch_add", R"({"addr":<buffer>,"len":64,"width":"u8"})", "watch the destination buffer"},
+          {"debugger", "bp_set", R"({"addr":<decrypt_call>,"log":"decrypt called"})", "log every call to the decrypt routine"},
+          {"debugger", "wait_halt", "{}", "stop at the call"},
+          {"memory", "read", R"({"addr":<buffer>,"len":64,"format":"utf8"})", "plaintext after the call"},
+          {"patch", "decode_strings", R"({"addr":<func>})", "or statically decode in the loaded image"}}},
+        {"api_monitor_local", "Monitor calls to a Win32/game API in a local process",
+         "Attach the debugger, set a breakpoint on the import thunk with a log string or condition, continue, then read the event log and registers.",
+         {{"target", "attach", R"({"pid":1234})", "attach the game"},
+          {"target", "modules", "{}", "find the module base"},
+          {"disasm", "disassemble", R"({"addr":<iat_thunk>,"count":4})", "resolve the API's thunk"},
+          {"debugger", "attach", R"({"pid":1234})", "start the debug loop"},
+          {"debugger", "bp_set", R"({"addr":<thunk>,"log":"CreateFileW","condition":""})", "bp with log = tracepoint"},
+          {"debugger", "continue", "{}", "run"},
+          {"debugger", "wait_halt", R"({"timeout_ms":30000})", "until next stop"},
+          {"debugger", "events", "{}", "logged hits"},
+          {"debugger", "regs", "{}", "rcx/rdx/r8/r9 = Win64 args"}}},
+        {"snapshot_diff", "See exactly what memory a game action changed",
+         "snapshot before, do the action, diff the two snapshots — every changed byte with old/new values.",
+         {{"memory", "snapshot", R"({"label":"a"})", "before"},
+          {"memory", "snapshot", R"({"label":"b"})", "after the action"},
+          {"memory", "diff", R"({"a":<id_a>,"b":<id_b>})", "changed ranges with old/new"}}},
+        {"emulate_function", "Emulate a function offline with stubbed imports",
+         "emulate.run executes target_addr code in Unicorn with IAT stubs returning api_ret/api_returns, TEB/PEB, page-in from live memory, trace and taint. Ideal for crypto, checksum, decrypt routines.",
+         {{"target", "attach", R"({"pid":1234})", "so target_addr reads live memory"},
+          {"debugger", "ps4_regs", R"({"lwpid":101})", "on PS4: grab live regs first"},
+          {"emulate", "run", R"({"target_addr":4202496,"code_len":256,"regs":{"rcx":1234},"api_returns":{"kernel32.dll!VirtualAlloc":4096},"trace":true,"trace_max":128})", "run the slice"},
+          {"emulate", "run", R"({"hex":"...","count":100000,"until":<ret_addr>})", "or raw bytes"}}},
+        {"devirt_cflow", "Recover a flattened/obfuscated control flow",
+         "xray.cff finds the dispatcher and state blocks; devirt.recover_cfg rebuilds the CFG; decomp then shows readable code.",
+         {{"disasm", "functions", R"({"limit":200})", "find suspicious functions"},
+          {"xray", "cff", R"({"addr":<func>})", "dispatcher + state_blocks"},
+          {"devirt", "recover_cfg", R"({"addr":<func>})", "rebuild the CFG"},
+          {"decomp", "function", R"({"function_va":<func>})", "decompile after recovery"}}},
+        {"unpack_runtime", "Unpack a packed binary by dumping memory, or analyze statically",
+         "Packed code unpacks itself at runtime: attach early, break at the OEP (entry entropy spike), dump_module the live image, then load the dump for static analysis.",
+         {{"analyze", "packer", R"({"path":"game.exe"})", "is it packed? entropy/sections"},
+          {"target", "attach", R"({"pid":1234})", "attach at start"},
+          {"debugger", "bp_set", R"({"addr":<oep>})", "break at the unpacked entry"},
+          {"debugger", "wait_halt", R"({"timeout_ms":60000})", "wait for unpack"},
+          {"target", "dump_module", R"({"base":<image_base>,"path":"dump.exe","load":true})", "dump live unpacked image and load it"},
+          {"xray", "entropy", R"({"path":"dump.exe"})", "verify unpacked"}}},
+        {"hw_breakpoints", "Hardware breakpoints without touching target memory",
+         "With slopdrvr loaded, DR0-DR3 breakpoints catch execution/reads/writes without an INT3 byte, invisible to memory scans. debugger bp_set hw=true uses them; on PS4 use ps4_watch_set (the payload programs DR registers).",
+         {{"driver", "status", "{}", "is slopdrvr active?"},
+          {"debugger", "attach", R"({"pid":1234})", "attach"},
+          {"debugger", "bp_set", R"({"addr":<addr>,"hw":true,"type":0,"len":8})", "type 0=exec 1=write 3=rdwr"},
+          {"debugger", "continue", "{}", "go"},
+          {"debugger", "ps4_watch_set", R"({"addr":<addr>,"type":3,"len":8})", "PS4 equivalent via ps4debug DR slots"}}},
+    };
+
+    const std::string action = require_action(args);
+    if (action == "list") {
+        json arr = json::array();
+        for (const auto& t : kTopics)
+            arr.push_back({{"topic", t.id}, {"title", t.title}, {"summary", t.summary}});
+        return {{"topics", arr}, {"count", arr.size()},
+                {"note", "call guide get {topic:<id>} for the exact tool-call sequence"}};
+    }
+    if (action == "get") {
+        if (!args.contains("topic") || !args.at("topic").is_string())
+            fail("guide get requires 'topic' (see guide list)");
+        const std::string want = args.at("topic").get<std::string>();
+        for (const auto& t : kTopics) {
+            if (want == t.id) {
+                json steps = json::array();
+                for (const auto& s : t.steps)
+                    steps.push_back({{"tool", s.tool}, {"action", s.action},
+                                     {"params", json::parse(s.params, nullptr, false)},
+                                     {"why", s.why}});
+                return {{"topic", t.id}, {"title", t.title},
+                        {"summary", t.summary}, {"steps", steps}};
+            }
+        }
+        json ids = json::array();
+        for (const auto& t : kTopics) ids.push_back(t.id);
+        fail("unknown guide topic '" + want + "' (available: " + ids.dump() + ")");
+    }
+    fail("guide: unknown action (list|get)");
+}
+
 void list_tools(json& out) {
     const char* target_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","icon","ps4_connect","ps4_disconnect"]},"pid":{"type":"integer"},"host":{"type":"string"},"port":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"load":{"type":"boolean"},"strict":{"type":"boolean"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","icon","ps4_connect","ps4_disconnect","ps4_auto"]},"pid":{"type":"integer"},"host":{"type":"string"},"port":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"load":{"type":"boolean"},"strict":{"type":"boolean"}},"required":["action"]})";
     const char* memory_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","aob","pointerscan","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"]},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"}},"required":["action"]})";
     const char* disasm_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"}},"required":["action"]})";
     const char* debugger_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["attach","detach","status","suspend_all","resume_all","bp_set","bp_clear","continue","step_into","step_over","step_out","wait_halt","regs","events","callstack","seh","set_register","watchpoint_set","watchpoint_clear","watchpoints","trace_run","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"hw":{"type":"boolean"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"condition":{"type":"string"},"log":{"type":"string"},"auto_continue":{"type":"boolean"},"one_shot":{"type":"boolean"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{"type":"integer"},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["attach","detach","status","suspend_all","resume_all","bp_set","bp_clear","continue","step_into","step_over","step_out","wait_halt","regs","events","callstack","seh","set_register","watchpoint_set","watchpoint_clear","watchpoints","trace_run","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","until"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"hw":{"type":"boolean"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"condition":{"type":"string"},"log":{"type":"string"},"auto_continue":{"type":"boolean"},"one_shot":{"type":"boolean"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{"type":"integer"},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}}},"required":["action"]})";
     const char* driver_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","backend","kernel_modules","dump_driver","kernel_read","kernel_write","kernel_search","call","v2p","ssdt","peb","resolve_export","windows","find_references","heap_walk","heap_blocks","defer_call","defer_list","defer_execute","defer_results","defer_cancel","symbols_load","symbols_lookup","symbols_nearest","anti_debug_spoof","sandbox_protect","sandbox_unprotect","log_config","read_teb","peb_modules","integrity_checks","sniff_buffers"]},"pref":{"type":"string","enum":["auto","kernel","user"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"len":{"type":"integer"},"hex":{"type":"string"},"pattern":{"type":"string"},"begin":{"type":"integer"},"end":{"type":"integer"},"a1":{"type":"integer"},"a2":{"type":"integer"},"a3":{"type":"integer"},"a4":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"base":{"type":"integer"},"size":{"type":"integer"},"module_base":{"type":"integer"},"value":{"type":"integer"},"kind":{"type":"string"},"id":{"type":"integer"},"limit":{"type":"integer"},"flags":{"type":"integer"},"tid":{"type":"integer"},"order":{"type":"string"},"filter":{"type":"string"},"op":{"type":"string"},"timestamp":{"type":"integer"},"thread_id":{"type":"integer"},"buffer_register":{"type":"string"},"size_register":{"type":"string"},"max_captures":{"type":"integer"},"bp_index":{"type":"integer"},"level":{"type":"integer"},"cap_mb":{"type":"integer"}},"required":["action"]})";
     const char* xray_schema =
@@ -9076,7 +9587,7 @@ void list_tools(json& out) {
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","find_module","resolve_export","loadlibrary","manual_map","unload"]},"pid":{"type":"integer","minimum":1},"name":{"type":"string"},"module":{"type":"string"},"dll_path":{"type":"string"},"dll_hex":{"type":"string"},"base":{"type":"integer"},"manual_mapped":{"type":"boolean"},"erase_pe_header":{"type":"boolean"},"protect_sections":{"type":"boolean"},"call_dllmain":{"type":"boolean"},"call_tls_callbacks":{"type":"boolean"},"unlink_peb":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":100,"maximum":60000}},"required":["action"]})";
 
     out.push_back({{"name", "target"},
-                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image. Remote consoles: ps4_connect {host, port=744, pid?} connects to a PS4 running ps4debug-NG and makes the console the active target (list/attach/memory/regions/threads then go over the wire); ps4_disconnect drops it. On a PS4 the backend badge reads PS4 and PS4 modules are ELF/SELF, so dump_module/load are PE-only - analyze live addresses instead."},
+                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image. Remote consoles: ps4_connect {host, port=744, pid?} connects to a PS4 running ps4debug-NG and makes the console the active target (list/attach/memory/regions/threads then go over the wire); ps4_disconnect drops it. ps4_auto {host} is the one-call setup: it connects, auto-picks the game process (the one with /app0/ modules), attaches, debug-attaches via the debugger, and returns modules/threads. On a PS4 the backend badge reads PS4 and PS4 modules are ELF/SELF, so dump_module/load are PE-only - analyze live addresses instead."},
                    {"inputSchema", json::parse(target_schema)}, {"read_only", false}});
     out.push_back({{"name", "memory"},
                    {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active user/kernel backend is chosen automatically. Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. Kernel mode uses slopdrvr DTB reads and driver region enumeration."},
@@ -9085,7 +9596,7 @@ void list_tools(json& out) {
                    {"description", "Primary static-analysis and instruction tool for the shared binary session. Call action='loaded' first: image.ready means a PE, Mach-O (thin/FAT), or .ipa executable is loaded; image.format/arch describe its code, and encrypted/warning identify FairPlay-encrypted code that must be decrypted before analysis. image.hype.ready means background Hyperion analysis is complete; image.hype.progress/error explain pending or failed analysis. Use load(path) for PE, Mach-O (thin/FAT), or .ipa and unload to manage the same session as the UI, and analyze_stop to cancel analysis. pe/strings support the shared image or an explicit path; functions/xrefs with path support x86/x64 only, so load ARM images first. symbols use the shared image; blocks/globals/vtables require hype.ready. disassemble reads attached-process memory first and otherwise decodes the loaded file's architecture. assemble converts x86/x64 text to bytes. symbol_set renames a VA persistently (empty name clears) and updates the UI. Strings paginate with limit and omit executable sections unless include_exec=true. Runtime-base loads make static and live VAs directly comparable."},
                    {"inputSchema", json::parse(disasm_schema)}, {"read_only", false}});
     out.push_back({{"name", "debugger"},
-                   {"description", "Control a live debugging session. Call status first; attach(pid) starts kernel-stealth VEH debugging when slopdrvr is available, otherwise the classic Win32 debug loop. Set software or hardware breakpoints with bp_set(addr, hw); optional condition, log, auto_continue, and one_shot fields create conditional stops or tracepoints. After continue or a step action, use wait_halt(timeout_ms), then inspect regs, events, callstack, or seh; set_register mutates paused state. watchpoint_set/clear/list manage page-guard access watches, and trace_run records a bounded instruction trace. suspend_all/resume_all freeze or thaw target threads. Hardware DR0-DR3 breakpoints and handle-free thread control require the driver. On a PS4 console (target.ps4_connect), the ps4_* actions drive the console's ps4debug-NG debug session live instead: ps4_attach {pid} attaches the payload's debugger, ps4_bp_set/ps4_bp_clear arm software INT3 breakpoints (index auto-allocated 0-29), ps4_watch_set/ps4_watch_clear arm hardware DR watchpoints (type 0=exec 1=write 3=rdwr, len 1/2/4/8), ps4_continue {stop} resumes (stop 0=resume 1=SIGSTOP 2=SIGKILL), ps4_step {lwpid?} single-steps, ps4_suspend/ps4_resume freeze one thread, ps4_process_stop {state} signals the process, ps4_regs/ps4_set_reg/ps4_dbregs read or write register state, ps4_wait {timeout_ms} blocks for the next stop event on the console's port-755 stream (breakpoint hit, watchpoint hit, step, signal; signal 9 tears the session down) and ps4_events drains the queued ones, ps4_callstack {lwpid, depth} walks the rbp frame chain through live memory reads, and ps4_call {addr, args[6]} installs the payload's rpc stub (once per pid) and calls an arbitrary address in the console process returning rax."},
+                   {"description", "Control a live debugging session. Call status first; attach(pid) starts kernel-stealth VEH debugging when slopdrvr is available, otherwise the classic Win32 debug loop. Set software or hardware breakpoints with bp_set(addr, hw); optional condition, log, auto_continue, and one_shot fields create conditional stops or tracepoints. After continue or a step action, use wait_halt(timeout_ms), then inspect regs, events, callstack, or seh; set_register mutates paused state. watchpoint_set/clear/list manage page-guard access watches, and trace_run records a bounded instruction trace. suspend_all/resume_all freeze or thaw target threads. Hardware DR0-DR3 breakpoints and handle-free thread control require the driver. On a PS4 console (target.ps4_connect), the ps4_* actions drive the console's ps4debug-NG debug session live instead: ps4_attach {pid} attaches the payload's debugger, ps4_bp_set/ps4_bp_clear arm software INT3 breakpoints (index auto-allocated 0-29), ps4_watch_set/ps4_watch_clear arm hardware DR watchpoints (type 0=exec 1=write 3=rdwr, len 1/2/4/8), ps4_continue {stop} resumes (stop 0=resume 1=SIGSTOP 2=SIGKILL), ps4_step {lwpid?} single-steps, ps4_suspend/ps4_resume freeze one thread, ps4_process_stop {state} signals the process, ps4_regs/ps4_set_reg/ps4_dbregs read or write register state, ps4_wait {timeout_ms} blocks for the next stop event on the console's port-755 stream (breakpoint hit, watchpoint hit, step, signal; signal 9 tears the session down) and ps4_events drains the queued ones, ps4_callstack {lwpid, depth} walks the rbp frame chain through live memory reads, and ps4_call {addr, args[6]} installs the payload's rpc stub (once per pid) and calls an arbitrary address in the console process returning rax. One-call power actions: until {addr} (local: temp bp + go + wait_halt + clear) and ps4_until {addr} do the same on the console; ps4_find_write {addr, len} arms a write watchpoint and returns the stop event plus the writer's callstack; ps4_trace_calls {addr, count} logs rdi/rsi/rdx/rcx/r8/r9 at every breakpoint hit; ps4_trace_steps {lwpid, count} single-steps and disassembles each rip; ps4_bp_list/ps4_watch_list show the armed slots. For whole workflows (find health, damage source, API trace, unpacking), call guide: guide list / guide get {topic}."},
                    {"inputSchema", json::parse(debugger_schema)}, {"read_only", false}});
     out.push_back({{"name", "driver"},
                    {"description", "Inspect and control the optional slopdrvr kernel bridge. Start with status to discover connection, capabilities, and active backend. backend reads or sets pref='auto'|'kernel'|'user', but cannot switch while a target or debugger session is live. Kernel actions include modules, memory read/write/search, driver dump, calls, virtual-to-physical translation, SSDT/PEB/TEB/loader views, exports, windows, heaps, references, symbols, deferred calls, integrity checks, anti-debug spoofing, sandboxing, logs, and network-buffer sniffing. Kernel-address operations lazily resolve the kernel DTB and return structured errors when unavailable; a symbols_load response with ntos_base=0 means the kernel context was not established and symbol lookups will fail. sniff_buffers uses op to start/get/store/stop capture. Use status rather than assuming the driver is installed."},
@@ -9111,6 +9622,9 @@ void list_tools(json& out) {
     out.push_back({{"name", "emulate"},
                    {"description", "Emulate x86-64 code in an isolated Unicorn VM. action='run' accepts exactly one practical code source: hex bytes, file_addr from the shared image, or target_addr from attached-process memory; code_len sets the initial slice. With file_addr/target_addr, page_in (default true) maps any other page the code touches from that same source on first use (image sections inside SizeOfImage with base relocations applied when the image is rebased, or live process memory; up to 16 MiB), so calls, jumps and global loads outside the slice keep running; hex runs map only the code and maps. With file_addr on a PE32+ image, stub_imports (default true) points every IAT slot at a stub that returns api_ret (default 0) in rax and logs api_calls (caller ip, return address, import name, rcx/rdx/r8/r9); api_returns={\"InitializeCriticalSectionAndSpinCount\":1,\"kernel32.dll!CreateFileW\":-1} overrides it per import (case-insensitive, unmatched keys come back in api_returns_unmatched). A zeroed TEB/PEB sits at gs_base (self, PEB, stack bounds, ImageBaseAddress; BeingDebugged=0) unless regs sets gs_base. Set base/entry, registers (rax..r15, rip, rflags, fs_base, gs_base), stack, and extra maps as needed. dump=[{addr,len}] (<= 1 MiB total) returns final memory as hex in memory; writes log ip/addr/len/value. Stop with until, count (default 100000), or timeout_ms (default 5000, capped at 30000); MCP notifications/cancelled stops a run early with stopped_reason='cancelled'. Runs do not block other tools. trace enables bounded instruction history (trace_max <= 16384); taint entries mark source byte ranges (<= 1 MiB total), and watch_addr/watch_len selects the output window for byte-granular propagation results. Emulation does not modify the loaded image or live target."},
                    {"inputSchema", json::parse(emulate_schema)}, {"read_only", true}});
+    out.push_back({{"name", "guide"},
+                   {"description", "Task-oriented playbooks for game reverse engineering: action='list' enumerates topics, action='get' {topic} returns the exact ordered tool-call sequence (tool, action, params, why) for that workflow — PS4 setup/breakpoints/API tracing/find-writes/step traces/remote calls, Cheat-Engine style value finding, damage-source hunting, pointer chains, runtime string decryption, local API monitoring, snapshot diffs, emulation, control-flow recovery, unpacking, and hardware breakpoints. Call it whenever you are unsure which tools to combine for a task."},
+                   {"inputSchema", json::parse(R"({"type":"object","properties":{"action":{"type":"string","enum":["list","get"]},"topic":{"type":"string"}},"required":["action"]})")}, {"read_only", true}});
     out.push_back({{"name", "analyze"},
                    {"description", "Run whole-binary read-only analysis. packer uses the shared image or path and reports protector names, entry signatures, entropy, import anomalies, W+X sections, TLS, overlay, crypto constants, and the shared Hyperion verdict when available. signatures requires the analyzed shared session and returns analyzer-derived names in named_functions; names may come from RTTI, vtables, thunks, or signature candidates and are not provenance-verified as FLIRT. diff(path_a,path_b) performs two full Hyperion analyses and reports added, removed, and modified functions with similarity scores, so expect a longer call; for huge binaries use async diff_start(path_a,path_b) then poll diff_job(id) for stage/progress and stop with diff_cancel(id). Check disasm.loaded before shared-session actions."},
                    {"inputSchema", json::parse(analyze_schema)}, {"read_only", true}});
@@ -9230,6 +9744,7 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         else if (name == "types")    out = tool_types(args);
         else if (name == "notes")    out = tool_notes(args);
         else if (name == "devirt")   out = tool_devirt(args);
+        else if (name == "guide")    out = tool_guide(args);
         else found = false;
         if (!found) {
             is_error = true;
