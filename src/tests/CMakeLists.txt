@@ -33,6 +33,15 @@ target_include_directories(slop_tests PRIVATE "${CMAKE_SOURCE_DIR}/src")
 
 target_link_libraries(slop_tests PRIVATE slop_core httplib::httplib)
 
+# Real-world PE fixture: the built SlopTarget.exe itself (hidden local
+# user-mode target used by the test harness only)
+if(TARGET slop_target)
+    target_compile_definitions(slop_tests PRIVATE
+        SLOP_TARGET_EXE_PATH=\"$<TARGET_FILE:slop_target>\"
+    )
+    add_dependencies(slop_tests slop_target)
+endif()
+
 if(MSVC)
     target_compile_options(slop_tests PRIVATE /W4 /EHsc)
 endif()

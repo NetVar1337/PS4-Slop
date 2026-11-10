@@ -3553,6 +3553,114 @@ json tool_debugger(const json& args) {
     fail("debugger: PS4-only build - use ps4_* actions (see guide get ps4_setup); local Win32 debugging was removed");
 }
 
+struct image_view_t {
+    struct reloc_t { uint32_t rva = 0; uint8_t width = 0; };   // width 4 | 8
+
+    uint64_t hash   = 0;
+    uint64_t extent = 0;            // SizeOfImage, or the section span
+    uint64_t delta  = 0;            // session base - ImageBase, mod 2^64
+    std::vector<reloc_t> relocs;    // sorted by rva, empty when not rebased
+
+    // Raw mapped bytes for [rva, rva + len), no relocation. Caller holds
+    // the state mutex
+    static void copy_mapped(const ds::binary_t& bin, uint64_t rva, size_t len, uint8_t* out) {
+        std::memset(out, 0, len);
+        const uint64_t end = rva + len;
+        if (bin.format == disasm::image_format_t::pe) {
+            uint64_t headers = emu::kPageSize;
+            for (const auto& s : bin.pe.sections)
+                if (s.raw_size) headers = std::min<uint64_t>(headers, s.raw_offset);
+            headers = std::min<uint64_t>(headers, bin.file.size());
+            if (rva < headers)
+                std::memcpy(out, bin.file.data() + rva,
+                            static_cast<size_t>(std::min(end, headers) - rva));
+        }
+        for (const auto& s : bin.pe.sections) {
+            // file bytes past VirtualSize are not mapped by the loader
+            const uint64_t backed = std::min<uint64_t>(
+                s.virtual_size ? s.virtual_size : s.raw_size, s.raw_size);
+            const uint64_t lo = std::max<uint64_t>(rva, s.rva);
+            const uint64_t hi = std::min<uint64_t>(end, s.rva + backed);
+            if (lo >= hi) continue;
+            const uint64_t off = uint64_t{s.raw_offset} + (lo - s.rva);
+            if (off >= bin.file.size()) continue;
+            const uint64_t n = std::min<uint64_t>(hi - lo, bin.file.size() - off);
+            std::memcpy(out + (lo - rva), bin.file.data() + off, static_cast<size_t>(n));
+        }
+    }
+
+    // Caller holds the state mutex
+    static std::shared_ptr<const image_view_t> make(const ds::binary_t& bin) {
+        auto v = std::make_shared<image_view_t>();
+        v->hash   = bin.file_hash;
+        v->extent = bin.pe.size_of_image;
+        if (!v->extent)
+            for (const auto& s : bin.pe.sections)
+                v->extent = std::max<uint64_t>(
+                    v->extent, uint64_t{s.rva} + (s.virtual_size ? s.virtual_size : s.raw_size));
+        v->delta = bin.base - bin.pe.image_base;
+
+        // IMAGE_DIRECTORY_ENTRY_BASERELOC: blocks of {page rva, size, u16
+        // entries}, type in the top 4 bits (3 HIGHLOW, 10 DIR64)
+        const auto& dir = bin.pe.data_dirs[5];
+        if (v->delta == 0 || bin.format != disasm::image_format_t::pe ||
+            !dir.rva || !dir.size || dir.size > (64u << 20))
+            return v;
+        std::vector<uint8_t> raw(dir.size);
+        copy_mapped(bin, dir.rva, raw.size(), raw.data());
+        for (size_t pos = 0; pos + 8 <= raw.size();) {
+            uint32_t page = 0, block = 0;
+            std::memcpy(&page, raw.data() + pos, 4);
+            std::memcpy(&block, raw.data() + pos + 4, 4);
+            if (block < 8 || block > raw.size() - pos) break;
+            for (size_t e = pos + 8; e + 2 <= pos + block; e += 2) {
+                uint16_t entry = 0;
+                std::memcpy(&entry, raw.data() + e, 2);
+                const uint32_t at = page + (entry & 0xFFFu);
+                if ((entry >> 12) == 10)     v->relocs.push_back({at, 8});
+                else if ((entry >> 12) == 3) v->relocs.push_back({at, 4});
+            }
+            pos += block;
+        }
+        std::sort(v->relocs.begin(), v->relocs.end(),
+                  [](const reloc_t& a, const reloc_t& b) { return a.rva < b.rva; });
+        return v;
+    }
+
+    // Relocated mapped bytes for [rva, rva + len). Caller holds the state mutex
+    void read(const ds::binary_t& bin, uint64_t rva, size_t len, uint8_t* out) const {
+        copy_mapped(bin, rva, len, out);
+        if (relocs.empty()) return;
+        // a fixup starting up to 7 bytes before the range still reaches into it
+        const uint64_t from = rva >= 7 ? rva - 7 : 0;
+        auto it = std::lower_bound(relocs.begin(), relocs.end(), from,
+                                   [](const reloc_t& r, uint64_t a) { return r.rva < a; });
+        for (; it != relocs.end() && it->rva < rva + len; ++it) {
+            uint8_t v[8] = {};
+            copy_mapped(bin, it->rva, it->width, v);
+            if (it->width == 8) {
+                uint64_t x = 0;
+                std::memcpy(&x, v, 8);
+                x += delta;
+                std::memcpy(v, &x, 8);
+            } else {
+                uint32_t x = 0;
+                std::memcpy(&x, v, 4);
+                x += static_cast<uint32_t>(delta);
+                std::memcpy(v, &x, 4);
+            }
+            for (uint8_t i = 0; i < it->width; ++i) {
+                const uint64_t at = uint64_t{it->rva} + i;
+                if (at >= rva && at < rva + len) out[at - rva] = v[i];
+            }
+        }
+    }
+};
+
+// Demand pages over the shared image. The run is off every tool lock, so
+// each page is copied under the state mutex and the source goes dry once
+// another image replaces this one
+
 emu::page_source_t image_page_source(std::shared_ptr<const image_view_t> view) {
     return [view = std::move(view)](uint64_t page, uint8_t* out) {
         std::lock_guard lk(ds::state_mutex());
