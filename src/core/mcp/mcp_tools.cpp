@@ -9392,7 +9392,7 @@ json tool_guide(const json& args) {
     struct step_t { const char* tool; const char* action; const char* params; const char* why; };
     struct topic_t {
         const char* id; const char* title; const char* summary;
-        std::initializer_list<step_t> steps;
+        std::vector<step_t> steps;
     };
     static const std::vector<topic_t> kTopics = {
         {"ps4_setup", "Connect to a PS4 and start debugging the game in one call",
@@ -9507,7 +9507,6 @@ json tool_guide(const json& args) {
     };
 
     const std::string action = require_action(args);
-    std::fprintf(stderr, "GD-start\n");
     if (action == "list") {
         json arr = json::array();
         for (const auto& t : kTopics)

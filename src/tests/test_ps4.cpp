@@ -1140,6 +1140,17 @@ TEST_CASE(ps4_mcp_debugger_flow) {
     CHECK(r.value("attached", true) == false);
 }
 
+TEST_CASE(guide_smoke_before_ps4) {
+    bool e = false;
+    json l = slop::core::mcp::call_tool("guide", {{"action", "list"}}, e);
+    CHECK(!e);
+    CHECK(l.value("count", 0) >= 10);
+    json g = slop::core::mcp::call_tool("guide", {{"action", "get"}, {"topic", "ps4_setup"}}, e);
+    CHECK(!e);
+    REQUIRE(g.contains("steps") && g["steps"].is_array() && !g["steps"].empty());
+    CHECK(g["steps"][0].value("tool", "") == "target");
+}
+
 TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
@@ -1154,13 +1165,11 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     };
     bool e = false;
 
-    std::fprintf(stderr, "MARK attach\n");
     // debug attach
     json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
     CHECK(!e);
     CHECK(r.value("attached", false) == true);
 
-    std::fprintf(stderr, "MARK until\n");
     // ps4_until: one-call run-until, bp auto-armed and auto-cleared
     r = dbg({{"action", "ps4_bp_list"}}, e);
     CHECK(!e);
@@ -1175,7 +1184,6 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     CHECK(!e);
     CHECK(r.value("count", 999) == 0);
 
-    std::fprintf(stderr, "MARK trace_calls\n");
     // ps4_trace_calls: 3 hits, each carrying the arg registers
     r = dbg({{"action", "ps4_trace_calls"}, {"addr", 0x400600}, {"count", 3}, {"timeout_ms", 2000}}, e);
     CHECK(!e);
@@ -1191,7 +1199,6 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     CHECK(!e);
     CHECK(r.value("count", 999) == 0);
 
-    std::fprintf(stderr, "MARK find_write\n");
     // ps4_find_write: watchpoint -> event -> callstack, watchpoint auto-cleared
     r = dbg({{"action", "ps4_find_write"}, {"addr", 0x7FFF00001000}, {"len", 8}, {"timeout_ms", 3000}}, e);
     CHECK(!e);
@@ -1204,7 +1211,6 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     CHECK(!e);
     CHECK(r.value("count", 999) == 0);
 
-    std::fprintf(stderr, "MARK trace_steps\n");
     // ps4_trace_steps: rip advances by one per step
     r = dbg({{"action", "ps4_trace_steps"}, {"lwpid", 101}, {"count", 4}, {"timeout_ms", 2000}}, e);
     CHECK(!e);
@@ -1214,7 +1220,6 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     for (size_t i = 1; i < 4; ++i)
         CHECK(r["steps"][i].value("rip", 0) == r["steps"][i - 1].value("rip", 0) + 1);
 
-    std::fprintf(stderr, "MARK ps4_auto\n");
     // ps4_auto: already connected; picks the /app0/ game process (1234), not 42
     {
         bool e2 = false;
@@ -1249,15 +1254,12 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
         CHECK(saw_system);
     }
 
-    std::fprintf(stderr, "MARK guide\n");
     // guide tool: list + get
     {
         bool e2 = false;
-        std::fprintf(stderr, "G1\n");
         json l = slop::core::mcp::call_tool("guide", {{"action", "list"}}, e2);
         CHECK(!e2);
         CHECK(l.value("count", 0) >= 10);
-        std::fprintf(stderr, "G2\n");
         json gt = slop::core::mcp::call_tool(
             "guide", {{"action", "get"}, {"topic", "ps4_setup"}}, e2);
         CHECK(!e2);
@@ -1265,14 +1267,12 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
         CHECK(gt["steps"][0].value("tool", "") == "target");
         CHECK(gt["steps"][0].contains("params"));
         bool e3 = false;
-        std::fprintf(stderr, "G3\n");
         json bad = slop::core::mcp::call_tool(
             "guide", {{"action", "get"}, {"topic", "nope"}}, e3);
         CHECK(e3);
     }
 
     // ps4_detach at the end
-    std::fprintf(stderr, "MARK detach\n");
     r = dbg({{"action", "ps4_detach"}}, e);
     CHECK(!e);
 }
