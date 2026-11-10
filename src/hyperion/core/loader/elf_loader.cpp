@@ -28,8 +28,21 @@ constexpr u16 EM_X86_64  = 62;
 constexpr u16 EM_AARCH64 = 183;
 
 // Segment types
-constexpr u32 PT_LOAD    = 1;
+constexpr u32 PT_LOAD         = 1;
 [[maybe_unused]] constexpr u32 PT_DYNAMIC = 2;
+// PS4 SCE-specific program header types
+constexpr u32 PT_SCE_DYNLIBDATA = 0x61000000;
+constexpr u32 PT_SCE_RELRO      = 0x61000010;
+
+// PS4 SCE dynamic tags (d_val is offset within PT_SCE_DYNLIBDATA)
+constexpr i64 DT_SCE_STRTAB  = 0x61000035;
+constexpr i64 DT_SCE_STRSZ   = 0x61000037;
+constexpr i64 DT_SCE_SYMTAB  = 0x61000039;
+constexpr i64 DT_SCE_SYMTABSZ = 0x6100003F;
+constexpr i64 DT_SCE_JMPREL  = 0x61000029;
+constexpr i64 DT_SCE_PLTRELSZ = 0x6100002B;
+constexpr i64 DT_SCE_RELA    = 0x6100002F;
+constexpr i64 DT_SCE_RELASZ  = 0x61000031;
 
 // Segment flags
 constexpr u32 PF_X = 1;
@@ -151,6 +164,37 @@ const char* strtab_get(const u8* strtab, size_t strtab_sz, u32 offset) {
 
 } // anon
 
+bool ELFLoader::is_elf(const u8* data, size_t size) {
+    if (size < 4) return false;
+    u32 magic = 0;
+    std::memcpy(&magic, data, 4);
+    return magic == ELF_MAGIC;
+}
+
+std::optional<PEImage> ELFLoader::load_buffer(const u8* data, size_t size) {
+    if (size < 64) return std::nullopt;
+
+    PEImage img;
+    auto file = std::make_shared<std::vector<u8>>(data, data + size);
+    img.storage.push_back(file);
+    img.raw = *file;
+
+    base_ = file->data();
+    size_ = size;
+
+    if (!parse_header(img)) return std::nullopt;
+    if (!parse_segments(img)) return std::nullopt;
+    if (!parse_sections(img)) return std::nullopt;
+    if (!parse_symbols(img)) return std::nullopt;
+    parse_dynamic(img);
+    if (img.imports.empty()) parse_sce_dynlibdata(img);
+
+    spdlog::info("elf: loaded buffer - base=0x{:X} entry=0x{:X} segs={} imports={} exports={}",
+                 img.base, img.entry,
+                 img.segments.size(), img.imports.size(), img.exports.size());
+    return img;
+}
+
 std::optional<PEImage> ELFLoader::load(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return std::nullopt;
@@ -173,6 +217,7 @@ std::optional<PEImage> ELFLoader::load(const std::filesystem::path& path) {
     if (!parse_sections(img)) return std::nullopt;
     if (!parse_symbols(img)) return std::nullopt;
     parse_dynamic(img);
+    if (img.imports.empty()) parse_sce_dynlibdata(img);
 
     spdlog::info("elf: loaded {} - base=0x{:X} entry=0x{:X} segs={} imports={} exports={}",
                  path.filename().string(), img.base, img.entry,
@@ -244,7 +289,8 @@ bool ELFLoader::parse_segments(PEImage& img) {
             size_t off = eh->e_phoff + i * eh->e_phentsize;
             if (off + sizeof(Elf64_Phdr) > size_) break;
             auto* ph = reinterpret_cast<const Elf64_Phdr*>(base_ + off);
-            if (ph->p_type != PT_LOAD) continue;
+            // PT_SCE_RELRO is a PS4 read-only-after-reloc segment, treat as PT_LOAD
+            if (ph->p_type != PT_LOAD && ph->p_type != PT_SCE_RELRO) continue;
 
             Segment seg;
             seg.name = fmt::format("LOAD_{}", img.segments.size());
@@ -572,6 +618,116 @@ bool ELFLoader::parse_dynamic(PEImage& img) {
         }
     }
     return true;
+}
+
+// PS4 OELF: imports live in PT_SCE_DYNLIBDATA, not in section headers.
+// Walk PT_DYNAMIC tags to find strtab/symtab/jmprel offsets (all relative
+// to the start of PT_SCE_DYNLIBDATA), then emit one Import per PLT slot.
+void ELFLoader::parse_sce_dynlibdata(PEImage& img) {
+    if (!is64_) return;
+    auto* eh = reinterpret_cast<const Elf64_Ehdr*>(base_);
+
+    // find PT_SCE_DYNLIBDATA and PT_DYNAMIC offsets
+    u64 dynlib_file_off = 0, dynlib_filesz = 0;
+    u64 dyn_file_off = 0,    dyn_filesz = 0;
+    for (u16 i = 0; i < eh->e_phnum; ++i) {
+        size_t poff = static_cast<size_t>(eh->e_phoff) + i * eh->e_phentsize;
+        if (poff + sizeof(Elf64_Phdr) > size_) break;
+        auto* ph = reinterpret_cast<const Elf64_Phdr*>(base_ + poff);
+        if (ph->p_type == PT_SCE_DYNLIBDATA) {
+            dynlib_file_off = ph->p_offset;
+            dynlib_filesz   = ph->p_filesz;
+        } else if (ph->p_type == 2 /* PT_DYNAMIC */) {
+            dyn_file_off = ph->p_offset;
+            dyn_filesz   = ph->p_filesz;
+        }
+    }
+    if (!dynlib_file_off || !dyn_file_off) return;
+    if (dynlib_file_off + dynlib_filesz > size_) return;
+    if (dyn_file_off + dyn_filesz > size_) return;
+
+    // parse PT_DYNAMIC tags — DT_SCE_* values are offsets within PT_SCE_DYNLIBDATA
+    u64 strtab_off = 0, strsz = 0;
+    u64 symtab_off = 0, symtabsz = 0;
+    u64 jmprel_off = 0, jmprelsz = 0;
+    u64 rela_off = 0,   relasz = 0;
+
+    size_t dyn_count = static_cast<size_t>(dyn_filesz) / sizeof(Elf64_Dyn);
+    for (size_t i = 0; i < dyn_count; ++i) {
+        size_t doff = static_cast<size_t>(dyn_file_off) + i * sizeof(Elf64_Dyn);
+        if (doff + sizeof(Elf64_Dyn) > size_) break;
+        auto* d = reinterpret_cast<const Elf64_Dyn*>(base_ + doff);
+        if (d->d_tag == 0) break;
+        switch (d->d_tag) {
+        case DT_SCE_STRTAB:   strtab_off = d->d_val; break;
+        case DT_SCE_STRSZ:    strsz      = d->d_val; break;
+        case DT_SCE_SYMTAB:   symtab_off = d->d_val; break;
+        case DT_SCE_SYMTABSZ: symtabsz   = d->d_val; break;
+        case DT_SCE_JMPREL:   jmprel_off = d->d_val; break;
+        case DT_SCE_PLTRELSZ: jmprelsz   = d->d_val; break;
+        case DT_SCE_RELA:     rela_off   = d->d_val; break;
+        case DT_SCE_RELASZ:   relasz     = d->d_val; break;
+        default: break;
+        }
+    }
+    if (!strtab_off || !strsz || !symtab_off || !symtabsz) return;
+
+    // pointers into PT_SCE_DYNLIBDATA content
+    const u8* dynbase = base_ + dynlib_file_off;
+    auto safe_ptr = [&](u64 rel_off, size_t need) -> const u8* {
+        if (rel_off + need > dynlib_filesz) return nullptr;
+        return dynbase + rel_off;
+    };
+
+    const u8* strtab = safe_ptr(strtab_off, strsz);
+    if (!strtab) return;
+
+    // helper: get a NID or library name from the SCE strtab
+    auto sce_str = [&](u32 idx) -> const char* {
+        return strtab_get(strtab, static_cast<size_t>(strsz), idx);
+    };
+
+    // group imports by library (strip trailing "#module" from NID name)
+    // NID format: "<11chars>#<lib_id>#<mod_id>" — lib_id part identifies the .prx
+    // The strtab also contains library names like "libScePad.prx" at known indices.
+    // We group all imports under a single "sce_imports" dll for simplicity; the
+    // NID string itself carries the library hint for callers that want it.
+    constexpr size_t kSymEntSize = sizeof(Elf64_Sym); // 24 bytes
+
+    // emit from JMPREL (PLT slots = lazy-bound function imports)
+    auto emit_rela = [&](u64 rel_off, u64 rel_sz) {
+        if (!rel_off || !rel_sz) return;
+        const u8* rela_base = safe_ptr(rel_off, static_cast<size_t>(rel_sz));
+        if (!rela_base) return;
+        size_t count = static_cast<size_t>(rel_sz) / sizeof(Elf64_Rela);
+        for (size_t i = 0; i < count; ++i) {
+            auto* r = reinterpret_cast<const Elf64_Rela*>(rela_base + i * sizeof(Elf64_Rela));
+            u32 sym_idx = static_cast<u32>(r->r_info >> 32);
+            if (!sym_idx) continue;
+            u64 sym_off = symtab_off + sym_idx * kSymEntSize;
+            const u8* symp = safe_ptr(sym_off, kSymEntSize);
+            if (!symp) continue;
+            auto* sym = reinterpret_cast<const Elf64_Sym*>(symp);
+            const char* name = sce_str(sym->st_name);
+            if (!name[0]) continue;
+
+            Import imp;
+            imp.dll      = "sce_imports";
+            imp.name     = name;   // e.g. "ub6vaobIaEY#+#+"
+            imp.ordinal  = 0;
+            imp.iat_addr = r->r_offset;
+            img.imports.push_back(std::move(imp));
+        }
+    };
+
+    emit_rela(jmprel_off, jmprelsz);
+    // also scan DT_SCE_RELA for GLOB_DAT entries (data symbol imports); skip
+    // if the table is implausibly large (> 32 MB) to avoid scanning huge reloc sets
+    if (rela_off && relasz && relasz <= 0x2000000ULL)
+        emit_rela(rela_off, relasz);
+
+    if (!img.imports.empty())
+        spdlog::info("elf: PS4 SCE dynlibdata resolved {} imports", img.imports.size());
 }
 
 }

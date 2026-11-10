@@ -2,6 +2,7 @@
 
 #include "core/disasm/image_open.hpp"
 
+#include "core/loader/elf_loader.h"
 #include "core/loader/macho_loader.h"
 #include "core/util/zip_reader.hpp"
 
@@ -99,6 +100,27 @@ void synthesize_section_map(const hype::PEImage& img, image_arch_t arch,
     }
 }
 
+void open_elf(std::vector<uint8_t> raw, opened_image_t& out) {
+    hype::ELFLoader loader;
+    const auto img = loader.load_buffer(raw.data(), raw.size());
+    if (!img) {
+        out.error = "elf: could not parse ELF (unsupported arch or truncated file)";
+        return;
+    }
+    if (!arch_from_hype(img->arch, out.arch)) {
+        out.error = "elf: unsupported cpu type (only x86/x64/arm/arm64 are mapped)";
+        return;
+    }
+    out.format = image_format_t::elf;
+    out.file   = std::move(raw);
+    synthesize_section_map(*img, out.arch, out.file.size(), out.pe);
+    if (out.pe.sections.empty()) {
+        out.error = "elf: no loadable segments";
+        return;
+    }
+    out.ok = true;
+}
+
 void open_macho(std::vector<uint8_t> raw, opened_image_t& out) {
     const auto slice = hype::MachOLoader::select_slice(raw.data(), raw.size());
     if (!slice) {
@@ -140,6 +162,7 @@ const char* image_format_name(image_format_t f) noexcept {
     switch (f) {
     case image_format_t::pe:    return "pe";
     case image_format_t::macho: return "macho";
+    case image_format_t::elf:   return "elf";
     }
     return "unknown";
 }
@@ -191,9 +214,14 @@ opened_image_t open_image(std::vector<uint8_t> raw) {
         return out;
     }
 
+    if (hype::ELFLoader::is_elf(raw.data(), raw.size())) {
+        open_elf(std::move(raw), out);
+        return out;
+    }
+
     out.pe = pe_parse(raw.data(), raw.size());
     if (!out.pe.ok) {
-        out.error = "unrecognized image format (expected PE, Mach-O or .ipa)";
+        out.error = "unrecognized image format (expected PE, Mach-O, ELF or .ipa)";
         return out;
     }
     // same rule the hyperion PE loader applies: the optional header picks

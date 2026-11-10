@@ -17,7 +17,7 @@
 
 namespace slop::core::disasm {
 
-enum class image_format_t : uint8_t { pe, macho };
+enum class image_format_t : uint8_t { pe, macho, elf };
 enum class image_arch_t   : uint8_t { x86, x64, arm, arm64 };
 
 const char* image_format_name(image_format_t f) noexcept;   // "pe" | "macho"

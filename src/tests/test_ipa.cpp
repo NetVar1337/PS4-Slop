@@ -404,6 +404,71 @@ TEST_CASE(ipa_macho_loader_layout) {
     }
 }
 
+// Build a minimal ELF64 (x86-64, one PT_LOAD) in memory
+static std::vector<uint8_t> make_minimal_elf64() {
+    // ELF header = 64 bytes, one program header = 56 bytes
+    // We put one NOP at offset 0x1000 (file) / va 0x400000
+    constexpr size_t kCodeOff = 0x1000;
+    constexpr size_t kTotal   = kCodeOff + 1;
+    std::vector<uint8_t> b(kTotal, 0);
+
+    // e_ident
+    b[0] = 0x7f; b[1] = 'E'; b[2] = 'L'; b[3] = 'F';
+    b[4] = 2;    // ELFCLASS64
+    b[5] = 1;    // ELFDATA2LSB
+    b[6] = 1;    // EV_CURRENT
+    b[7] = 0x09; // ELFOSABI_FREEBSD (PS4)
+    // e_type = ET_EXEC (2)
+    b[16] = 2; b[17] = 0;
+    // e_machine = EM_X86_64 (62 = 0x3E)
+    b[18] = 0x3E; b[19] = 0;
+    // e_version = 1
+    b[20] = 1;
+    // e_entry = 0x400000 (8 bytes LE at offset 24)
+    b[24] = 0x00; b[25] = 0x00; b[26] = 0x40; b[27] = 0;
+    // e_phoff = 64 (right after the header)
+    b[32] = 64;
+    // e_flags = 0
+    // e_ehsize = 64
+    b[52] = 64;
+    // e_phentsize = 56
+    b[54] = 56;
+    // e_phnum = 1
+    b[56] = 1;
+    // e_shentsize, e_shnum, e_shstrndx = 0
+
+    // Program header at offset 64
+    // p_type = PT_LOAD = 1
+    b[64] = 1;
+    // p_flags = PF_R|PF_X = 5
+    b[68] = 5;
+    // p_offset = 0x1000
+    b[72] = 0x00; b[73] = 0x10;
+    // p_vaddr = 0x400000
+    b[80] = 0x00; b[81] = 0x00; b[82] = 0x40;
+    // p_paddr = 0x400000
+    b[88] = 0x00; b[89] = 0x00; b[90] = 0x40;
+    // p_filesz = 1
+    b[96] = 1;
+    // p_memsz = 1
+    b[104] = 1;
+    // p_align = 0x1000
+    b[112] = 0x00; b[113] = 0x10;
+
+    b[kCodeOff] = 0x90; // NOP
+    return b;
+}
+
+TEST_CASE(elf_open_image_minimal_x64) {
+    const auto elf = make_minimal_elf64();
+    const auto img = disasm::open_image(elf);
+    REQUIRE(img.ok);
+    REQUIRE(img.format == disasm::image_format_t::elf);
+    REQUIRE(img.arch == disasm::image_arch_t::x64);
+    REQUIRE_EQ(img.pe.sections.size(), size_t(1));
+    REQUIRE_EQ(img.pe.image_base, uint64_t(0x400000));
+}
+
 TEST_CASE(ipa_open_image_synthesizes_section_map) {
     const auto exe = mf::build_arm64_exe();
     const auto fat = mf::build_fat({
