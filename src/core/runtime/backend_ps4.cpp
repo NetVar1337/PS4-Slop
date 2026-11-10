@@ -365,6 +365,13 @@ struct backend_ps4_t::impl_t {
         return true;
     }
 
+    void invalidate_maps_cache() {
+        std::lock_guard lk(cache_mu);
+        cache_at = 0;
+        cache.clear();
+        cache_pid = 0;
+    }
+
     // cached maps with a short TTL; coverage checks ride on this
     bool maps_cached(uint32_t pid, std::vector<ps4::vm_map_entry_t>& out, uint32_t& err) {
         {
@@ -766,6 +773,7 @@ io_result_t backend_ps4_t::protect_memory(const target_handle_t& h, uintptr_t ad
     uint32_t extra = 0;
     c.recv_u32(extra, kShortTimeoutMs);
     r.ok = true;
+    m_impl->invalidate_maps_cache();
     return r;
 }
 
@@ -814,6 +822,7 @@ io_result_t backend_ps4_t::allocate_memory(const target_handle_t& h, uintptr_t a
             }
         }
     }
+    m_impl->invalidate_maps_cache();
     return r;
 }
 
@@ -838,6 +847,7 @@ io_result_t backend_ps4_t::free_memory(const target_handle_t& h, uintptr_t addr)
     uint32_t st = 0;
     if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { r.error = 5; return r; }
     r.ok = true;
+    m_impl->invalidate_maps_cache();
     return r;
 }
 
@@ -897,9 +907,12 @@ enum_result_t<thread_info_t> backend_ps4_t::enum_threads(uint32_t pid) {
     uint32_t st = 0, num = 0;
     if (!c.recv_u32(st) || st != ps4::CMD_SUCCESS) { res.error = 3; return res; }
     if (!c.recv_u32(num) || num > kMaxListEntries) { res.error = 4; return res; }
-    for (uint32_t i = 0; i < num; ++i) {
-        uint32_t lwpid = 0;
-        if (!c.recv_u32(lwpid)) { res.error = 5; return res; }
+    // the server sends the whole lwpid array in one go; read it all before
+    // issuing any follow-up command or the stream desyncs
+    std::vector<uint32_t> lwpids(num);
+    for (uint32_t i = 0; i < num; ++i)
+        if (!c.recv_u32(lwpids[i])) { res.error = 5; return res; }
+    for (uint32_t lwpid : lwpids) {
         thread_info_t t;
         t.tid       = lwpid;
         t.owner_pid = pid;

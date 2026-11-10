@@ -38,6 +38,10 @@ The strings view with search, UTF-16 flagging and xref counts:
 - **Two desktop interfaces, one core:** native ImGui/DX11 shell and Tauri v2 +
   React shell both drive the same C++ engine.
 - **Headless operation:** run the engine without a window for MCP or HTTP clients.
+- **Remote PS4 targets:** connect directly to a console running the
+  [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload (TCP 744) and
+  use the same process list, attach, memory read/write/scan, regions, modules,
+  threads, and register tools against the console as against a local process.
 - **Live process analysis:** processes, modules, threads, regions, handles,
   module dumping, memory scans, watchlists, snapshots, pointer scans, and AOB
   searches.
@@ -332,6 +336,32 @@ output, inspector, theme/motion settings, and backend selection.
 - Snapshot memory, compare snapshots, list/free snapshot state.
 - Shared watchlist sampled around 10 Hz, including freeze writes; UI and MCP
   changes appear in both surfaces.
+
+### Remote PS4 targets (ps4debug-NG)
+
+With a PS4 on the same network running the
+[ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload, reverse-slop
+speaks its wire protocol directly (TCP 744, plus the port-755 debug-event
+callback) through a dedicated `PS4` backend:
+
+- Connect from the ImGui targets view ("PS4..." button), the Tauri targets
+  panel (gamepad button), or MCP with `target.ps4_connect {host, port=744,
+  pid?}`; `target.ps4_disconnect` drops the console. `target.status` reports
+  the endpoint and the server branding string.
+- Once connected, `target.list` enumerates console processes and the existing
+  attach button / `target.attach {pid}` opens a session over the wire; the
+  backend badge reads `PS4`.
+- Memory read/write, protect/alloc/free, AOB and numeric scans, snapshots,
+  watchlists, regions, and module enumeration all work against the remote
+  process. Reads are validated against the console's VM map so unmapped
+  ranges report failure instead of zero fill; Windows `PAGE_*` constants are
+  translated to FreeBSD `VM_PROT_*` on the way out.
+- `target.threads` and thread register get/set use ps4debug-NG's debug
+  commands (`CMD_DEBUG_ATTACH` + `GET_THREAD_LIST`/`GETREGS`/`SETREGS`); the
+  engine listens on port 755 for the server's event callback while a debug
+  session is attached.
+- PS4 modules are ELF/SELF, not PE, so `dump_module`/PE loading stay local-only;
+  analyze live addresses with `disasm.disassemble` and `memory.read` instead.
 
 ### Static analysis and decompilation
 
@@ -655,7 +685,7 @@ operational guidance are returned by `tools/list`.
 
 | Tool | Actions |
 |---|---|
-| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon` |
+| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon`, `ps4_connect`, `ps4_disconnect` |
 | `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set` |
 | `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop` |
 | `debugger` | `attach`, `detach`, `status`, `suspend_all`, `resume_all`, `bp_set`, `bp_clear`, `continue`, `step_into`, `step_over`, `step_out`, `wait_halt`, `regs`, `events`, `callstack`, `seh`, `set_register`, `watchpoint_set`, `watchpoint_clear`, `watchpoints`, `trace_run` |

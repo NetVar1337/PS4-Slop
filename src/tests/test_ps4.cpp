@@ -129,7 +129,7 @@ struct fake_ps4_server_t {
     void shutdown() {
         stop_flag = true;
         if (listen_fd != INVALID_SOCKET) {
-            shutdown(listen_fd, SD_BOTH);
+            ::shutdown(listen_fd, SD_BOTH);
             closesocket(listen_fd);
             listen_fd = INVALID_SOCKET;
         }
@@ -417,7 +417,7 @@ TEST_CASE(ps4_backend_handshake_and_enums) {
 
     auto procs = b.enum_processes();
     REQUIRE(procs.ok);
-    REQUIRE_EQ(procs.items.size(), 2u);
+    CHECK(procs.items.size() == 2u);
     bool found = false;
     for (const auto& p : procs.items) {
         if (p.pid == kFakePid) {
@@ -436,7 +436,7 @@ TEST_CASE(ps4_backend_handshake_and_enums) {
 
     auto regions = b.enum_regions(h);
     REQUIRE(regions.ok);
-    REQUIRE_EQ(regions.items.size(), 3u);
+    CHECK(regions.items.size() == 3u);
     bool saw_eboot = false;
     for (const auto& r : regions.items) {
         if (r.base == 0x400000) {
@@ -481,7 +481,7 @@ TEST_CASE(ps4_backend_memory_rw_protect_alloc) {
     for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = static_cast<uint8_t>(0xA0 + i);
     auto w = b.write_memory(h, 0x400100, pattern.data(), pattern.size());
     REQUIRE(w.ok);
-    CHECK_EQ(w.bytes, pattern.size());
+    CHECK(w.bytes == pattern.size());
     std::vector<uint8_t> back(pattern.size(), 0);
     auto r = b.read_memory(h, 0x400100, back.data(), back.size());
     REQUIRE(r.ok);
@@ -537,7 +537,7 @@ TEST_CASE(ps4_backend_threads_and_regs) {
     // enum_threads triggers the lazy debug attach (with the 755 callback)
     auto thr = b.enum_threads(kFakePid);
     REQUIRE(thr.ok);
-    REQUIRE_EQ(thr.items.size(), 2u);
+    CHECK(thr.items.size() == 2u);
     CHECK(thr.items[0].tid == 101);
     CHECK(thr.items[1].tid == 102);
     CHECK(thr.items[0].owner_pid == kFakePid);
@@ -715,7 +715,7 @@ TEST_CASE(ps4_connect_refuses_non_ps4debug_server) {
     CHECK(!b.connected());
 
     stop = true;
-    shutdown(ls, SD_BOTH);
+    ::shutdown(ls, SD_BOTH);
     closesocket(ls);
     th.join();
 }
