@@ -781,7 +781,7 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "load") return "Loads PE, Mach-O (thin/FAT), or an .ipa main executable. Poll disasm.loaded until hype.ready=true before decomp/DB queries; encrypted images must be decrypted first.";
     } else if (tool == "debugger") {
         if (action == "status") return "PS4-only build: reports the console debug state (ps4_connected, debug_attached, debug_pid, pending_events).";
-        if (action.rfind("ps4_", 0) == 0) return "PS4 console live debugging via ps4debug-NG. Flow: target.ps4_connect {host} (or ps4_auto {host}) -> ps4_attach {pid} -> ps4_bp_set {addr} / ps4_watch_set {addr,type,len} -> ps4_continue -> ps4_wait {timeout_ms} (stop event with rip/regs) -> ps4_regs/ps4_callstack/ps4_events -> ps4_step or ps4_continue again. ps4_call {addr, args} runs a function in the console process and returns rax. One-call power actions: ps4_until, ps4_find_write, ps4_trace_calls, ps4_trace_steps. ps4_* actions fail with a clear error when no console is connected.";
+        if (action.rfind("ps4_", 0) == 0) return "PS4 console tooling via ps4debug-NG. Live debugging: target.ps4_connect {host} (or ps4_auto {host}) -> ps4_attach {pid} -> ps4_bp_set {addr} / ps4_watch_set {addr,type,len} -> ps4_continue -> ps4_wait {timeout_ms} (stop event with rip/regs) -> ps4_regs/ps4_callstack/ps4_events -> ps4_step or ps4_continue again. ps4_call {addr, args} runs a function in the console process and returns rax. One-call power actions: ps4_until, ps4_find_write, ps4_trace_calls, ps4_trace_steps. Console-side game hacking: ps4_scan {addr,len,value_type,compare,value} + ps4_rescan + ps4_scan_state/reset (native on-console value scan, unlocked by ps4_auth), ps4_scan_all (whole-memory), ps4_scan_aob {addr,len,pattern} (pattern with ?? wildcards), ps4_disasm/ps4_xrefs/ps4_xrefs_to (on-device disasm+xrefs), ps4_stack (server-side frame walk), ps4_assemble {asm} (on-device Keystone), ps4_elf_rpc/ps4_elf_load {path} (run a payload ELF in the game), ps4_notify/ps4_print/ps4_app (console UI/log/foreground game), ps4_fpregs/ps4_set_fpregs/ps4_set_dbregs/ps4_fsgs/ps4_set_fsgs (full register sets). target.ps4_dump_module {name|base,path,load} dumps a module over the wire. ps4_* actions fail with a clear error when no console is connected.";
     } else if (tool == "xray") {
         if (action == "cfg" || action == "complexity") return "Pass a function-start VA from disasm.functions. block_count/edge_count/back_edges feed cyclomatic=edges-blocks+2. Cross-check entry with decomp.function.";
         if (action == "cff") return "flattened=false carries no dispatcher (no score). flattened=true lists dispatcher + state_blocks; recover with devirt.recover_cfg.";
@@ -1339,9 +1339,10 @@ json tool_target(const json& args) {
             out["pid"]      = s->pid();
             out["name"]     = s->name();
             out["arch"]     = arch_name(s->arch());
-            out["hint"]     = "PS4 modules are ELF/SELF, not PE: dump_module writes a raw "
-                              "memory image and disasm.load cannot open it. Use target.modules, "
-                              "memory.read/write and disasm.disassemble on live addresses instead.";
+            out["hint"]     = "PS4 modules are ELF/SELF, not PE: use target.ps4_dump_module to pull the "
+                              "raw memory image over the wire (load=true for ELF static analysis). "
+                              "Use target.modules, memory.read/write and disasm.disassemble on live "
+                              "addresses instead.";
         } else {
             out["attached"] = false;
             out["hint"]     = "Console connected. Next: target.list to pick a pid, then "
@@ -1626,8 +1627,89 @@ json tool_target(const json& args) {
         return {{"handles", arr}, {"count", arr.size()}, {"total", res.items.size()}};
     }
 
+    if (action == "ps4_dump_module") {
+        // dump a module's whole mapped range from the console over ps4debug-NG
+        auto* p4 = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active());
+        if (!p4 || !p4->connected())
+            fail("ps4_dump_module requires a connected console (target.ps4_connect {host})");
+        auto& session = need_session();
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("ps4_dump_module requires output 'path'");
+        const std::string output_path = args.at("path").get<std::string>();
+        if (output_path.empty()) fail("ps4_dump_module output path is empty");
+        const uint64_t requested_base = args.contains("base") ? parse_addr(args, "base") : 0;
+        const std::string requested_name = args.value("name", std::string{});
+        if (requested_base == 0 && requested_name.empty())
+            fail("ps4_dump_module requires module 'base' or 'name'");
+        auto modules = p4->enum_modules(session.handle());
+        if (!modules.ok) fail("module enumeration failed on the console");
+        const runtime::module_info_t* selected = nullptr;
+        for (const auto& m : modules.items) {
+            if ((requested_base != 0 && m.base == requested_base) ||
+                (requested_base == 0 && _stricmp(m.name.c_str(), requested_name.c_str()) == 0)) {
+                selected = &m;
+                break;
+            }
+        }
+        if (!selected) fail("requested module is not loaded in the console process");
+        if (selected->size == 0 || selected->size > 512ull * 1024 * 1024)
+            fail("module size out of range (" + std::to_string(selected->size) + ")");
+
+        std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+        if (!out) fail("cannot create " + output_path);
+        constexpr uint32_t kChunk = 256 * 1024;
+        uint64_t written = 0;
+        bool complete = true;
+        std::vector<uint8_t> buf;
+        for (uint64_t off = 0; off < selected->size; off += kChunk) {
+            const uint32_t n = static_cast<uint32_t>(
+                std::min<uint64_t>(kChunk, selected->size - off));
+            buf.resize(n);
+            auto io = p4->read_memory(session.handle(),
+                                     static_cast<uintptr_t>(selected->base + off),
+                                     buf.data(), n);
+            if (!io.ok || io.bytes != n) { complete = false; break; }
+            out.write(reinterpret_cast<const char*>(buf.data()), n);
+            written += n;
+        }
+        out.close();
+        if (written == 0) fail("ps4_dump_module read 0 bytes from the console");
+
+        bool loaded = false;
+        std::string load_note;
+        if (args.value("load", false)) {
+            // a memory dump of a PS4 module starts with the ELF header at base
+            std::ifstream chk(output_path, std::ios::binary);
+            char magic[4] = {};
+            chk.read(magic, 4);
+            if (std::memcmp(magic, "\x7f""ELF", 4) == 0) {
+                loaded = ds::load_file(output_path, selected->base);
+                if (!loaded) load_note = ds::last_load_error();
+            } else {
+                load_note = "dumped range is not an ELF image (no \\x7fELF at base); "
+                            "not loaded - inspect with a hex editor or re-dump from the "
+                            "module base";
+            }
+        }
+        return {{"dumped", true},
+                {"complete", complete},
+                {"path", output_path},
+                {"bytes_written", written},
+                {"module", {{"base", static_cast<uint64_t>(selected->base)},
+                            {"base_hex", addr_hex_str(selected->base)},
+                            {"size", selected->size},
+                            {"name", selected->name},
+                            {"path", selected->path}}},
+                {"loaded", loaded},
+                {"load_note", load_note},
+                {"note", "raw memory image of the module over the wire; ELF dumps can be "
+                         "loaded with load=true for static analysis (disasm.*), SELF/"
+                         "eboot files need the ps4 payload's decrypted memory image"}};
+    }
+
     fail("target: unknown action (list|attach|detach|status|modules|"
-         "dump_module|threads|regions|handles|icon|ps4_connect|ps4_disconnect|ps4_auto)");
+         "dump_module|ps4_dump_module|threads|regions|handles|icon|"
+         "ps4_connect|ps4_disconnect|ps4_auto)");
 }
 
 // tool: memory
@@ -3062,6 +3144,263 @@ json ps4_frames_json(runtime::session_t& s, uint32_t lwpid,
         rbp = next;
     }
     return arr;
+}
+
+std::string ps4_hex_str(const std::vector<uint8_t>& bytes) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0xF]);
+    }
+    return out;
+}
+
+// native ps4debug-NG scan session (one per console connection); mirrors the
+// host-side memory.scan state but runs the scan on the console itself
+struct ps4_scan_session_t {
+    bool     used = false;
+    uint32_t pid = 0;
+    uint64_t base = 0;
+    uint8_t  valtype = 0;
+    std::vector<runtime::backend_ps4_t::ps4_scan_hit_t> hits;
+};
+ps4_scan_session_t& ps4_scan_sess() { static ps4_scan_session_t s; return s; }
+
+uint8_t ps4_valtype_arg(const json& args) {
+    const std::string w = args.value("value_type",
+                                     args.value("width", std::string{"u32"}));
+    if (w == "u8") return runtime::ps4::kValU8;
+    if (w == "i8") return runtime::ps4::kValI8;
+    if (w == "u16") return runtime::ps4::kValU16;
+    if (w == "i16") return runtime::ps4::kValI16;
+    if (w == "u32") return runtime::ps4::kValU32;
+    if (w == "i32") return runtime::ps4::kValI32;
+    if (w == "u64") return runtime::ps4::kValU64;
+    if (w == "i64") return runtime::ps4::kValI64;
+    if (w == "f32" || w == "float")  return runtime::ps4::kValF32;
+    if (w == "f64" || w == "double") return runtime::ps4::kValF64;
+    if (w == "bytes" || w == "array") return runtime::ps4::kValArrBytes;
+    if (w == "string") return runtime::ps4::kValString;
+    fail("bad value_type (u8|i8|u16|i16|u32|i32|u64|i64|f32|f64|bytes|string)");
+}
+
+uint8_t ps4_cmptype_arg(const json& args) {
+    const std::string k = args.value("compare",
+                                     args.value("kind", std::string{"exact"}));
+    if (k == "exact") return runtime::ps4::kCmpExact;
+    if (k == "fuzzy") return runtime::ps4::kCmpFuzzy;
+    if (k == "bigger" || k == "bigger_than") return runtime::ps4::kCmpBigger;
+    if (k == "smaller" || k == "smaller_than") return runtime::ps4::kCmpSmaller;
+    if (k == "between") return runtime::ps4::kCmpBetween;
+    if (k == "increased") return runtime::ps4::kCmpIncreased;
+    if (k == "increased_by") return runtime::ps4::kCmpIncreasedBy;
+    if (k == "decreased") return runtime::ps4::kCmpDecreased;
+    if (k == "decreased_by") return runtime::ps4::kCmpDecreasedBy;
+    if (k == "changed") return runtime::ps4::kCmpChanged;
+    if (k == "unchanged") return runtime::ps4::kCmpUnchanged;
+    if (k == "unknown") return runtime::ps4::kCmpUnknown;
+    if (k == "unknown_low") return runtime::ps4::kCmpUnknownLow;
+    fail("bad compare (exact|fuzzy|bigger|smaller|between|increased|increased_by|"
+         "decreased|decreased_by|changed|unchanged|unknown|unknown_low)");
+}
+
+memory::value_width_t ps4_width_of(uint8_t vt) {
+    using memory::value_width_t;
+    switch (vt) {
+        case runtime::ps4::kValU8: return value_width_t::u8;
+        case runtime::ps4::kValI8: return value_width_t::i8;
+        case runtime::ps4::kValU16: return value_width_t::u16;
+        case runtime::ps4::kValI16: return value_width_t::i16;
+        case runtime::ps4::kValU32: return value_width_t::u32;
+        case runtime::ps4::kValI32: return value_width_t::i32;
+        case runtime::ps4::kValU64: return value_width_t::u64;
+        case runtime::ps4::kValI64: return value_width_t::i64;
+        case runtime::ps4::kValF32: return value_width_t::f32;
+        case runtime::ps4::kValF64: return value_width_t::f64;
+        default: return value_width_t::u32;
+    }
+}
+
+// encode the 'value' arg (number, numeric string, [min,max] for between, or
+// 'hex' for bytes) into little-endian scan bytes
+std::vector<uint8_t> ps4_value_bytes(const json& args, uint8_t vt, uint8_t ct) {
+    const auto append_bits = [&](uint64_t bits, uint32_t nbytes) {
+        std::vector<uint8_t> out;
+        for (uint32_t i = 0; i < nbytes; ++i)
+            out.push_back(static_cast<uint8_t>((bits >> (8 * i)) & 0xFF));
+        return out;
+    };
+    if (vt == runtime::ps4::kValArrBytes || vt == runtime::ps4::kValString) {
+        if (vt == runtime::ps4::kValString) {
+            if (!args.contains("value") || !args.at("value").is_string())
+                fail("string scan requires string 'value'");
+            return std::vector<uint8_t>(args.at("value").get<std::string>().begin(),
+                                        args.at("value").get<std::string>().end());
+        }
+        if (!args.contains("hex") || !args.at("hex").is_string())
+            fail("bytes scan requires 'hex'");
+        return hex_decode(args.at("hex").get<std::string>());
+    }
+    const auto width = ps4_width_of(vt);
+    const uint32_t nbytes = static_cast<uint32_t>(memory::value_size(width));
+    std::vector<uint8_t> out;
+    if (ct == runtime::ps4::kCmpBetween) {
+        // value: [min, max] or "min,max"
+        std::vector<std::string> parts;
+        if (args.contains("value") && args.at("value").is_array()) {
+            for (const auto& v : args.at("value")) {
+                if (v.is_string()) parts.push_back(v.get<std::string>());
+                else if (v.is_number()) parts.push_back(v.dump());
+                else fail("between value entries must be numbers/strings");
+            }
+        } else if (args.contains("value") && args.at("value").is_string()) {
+            const std::string s = args.at("value").get<std::string>();
+            size_t pos = 0;
+            while (true) {
+                const size_t comma = s.find(',', pos);
+                parts.push_back(s.substr(pos, comma == std::string::npos ? comma : comma - pos));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        } else fail("between scan requires value: [min, max]");
+        if (parts.size() != 2) fail("between scan needs exactly two values");
+        for (const auto& p : parts) {
+            uint64_t bits = 0;
+            if (!memory::parse_value_text(width, p, bits))
+                fail("bad between value '" + p + "' for the chosen value_type");
+            auto b = append_bits(bits, nbytes);
+            out.insert(out.end(), b.begin(), b.end());
+        }
+        return out;
+    }
+    if (!args.contains("value")) fail("scan requires 'value' (or 'hex' for bytes)");
+    const json& v = args.at("value");
+    std::string text;
+    if (v.is_string()) text = v.get<std::string>();
+    else if (v.is_number()) text = v.dump();
+    else fail("value must be a number or numeric string");
+    uint64_t bits = 0;
+    if (!memory::parse_value_text(width, text, bits))
+        fail("bad value '" + text + "' for the chosen value_type");
+    return append_bits(bits, nbytes);
+}
+
+json ps4_hits_json(const std::vector<runtime::backend_ps4_t::ps4_scan_hit_t>& hits,
+                   size_t cap) {
+    json arr = json::array();
+    for (size_t i = 0; i < hits.size() && i < cap; ++i) {
+        arr.push_back({{"addr", hits[i].addr},
+                       {"addr_hex", addr_hex_str(hits[i].addr)},
+                       {"value_hex", ps4_hex_str(hits[i].value)}});
+    }
+    return arr;
+}
+
+json tool_ps4_scan(const std::string& action, const json& args,
+                   runtime::backend_ps4_t& p) {
+    auto& ss = ps4_scan_sess();
+    if (action == "ps4_scan_reset") {
+        ss = ps4_scan_session_t{};
+        return {{"reset", true}};
+    }
+    if (action == "ps4_scan_state") {
+        if (!ss.used) return {{"used", false}, {"note", "no native scan running; start with debugger ps4_scan"}};
+        return {{"used", true}, {"pid", ss.pid}, {"base", ss.base},
+                {"base_hex", addr_hex_str(ss.base)}, {"value_type", ss.valtype},
+                {"count", ss.hits.size()},
+                {"hits", ps4_hits_json(ss.hits, 256)},
+                {"truncated", ss.hits.size() > 256},
+                {"note", "narrow with ps4_rescan; read values with memory.read"}};
+    }
+    if (action == "ps4_scan_all") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint8_t vt = ps4_valtype_arg(args);
+        const uint8_t ct = ps4_cmptype_arg(args);
+        auto data = ps4_value_bytes(args, vt, ct);
+        if (!runtime::ps4::scan_cmp_needs_value(ct) && !data.empty()) data.clear();
+        std::vector<uint64_t> addrs;
+        auto io = p.ps4_scan_all(pid, vt, ct, data, addrs);
+        if (!io.ok) fail("ps4_scan_all failed (error " + std::to_string(io.error) +
+                         "; scan family needs auth bit 1 - ps4_auth)");
+        const size_t cap = std::min(addrs.size(), size_t{4096});
+        json arr = json::array();
+        for (size_t i = 0; i < cap; ++i)
+            arr.push_back({{"addr", addrs[i]}, {"addr_hex", addr_hex_str(addrs[i])}});
+        return {{"scanned", "all readable maps"}, {"count", addrs.size()},
+                {"hits", arr}, {"truncated", addrs.size() > cap}};
+    }
+    if (action == "ps4_scan_aob") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint32_t len = static_cast<uint32_t>(parse_addr(args, "len"));
+        if (!args.contains("pattern") || !args.at("pattern").is_string())
+            fail("ps4_scan_aob requires 'pattern' hex with ?? wildcards, e.g. \"48 8B ?? ?? 90\"");
+        // build pattern+mask from a hex string where ?? (or any non-hex pair) is a wildcard
+        const std::string raw = args.at("pattern").get<std::string>();
+        std::vector<uint8_t> pattern, mask;
+        size_t i = 0;
+        while (i < raw.size()) {
+            if (raw[i] == '?') {   // ?? (or a lone ?) is a wildcard byte
+                pattern.push_back(0);
+                mask.push_back(0);
+                ++i;
+                continue;
+            }
+            if (!std::isxdigit(static_cast<unsigned char>(raw[i]))) { ++i; continue; }
+            if (i + 1 >= raw.size() || !std::isxdigit(static_cast<unsigned char>(raw[i + 1]))) {
+                fail("ps4_scan_aob: pattern has an odd hex digit at offset " +
+                     std::to_string(i));
+            }
+            pattern.push_back(static_cast<uint8_t>(std::stoul(raw.substr(i, 2), nullptr, 16)));
+            mask.push_back(1);
+            i += 2;
+        }
+        if (pattern.empty()) fail("ps4_scan_aob: empty pattern");
+        const uint8_t max_matches = static_cast<uint8_t>(args.value("max_matches", 1u));
+        const uint8_t stop_flag = static_cast<uint8_t>(args.value("unique", 0u));
+        uint64_t hit = 0;
+        auto io = p.ps4_scan_aob(pid, addr, len, pattern, mask, max_matches, stop_flag, hit);
+        if (!io.ok) fail("ps4_scan_aob failed (error " + std::to_string(io.error) +
+                         "; scan family needs auth bit 1 - ps4_auth)");
+        return {{"addr", hit}, {"addr_hex", addr_hex_str(hit)},
+                {"found", hit != 0},
+                {"note", "returns the max_matches-th match (0 when none or "
+                         "invalidated with unique=1); raise max_matches to walk matches"}};
+    }
+    // ps4_scan (first) / ps4_rescan (narrow)
+    const uint32_t pid = ps4_pid_arg(args);
+    const uint8_t vt = action == "ps4_rescan"
+        ? (ss.used ? ss.valtype : ps4_valtype_arg(args))
+        : ps4_valtype_arg(args);
+    const uint8_t ct = ps4_cmptype_arg(args);
+    auto data = ps4_value_bytes(args, vt, ct);
+    if (!runtime::ps4::scan_cmp_needs_value(ct)) data.clear();
+    if (action == "ps4_scan") {
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint32_t len = static_cast<uint32_t>(parse_addr(args, "len"));
+        const uint8_t alignment = static_cast<uint8_t>(args.value("alignment", 0u));
+        std::vector<runtime::backend_ps4_t::ps4_scan_hit_t> hits;
+        auto io = p.ps4_scan_first(pid, addr, len, vt, ct, alignment, data, hits);
+        if (!io.ok) fail("ps4_scan failed (error " + std::to_string(io.error) +
+                         "; scan family needs auth bit 1 - ps4_auth)");
+        ss.used = true; ss.pid = pid; ss.base = addr; ss.valtype = vt; ss.hits = hits;
+        return {{"first_scan", true}, {"pid", pid}, {"addr", addr},
+                {"addr_hex", addr_hex_str(addr)}, {"len", len},
+                {"count", hits.size()}, {"hits", ps4_hits_json(hits, 256)},
+                {"truncated", hits.size() > 256},
+                {"note", "narrow with ps4_rescan {compare, value}; state in ps4_scan_state"}};
+    }
+    if (!ss.used || ss.pid != pid)
+        fail("ps4_rescan needs a ps4_scan for this pid first");
+    std::vector<runtime::backend_ps4_t::ps4_scan_hit_t> hits;
+    auto io = p.ps4_scan_next(pid, ss.base, vt, ct, ss.hits, data, hits);
+    if (!io.ok) fail("ps4_rescan failed (error " + std::to_string(io.error) + ")");
+    ss.hits = hits;
+    return {{"rescanned", true}, {"pid", pid}, {"base", ss.base},
+            {"base_hex", addr_hex_str(ss.base)}, {"count", hits.size()},
+            {"hits", ps4_hits_json(hits, 256)}, {"truncated", hits.size() > 256}};
 }
 
 uint64_t* ps4_reg_ptr(runtime::thread_context_t& c, const std::string& n) {

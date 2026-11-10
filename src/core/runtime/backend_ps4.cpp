@@ -200,10 +200,9 @@ public:
     }
 };
 
-namespace {
 // defined near the console-capabilities section below; used by connect()
+// (this file's helper namespace is already the anonymous namespace)
 bool auth_locked(conn_t& c, bool& authed, uint32_t flags, std::string& err);
-} // namespace
 
 // ---------------------------------------------------------------------------
 // event_listener_t: accepts the server->client debug-event connection on 755.
@@ -1747,7 +1746,7 @@ io_result_t backend_ps4_t::ps4_elf_load(uint32_t pid, const std::vector<uint8_t>
     auto& c = *m_impl->conn;
     std::lock_guard lk(c.mu);
     if (!c.connected()) { r.error = 1; return r; }
-    if (elf.empty() || elf.size() > kMaxIoLen) { r.error = 2; return r; }
+    if (elf.empty() || elf.size() > ps4::kMaxIoLen) { r.error = 2; return r; }
     ps4::proc_elf_packet_t pkt{};
     pkt.pid = pid; pkt.length = static_cast<uint32_t>(elf.size());
     if (!c.send_cmd(ps4::CMD_PROC_ELF, &pkt, sizeof(pkt))) { r.error = 3; return r; }
@@ -1765,7 +1764,7 @@ io_result_t backend_ps4_t::ps4_elf_rpc(uint32_t pid, const std::vector<uint8_t>&
     auto& c = *m_impl->conn;
     std::lock_guard lk(c.mu);
     if (!c.connected()) { r.error = 1; return r; }
-    if (elf.empty() || elf.size() > kMaxIoLen) { r.error = 2; return r; }
+    if (elf.empty() || elf.size() > ps4::kMaxIoLen) { r.error = 2; return r; }
     ps4::proc_elf_packet_t pkt{};
     pkt.pid = pid; pkt.length = static_cast<uint32_t>(elf.size());
     if (!c.send_cmd(ps4::CMD_PROC_ELF_RPC, &pkt, sizeof(pkt))) { r.error = 3; return r; }

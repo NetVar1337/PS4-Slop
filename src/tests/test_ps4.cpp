@@ -18,7 +18,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <array>
+#include <cstdio>
+#include <fstream>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -100,6 +103,19 @@ struct fake_ps4_server_t {
     int intall_count = 0;
     uint64_t rpcstub = 0x700000;
     ps4::proc_call_packet_t last_call{};
+
+    // console-side capability state observed by the tests
+    bool auth_ok = false;
+    int auth_attempts = 0;
+    std::string last_notify, last_print;
+    uint32_t last_notify_type = 0;
+    uint64_t elf_rpc_entry = 0;
+    int elf_rpc_count = 0, elf_load_count = 0;
+    uint8_t last_fpregs[848]{};
+    uint32_t setfpregs_len = 0;
+    uint8_t last_dbregs[128]{};
+    bool setdbregs_called = false;
+    uint64_t last_fsgs_fs = 0, last_fsgs_gs = 0;
 
     // send one packed 0x4A0 debug event on the port-755 connection
     void send_event(uint32_t lwpid, uint32_t status, const char* name, uint64_t rip_override) {
@@ -555,6 +571,398 @@ private:
             resp.pid = p->pid;
             resp.rax = p->rdi + 1;   // fake target function: return arg0 + 1
             return send_all(c, &resp, sizeof(resp));
+        }
+
+        case ps4::CMD_PROC_AUTH: {
+            const auto* p = reinterpret_cast<const ps4::proc_auth_packet_t*>(body);
+            {
+                std::lock_guard lk(mu);
+                ++auth_attempts;
+                if (!p || p->magic != ps4::CMD_PROC_AUTH_MAGIC) {
+                    auth_ok = false;
+                    return send_u32(c, ps4::CMD_DATA_NULL), true;
+                }
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            const uint16_t chlen = 64;
+            uint8_t challenge[64], response[64];
+            for (uint16_t i = 0; i < chlen; ++i) challenge[i] = static_cast<uint8_t>(i * 7 + 3);
+            if (!send_all(c, &chlen, sizeof(chlen))) return false;
+            if (!send_all(c, challenge, chlen)) return false;
+            if (!recv_all(c, response, chlen)) return false;
+            // same LFSR keystream as the payload (proc.c auth_lfsr_next)
+            uint32_t s1 = 200, s2 = 300, s3 = 400, s4 = 500;
+            bool match = true;
+            for (uint16_t i = 0; i < chlen; ++i) {
+                s1 = ((s1 << 18) & 0xFFF80000u) ^ ((s1 ^ (s1 << 6)) >> 13);
+                s2 = ((s2 << 2) & 0xFFFFFFE0u) ^ ((s2 ^ (s2 << 2)) >> 27);
+                s3 = ((s3 << 7) & 0xFFFFF800u) ^ ((s3 ^ (s3 << 13)) >> 21);
+                s4 = ((s4 << 13) & 0xFFF00000u) ^ ((s4 ^ (s4 << 3)) >> 12);
+                const uint8_t ks = static_cast<uint8_t>(s1 ^ s2 ^ s3 ^ s4);
+                if (response[i] != static_cast<uint8_t>(challenge[i] ^ ks)) { match = false; break; }
+            }
+            {
+                std::lock_guard lk(mu);
+                auth_ok = match;
+            }
+            return send_u32(c, match ? ps4::CMD_SUCCESS : ps4::CMD_DATA_NULL), true;
+        }
+
+        case ps4::CMD_PROC_SCAN_START: {
+            bool authed;
+            { std::lock_guard lk(mu); authed = auth_ok; }
+            if (!authed) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (bodylen < sizeof(ps4::proc_scan_start_packet_t))
+                return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* sp = reinterpret_cast<const ps4::proc_scan_start_packet_t*>(body);
+            const uint32_t raw_vlen = ps4::scan_value_size(sp->valueType);
+            const uint32_t vlen = raw_vlen ? raw_vlen : sp->lenData;
+            const bool needs_val = ps4::scan_cmp_needs_value(sp->compareType);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> pattern(needs_val ? sp->lenData : 0);
+            if (needs_val && sp->lenData && !recv_all(c, pattern.data(), sp->lenData)) return false;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> region(sp->length);
+            for (uint32_t i = 0; i < sp->length; ++i) region[i] = mem_byte(sp->address + i);
+            std::vector<uint8_t> block;
+            const uint64_t step = sp->alignment ? sp->alignment : vlen;
+            for (uint64_t a = 0; a + vlen <= sp->length; a += step) {
+                bool match = !needs_val;   // value-less compares match all in the fake
+                if (needs_val) {
+                    uint64_t cur = 0, pat = 0;
+                    for (uint32_t i = 0; i < vlen && i < 8; ++i) {
+                        cur |= static_cast<uint64_t>(region[a + i]) << (8 * i);
+                        pat |= static_cast<uint64_t>(pattern[i]) << (8 * i);
+                    }
+                    if (sp->compareType == ps4::kCmpBigger) match = cur > pat;
+                    else if (sp->compareType == ps4::kCmpSmaller) match = cur < pat;
+                    else match = cur == pat;   // exact/fuzzy/between-ish
+                }
+                if (!match) continue;
+                const uint32_t off = static_cast<uint32_t>(a);
+                block.insert(block.end(), reinterpret_cast<const uint8_t*>(&off),
+                             reinterpret_cast<const uint8_t*>(&off) + 4);
+                block.insert(block.end(), region.begin() + a, region.begin() + a + vlen);
+            }
+            const uint64_t blen = block.size();
+            if (!send_all(c, &blen, sizeof(blen))) return false;
+            if (blen && !send_all(c, block.data(), block.size())) return false;
+            const uint64_t sentinel = 0xFFFFFFFFFFFFFFFFull;
+            if (!send_all(c, &sentinel, sizeof(sentinel))) return false;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_PROC_SCAN_COUNT: {
+            bool authed;
+            { std::lock_guard lk(mu); authed = auth_ok; }
+            if (!authed) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (bodylen < sizeof(ps4::proc_scan_count_packet_t))
+                return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* cp = reinterpret_cast<const ps4::proc_scan_count_packet_t*>(body);
+            const uint32_t raw_vlen = ps4::scan_value_size(cp->valueType);
+            const uint32_t vlen = raw_vlen ? raw_vlen : cp->lenData;
+            const bool needs_val = ps4::scan_cmp_needs_value(cp->compareType);
+            const bool needs_prev = ps4::scan_cmp_needs_previous(cp->compareType);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> pattern(needs_val ? cp->lenData : 0);
+            if (needs_val && cp->lenData && !recv_all(c, pattern.data(), cp->lenData)) return false;
+            const size_t esz = 4 + (needs_prev ? vlen : 0);
+            for (;;) {
+                uint32_t chunkLen = 0;
+                if (!recv_all(c, &chunkLen, sizeof(chunkLen))) return false;
+                if (chunkLen == 0xFFFFFFFFu) break;
+                if (chunkLen == 0) {
+                    const uint64_t s = 0xFFFFFFFFFFFFFFFFull;
+                    if (!send_all(c, &s, sizeof(s))) return false;
+                    continue;
+                }
+                std::vector<uint8_t> chunk(chunkLen);
+                if (!recv_all(c, chunk.data(), chunkLen)) return false;
+                std::vector<uint8_t> res;
+                for (size_t off = 0; off + esz <= chunk.size(); off += esz) {
+                    uint32_t eo = 0;
+                    std::memcpy(&eo, chunk.data() + off, 4);
+                    const uint64_t a = cp->base_address + eo;
+                    bool match = false;
+                    if (needs_prev) {
+                        bool same = true;
+                        for (uint32_t i = 0; i < vlen; ++i)
+                            if (mem_byte(a + i) != chunk[off + 4 + i]) { same = false; break; }
+                        if (cp->compareType == ps4::kCmpChanged) match = !same;
+                        else if (cp->compareType == ps4::kCmpUnchanged) match = same;
+                    } else if (needs_val) {
+                        match = true;
+                        for (uint32_t i = 0; i < vlen; ++i)
+                            if (mem_byte(a + i) != pattern[i]) { match = false; break; }
+                    }
+                    if (!match) continue;
+                    res.insert(res.end(), chunk.data() + off, chunk.data() + off + 4);
+                    for (uint32_t i = 0; i < vlen; ++i) res.push_back(mem_byte(a + i));
+                }
+                const uint64_t rlen = res.size();
+                if (!send_all(c, &rlen, sizeof(rlen))) return false;
+                if (rlen && !send_all(c, res.data(), res.size())) return false;
+                const uint64_t s = 0xFFFFFFFFFFFFFFFFull;
+                if (!send_all(c, &s, sizeof(s))) return false;
+            }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_PROC_SCAN: {
+            bool authed;
+            { std::lock_guard lk(mu); authed = auth_ok; }
+            if (!authed) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* sp = reinterpret_cast<const ps4::proc_scan_packet_t*>(body);
+            const uint32_t raw_vlen = ps4::scan_value_size(sp->valueType);
+            const uint32_t vlen = raw_vlen ? raw_vlen : sp->lenData;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> data(sp->lenData);
+            if (sp->lenData && !recv_all(c, data.data(), sp->lenData)) return false;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<ps4::vm_map_entry_t> maps_copy;
+            { std::lock_guard lk(mu); maps_copy = maps; }
+            for (const auto& m : maps_copy) {
+                if (!(m.prot & ps4::kVmProtRead)) continue;
+                for (uint64_t a = m.start; a + vlen <= m.end; a += vlen) {
+                    bool match = true;
+                    for (uint32_t i = 0; i < vlen; ++i)
+                        if (mem_byte(a + i) != data[i]) { match = false; break; }
+                    if (match && !send_all(c, &a, sizeof(a))) return false;
+                }
+            }
+            const uint64_t end = 0xFFFFFFFFFFFFFFFFull;
+            return send_all(c, &end, sizeof(end));
+        }
+
+        case ps4::CMD_PROC_SCAN_AOB: {
+            bool authed;
+            { std::lock_guard lk(mu); authed = auth_ok; }
+            if (!authed) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* sp = reinterpret_cast<const ps4::proc_scan_aob_packet_t*>(body);
+            const uint32_t plen = sp->pattern_length;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> pat(plen), msk(plen);
+            if (!recv_all(c, pat.data(), plen) || !recv_all(c, msk.data(), plen)) return false;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            const uint32_t target = sp->max_matches ? sp->max_matches : 1;
+            uint64_t match_addr = 0;
+            uint32_t count = 0;
+            for (uint64_t a = sp->address; a + plen <= sp->address + sp->length; ++a) {
+                bool m = true;
+                for (uint32_t k = 0; k < plen; ++k)
+                    if (msk[k] == 1 && mem_byte(a + k) != pat[k]) { m = false; break; }
+                if (!m) continue;
+                if (++count == target) { match_addr = a; break; }
+            }
+            if (!send_all(c, &match_addr, sizeof(match_addr))) return false;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_PROC_DISASM_REGION: {
+            const auto* dp = reinterpret_cast<const ps4::proc_disasm_packet_t*>(body);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            ps4::disasm_instr_entry_t e{};
+            e.addr = dp->address;
+            e.length = 3;
+            e.kind = 0x01 | 0x20;
+            e.rip_rel_target = dp->address + 0x100;
+            e.mnemonic_lo = 0x10;
+            if (!send_all(c, &e, sizeof(e))) return false;
+            std::memset(&e, 0, sizeof(e));
+            e.addr = dp->address + 3;
+            e.length = 1;
+            e.kind = 0x02;
+            e.mnemonic_lo = 0x20;
+            if (!send_all(c, &e, sizeof(e))) return false;
+            uint8_t sentinel[ps4::kDisasmEntrySize];
+            std::memset(sentinel, 0xFF, sizeof(sentinel));
+            return send_all(c, sentinel, sizeof(sentinel));
+        }
+
+        case ps4::CMD_PROC_EXTRACT_CODE_XREFS: {
+            const auto* dp = reinterpret_cast<const ps4::proc_disasm_packet_t*>(body);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            const uint64_t t = dp->address + 0x100;
+            if (!send_all(c, &t, sizeof(t))) return false;
+            const uint64_t s = 0xFFFFFFFFFFFFFFFFull;
+            return send_all(c, &s, sizeof(s));
+        }
+
+        case ps4::CMD_PROC_FIND_XREFS_TO: {
+            const auto* xp = reinterpret_cast<const ps4::proc_xrefs_to_packet_t*>(body);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            if (xp->target_address == xp->scan_address + 0x100) {
+                const uint64_t a = xp->scan_address + 3;
+                if (!send_all(c, &a, sizeof(a))) return false;
+            }
+            const uint64_t s = 0xFFFFFFFFFFFFFFFFull;
+            return send_all(c, &s, sizeof(s));
+        }
+
+        case ps4::CMD_PROC_READ_STACK: {
+            const auto* sp = reinterpret_cast<const ps4::proc_read_stack_packet_t*>(body);
+            std::vector<uint8_t> buf(4);
+            auto put = [&](const void* p, size_t n) {
+                const uint8_t* b = static_cast<const uint8_t*>(p);
+                buf.insert(buf.end(), b, b + n);
+            };
+            uint32_t depth = sp->depth ? sp->depth : 1;
+            if (depth > ps4::kReadStackMaxDepth) depth = ps4::kReadStackMaxDepth;
+            uint32_t n_frames = 0;
+            uint64_t cur_rbp = sp->rbp, cur_rsp = sp->rsp;
+            for (uint32_t i = 0; i < depth; ++i) {
+                uint64_t pair[2] = {0, 0};
+                for (int k = 0; k < 2; ++k)
+                    for (int b = 0; b < 8; ++b)
+                        reinterpret_cast<uint8_t*>(pair)[k * 8 + b] = mem_byte(cur_rbp + k * 8 + b);
+                const uint64_t saved_rbp = pair[0];
+                const uint64_t ret_addr = pair[1];
+                const int64_t fs = static_cast<int64_t>(cur_rbp) - static_cast<int64_t>(cur_rsp) + 8;
+                uint32_t flags = 0, locals_len = 0;
+                if (fs <= 0 || static_cast<uint64_t>(fs) > ps4::kReadStackLocalsCap) flags |= 1;
+                else locals_len = static_cast<uint32_t>(fs);
+                const uint32_t code_len = ps4::kReadStackCodeLen;
+                put(&cur_rbp, 8); put(&cur_rsp, 8); put(&saved_rbp, 8); put(&ret_addr, 8);
+                put(&flags, 4); put(&locals_len, 4); put(&code_len, 4);
+                for (uint32_t k = 0; k < locals_len; ++k) { const uint8_t v = mem_byte(cur_rsp + k); put(&v, 1); }
+                for (uint32_t k = 0; k < code_len; ++k) {
+                    const uint8_t v = mem_byte(ret_addr - ps4::kReadStackCodeOff + k);
+                    put(&v, 1);
+                }
+                ++n_frames;
+                if (saved_rbp == 0 || saved_rbp <= cur_rbp) break;
+                cur_rsp = cur_rbp + 8;
+                cur_rbp = saved_rbp;
+            }
+            std::memcpy(buf.data(), &n_frames, 4);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            const uint32_t off = static_cast<uint32_t>(buf.size());
+            if (!send_all(c, &off, sizeof(off))) return false;
+            return send_all(c, buf.data(), buf.size());
+        }
+
+        case ps4::CMD_PROC_ASSEMBLE: {
+            const uint32_t textlen = bodylen >= sizeof(ps4::proc_assemble_packet_t)
+                ? bodylen - static_cast<uint32_t>(sizeof(ps4::proc_assemble_packet_t)) : 0;
+            std::vector<uint8_t> t(textlen);
+            if (textlen && !recv_all(c, t.data(), textlen)) return false;
+            const std::string text(t.begin(), t.end());
+            if (text.find("zzz") != std::string::npos) {
+                if (!send_u32(c, ps4::CMD_ERROR)) return false;
+                ps4::proc_assemble_err_t e{1, 10};
+                static const char msg[] = "ks error!!";
+                if (!send_all(c, &e, sizeof(e))) return false;
+                return send_all(c, msg, e.msg_len);
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            ps4::proc_assemble_ok_t ok{1, 1};
+            const uint8_t byte = 0xCC;
+            if (!send_all(c, &ok, sizeof(ok))) return false;
+            return send_all(c, &byte, 1);
+        }
+
+        case ps4::CMD_PROC_ELF_RPC:
+        case ps4::CMD_PROC_ELF: {
+            const auto* ep = reinterpret_cast<const ps4::proc_elf_packet_t*>(body);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> elf(ep->length);
+            if (ep->length && !recv_all(c, elf.data(), ep->length)) return false;
+            {
+                std::lock_guard lk(mu);
+                if (cmd == ps4::CMD_PROC_ELF_RPC) { elf_rpc_entry = 0x400500; ++elf_rpc_count; }
+                else ++elf_load_count;
+            }
+            if (cmd == ps4::CMD_PROC_ELF) return send_u32(c, ps4::CMD_SUCCESS);
+            ps4::proc_elf_rpc_response_t r{};
+            { std::lock_guard lk(mu); r.entry = elf_rpc_entry; }
+            return send_all(c, &r, sizeof(r));
+        }
+
+        case ps4::CMD_CONSOLE_NOTIFY: {
+            const auto* np = reinterpret_cast<const ps4::console_notify_packet_t*>(body);
+            std::vector<uint8_t> msg(np->length);
+            if (np->length && !recv_all(c, msg.data(), np->length)) return false;
+            {
+                std::lock_guard lk(mu);
+                last_notify.assign(msg.begin(), msg.end());
+                last_notify_type = np->messageType;
+            }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_CONSOLE_PRINT: {
+            const uint32_t len = bodylen >= 4 ? *reinterpret_cast<const uint32_t*>(body) : 0;
+            std::vector<uint8_t> msg(len);
+            if (len && !recv_all(c, msg.data(), len)) return false;
+            { std::lock_guard lk(mu); last_print.assign(msg.begin(), msg.end()); }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_CONSOLE_FOREGROUND_APP: {
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            ps4::console_foreground_app_response_t r{};
+            r.pid = kFakePid;
+            std::strncpy(r.titleid, "CUSA12345_00", sizeof(r.titleid) - 1);
+            std::strncpy(r.contentid, "EP1234-CUSA12345_00-A0000000000000", sizeof(r.contentid) - 1);
+            std::strncpy(r.name, "eboot.bin", sizeof(r.name) - 1);
+            std::strncpy(r.app_ver, "01.00", sizeof(r.app_ver) - 1);
+            return send_all(c, &r, sizeof(r));
+        }
+
+        case ps4::CMD_DEBUG_GETFPREGS: {
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            uint8_t buf[ps4::kFpregsSize];
+            for (uint32_t i = 0; i < sizeof(buf); ++i)
+                buf[i] = static_cast<uint8_t>(0xF0 + (i & 0xF));
+            return send_all(c, buf, sizeof(buf));
+        }
+
+        case ps4::CMD_DEBUG_SETFPREGS: {
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            const auto* p = reinterpret_cast<const ps4::debug_setregs_packet_t*>(body);
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> d(p->length);
+            if (p->length && !recv_all(c, d.data(), p->length)) return false;
+            const size_t n = p->length < sizeof(last_fpregs) ? p->length : sizeof(last_fpregs);
+            std::memcpy(last_fpregs, d.data(), n);
+            setfpregs_len = p->length;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_SETDBREGS: {
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            uint8_t dr[ps4::kDbregsSize]{};
+            if (!recv_all(c, dr, sizeof(dr))) return false;
+            std::memcpy(last_dbregs, dr, sizeof(dr));
+            setdbregs_called = true;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_GETFSGSBASE: {
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            uint8_t buf[16]{};
+            const uint64_t fs = 0x7FFF0000ull, gs = 0x1000ull;
+            std::memcpy(buf, &fs, 8);
+            std::memcpy(buf + 8, &gs, 8);
+            return send_all(c, buf, sizeof(buf));
+        }
+
+        case ps4::CMD_DEBUG_SETFSGSBASE: {
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            uint8_t buf[16]{};
+            if (!recv_all(c, buf, sizeof(buf))) return false;
+            std::memcpy(&last_fsgs_fs, buf, 8);
+            std::memcpy(&last_fsgs_gs, buf + 8, 8);
+            return send_u32(c, ps4::CMD_SUCCESS);
         }
         }
         return send_u32(c, ps4::CMD_ERROR), true;
@@ -1275,4 +1683,222 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     // ps4_detach at the end
     r = dbg({{"action", "ps4_detach"}}, e);
     CHECK(!e);
+}
+
+TEST_CASE(ps4_auth_and_native_scan) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));   // auto-auth runs on connect
+    CHECK(b.ps4_authed());
+    CHECK(g.srv.auth_attempts >= 1);
+    CHECK(g.srv.auth_ok);
+
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+
+    const auto put32 = [&](uint64_t a, uint32_t v) {
+        g.srv.mem_write(a, reinterpret_cast<const uint8_t*>(&v), 4);
+    };
+    put32(0x401000, 1000);
+    put32(0x401008, 2000);
+    put32(0x401010, 1000);
+
+    std::vector<uint8_t> val(4);
+    const uint32_t want = 1000;
+    std::memcpy(val.data(), &want, 4);
+    std::vector<backend_ps4_t::ps4_scan_hit_t> hits;
+    auto io = b.ps4_scan_first(kFakePid, 0x401000, 0x20, ps4::kValU32, ps4::kCmpExact, 0, val, hits);
+    REQUIRE(io.ok);
+    CHECK(hits.size() == 2u);
+
+    put32(0x401000, 555);   // change one of the hits
+    std::vector<backend_ps4_t::ps4_scan_hit_t> hits2;
+    auto io2 = b.ps4_scan_next(kFakePid, 0x401000, ps4::kValU32, ps4::kCmpChanged, hits, {}, hits2);
+    REQUIRE(io2.ok);
+    CHECK(hits2.size() == 1u);
+    CHECK(hits2[0].addr == 0x401000ull);
+
+    // AOB with wildcards
+    const uint8_t code[] = {0xE8, 0x03, 0x00, 0x00, 0x00, 0x90};
+    g.srv.mem_write(0x401020, code, sizeof(code));
+    std::vector<uint8_t> pat = {0xE8, 0x03}, msk = {1, 1};
+    uint64_t hit = 0;
+    auto io3 = b.ps4_scan_aob(kFakePid, 0x401000, 0x40, pat, msk, 1, 0, hit);
+    REQUIRE(io3.ok);
+    CHECK(hit == 0x401020ull);
+
+    // legacy whole-memory scan
+    std::vector<uint64_t> addrs;
+    auto io4 = b.ps4_scan_all(kFakePid, ps4::kValU32, ps4::kCmpExact, val, addrs);
+    REQUIRE(io4.ok);
+    CHECK(std::find(addrs.begin(), addrs.end(), 0x401010ull) != addrs.end());
+    CHECK(std::find(addrs.begin(), addrs.end(), 0x401000ull) == addrs.end());  // now 555
+
+    b.detach(h);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_mcp_console_side_tooling) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto dbg = [&](const json& a, bool& is_err) {
+        return slop::core::mcp::call_tool("debugger", a, is_err);
+    };
+
+    // native scan through MCP
+    {
+        bool e = false;
+        const uint32_t want = 1000;
+        g.srv.mem_write(0x401000, reinterpret_cast<const uint8_t*>(&want), 4);
+        json r = dbg({{"action", "ps4_scan"}, {"addr", 0x401000}, {"len", 0x20},
+                      {"value_type", "u32"}, {"compare", "exact"}, {"value", 1000}}, e);
+        CHECK(!e);
+        if (e) std::printf("  ps4_scan error: %s\n", r.dump().c_str());
+        CHECK(r.value("count", 0) == 1u);
+        json st = dbg({{"action", "ps4_scan_state"}}, e);
+        CHECK(!e);
+        CHECK(st.value("count", 0) == 1u);
+        json rs = dbg({{"action", "ps4_rescan"}, {"compare", "unchanged"}}, e);
+        CHECK(!e);
+        CHECK(rs.value("count", 0) == 1u);
+        json clr = dbg({{"action", "ps4_scan_reset"}}, e);
+        CHECK(!e);
+        json st2 = dbg({{"action", "ps4_scan_state"}}, e);
+        CHECK(!e);
+        CHECK(st2.value("used", true) == false);
+    }
+    // aob through MCP (?? wildcards)
+    {
+        bool e = false;
+        const uint8_t code[] = {0x48, 0x8B, 0x05, 0x11, 0x22, 0x33, 0x44};
+        g.srv.mem_write(0x401040, code, sizeof(code));
+        json r = dbg({{"action", "ps4_scan_aob"}, {"addr", 0x401000}, {"len", 0x100},
+                      {"pattern", "48 8b 05 ?? ?? ?? ??"}}, e);
+        CHECK(!e);
+        if (e) std::printf("  ps4_scan_aob error: %s\n", r.dump().c_str());
+        CHECK(r.value("found", false) == true);
+        CHECK(r.value("addr", 0) == 0x401040ull);
+    }
+    // on-device disasm + xrefs
+    {
+        bool e = false;
+        json r = dbg({{"action", "ps4_disasm"}, {"addr", 0x400000}, {"len", 16}, {"max", 8}}, e);
+        CHECK(!e);
+        if (e) std::printf("  ps4_disasm error: %s\n", r.dump().c_str());
+        CHECK(r.value("count", 0) == 2u);
+        CHECK(r["instructions"][0].value("rip_rel_target", 0) == 0x400100ull);
+        json x = dbg({{"action", "ps4_xrefs"}, {"addr", 0x400000}, {"len", 64}}, e);
+        CHECK(!e);
+        CHECK(x.value("count", 0) == 1u);
+        json xt = dbg({{"action", "ps4_xrefs_to"}, {"addr", 0x400000}, {"len", 64},
+                       {"target", 0x400100}}, e);
+        CHECK(!e);
+        CHECK(xt.value("count", 0) == 1u);
+    }
+    // server-side stack walk over a fake frame chain
+    {
+        const uint64_t saved_rbp = 0x7FFF00007FF0ull, ret = 0x400123ull;
+        const uint64_t zero = 0;
+        g.srv.mem_write(0x7FFF00008000, reinterpret_cast<const uint8_t*>(&saved_rbp), 8);
+        g.srv.mem_write(0x7FFF00008008, reinterpret_cast<const uint8_t*>(&ret), 8);
+        g.srv.mem_write(0x7FFF00007FF0, reinterpret_cast<const uint8_t*>(&zero), 8);
+        bool e = false;
+        json r = dbg({{"action", "ps4_stack"}, {"rbp", 0x7FFF00008000ull},
+                      {"rsp", 0x7FFF00007FF0ull}, {"depth", 4}}, e);
+        CHECK(!e);
+        if (e) std::printf("  ps4_stack error: %s\n", r.dump().c_str());
+        CHECK(r.value("count", 0) == 1u);
+        CHECK(r["frames"][0].value("ret_addr", 0) == 0x400123ull);
+    }
+    // on-device assemble
+    {
+        bool e = false;
+        json r = dbg({{"action", "ps4_assemble"}, {"asm", "int3"}}, e);
+        CHECK(!e);
+        if (e) std::printf("  ps4_assemble error: %s\n", r.dump().c_str());
+        CHECK(r.value("bytes_hex", "") == "cc");
+        json bad = dbg({{"action", "ps4_assemble"}, {"asm", "zzz"}}, e);
+        CHECK(e);   // assembler error surfaces as a tool error carrying the message
+    }
+    // elf rpc + load
+    {
+        bool e = false;
+        const char* path = "ps4_test_payload.elf";
+        {
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            const uint8_t hdr[8] = {0x7F, 'E', 'L', 'F', 2, 1, 1, 0};
+            f.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+            const uint8_t pad[56] = {};
+            f.write(reinterpret_cast<const char*>(pad), sizeof(pad));
+        }
+        json r = dbg({{"action", "ps4_elf_rpc"}, {"path", path}}, e);
+        CHECK(!e);
+        if (e) std::printf("  elf_rpc err: %s\n", r.dump().c_str());
+        CHECK(r.value("entry", 0) == 0x400500ull);
+        json l = dbg({{"action", "ps4_elf_load"}, {"path", path}}, e);
+        CHECK(!e);
+        CHECK(l.value("executed", false) == true);
+        std::remove(path);
+    }
+    // notify / print / foreground app
+    {
+        bool e = false;
+        json r = dbg({{"action", "ps4_notify"}, {"msg", "hello from reverse-slap"}}, e);
+        CHECK(!e);
+        CHECK(r.value("notified", false) == true);
+        CHECK(g.srv.last_notify.find("hello from reverse-slap") != std::string::npos);
+        CHECK(g.srv.last_notify_type == 222u);
+        json p = dbg({{"action", "ps4_print"}, {"msg", "klog line"}}, e);
+        CHECK(!e);
+        CHECK(g.srv.last_print == "klog line");
+        json a = dbg({{"action", "ps4_app"}}, e);
+        CHECK(!e);
+        CHECK(a.value("pid", 0) == kFakePid);
+        REQUIRE_STR_EQ(a.value("titleid", ""), "CUSA12345_00");
+    }
+    // dump a module over the wire through the target tool
+    {
+        bool e = false;
+        const uint8_t marker[16] = {0x7F, 'E', 'L', 'F', 2, 1, 1, 0, 0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4};
+        g.srv.mem_write(0x400000, marker, sizeof(marker));
+        const char* out = "ps4_dump_test.bin";
+        json r = slop::core::mcp::call_tool("target",
+            {{"action", "ps4_dump_module"}, {"name", "eboot.bin"}, {"path", out}}, e);
+        CHECK(!e);
+        if (e) std::printf("  ps4_dump_module err: %s\n", r.dump().c_str());
+        CHECK(r.value("dumped", false) == true);
+        CHECK(r.value("bytes_written", 0) == 0x100000ull);
+        std::ifstream f(out, std::ios::binary);
+        REQUIRE(f.good());
+        std::vector<uint8_t> head(16);
+        f.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+        CHECK(std::memcmp(head.data(), marker, 16) == 0);
+        f.close();
+        std::remove(out);
+    }
+    // fpregs / fsgs need a debug session
+    {
+        bool e = false;
+        json a = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
+        CHECK(!e);
+        json fr = dbg({{"action", "ps4_fpregs"}, {"lwpid", 101}}, e);
+        CHECK(!e);
+        CHECK(fr.value("size", 0) == 832u);
+        CHECK(fr.value("hex", std::string{}).size() == 832u * 2u);
+        json sf = dbg({{"action", "ps4_set_fsgs"}, {"lwpid", 101},
+                       {"fs_base", 0x7FFF0000}, {"gs_base", 0x2000}}, e);
+        CHECK(!e);
+        CHECK(g.srv.last_fsgs_fs == 0x7FFF0000ull);
+        CHECK(g.srv.last_fsgs_gs == 0x2000ull);
+        json fg = dbg({{"action", "ps4_fsgs"}, {"lwpid", 101}}, e);
+        CHECK(!e);
+        CHECK(fg.value("fs_base", 0) == 0x7FFF0000ull);
+        CHECK(fg.value("gs_base", 0) == 0x1000ull);
+        json d = dbg({{"action", "ps4_detach"}}, e);
+        CHECK(!e);
+    }
 }
