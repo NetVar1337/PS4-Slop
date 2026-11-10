@@ -165,6 +165,9 @@ add_library(slop_core STATIC
     runtime/backend_registry.cpp
     runtime/backend_kernel.hpp
     runtime/backend_kernel.cpp
+    runtime/ps4_protocol.hpp
+    runtime/backend_ps4.hpp
+    runtime/backend_ps4.cpp
     runtime/scan_bridge.hpp
     runtime/scan_bridge.cpp
     runtime/voyager_comm.cpp

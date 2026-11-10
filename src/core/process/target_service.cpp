@@ -1,5 +1,6 @@
 #include "core/process/target_service.hpp"
 
+#include "core/infra/clock.hpp"
 #include "core/runtime/backend_registry.hpp"
 
 #include <algorithm>
@@ -53,6 +54,25 @@ std::shared_ptr<runtime::session_t> active_session() {
     return g_session;
 }
 
+bool target_connect_ps4(const std::string& host, uint16_t port, uint32_t pid,
+                        std::string& err) {
+    if (!runtime::registry_connect_ps4(host, port, err)) return false;
+    if (pid == 0) return true;
+    if (!target_attach(pid)) {
+        err = "connected to " + host + ":" + std::to_string(port) +
+              " but attach to pid " + std::to_string(pid) + " failed";
+        target_detach();
+        runtime::registry_disconnect_ps4();
+        return false;
+    }
+    return true;
+}
+
+void target_disconnect_ps4() {
+    target_detach();
+    runtime::registry_disconnect_ps4();
+}
+
 void target_tick() {
     // Heartbeat: drop the session if the target died. Work on a local copy  
     // the session may be replaced concurrently by an MCP attach
@@ -62,6 +82,15 @@ void target_tick() {
         s = g_session;
     }
     if (!s) return;
+
+    // a remote console roundtrip per frame is too chatty, check once a second
+    static int64_t g_last_hb_ms = 0;
+    const bool remote = runtime::active_kind() == runtime::backend_kind_t::ps4;
+    if (remote) {
+        const int64_t now = infra::steady_ms();
+        if (now - g_last_hb_ms < 1000) return;
+        g_last_hb_ms = now;
+    }
 
     auto procs = runtime::active().enum_processes();
     if (!procs.ok) return;

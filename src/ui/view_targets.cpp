@@ -8,6 +8,7 @@
 #include "core/process/module_dump.hpp"
 #include "core/disasm/binary_state.hpp"
 #include "core/runtime/backend_registry.hpp"
+#include "core/runtime/ps4_protocol.hpp"
 #include "ui/panels.hpp"
 
 #include "imgui.h"
@@ -115,6 +116,43 @@ void Draw() {
         }
     } else {
         ImGui::TextDisabled("no target attached");
+    }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("PS4...")) ImGui::OpenPopup("ps4_connect_popup");
+    if (ImGui::BeginPopup("ps4_connect_popup")) {
+        static char host_buf[64] = {};
+        static int  port_val = runtime::ps4::kDefaultPort;
+        if (runtime::registry_ps4_active()) {
+            ImGui::Text("connected: %s", runtime::registry_ps4_endpoint().c_str());
+            const std::string brand = runtime::registry_ps4_branding();
+            if (!brand.empty()) ImGui::TextDisabled("%s", brand.c_str());
+            if (ImGui::SmallButton("Disconnect PS4")) {
+                process::target_disconnect_ps4();
+                panels::AppendBootLog("ps4 disconnected");
+                g_dirty = true;
+                ImGui::CloseCurrentPopup();
+            }
+        } else {
+            ImGui::TextDisabled("connect to a PS4 running ps4debug-NG");
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::InputTextWithHint("##ps4host", "PS4 IP", host_buf, sizeof(host_buf));
+            ImGui::SetNextItemWidth(200.0f);
+            ImGui::InputInt("port", &port_val);
+            if (port_val < 1 || port_val > 0xFFFF) port_val = runtime::ps4::kDefaultPort;
+            if (ImGui::SmallButton("Connect") && host_buf[0] != '\0') {
+                std::string err;
+                if (process::target_connect_ps4(host_buf,
+                                                static_cast<uint16_t>(port_val), 0, err)) {
+                    panels::AppendBootLog("ps4 connected: " +
+                                          runtime::registry_ps4_endpoint());
+                    g_dirty = true;
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    panels::AppendBootLog("ps4 connect FAILED: " + err);
+                }
+            }
+        }
+        ImGui::EndPopup();
     }
     ImGui::Separator();
 

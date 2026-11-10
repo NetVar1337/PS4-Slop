@@ -2,9 +2,9 @@
 // process list and attach flow, stays on the list after attaching so targets
 // can be switched without detaching
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { RefreshCw, Search, Unplug } from "lucide-react";
+import { Gamepad2, RefreshCw, Search, Unplug } from "lucide-react";
 import ProcessIcon from "@/components/ProcessIcon";
 import { matchesFilter, useTargets } from "@/store/targets";
 import { useEngine } from "@/store/engine";
@@ -12,10 +12,14 @@ import { useEngine } from "@/store/engine";
 const kRowHeight = 22;
 
 export default function TargetsPanel() {
-  const { processes, filter, loading, setFilter, refresh, attach, detach } = useTargets();
+  const { processes, filter, loading, setFilter, refresh, attach, detach, ps4, connectPs4, disconnectPs4 } =
+    useTargets();
   const target = useEngine((s) => s.target);
   const backend = useEngine((s) => s.backend);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [showPs4, setShowPs4] = useState(false);
+  const [ps4Host, setPs4Host] = useState("");
+  const [ps4Port, setPs4Port] = useState(744);
 
   useEffect(() => {
     void refresh();
@@ -46,10 +50,60 @@ export default function TargetsPanel() {
             <Unplug size={14} />
           </button>
         )}
+        <button
+          className="icon-button"
+          data-tip={ps4 ? `PS4: ${ps4.endpoint}` : "Connect to a PS4 running ps4debug-NG"}
+          data-active={ps4 ? "true" : undefined}
+          onClick={() => setShowPs4((v) => !v)}
+        >
+          <Gamepad2 size={14} />
+        </button>
         <button className="icon-button" data-tip="Refresh" onClick={() => void refresh()}>
           <RefreshCw size={14} className={loading ? "spin" : undefined} />
         </button>
       </div>
+
+      {(showPs4 || ps4) && (
+        <div className="search" style={{ gap: "var(--pad-sm)", alignItems: "center" }}>
+          {ps4 ? (
+            <>
+              <span className="faint" style={{ fontSize: "var(--type-small)" }}>
+                PS4 {ps4.endpoint}
+                {ps4.branding ? ` · ${ps4.branding}` : ""}
+              </span>
+              <div className="spacer" />
+              <button className="row-action" onClick={() => void disconnectPs4()}>
+                Disconnect
+              </button>
+            </>
+          ) : (
+            <>
+              <input
+                style={{ width: 140 }}
+                placeholder="PS4 IP"
+                value={ps4Host}
+                onChange={(e) => setPs4Host(e.target.value)}
+              />
+              <input
+                style={{ width: 70 }}
+                type="number"
+                value={ps4Port}
+                onChange={(e) => setPs4Port(Number(e.target.value) || 744)}
+              />
+              <button
+                className="row-action"
+                disabled={!ps4Host}
+                onClick={() => void connectPs4(ps4Host, ps4Port)}
+              >
+                Connect
+              </button>
+              <span className="faint" style={{ fontSize: "var(--type-small)" }}>
+                ps4debug-NG payload, port 744
+              </span>
+            </>
+          )}
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateRows: "auto 1fr", minHeight: 0 }}>
         <div className="search">

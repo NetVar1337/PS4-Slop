@@ -13,7 +13,8 @@ namespace slop::core::runtime {
 
 enum class backend_kind_t : uint8_t {
     user_mode,
-    kernel
+    kernel,
+    ps4   // remote console over ps4debug-NG
 };
 
 enum class arch_t : uint8_t {

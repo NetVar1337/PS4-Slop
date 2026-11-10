@@ -41,6 +41,7 @@ constexpr uint32_t CMD_DEBUG_ATTACH          = 0xBDBB0001;
 constexpr uint32_t CMD_DEBUG_DETACH          = 0xBDBB0002;
 constexpr uint32_t CMD_DEBUG_GET_THREAD_LIST = 0xBDBB0005;
 constexpr uint32_t CMD_DEBUG_GETREGS         = 0xBDBB0008;
+constexpr uint32_t CMD_DEBUG_THREAD_INFO     = 0xBDBB0011;
 constexpr uint32_t CMD_DEBUG_SETREGS         = 0xBDBB0009;
 
 // status codes

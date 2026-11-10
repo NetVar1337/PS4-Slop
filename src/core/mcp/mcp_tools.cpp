@@ -70,6 +70,7 @@
 #include "core/runtime/backend.hpp"
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
+#include "core/runtime/ps4_protocol.hpp"
 #include "core/runtime/backend_kernel.hpp"
 #include "core/runtime/scan_bridge.hpp"
 #include "core/runtime/session.hpp"
@@ -774,6 +775,8 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "dump_module") return "complete=false means unreadable spans were zero-filled (strict=false); verify imports with disasm.pe on the dumped file.";
         if (action == "threads") return "start is a VA (see start_hex); resolve owner function with disasm.functions or decomp.function.";
         if (action == "handles") return "count is returned rows, total is the full table; granted_access is a raw mask.";
+        if (action == "ps4_connect") return "Connected to the console: target.list lists PS4 processes, then target.attach {pid}. Memory/disasm tools then read the console over ps4debug-NG.";
+        if (action == "ps4_disconnect") return "Console connection dropped; backend is local again. Use target.list/attach for local processes.";
     } else if (tool == "memory") {
         if (action == "read") return "len is bytes actually returned (may be short on partial reads). Use format u32/u64 for pointers, utf8 for strings. Values carry addr_hex for copy/paste.";
         if (action == "scan") return "Refine with rescan (same width/kind), inspect scan_state, release with scan_reset. Hits carry addr_hex; read them with memory.read.";
@@ -1338,10 +1341,66 @@ json tool_target(const json& args) {
         return {{"attached", false}};
     }
 
+    if (action == "ps4_connect") {
+        if (!args.contains("host") || !args.at("host").is_string())
+            fail("ps4_connect requires string 'host' (the PS4 IP)");
+        const std::string host = args.at("host").get<std::string>();
+        if (host.empty()) fail("ps4_connect: 'host' is empty");
+        const uint64_t port = args.contains("port") ? parse_addr(args, "port")
+                                                    : runtime::ps4::kDefaultPort;
+        if (port == 0 || port > 0xFFFF) fail("ps4_connect: bad port");
+        uint32_t pid = 0;
+        if (args.contains("pid")) {
+            const uint64_t p = parse_addr(args, "pid");
+            if (p == 0 || p > 0xFFFFFFFFull) fail("ps4_connect: bad pid");
+            pid = static_cast<uint32_t>(p);
+        }
+        std::string err;
+        if (!process::target_connect_ps4(host, static_cast<uint16_t>(port), pid, err))
+            fail("ps4_connect failed: " + err);
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid = 0;
+        json out = {{"connected", true},
+                    {"host", host},
+                    {"port", port},
+                    {"endpoint", runtime::registry_ps4_endpoint()},
+                    {"branding", runtime::registry_ps4_branding()},
+                    {"backend", runtime::active_badge()}};
+        auto s = process::active_session();
+        if (pid != 0 && s && s->valid()) {
+            out["attached"] = true;
+            out["pid"]      = s->pid();
+            out["name"]     = s->name();
+            out["arch"]     = arch_name(s->arch());
+            out["hint"]     = "PS4 modules are ELF/SELF, not PE: dump_module writes a raw "
+                              "memory image and disasm.load cannot open it. Use target.modules, "
+                              "memory.read/write and disasm.disassemble on live addresses instead.";
+        } else {
+            out["attached"] = false;
+            out["hint"]     = "Console connected. Next: target.list to pick a pid, then "
+                              "target.attach {pid} (or ps4_connect again with pid).";
+        }
+        return out;
+    }
+
+    if (action == "ps4_disconnect") {
+        process::target_disconnect_ps4();
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid = 0;
+        return {{"connected", false},
+                {"backend", runtime::active_badge()}};
+    }
+
     if (action == "status") {
         json out;
         out["backend"]  = runtime::active_badge();
         out["kernel"]   = runtime::active_kind() == runtime::backend_kind_t::kernel;
+        if (runtime::registry_ps4_active()) {
+            out["ps4"] = {{"endpoint", runtime::registry_ps4_endpoint()},
+                         {"branding", runtime::registry_ps4_branding()}};
+        }
         auto s = process::active_session();
         if (s && s->valid()) {
             out["attached"] = true;
@@ -1476,7 +1535,7 @@ json tool_target(const json& args) {
     }
 
     fail("target: unknown action (list|attach|detach|status|modules|"
-         "dump_module|threads|regions|handles|icon)");
+         "dump_module|threads|regions|handles|icon|ps4_connect|ps4_disconnect)");
 }
 
 // tool: memory
@@ -8604,7 +8663,7 @@ json tool_app(const json& args) {
 
 void list_tools(json& out) {
     const char* target_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","icon"]},"pid":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"load":{"type":"boolean"},"strict":{"type":"boolean"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","icon","ps4_connect","ps4_disconnect"]},"pid":{"type":"integer"},"host":{"type":"string"},"port":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"load":{"type":"boolean"},"strict":{"type":"boolean"}},"required":["action"]})";
     const char* memory_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","aob","pointerscan","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"]},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"}},"required":["action"]})";
     const char* disasm_schema =
@@ -8653,7 +8712,7 @@ void list_tools(json& out) {
         R"({"type":"object","properties":{"action":{"type":"string","enum":["status","find_module","resolve_export","loadlibrary","manual_map","unload"]},"pid":{"type":"integer","minimum":1},"name":{"type":"string"},"module":{"type":"string"},"dll_path":{"type":"string"},"dll_hex":{"type":"string"},"base":{"type":"integer"},"manual_mapped":{"type":"boolean"},"erase_pe_header":{"type":"boolean"},"protect_sections":{"type":"boolean"},"call_dllmain":{"type":"boolean"},"call_tls_callbacks":{"type":"boolean"},"unlink_peb":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":100,"maximum":60000}},"required":["action"]})";
 
     out.push_back({{"name", "target"},
-                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image."},
+                   {"description", "Select and inspect the live process used by memory, debugger, and other runtime tools. Start with action='status' to read the active backend plus attached-target and shared-image context; use action='list' to find a pid, then action='attach' with pid. Attach uses the kernel DTB path when slopdrvr is active and best-effort loads the process's main module from disk at its runtime base, unless the UI already has a binary loaded. dump_module selects a loaded module by base or exact name, reconstructs a conventional PE from its mapped bytes to output path, and optionally load=true opens it in the shared Hyperion analysis session. strict defaults true; false zero-fills unreadable section spans and reports complete=false. Actions modules, dump_module, threads, regions, and handles require an attached target. Detach clears the live target but does not unload a separately UI-loaded image. Remote consoles: ps4_connect {host, port=744, pid?} connects to a PS4 running ps4debug-NG and makes the console the active target (list/attach/memory/regions/threads then go over the wire); ps4_disconnect drops it. On a PS4 the backend badge reads PS4 and PS4 modules are ELF/SELF, so dump_module/load are PE-only - analyze live addresses instead."},
                    {"inputSchema", json::parse(target_schema)}, {"read_only", false}});
     out.push_back({{"name", "memory"},
                    {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active user/kernel backend is chosen automatically. Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. Kernel mode uses slopdrvr DTB reads and driver region enumeration."},
