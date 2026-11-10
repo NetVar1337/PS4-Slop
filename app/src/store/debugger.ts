@@ -90,8 +90,9 @@ type DebuggerStore = {
   readStack: (lwpid: number) => Promise<void>;
   scanFirst: (a: { addr: number; len: number; value_type: string; compare: string; value?: number | string; hex?: string }) => Promise<void>;
   scanRescan: (compare: string, value?: number | string) => Promise<void>;
-  scanAob: (addr: number, len: number, pattern: string) => Promise<void>;
+  scanAob: (addr: number, len: number, pattern: string) => Promise<{ found?: boolean; addr?: number; addr_hex?: string } | null>;
   scanReset: () => Promise<void>;
+  scanRefreshInternal: () => Promise<void>;
   notify: (msg: string) => Promise<void>;
   readApp: () => Promise<void>;
   dumpModule: (name: string, path: string, load: boolean) => Promise<void>;
@@ -115,6 +116,10 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
     try {
       const status = await call<Ps4Status>("debugger", "status");
       set({ status, error: null });
+      if (status.ps4_connected) {
+        void get().scanRefreshInternal();
+        void get().readApp();
+      }
       if (!status.ps4_connected || !status.debug_attached) {
         set({ regs: null, frames: [], breakpoints: [], watchpoints: [] });
         return;
@@ -261,7 +266,7 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
   scanRescan: async (compare, value) => {
     set({ busy: true });
     try {
-      const args: Record<string, unknown> = { action: undefined, compare };
+      const args: Record<string, unknown> = { compare };
       if (value !== undefined) args.value = value;
       await call("debugger", "ps4_rescan", args);
       await get().scanRefreshInternal();
@@ -291,6 +296,15 @@ export const useDebugger = create<DebuggerStore>((set, get) => ({
   scanReset: async () => {
     await call("debugger", "ps4_scan_reset").catch(() => undefined);
     set({ scan: null });
+  },
+
+  scanRefreshInternal: async () => {
+    try {
+      const scan = await call<ScanState>("debugger", "ps4_scan_state");
+      set({ scan });
+    } catch {
+      set({ scan: null });
+    }
   },
 
   notify: async (msg) => {

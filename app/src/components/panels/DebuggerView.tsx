@@ -18,8 +18,9 @@ export default function DebuggerView() {
   const target = useEngine((s) => s.target);
   const backend = useEngine((s) => s.backend);
   const {
-    status, regs, regsLwpid, frames, events, breakpoints, watchpoints, error, busy,
+    status, regs, regsLwpid, frames, events, breakpoints, watchpoints, scan, app, error, busy,
     refresh, attach, detach, cont, step, waitHalt, bpSet, bpClear, wpSet, wpClear,
+    scanFirst, scanRescan, scanAob, scanReset, notify, dumpModule,
   } = useDebugger();
   const { gotoAddress } = useDisasm();
   const [bpAddr, setBpAddr] = useState("");
@@ -27,6 +28,15 @@ export default function DebuggerView() {
   const [wpType, setWpType] = useState(1);
   const [wpLen, setWpLen] = useState(8);
   const [lwp, setLwp] = useState("0");
+  const [scAddr, setScAddr] = useState("");
+  const [scLen, setScLen] = useState("0x10000");
+  const [scType, setScType] = useState("u32");
+  const [scCmp, setScCmp] = useState("exact");
+  const [scVal, setScVal] = useState("");
+  const [scAob, setScAob] = useState("");
+  const [notifyMsg, setNotifyMsg] = useState("");
+  const [dumpName, setDumpName] = useState("eboot.bin");
+  const [dumpPath, setDumpPath] = useState("C:/dumps/eboot.bin");
 
   useEffect(() => {
     void refresh();
@@ -246,6 +256,114 @@ export default function DebuggerView() {
                 </div>
               ))
             )}
+          </div>
+        </div>
+
+        <div className="dbg-col">
+          <div className="dbg-head">
+            Console scan (on-device)
+            <div className="spacer" />
+            <button className="row-action" disabled={busy} onClick={() => void scanReset()}>
+              reset
+            </button>
+          </div>
+          <div className="panel-body">
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", padding: "2px var(--pad-md)" }}>
+              <input className="addr-input mono" style={{ width: 100 }} value={scAddr} placeholder="addr"
+                onChange={(e) => setScAddr(e.target.value)} />
+              <input className="addr-input mono" style={{ width: 64 }} value={scLen} placeholder="len"
+                onChange={(e) => setScLen(e.target.value)} />
+              <select className="addr-input" value={scType} onChange={(e) => setScType(e.target.value)}>
+                {["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"].map((w) => (
+                  <option key={w} value={w}>{w}</option>
+                ))}
+              </select>
+              <select className="addr-input" value={scCmp} onChange={(e) => setScCmp(e.target.value)}>
+                {["exact", "bigger", "smaller", "between", "increased", "decreased", "changed", "unchanged", "unknown"].map((c) => (
+                  <option key={c} value={c}>{c}</option>
+                ))}
+              </select>
+              <input className="addr-input mono" style={{ width: 80 }} value={scVal} placeholder="value"
+                onChange={(e) => setScVal(e.target.value)} />
+              <button className="row-action" disabled={busy || !scAddr || !scVal}
+                onClick={() => {
+                  const a = parseHex(scAddr);
+                  const l = parseHex(scLen);
+                  const v = scVal.trim();
+                  const num = Number(v);
+                  void scanFirst({
+                    addr: a, len: l, value_type: scType, compare: scCmp,
+                    value: Number.isFinite(num) && v !== "" ? num : v,
+                  });
+                }}>
+                scan
+              </button>
+              <button className="row-action" disabled={busy || !scan?.used}
+                onClick={() => void scanRescan(scCmp === "exact" ? "changed" : scCmp,
+                  scCmp === "exact" && scVal !== "" ? Number(scVal) : undefined)}>
+                rescan
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 4, padding: "2px var(--pad-md)" }}>
+              <input className="addr-input mono" style={{ flex: 1 }} value={scAob}
+                placeholder="aob pattern: 48 8B ?? ?? 90 (scan range above)"
+                onChange={(e) => setScAob(e.target.value)} />
+              <button className="row-action" disabled={busy || !scAddr || !scAob}
+                onClick={() => {
+                  void scanAob(parseHex(scAddr), parseHex(scLen), scAob);
+                }}>
+                aob
+              </button>
+            </div>
+            {scan === null || !scan.used ? (
+              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
+                no native scan running - ps4_scan runs on the console (auth unlocked on connect).
+              </div>
+            ) : (
+              <>
+                <div className="faint mono" style={{ padding: "2px var(--pad-md)", fontSize: 11 }}>
+                  base {scan.base_hex ?? hex(scan.base ?? 0)} · {scan.count ?? 0} hits{scan.truncated === true ? " (capped)" : ""}
+                </div>
+                {(scan.hits ?? []).slice(0, 100).map((h, i) => (
+                  <div className="fn-row" style={{ position: "static", height: 20 }} key={i}>
+                    <button className="fn-name mono" onClick={() => void gotoAddress(h.addr)}>
+                      {h.addr_hex ?? hex(h.addr)}
+                    </button>
+                    <span className="faint mono" style={{ fontSize: 11 }}>{h.value_hex ?? ""}</span>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+          <div className="dbg-head">Console</div>
+          <div className="panel-body">
+            <div className="faint" style={{ padding: "2px var(--pad-md)", fontSize: 11 }}>
+              {app === null
+                ? "foreground app unknown"
+                : app.running === false || app.pid === 0
+                  ? "no game in foreground"
+                  : `foreground: ${app.name ?? "?"} ${app.titleid ?? ""} v${app.app_ver ?? "?"} (pid ${app.pid})`}
+            </div>
+            <div style={{ display: "flex", gap: 4, padding: "2px var(--pad-md)" }}>
+              <input className="addr-input" style={{ flex: 1 }} value={notifyMsg}
+                placeholder="notification text for the PS4 UI"
+                onChange={(e) => setNotifyMsg(e.target.value)} />
+              <button className="row-action" disabled={!notifyMsg}
+                onClick={() => { void notify(notifyMsg); setNotifyMsg(""); }}>
+                notify
+              </button>
+            </div>
+            <div style={{ display: "flex", gap: 4, padding: "2px var(--pad-md)" }}>
+              <input className="addr-input mono" style={{ width: 90 }} value={dumpName}
+                onChange={(e) => setDumpName(e.target.value)} />
+              <input className="addr-input mono" style={{ flex: 1 }} value={dumpPath}
+                onChange={(e) => setDumpPath(e.target.value)} />
+              <button className="row-action" disabled={busy || !dumpName || !dumpPath}
+                onClick={() => void dumpModule(dumpName, dumpPath, true)}
+                data-tip="dump the module's memory over the wire and load the ELF into disasm">
+                dump+load
+              </button>
+            </div>
           </div>
         </div>
 
