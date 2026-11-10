@@ -781,7 +781,7 @@ const char* hint_for_tool_action(const std::string& tool, const std::string& act
         if (action == "load") return "Loads PE, Mach-O (thin/FAT), or an .ipa main executable. Poll disasm.loaded until hype.ready=true before decomp/DB queries; encrypted images must be decrypted first.";
     } else if (tool == "debugger") {
         if (action == "status") return "PS4-only build: reports the console debug state (ps4_connected, debug_attached, debug_pid, pending_events).";
-        if (action.rfind("ps4_", 0) == 0) return "PS4 console tooling via ps4debug-NG. Live debugging: target.ps4_connect {host} (or ps4_auto {host}) -> ps4_attach {pid} -> ps4_bp_set {addr} / ps4_watch_set {addr,type,len} -> ps4_continue -> ps4_wait {timeout_ms} (stop event with rip/regs) -> ps4_regs/ps4_callstack/ps4_events -> ps4_step or ps4_continue again. ps4_call {addr, args} runs a function in the console process and returns rax. One-call power actions: ps4_until, ps4_find_write, ps4_trace_calls, ps4_trace_steps. Console-side game hacking: ps4_scan {addr,len,value_type,compare,value} + ps4_rescan + ps4_scan_state/reset (native on-console value scan, unlocked by ps4_auth), ps4_scan_all (whole-memory), ps4_scan_aob {addr,len,pattern} (pattern with ?? wildcards), Turbo Scan (fast, results stay on the console): ps4_turbo_caps, ps4_turbo_scan {addr,len | regions:writable, value_type, compare, value} (compare unknown -> snapshot scan, no seed value), ps4_turbo_rescan {compare, value}, ps4_turbo_results {start,count}, ps4_turbo_regions (uncached/slow region map), ps4_turbo_cancel, ps4_turbo_end, ps4_turbo_config {ram_mb, spill_path}; ps4_write_multi {writes:[{addr,hex}|{addr,value,value_type}]} applies many verified pokes in one round-trip, ps4_disasm/ps4_xrefs/ps4_xrefs_to (on-device disasm+xrefs), ps4_stack (server-side frame walk), ps4_assemble {asm} (on-device Keystone), ps4_elf_rpc/ps4_elf_load {path} (run a payload ELF in the game), ps4_notify/ps4_print/ps4_app (console UI/log/foreground game), ps4_fpregs/ps4_set_fpregs/ps4_set_dbregs/ps4_fsgs/ps4_set_fsgs (full register sets). target.ps4_dump_module {name|base,path,load} dumps a module over the wire. ps4_* actions fail with a clear error when no console is connected.";
+        if (action.rfind("ps4_", 0) == 0) return "PS4 console tooling via ps4debug-NG. Live debugging: target.ps4_connect {host} (or ps4_auto {host}) -> ps4_attach {pid} -> ps4_bp_set {addr} / ps4_watch_set {addr,type,len} -> ps4_continue -> ps4_wait {timeout_ms} (stop event with rip/regs) -> ps4_regs/ps4_callstack/ps4_events -> ps4_step or ps4_continue again. ps4_call {addr, args} runs a function in the console process and returns rax. One-call power actions: ps4_until, ps4_find_write, ps4_trace_calls, ps4_trace_steps. Console-side game hacking: ps4_scan {addr,len,value_type,compare,value} + ps4_rescan + ps4_scan_state/reset (native on-console value scan, unlocked by ps4_auth), ps4_scan_all (whole-memory), ps4_scan_aob {addr,len,pattern} (pattern with ?? wildcards), Turbo Scan (fast, results stay on the console): ps4_turbo_caps, ps4_turbo_scan {addr,len | regions:writable, value_type, compare, value} (compare unknown -> snapshot scan, no seed value), ps4_turbo_rescan {compare, value}, ps4_turbo_results {start,count}, ps4_turbo_regions (uncached/slow region map), ps4_turbo_cancel, ps4_turbo_end, ps4_turbo_config {ram_mb, spill_path}; ps4_write_multi {writes:[{addr,hex}|{addr,value,value_type}]} applies many verified pokes in one round-trip, NetVar1337 fork extensions: ps4_modules (server-side module list), ps4_snapshot {addr,len,path} (one-round-trip region dump of any size), ps4_status shows fork_extensions/reconnects (the payload drops the client on most failures; the backend reconnects on the next command and errors carry the console's CMD_ERR_* code), ps4_disasm/ps4_xrefs/ps4_xrefs_to (on-device disasm+xrefs), ps4_stack (server-side frame walk), ps4_assemble {asm} (on-device Keystone), ps4_elf_rpc/ps4_elf_load {path} (run a payload ELF in the game), ps4_notify/ps4_print/ps4_app (console UI/log/foreground game), ps4_fpregs/ps4_set_fpregs/ps4_set_dbregs/ps4_fsgs/ps4_set_fsgs (full register sets). target.ps4_dump_module {name|base,path,load} dumps a module over the wire. ps4_* actions fail with a clear error when no console is connected.";
     } else if (tool == "xray") {
         if (action == "cfg" || action == "complexity") return "Pass a function-start VA from disasm.functions. block_count/edge_count/back_edges feed cyclomatic=edges-blocks+2. Cross-check entry with decomp.function.";
         if (action == "cff") return "flattened=false carries no dispatcher (no score). flattened=true lists dispatcher + state_blocks; recover with devirt.recover_cfg.";
@@ -1659,6 +1659,7 @@ json tool_target(const json& args) {
         if (!out) fail("cannot create " + output_path);
         constexpr uint32_t kChunk = 256 * 1024;
         uint64_t written = 0;
+        uint64_t gap_chunks = 0;
         bool complete = true;
         std::vector<uint8_t> buf;
         for (uint64_t off = 0; off < selected->size; off += kChunk) {
@@ -1668,12 +1669,19 @@ json tool_target(const json& args) {
             auto io = p4->read_memory(session.handle(),
                                      static_cast<uintptr_t>(selected->base + off),
                                      buf.data(), n);
-            if (!io.ok || io.bytes != n) { complete = false; break; }
+            if (!io.ok || io.bytes != n) {
+                // a module span covers all of its maps, so holes between
+                // segments are expected: zero-fill to keep file offsets == RVAs
+                std::fill(buf.begin(), buf.end(), uint8_t{0});
+                complete = false;
+                ++gap_chunks;
+            }
             out.write(reinterpret_cast<const char*>(buf.data()), n);
             written += n;
         }
         out.close();
-        if (written == 0) fail("ps4_dump_module read 0 bytes from the console");
+        if (written == 0 || gap_chunks * kChunk >= selected->size)
+            fail("ps4_dump_module could not read any of the module from the console");
 
         bool loaded = false;
         std::string load_note;
@@ -1693,6 +1701,7 @@ json tool_target(const json& args) {
         }
         return {{"dumped", true},
                 {"complete", complete},
+                {"zero_filled_chunks", gap_chunks},
                 {"path", output_path},
                 {"bytes_written", written},
                 {"module", {{"base", static_cast<uint64_t>(selected->base)},
@@ -3418,6 +3427,7 @@ struct ps4_turbo_session_t {
     bool     snapshot = false;
     uint64_t count = 0;
     uint32_t passes = 0;
+    uint64_t generation = 0;  // connection generation the console session lives on
     std::vector<runtime::backend_ps4_t::ps4_scan_hit_t> hits;
 };
 ps4_turbo_session_t& ps4_turbo_sess() { static ps4_turbo_session_t s; return s; }
@@ -3605,6 +3615,16 @@ json tool_ps4_turbo(const std::string& action, const json& args,
                          "ones as ps4_turbo_scan segments"}};
     }
 
+    // a resident session dies with the connection it was created on; a NOP
+    // makes the backend notice (and reopen) a connection the payload dropped
+    if (ts.used && ts.resident) p.ping();
+    if (ts.used && ts.resident && ts.generation != p.ps4_connection_generation()) {
+        ts = ps4_turbo_session_t{};
+        if (action == "ps4_turbo_results" || action == "ps4_turbo_rescan")
+            fail("the console dropped the connection since the last turbo scan, which "
+                 "freed its results; run ps4_turbo_scan again");
+    }
+
     if (action == "ps4_turbo_results") {
         if (!ts.used) fail("no turbo scan session; start with ps4_turbo_scan");
         const uint32_t start = args.value("start", 0u);
@@ -3713,6 +3733,7 @@ json tool_ps4_turbo(const std::string& action, const json& args,
         ts.snapshot = res.snapshot;
         ts.count = res.count;
         ts.passes = 1;
+        ts.generation = p.ps4_connection_generation();
         ts.hits = std::move(res.hits);
         json j = {{"first_scan", true}, {"pid", ts.pid}, {"count", ts.count},
                   {"resident", ts.resident}, {"snapshot", ts.snapshot},
@@ -3813,12 +3834,61 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         return {{"attached", false}};
     }
     if (action == "ps4_status") {
+        const int ext = p.ps4_fork_extensions();
         return {{"attached", p.ps4_debug_attached()},
                 {"pid", p.ps4_debug_pid()},
                 {"pending_events", p.ps4_pending_events()},
                 {"endpoint", p.endpoint()},
                 {"branding", p.branding()},
+                {"capability_level", p.ps4_capability_level()},
+                {"fork_extensions", ext == 1 ? "yes" : ext == 0 ? "no (upstream payload)" : "not probed yet"},
+                {"reconnects", p.ps4_connection_generation()},
                 {"backend", "PS4"}};
+    }
+
+    // ---- NetVar1337 ps4debug-NG fork extensions ----
+    if (action == "ps4_modules") {
+        const uint32_t pid = ps4_pid_arg(args);
+        std::vector<runtime::module_info_t> mods;
+        auto io = p.ps4_modules(pid, mods);
+        if (!io.ok) {
+            if (io.error == 100)
+                fail("ps4_modules needs the NetVar1337 ps4debug-NG fork (CMD_PROC_MODULES); "
+                     "target.modules works on any payload");
+            fail("ps4_modules failed (error " + std::to_string(io.error) + ")");
+        }
+        json arr = json::array();
+        for (const auto& m : mods)
+            arr.push_back({{"name", m.name}, {"path", m.path}, {"base", static_cast<uint64_t>(m.base)},
+                           {"base_hex", addr_hex_str(m.base)}, {"size", m.size}});
+        return {{"pid", pid}, {"count", mods.size()}, {"modules", arr}};
+    }
+    if (action == "ps4_snapshot") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = parse_addr(args, "len");
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("ps4_snapshot requires output 'path'");
+        const std::string path = args.at("path").get<std::string>();
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) fail("cannot create " + path);
+        auto io = p.ps4_snapshot(pid, addr, len, [&](const uint8_t* d, size_t n) {
+            out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(n));
+            return static_cast<bool>(out);
+        });
+        out.close();
+        if (!io.ok) {
+            std::remove(path.c_str());
+            if (io.error == 100)
+                fail("ps4_snapshot needs the NetVar1337 ps4debug-NG fork (CMD_PROC_SNAPSHOT); "
+                     "use memory.read or target.ps4_dump_module instead");
+            if (io.error == 2)
+                fail("ps4_snapshot: range is not fully mapped and readable (target.regions)");
+            fail("ps4_snapshot failed after " + std::to_string(io.bytes) + " bytes (error " +
+                 std::to_string(io.error) + ")");
+        }
+        return {{"pid", pid}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                {"bytes", io.bytes}, {"path", path}};
     }
     if (action == "ps4_bp_set") {
         const uint64_t addr = parse_addr(args, "addr");
@@ -4485,7 +4555,7 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
          "ps4_scan_state|ps4_scan_reset|ps4_scan_all|ps4_scan_aob|"
          "ps4_turbo_caps|ps4_turbo_scan|ps4_turbo_rescan|ps4_turbo_results|"
          "ps4_turbo_end|ps4_turbo_config|ps4_turbo_regions|ps4_turbo_cancel|"
-         "ps4_write_multi|ps4_disasm|ps4_xrefs|ps4_xrefs_to|ps4_stack|ps4_assemble|"
+         "ps4_write_multi|ps4_modules|ps4_snapshot|ps4_disasm|ps4_xrefs|ps4_xrefs_to|ps4_stack|ps4_assemble|"
          "ps4_elf_rpc|ps4_elf_load|ps4_notify|ps4_print|ps4_app|"
          "ps4_fpregs|ps4_set_fpregs|ps4_set_dbregs|ps4_fsgs|ps4_set_fsgs)");
 }
@@ -4498,7 +4568,30 @@ json tool_debugger(const json& args) {
     const std::string action = require_action(args);
     // PS4-only build: every live-debug action drives the console's
     // ps4debug-NG session over the wire
-    if (action.rfind("ps4_", 0) == 0) return tool_debugger_ps4(action, args);
+    if (action.rfind("ps4_", 0) == 0) {
+        // append the console's own status word (CMD_ERR_* from the
+        // NetVar1337 fork, CMD_DATA_NULL, ...) to failures so callers see
+        // why, and say when the payload dropped and the backend reconnected
+        auto* p4 = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active());
+        uint64_t gen = 0;
+        if (p4) {
+            p4->ps4_take_last_status();
+            gen = p4->ps4_connection_generation();
+        }
+        try {
+            return tool_debugger_ps4(action, args);
+        } catch (const std::runtime_error& ex) {
+            std::string msg = ex.what();
+            if (p4) {
+                if (const char* n = runtime::ps4::status_name(p4->ps4_take_last_status()); n[0])
+                    msg += std::string(" [console: ") + n + "]";
+                if (p4->ps4_connection_generation() != gen)
+                    msg += " [the console dropped the connection; reconnected - debug and "
+                           "turbo scan sessions were reset]";
+            }
+            throw std::runtime_error(msg);
+        }
+    }
     if (action == "status") {
         auto* p = dynamic_cast<runtime::backend_ps4_t*>(&runtime::active());
         json out;
@@ -8063,7 +8156,7 @@ void list_tools(json& out) {
     const char* disasm_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"}},"required":["action"]})";
     const char* debugger_schema =
-        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_turbo_caps","ps4_turbo_scan","ps4_turbo_rescan","ps4_turbo_results","ps4_turbo_end","ps4_turbo_config","ps4_turbo_regions","ps4_turbo_cancel","ps4_write_multi","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer"},"unique":{"type":"boolean"},"asm":{"type":"string"},"syntax":{"type":"string"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"},"regions":{"type":"string"},"resident":{"type":"boolean"},"snapshot":{"type":"boolean"},"aliasing":{"type":"boolean"},"parallel":{"type":"boolean"},"keep_first":{"type":"boolean"},"keep_previous":{"type":"boolean"},"include_zeros":{"type":"boolean"},"float":{"type":"string"},"float_exponent":{"type":"integer"},"mask_hex":{"type":"string"},"limit":{"type":"integer"},"start":{"type":"integer"},"ram_mb":{"type":"integer"},"spill_path":{"type":"string"},"probe_bytes":{"type":"integer"},"writes":{"type":"array","items":{"type":"object"}},"status":{"type":"boolean"}},"required":["action"]})";
+        R"({"type":"object","properties":{"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_turbo_caps","ps4_turbo_scan","ps4_turbo_rescan","ps4_turbo_results","ps4_turbo_end","ps4_turbo_config","ps4_turbo_regions","ps4_turbo_cancel","ps4_write_multi","ps4_modules","ps4_snapshot","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer"},"unique":{"type":"boolean"},"asm":{"type":"string"},"syntax":{"type":"string"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"},"regions":{"type":"string"},"resident":{"type":"boolean"},"snapshot":{"type":"boolean"},"aliasing":{"type":"boolean"},"parallel":{"type":"boolean"},"keep_first":{"type":"boolean"},"keep_previous":{"type":"boolean"},"include_zeros":{"type":"boolean"},"float":{"type":"string"},"float_exponent":{"type":"integer"},"mask_hex":{"type":"string"},"limit":{"type":"integer"},"start":{"type":"integer"},"ram_mb":{"type":"integer"},"spill_path":{"type":"string"},"probe_bytes":{"type":"integer"},"writes":{"type":"array","items":{"type":"object"}},"status":{"type":"boolean"}},"required":["action"]})";
     const char* xray_schema =
         R"({"type":"object","properties":{"action":{"type":"string","enum":["cfg","complexity","cff","obfuscation","strings_recon","indirect_calls","anti_analysis","hooks","syscalls","apihash","entropy","pages","crypto_range","gadgets"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"size":{"type":"integer"},"len":{"type":"integer"},"length":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"window_size":{"type":"integer"},"window":{"type":"integer"},"window_limit":{"type":"integer"},"page_size":{"type":"integer"},"max_functions":{"type":"integer"},"hash":{},"hashes":{"type":"array"},"algorithm":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})";
     const char* patch_schema =

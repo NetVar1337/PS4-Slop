@@ -52,6 +52,46 @@ public:
     uint16_t port = 0;
     std::mutex mu;   // serializes whole command exchanges
 
+    // the payload closes a client whenever a handler fails (handler returns
+    // 1 -> free_client), so before each command we check the socket and
+    // reopen it. on_reopen re-runs per-connection setup (auth) and resets
+    // state the payload tore down; it runs with mu held
+    std::function<bool(conn_t&)> on_reopen;
+    std::atomic<uint64_t> generation{0};   // bumped on every transparent reopen
+    std::atomic<uint32_t> last_status{0};  // last error status word seen
+    // set when an error status arrived: the payload usually closes the
+    // socket right after sending it, so the next liveness check waits a
+    // moment for that FIN instead of racing it
+    bool suspect = false;
+
+    // true when the server hung up, the socket errored, or stray bytes are
+    // queued (a previous exchange desynced, e.g. a snapshot that stopped
+    // streaming mid-region); any of those means the stream is unusable
+    bool peer_gone() {
+        if (fd == INVALID_SOCKET) return false;
+        fd_set rset;
+        FD_ZERO(&rset);
+        FD_SET(fd, &rset);
+        timeval tv{};
+        if (suspect) tv.tv_usec = 100 * 1000;
+        suspect = false;
+        if (select(0, &rset, nullptr, nullptr, &tv) <= 0) return false;
+        char b;
+        const int n = ::recv(fd, &b, 1, MSG_PEEK);
+        (void)n;
+        return true;   // closed (0), error (<0) or unexpected bytes (>0)
+    }
+
+    bool revive() {
+        std::string err;
+        const std::string h = host;
+        const uint16_t p = port;
+        if (!open(h, p, err)) return false;
+        if (on_reopen && !on_reopen(*this)) { close(); return false; }
+        generation.fetch_add(1);
+        return true;
+    }
+
     bool connected() const noexcept { return fd != INVALID_SOCKET; }
 
     bool open(const std::string& h, uint16_t p, std::string& err) {
@@ -175,11 +215,20 @@ public:
     }
 
     bool recv_u32(uint32_t& v, int timeout_ms = kIoTimeoutMs) {
-        return recv_all(&v, sizeof(v), timeout_ms);
+        if (!recv_all(&v, sizeof(v), timeout_ms)) return false;
+        // remember error status words so callers can explain a failure; the
+        // set is narrow enough that counts/lengths never collide in practice
+        if (ps4::status_name(v)[0] != '\0') {
+            last_status.store(v);
+            suspect = true;
+        }
+        return true;
     }
 
     // send one request header + body; the caller then drives the reply
     bool send_cmd(uint32_t cmd, const void* body, uint32_t bodylen) {
+        if (bodylen > ps4::kMaxDatalen) return false;   // payload would desync us
+        if (peer_gone() && !revive()) return false;
         ps4::packet_header_t hdr{};
         hdr.magic   = ps4::kPacketMagic;
         hdr.cmd     = cmd;
@@ -384,6 +433,22 @@ struct backend_ps4_t::impl_t {
 
     impl_t() {
         listener.on_packet = [this](const uint8_t* pkt, size_t n) { push_event(pkt, n); };
+        // transparent reopen after the payload dropped us (see conn_t). The
+        // payload's free_client tore down this client's debug session and
+        // Turbo Scan session, so forget them; auth is global on the payload
+        // but is re-run when it had succeeded before (an old payload without
+        // AUTH would drop us again)
+        conn->on_reopen = [this](conn_t& c) {
+            if (authed) {
+                std::string e;
+                auth_locked(c, authed, 0x3, e);
+            }
+            dbg_pid = 0;
+            invalidate_maps_cache();
+            std::lock_guard lk(ev_mu);
+            evq.clear();
+            return true;
+        };
     }
 
     std::shared_ptr<conn_t> conn = std::make_shared<conn_t>();
@@ -402,6 +467,11 @@ struct backend_ps4_t::impl_t {
 
     // CMD_PROC_AUTH result (per-connection on the payload side)
     bool authed = false;
+
+    // NetVar1337 fork extensions (CMD_PROC_MODULES/SNAPSHOT): -1 unknown,
+    // 0 absent (upstream payload), 1 present. Learned from the first
+    // CMD_PROC_MODULES reply; reset on connect
+    int fork_ext = -1;
 
     void push_event(const uint8_t* pkt, size_t n) {
         if (n < ps4::kDebugEventSize) return;
@@ -579,6 +649,8 @@ bool backend_ps4_t::connect(const std::string& host, uint16_t port, std::string&
         c.close();
     }
     if (!c.open(host, port, err)) return false;
+    m_impl->fork_ext = -1;
+    c.last_status = 0;
 
     // handshake: version + branding + fw + platform tag, then a NOP probe.
     // version/branding reply with u32 len + bytes (no status word), fw and
@@ -966,18 +1038,46 @@ enum_result_t<process_info_t> backend_ps4_t::enum_processes() {
 
 enum_result_t<module_info_t> backend_ps4_t::enum_modules(const target_handle_t& h) {
     enum_result_t<module_info_t> res;
+    // the fork's CMD_PROC_MODULES groups maps server-side. Probing it on an
+    // unknown payload costs a reconnect on upstream (unknown command -> drop),
+    // which would also kill a live debug session, so only probe when idle
+    const int ext = m_impl->fork_ext;
+    if (ext == 1 || (ext == -1 && m_impl->dbg_pid == 0)) {
+        std::vector<module_info_t> mods;
+        if (ps4_modules(handle_pid(h), mods).ok) {
+            res.items = std::move(mods);
+            res.ok = true;
+            return res;
+        }
+        if (m_impl->fork_ext == 1) {
+            // supported but failed (bad pid etc.): report, don't mask it
+            res.error = 2;
+            return res;
+        }
+    }
+    // upstream fallback: group the vm map by backing name, base = lowest
+    // start, size = span, like the fork does
     std::vector<ps4::vm_map_entry_t> maps;
     uint32_t err = 0;
     if (!m_impl->fetch_maps(handle_pid(h), maps, err)) { res.error = err ? err : 1; return res; }
     for (const auto& m : maps) {
         const std::string name = fixed_str(m.name, sizeof(m.name));
         if (name.empty()) continue;
-        module_info_t mi;
-        mi.base = static_cast<uintptr_t>(m.start);
-        mi.size = static_cast<uint32_t>(m.end - m.start);
-        mi.name = base_name(name);
-        mi.path = name;
-        res.items.push_back(std::move(mi));
+        auto it = std::find_if(res.items.begin(), res.items.end(),
+                               [&](const module_info_t& x) { return x.path == name; });
+        if (it == res.items.end()) {
+            module_info_t mi;
+            mi.base = static_cast<uintptr_t>(m.start);
+            mi.size = static_cast<uint32_t>(m.end - m.start);
+            mi.name = base_name(name);
+            mi.path = name;
+            res.items.push_back(std::move(mi));
+            continue;
+        }
+        const uint64_t lo  = std::min<uint64_t>(it->base, m.start);
+        const uint64_t hi  = std::max<uint64_t>(it->base + it->size, m.end);
+        it->base = static_cast<uintptr_t>(lo);
+        it->size = static_cast<uint32_t>(std::min<uint64_t>(hi - lo, 0xFFFFFFFFull));
     }
     res.ok = true;
     return res;
@@ -2022,6 +2122,123 @@ io_result_t backend_ps4_t::ps4_turbo_cancel(uint32_t pid, std::string& err) {
     return r;
 }
 
+// ---------------------------------------------------------------------------
+// NetVar1337 fork extensions: module list, one-shot region snapshot, and
+// connection bookkeeping
+
+uint64_t backend_ps4_t::ps4_connection_generation() const noexcept {
+    return m_impl->conn->generation.load();
+}
+
+uint32_t backend_ps4_t::ps4_take_last_status() noexcept {
+    return m_impl->conn->last_status.exchange(0);
+}
+
+int backend_ps4_t::ps4_fork_extensions() const noexcept {
+    return m_impl->fork_ext;
+}
+
+io_result_t backend_ps4_t::ps4_modules(uint32_t pid, std::vector<module_info_t>& out) {
+    io_result_t r;
+    out.clear();
+    if (m_impl->fork_ext == 0) { r.error = 100; return r; }   // known upstream payload
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    if (!c.connected()) { r.error = 1; return r; }
+    ps4::proc_maps_packet_t pkt{};
+    pkt.pid = pid;
+    if (!c.send_cmd(ps4::CMD_PROC_MODULES, &pkt, sizeof(pkt))) { r.error = 2; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st)) { r.error = 3; return r; }
+    if (st != ps4::CMD_SUCCESS) {
+        // upstream answers an unknown command with plain CMD_ERROR (and then
+        // drops us); the fork's own failures use CMD_ERR_PID / CMD_DATA_NULL
+        if (m_impl->fork_ext == -1)
+            m_impl->fork_ext = (st == ps4::CMD_ERROR) ? 0 : 1;
+        r.error = m_impl->fork_ext == 0 ? 100 : 4;
+        return r;
+    }
+    m_impl->fork_ext = 1;
+    uint32_t num = 0;
+    if (!c.recv_u32(num) || num > kMaxListEntries) { r.error = 5; return r; }
+    std::vector<ps4::proc_module_entry_t> ents(num);
+    if (num && !c.recv_all(ents.data(), num * sizeof(ps4::proc_module_entry_t))) {
+        r.error = 6; return r;
+    }
+    out.reserve(num);
+    for (const auto& e : ents) {
+        module_info_t mi;
+        mi.path = fixed_str(e.name, sizeof(e.name));
+        mi.name = base_name(mi.path);
+        mi.base = static_cast<uintptr_t>(e.base);
+        mi.size = static_cast<uint32_t>(std::min<uint64_t>(e.size, 0xFFFFFFFFull));
+        out.push_back(std::move(mi));
+    }
+    r.ok = true;
+    return r;
+}
+
+io_result_t backend_ps4_t::ps4_snapshot(uint32_t pid, uint64_t addr, uint64_t len,
+                                        const std::function<bool(const uint8_t*, size_t)>& sink) {
+    io_result_t r;
+    if (len == 0 || addr + len < addr) { r.error = ERROR_INVALID_PARAMETER; return r; }
+    if (m_impl->fork_ext == 0) { r.error = 100; return r; }
+    // the payload stops streaming (and drops the client) at the first page it
+    // cannot read, so refuse ranges the vm map says are not fully readable
+    std::vector<ps4::vm_map_entry_t> maps;
+    uint32_t merr = 0;
+    if (m_impl->maps_cached(pid, maps, merr) &&
+        !impl_t::covered_by(maps, addr, len, ps4::kVmProtRead)) {
+        r.error = 2;
+        return r;
+    }
+    auto& c = *m_impl->conn;
+    std::lock_guard lk(c.mu);
+    if (!c.connected()) { r.error = 1; return r; }
+    ps4::proc_snapshot_packet_t pkt{};
+    pkt.pid = pid;
+    pkt.address = addr;
+    pkt.length = len;
+    if (!c.send_cmd(ps4::CMD_PROC_SNAPSHOT, &pkt, sizeof(pkt))) { r.error = 3; return r; }
+    uint32_t st = 0;
+    if (!c.recv_u32(st)) { r.error = 4; return r; }
+    if (st != ps4::CMD_SUCCESS) {
+        if (m_impl->fork_ext == -1)
+            m_impl->fork_ext = (st == ps4::CMD_ERROR) ? 0 : 1;
+        r.error = m_impl->fork_ext == 0 ? 100 : 5;
+        return r;
+    }
+    m_impl->fork_ext = 1;
+    std::vector<uint8_t> buf(ps4::kSnapshotChunk);
+    uint64_t left = len;
+    while (left > 0) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(left, ps4::kSnapshotChunk));
+        if (!c.recv_all(buf.data(), n)) {
+            // short stream: the payload hit an unreadable page and closed the
+            // connection; the next command reconnects
+            r.error = 6;
+            r.bytes = static_cast<size_t>(len - left);
+            return r;
+        }
+        if (sink && !sink(buf.data(), n)) {
+            // the caller gave up mid-stream: drain so the stream stays in sync
+            left -= n;
+            while (left > 0) {
+                const size_t m = static_cast<size_t>(std::min<uint64_t>(left, ps4::kSnapshotChunk));
+                if (!c.recv_all(buf.data(), m)) break;
+                left -= m;
+            }
+            r.error = 7;
+            r.bytes = static_cast<size_t>(len - left);
+            return r;
+        }
+        left -= n;
+    }
+    r.ok = true;
+    r.bytes = static_cast<size_t>(len);
+    return r;
+}
+
 io_result_t backend_ps4_t::ps4_disasm_region(uint32_t pid, uint64_t addr, uint32_t len,
                                              uint32_t max_entries,
                                              std::vector<ps4_disasm_entry_t>& out) {
@@ -2227,7 +2444,7 @@ io_result_t backend_ps4_t::ps4_console_notify(uint32_t message_type, const std::
     auto& c = *m_impl->conn;
     std::lock_guard lk(c.mu);
     if (!c.connected()) { r.error = 1; return r; }
-    if (text.size() > 1024) { r.error = 2; return r; }
+    if (text.size() >= ps4::kMaxConsoleMsg) { r.error = 2; return r; }
     std::string msg = text;
     if (msg.empty() || msg.back() != '\0') msg.push_back('\0');   // payload requires NUL
     ps4::console_notify_packet_t pkt{};
@@ -2246,7 +2463,7 @@ io_result_t backend_ps4_t::ps4_console_print(const std::string& text) {
     auto& c = *m_impl->conn;
     std::lock_guard lk(c.mu);
     if (!c.connected()) { r.error = 1; return r; }
-    if (text.empty() || text.size() > 4096) { r.error = 2; return r; }
+    if (text.empty() || text.size() > ps4::kMaxConsoleMsg) { r.error = 2; return r; }
     const uint32_t len = static_cast<uint32_t>(text.size());
     if (!c.send_cmd(ps4::CMD_CONSOLE_PRINT, &len, sizeof(len))) { r.error = 3; return r; }
     if (!c.send_all(text.data(), text.size())) { r.error = 4; return r; }

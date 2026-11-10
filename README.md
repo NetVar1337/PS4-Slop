@@ -40,7 +40,7 @@ The strings view with search, UTF-16 flagging and xref counts:
   React shell both drive the same C++ engine.
 - **Headless operation:** run the engine without a window for MCP or HTTP clients.
 - **Remote PS4 targets:** connect directly to a console running the
-  [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload (TCP 744) and
+  [ps4debug-NG](https://github.com/NetVar1337/ps4debug-NG) payload (TCP 744) and
   use the same process list, attach, memory read/write/scan, regions, modules,
   and threads against the console — plus live remote debugging: breakpoints,
   hardware watchpoints, continue/step, stop events, register get/set,
@@ -337,9 +337,36 @@ wire; a hidden local user-mode backend remains for the automated test fixture.
 ### Remote PS4 targets (ps4debug-NG)
 
 With a PS4 on the same network running the
-[ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload, reverse-slop
-speaks its wire protocol directly (TCP 744, plus the port-755 debug-event
-callback) through a dedicated `PS4` backend:
+[NetVar1337 ps4debug-NG fork](https://github.com/NetVar1337/ps4debug-NG)
+payload, reverse-slop speaks its wire protocol directly (TCP 744, plus the
+port-755 debug-event callback) through a dedicated `PS4` backend. The fork is
+the reference payload: it is a superset of
+[Pharaoh2k/ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG), so the
+upstream payload still works, minus the fork-only features below.
+
+What the fork adds and how reverse-slop uses it:
+
+- `CMD_PROC_MODULES` (`0xBDAA0025`): server-side module list (one entry per
+  backing file, base..end spanning all of its maps). `target.modules`,
+  `target.ps4_dump_module` and `debugger.ps4_modules` use it; on upstream the
+  backend groups the vm map the same way client-side.
+- `CMD_PROC_SNAPSHOT` (`0xBDAA0026`): stream a region of any size in one round
+  trip; `debugger.ps4_snapshot {addr, len, path}` writes it to a file. Ranges
+  that are not fully readable are refused up front, because the payload stops
+  mid-stream at the first unreadable page.
+- Structured errors (`CMD_ERR_PID`, `CMD_ERR_UNMAPPED`, `CMD_ERR_NOATTACH`,
+  `CMD_ERR_RANGE`): appended to MCP tool errors as `[console: ...]`.
+- A minimum-length guard on every request (`cmd_guards.c`):
+  `CMD_DEBUG_PROCESS_STOP` is sent as 8 bytes so it passes; the test fake
+  enforces the same table for every command.
+- `debugger.ps4_status` reports `fork_extensions` (detected on first use, no
+  extra handshake) and `reconnects`.
+
+On either payload a failing command makes the server close the client socket,
+which also ends that client's debug session and Turbo Scan session. The backend
+notices the hang-up before the next command, reconnects and re-authenticates
+transparently, and tool errors say when that happened. Re-arm breakpoints and
+re-run a turbo scan after a reconnect.
 
 - Connect from the ImGui targets view ("PS4..." button), the Tauri targets
   panel (gamepad button), or MCP with `target.ps4_connect {host, port=744,

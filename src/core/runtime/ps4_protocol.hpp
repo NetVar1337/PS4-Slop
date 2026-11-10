@@ -2,9 +2,17 @@
 
 // src/core/runtime/ps4_protocol.hpp
 // ps4debug-NG wire protocol constants and packed structs.
-// Source of truth: github.com/Pharaoh2k/ps4debug-NG debugger/include/protocol.h
-// and debugger/source/*.c at the pinned commit. Every multi-byte field on the
-// wire is little-endian; the payload sends packed structs raw.
+// Source of truth: the NetVar1337/ps4debug-NG fork (debugger/include/protocol.h,
+// debugger/source/*.c, PROTOCOL.md), a superset of Pharaoh2k/ps4debug-NG. The
+// fork adds CMD_PROC_MODULES / CMD_PROC_SNAPSHOT, structured CMD_ERR_* codes
+// and a minimum-datalen guard on every command (cmd_guards.c). Every
+// multi-byte field on the wire is little-endian; the payload sends packed
+// structs raw.
+//
+// Connection contract (both payloads): when a handler fails it usually
+// returns 1 and the server CLOSES the client socket, tearing down that
+// client's debug session and Turbo Scan session. The backend reconnects
+// transparently on the next command.
 
 #include <cstddef>
 #include <cstdint>
@@ -69,6 +77,12 @@ constexpr uint32_t CMD_PROC_EXTRACT_CODE_XREFS = 0xBDAA0021;
 constexpr uint32_t CMD_PROC_FIND_XREFS_TO      = 0xBDAA0022;
 constexpr uint32_t CMD_PROC_READ_STACK         = 0xBDAA0023;
 constexpr uint32_t CMD_PROC_ASSEMBLE           = 0xBDAA0024;  // raw literal, no macro upstream
+
+// NetVar1337 fork extensions (unknown to upstream, which answers CMD_ERROR
+// and drops the connection)
+constexpr uint32_t CMD_PROC_MODULES  = 0xBDAA0025;  // body: proc_maps_packet_t
+constexpr uint32_t CMD_PROC_SNAPSHOT = 0xBDAA0026;  // body: proc_snapshot_packet_t
+constexpr uint32_t kSnapshotChunk    = 0x10000;
 
 // scan family; CMD_PROC_SCAN*/AOB* require auth bit 1 (CMD_PROC_AUTH first)
 constexpr uint32_t CMD_PROC_SCAN            = 0xBDAA0009;
@@ -215,6 +229,35 @@ constexpr uint32_t CMD_TOO_MUCH_DATA = 0xF0000002;
 constexpr uint32_t CMD_DATA_NULL     = 0xF0000003;
 constexpr uint32_t CMD_ALREADY_DEBUG = 0xF0000004;
 constexpr uint32_t CMD_INVALID_INDEX = 0xF0000005;
+// structured errors (fork extension), returned instead of CMD_ERROR where the
+// failure mode is known
+constexpr uint32_t CMD_ERR_PID       = 0xF0000010;  // pid not found / not permitted
+constexpr uint32_t CMD_ERR_UNMAPPED  = 0xF0000011;  // range not mapped/readable
+constexpr uint32_t CMD_ERR_NOATTACH  = 0xF0000012;  // debug cmd with no session
+constexpr uint32_t CMD_ERR_RANGE     = 0xF0000013;  // addr+len overflow / out of range
+
+// payload-side hardening limits (fork cmd_guards.h / PROTOCOL.md section 10)
+constexpr uint32_t kMaxDatalen       = 16u * 1024u * 1024u;  // CMD_MAX_DATALEN
+constexpr uint32_t kMaxConsoleMsg    = 64u * 1024u;          // print/notify
+constexpr uint32_t kMaxScanValueLen  = 4096;                 // scan values/patterns
+
+constexpr bool is_fatal_status(uint32_t s) { return (s >> 28) == 0xF; }
+
+// readable name for a status word, "" for CMD_SUCCESS / unknown values
+constexpr const char* status_name(uint32_t s) {
+    switch (s) {
+        case CMD_ERROR:         return "CMD_ERROR";
+        case CMD_TOO_MUCH_DATA: return "CMD_TOO_MUCH_DATA";
+        case CMD_DATA_NULL:     return "CMD_DATA_NULL";
+        case CMD_ALREADY_DEBUG: return "CMD_ALREADY_DEBUG";
+        case CMD_INVALID_INDEX: return "CMD_INVALID_INDEX";
+        case CMD_ERR_PID:       return "CMD_ERR_PID (pid not found or not permitted)";
+        case CMD_ERR_UNMAPPED:  return "CMD_ERR_UNMAPPED (address range not mapped/readable)";
+        case CMD_ERR_NOATTACH:  return "CMD_ERR_NOATTACH (no debug session attached)";
+        case CMD_ERR_RANGE:     return "CMD_ERR_RANGE (address+length out of range)";
+        default:                return "";
+    }
+}
 
 // FreeBSD VM_PROT_* flags used by CMD_PROC_PROTECT (not Windows PAGE_*)
 constexpr uint32_t kVmProtNone  = 0;
@@ -334,9 +377,13 @@ struct debug_continue_packet_t {
     uint32_t stop;   // kStopResume / kStopStop / kStopKill
 };
 
+// the payload reads pid + state byte, but the fork's datalen guard requires
+// 8 bytes (cmd_guards.c) and answers CMD_DATA_NULL to the old 5-byte form;
+// upstream ignores the padding, so always send 8
 struct debug_process_stop_packet_t {
     uint32_t pid;
     uint8_t  state;  // kStopResume / kStopStop / kStopKill
+    uint8_t  pad[3];
 };
 
 struct proc_intall_packet_t {
@@ -453,6 +500,20 @@ struct proc_scan_aob_packet_t {
     uint8_t  max_matches;
     uint8_t  stop_flag;   // 1 = invalidate if more than max_matches matches
     uint32_t pattern_length;
+};
+
+// CMD_PROC_MODULES entry, 48 bytes: one per backing file, base = lowest
+// mapped address, size = span (may include unmapped gaps)
+struct proc_module_entry_t {
+    char     name[32];
+    uint64_t base;
+    uint64_t size;
+};
+
+struct proc_snapshot_packet_t {
+    uint32_t pid;
+    uint64_t address;
+    uint64_t length;
 };
 
 struct proc_write_multi_packet_t {
@@ -605,7 +666,7 @@ static_assert(sizeof(debug_setregs_packet_t) == 8);
 static_assert(sizeof(debug_set_breakpoint_packet_t) == 16);
 static_assert(sizeof(debug_set_watchpoint_packet_t) == 24);
 static_assert(sizeof(debug_continue_packet_t) == 4);
-static_assert(sizeof(debug_process_stop_packet_t) == 5);
+static_assert(sizeof(debug_process_stop_packet_t) == 8);
 static_assert(sizeof(proc_intall_packet_t) == 4);
 static_assert(sizeof(proc_call_packet_t) == 68);
 static_assert(sizeof(proc_call_response_t) == 12);
@@ -624,6 +685,8 @@ static_assert(sizeof(proc_scan_count_packet_t) == 18);
 static_assert(sizeof(proc_scan_get_packet_t) == 8);
 static_assert(sizeof(proc_scan_aob_packet_t) == 22);
 static_assert(sizeof(proc_auth_packet_t) == 8);
+static_assert(sizeof(proc_module_entry_t) == 48);
+static_assert(sizeof(proc_snapshot_packet_t) == 20);
 static_assert(sizeof(proc_write_multi_packet_t) == 12);
 static_assert(sizeof(proc_write_multi_entry_t) == 12);
 static_assert(sizeof(turbo_start_packet_t) == 27);

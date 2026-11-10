@@ -121,6 +121,13 @@ struct fake_ps4_server_t {
     bool setdbregs_called = false;
     uint64_t last_fsgs_fs = 0, last_fsgs_gs = 0;
 
+    // NetVar1337 fork behaviour
+    bool fork_ext = true;          // CMD_PROC_MODULES / CMD_PROC_SNAPSHOT present
+    int guard_rejects = 0;         // requests the fork's datalen guard refused
+    uint32_t last_guard_cmd = 0;
+    int commands_seen = 0;
+    int module_requests = 0;
+
     // bulk write (0xBDAACC04) state
     int write_multi_calls = 0;
     uint32_t last_write_multi_count = 0;
@@ -137,6 +144,7 @@ struct fake_ps4_server_t {
     bool turbo_has_first = false;
     uint32_t turbo_vlen = 0;
     std::vector<turbo_rec_t> turbo_recs;
+    SOCKET turbo_owner = INVALID_SOCKET;
     uint32_t last_turbo_flags = 0;
     uint32_t last_turbo_nseg = 0;
     size_t turbo_resident_cap = 1u << 20;   // shrink to force the overflow path
@@ -273,13 +281,77 @@ private:
     std::vector<SOCKET> conn_socks;
     std::vector<std::thread> conn_threads;
 
+    // the NetVar1337 fork's cmd_guards.c table: requests shorter than this
+    // get CMD_DATA_NULL before dispatch (connection kept). Mirroring it makes
+    // every test check the backend's request sizes against the fork
+    static uint32_t fork_min_datalen(uint32_t cmd) {
+        switch (cmd) {
+        case ps4::CMD_PROC_READ: case ps4::CMD_PROC_WRITE: case ps4::CMD_PROC_FREE:
+        case ps4::CMD_PROC_ALLOC_HINTED:                        return 16;
+        case ps4::CMD_PROC_MAPS: case ps4::CMD_PROC_INTALL: case ps4::CMD_PROC_INFO:
+        case ps4::CMD_PROC_MODULES:                             return 4;
+        case ps4::CMD_PROC_CALL:                                return 68;
+        case ps4::CMD_PROC_ELF: case ps4::CMD_PROC_ELF_RPC:
+        case ps4::CMD_PROC_ALLOC: case ps4::CMD_PROC_AUTH:
+        case ps4::CMD_PROC_SCAN_GET:                            return 8;
+        case ps4::CMD_PROC_PROTECT: case ps4::CMD_PROC_DISASM_REGION:
+        case ps4::CMD_PROC_EXTRACT_CODE_XREFS: case ps4::CMD_PROC_SNAPSHOT: return 20;
+        case ps4::CMD_PROC_SCAN:                                return 10;
+        case ps4::CMD_PROC_FIND_XREFS_TO: case ps4::CMD_PROC_READ_STACK: return 24;
+        case ps4::CMD_PROC_ASSEMBLE: case ps4::CMD_PROC_WRITE_MULTI: return 12;
+        case ps4::CMD_PROC_SCAN_AOB:                            return 22;
+        case ps4::CMD_PROC_SCAN_AOB_MULTI:                      return 21;
+        case ps4::CMD_PROC_SCAN_START:                          return 23;
+        case ps4::CMD_PROC_SCAN_COUNT:                          return 18;
+        case ps4::CMD_DEBUG_PROCESS_STOP: case ps4::CMD_DEBUG_SETREGS:
+        case ps4::CMD_DEBUG_SETFPREGS: case ps4::CMD_DEBUG_SETDBREGS:
+        case ps4::CMD_DEBUG_SETFSGSBASE: case ps4::CMD_CONSOLE_NOTIFY: return 8;
+        case ps4::CMD_DEBUG_ATTACH: case ps4::CMD_DEBUG_SUSPEND: case ps4::CMD_DEBUG_RESUME:
+        case ps4::CMD_DEBUG_GETREGS: case ps4::CMD_DEBUG_GETFPREGS: case ps4::CMD_DEBUG_GETDBREGS:
+        case ps4::CMD_DEBUG_GETFSGSBASE: case ps4::CMD_DEBUG_CONTINUE:
+        case ps4::CMD_DEBUG_THREAD_INFO: case ps4::CMD_CONSOLE_PRINT:  return 4;
+        case ps4::CMD_DEBUG_SET_BREAKPOINT:                     return 16;
+        case ps4::CMD_DEBUG_SET_WATCHPOINT:                     return 24;
+        default:                                                return 0;
+        }
+    }
+
     void handle_conn(SOCKET c) {
+        handle_conn_loop(c);
+        {
+            // free_client frees the dropped client's Turbo Scan session
+            std::lock_guard lk(mu);
+            if (turbo_owner == c) {
+                turbo_used = false;
+                turbo_recs.clear();
+                turbo_owner = INVALID_SOCKET;
+            }
+        }
+        // like free_client: a failed handler closes the client. Shut the
+        // socket down so the backend sees the hang-up; the handle itself is
+        // closed in shutdown()
+        ::shutdown(c, SD_BOTH);
+    }
+
+    void handle_conn_loop(SOCKET c) {
         while (!stop_flag) {
             ps4::packet_header_t hdr{};
             if (!recv_all(c, &hdr, sizeof(hdr))) return;
             if (hdr.magic != ps4::kPacketMagic) return;
+            if (hdr.datalen > ps4::kMaxDatalen) { send_u32(c, ps4::CMD_TOO_MUCH_DATA); return; }
+            if (hdr.datalen < fork_min_datalen(hdr.cmd)) {
+                std::lock_guard lk(mu);
+                ++guard_rejects;
+                last_guard_cmd = hdr.cmd;
+                send_u32(c, ps4::CMD_DATA_NULL);
+                continue;   // the fork rejects before reading a body
+            }
             std::vector<uint8_t> body(hdr.datalen);
             if (hdr.datalen > 0 && !recv_all(c, body.data(), hdr.datalen)) return;
+            {
+                std::lock_guard lk(mu);
+                ++commands_seen;
+            }
             if (!dispatch(c, hdr.cmd, body.data(), hdr.datalen)) return;
         }
     }
@@ -1011,6 +1083,83 @@ private:
             std::memcpy(&last_fsgs_gs, buf + 8, 8);
             return send_u32(c, ps4::CMD_SUCCESS);
         }
+        case ps4::CMD_PROC_MODULES: {
+            {
+                std::lock_guard lk(mu);
+                ++module_requests;
+                if (!fork_ext) {   // upstream: unknown command -> CMD_ERROR + drop
+                    send_u32(c, ps4::CMD_ERROR);
+                    return false;
+                }
+            }
+            const auto* mp = reinterpret_cast<const ps4::proc_maps_packet_t*>(body);
+            if (static_cast<int32_t>(mp->pid) <= 0 || (mp->pid != kFakePid && mp->pid != 42)) {
+                send_u32(c, ps4::CMD_ERR_PID);
+                return false;      // the fork's handler returns 1 -> client dropped
+            }
+            std::vector<ps4::proc_module_entry_t> out;
+            {
+                std::lock_guard lk(mu);
+                std::vector<ps4::vm_map_entry_t> pm = maps;
+                if (mp->pid == 42) {   // same per-pid view as CMD_PROC_MAPS
+                    ps4::vm_map_entry_t m{};
+                    std::strncpy(m.name, "/system/privileged/SceShellCore", sizeof(m.name) - 1);
+                    m.start = 0x800000;
+                    m.end   = 0x900000;
+                    m.prot  = ps4::kVmProtRead | ps4::kVmProtExec;
+                    pm = {m};
+                }
+                for (const auto& m : pm) {
+                    if (!m.name[0]) continue;
+                    auto it = std::find_if(out.begin(), out.end(), [&](const auto& e) {
+                        return std::strncmp(e.name, m.name, sizeof(e.name)) == 0;
+                    });
+                    if (it == out.end()) {
+                        ps4::proc_module_entry_t e{};
+                        std::memcpy(e.name, m.name, sizeof(e.name));
+                        e.base = m.start;
+                        e.size = m.end - m.start;
+                        out.push_back(e);
+                    } else {
+                        const uint64_t lo = std::min(it->base, m.start);
+                        const uint64_t hi = std::max(it->base + it->size, m.end);
+                        it->base = lo;
+                        it->size = hi - lo;
+                    }
+                }
+            }
+            const uint32_t n = static_cast<uint32_t>(out.size());
+            return send_u32(c, ps4::CMD_SUCCESS) && send_u32(c, n) &&
+                   (n == 0 || send_all(c, out.data(), n * sizeof(out[0])));
+        }
+
+        case ps4::CMD_PROC_SNAPSHOT: {
+            {
+                std::lock_guard lk(mu);
+                if (!fork_ext) {
+                    send_u32(c, ps4::CMD_ERROR);
+                    return false;
+                }
+            }
+            const auto sp = *reinterpret_cast<const ps4::proc_snapshot_packet_t*>(body);
+            if (static_cast<int32_t>(sp.pid) <= 0 || sp.pid != kFakePid) {
+                send_u32(c, ps4::CMD_ERR_PID);
+                return false;
+            }
+            if (sp.length == 0 || sp.address + sp.length < sp.address) {
+                send_u32(c, ps4::CMD_ERR_RANGE);
+                return false;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            for (uint64_t off = 0; off < sp.length; off += ps4::kSnapshotChunk) {
+                const uint32_t n = static_cast<uint32_t>(
+                    std::min<uint64_t>(ps4::kSnapshotChunk, sp.length - off));
+                auto chunk = mem_read(sp.address + off, n);
+                if (!send_all(c, chunk.data(), chunk.size())) return false;
+            }
+            return true;
+        }
+
         case ps4::CMD_PROC_WRITE_MULTI: {
             if (bodylen < sizeof(ps4::proc_write_multi_packet_t))
                 return send_u32(c, ps4::CMD_DATA_NULL), true;
@@ -1125,6 +1274,7 @@ private:
                 {
                     std::lock_guard lk(mu);
                     turbo_used = true;
+                    turbo_owner = c;
                     turbo_snapshot = true;
                     turbo_has_first = (sp.flags & ps4::kTsSnapshotKeepFirst) != 0;
                     turbo_vlen = vlen;
@@ -1152,6 +1302,7 @@ private:
                     {
                         std::lock_guard lk(mu);
                         turbo_used = true;
+                        turbo_owner = c;
                         turbo_snapshot = false;
                         turbo_has_first = false;
                         turbo_vlen = vlen;
@@ -1404,7 +1555,13 @@ private:
 struct server_guard_t {
     fake_ps4_server_t srv;
     server_guard_t() { REQUIRE(srv.start()); }
-    ~server_guard_t() { srv.shutdown(); }
+    ~server_guard_t() {
+        srv.shutdown();
+        // no request may be shorter than the fork's cmd_guards.c minimum
+        if (srv.guard_rejects != 0)
+            std::printf("  fork datalen guard rejected cmd 0x%08X\n", srv.last_guard_cmd);
+        CHECK(srv.guard_rejects == 0);
+    }
 };
 
 // drop the global ps4 connection even when a REQUIRE throws mid-test
@@ -2608,4 +2765,185 @@ TEST_CASE(ps4_turbo_scan_mcp) {
     json old = dbg({{"action", "ps4_turbo_caps"}}, e);
     CHECK(!e);
     CHECK(old.value("supported", true) == false);
+}
+
+TEST_CASE(ps4_fork_modules_snapshot_and_errors) {
+    server_guard_t g;   // fork_ext on by default
+    backend_ps4_t b;
+    std::string err;
+    // a second eboot map (data segment) and more stack, added before any
+    // maps are cached
+    {
+        std::lock_guard lk(g.srv.mu);
+        ps4::vm_map_entry_t extra{};
+        std::strncpy(extra.name, "/app0/eboot.bin", sizeof(extra.name) - 1);
+        extra.start = 0x600000;
+        extra.end = 0x608000;
+        extra.prot = ps4::kVmProtRead | ps4::kVmProtWrite;
+        g.srv.maps.push_back(extra);
+        ps4::vm_map_entry_t stack2{};
+        stack2.start = 0x7FFF00010000ull;
+        stack2.end = 0x7FFF00030000ull;
+        stack2.prot = ps4::kVmProtRead | ps4::kVmProtWrite;
+        g.srv.maps.push_back(stack2);
+    }
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    CHECK(b.ps4_fork_extensions() == -1);
+
+    // server-side module list
+    std::vector<slop::core::runtime::module_info_t> mods;
+    REQUIRE(b.ps4_modules(kFakePid, mods).ok);
+    CHECK(b.ps4_fork_extensions() == 1);
+    REQUIRE(mods.size() == 2u);
+    CHECK(mods[0].name == "eboot.bin");
+    CHECK(mods[0].base == 0x400000u);
+    CHECK(mods[0].size == 0x208000u);   // text..data span
+
+    // enum_modules rides on it now
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    auto em = b.enum_modules(h);
+    REQUIRE(em.ok);
+    REQUIRE(em.items.size() == 2u);
+    CHECK(em.items[0].size == 0x208000u);
+    CHECK(g.srv.module_requests == 2);
+
+    // one-round-trip snapshot, larger than one 64 KiB chunk
+    std::vector<uint8_t> pat(0x18000);
+    for (size_t i = 0; i < pat.size(); ++i) pat[i] = static_cast<uint8_t>(i * 13 + 1);
+    g.srv.mem_write(0x7FFF00001000, pat.data(), pat.size());
+    std::vector<uint8_t> got;
+    auto io = b.ps4_snapshot(kFakePid, 0x7FFF00001000, pat.size(),
+                             [&](const uint8_t* d, size_t n) {
+                                 got.insert(got.end(), d, d + n);
+                                 return true;
+                             });
+    REQUIRE(io.ok);
+    CHECK(io.bytes == pat.size());
+    CHECK(got == pat);
+
+    // unreadable range is refused before the payload can drop us mid-stream
+    io = b.ps4_snapshot(kFakePid, 0x7FFF0002F000, 0x2000, {});
+    CHECK(!io.ok);
+    CHECK(io.error == 2u);
+
+    // structured error: bad pid -> CMD_ERR_PID, payload drops the client,
+    // the next command transparently reconnects (and re-auths)
+    const uint64_t gen0 = b.ps4_connection_generation();
+    b.ps4_take_last_status();
+    CHECK(!b.ps4_modules(999, mods).ok);
+    CHECK(b.ps4_take_last_status() == ps4::CMD_ERR_PID);
+    CHECK(std::string(ps4::status_name(ps4::CMD_ERR_PID)).find("CMD_ERR_PID") == 0);
+    CHECK(b.ping());
+    CHECK(b.ps4_connection_generation() == gen0 + 1);
+    CHECK(b.ps4_authed());
+    CHECK(b.ps4_fork_extensions() == 1);   // still known after the reconnect
+
+    // process stop is now 8 bytes and passes the fork's datalen guard
+    REQUIRE(b.ps4_process_stop(kFakePid, ps4::kStopStop).ok);
+    CHECK(g.srv.last_proc_stop_pid == kFakePid);
+    CHECK(g.srv.last_proc_stop_state == ps4::kStopStop);
+
+    b.detach(h);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_upstream_payload_fallback_and_reconnect) {
+    server_guard_t g;
+    g.srv.fork_ext = false;   // behave like Pharaoh2k upstream
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+
+    // first enum_modules probes CMD_PROC_MODULES once: upstream answers
+    // CMD_ERROR and drops the client; the backend falls back to grouping maps
+    auto em = b.enum_modules(h);
+    REQUIRE(em.ok);
+    CHECK(em.items.size() == 2u);
+    CHECK(b.ps4_fork_extensions() == 0);
+    CHECK(b.ps4_connection_generation() == 1u);
+    CHECK(g.srv.module_requests == 1);
+
+    // no further probes once the payload is known to be upstream
+    em = b.enum_modules(h);
+    REQUIRE(em.ok);
+    CHECK(g.srv.module_requests == 1);
+    CHECK(b.ps4_connection_generation() == 1u);
+    std::vector<slop::core::runtime::module_info_t> mods;
+    auto io = b.ps4_modules(kFakePid, mods);
+    CHECK(!io.ok);
+    CHECK(io.error == 100u);
+    io = b.ps4_snapshot(kFakePid, 0x7FFF00000000, 0x100, {});
+    CHECK(io.error == 100u);
+
+    // and memory I/O still works on the reopened connection
+    const uint8_t v[4] = {1, 2, 3, 4};
+    REQUIRE(b.write_memory(h, 0x7FFF00000040, v, 4).ok);
+    uint8_t back[4]{};
+    REQUIRE(b.read_memory(h, 0x7FFF00000040, back, 4).ok);
+    CHECK(std::memcmp(back, v, 4) == 0);
+    b.detach(h);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_fork_mcp_actions) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto dbg = [&](const json& a, bool& is_err) {
+        return slop::core::mcp::call_tool("debugger", a, is_err);
+    };
+    bool e = false;
+
+    json mods = dbg({{"action", "ps4_modules"}}, e);
+    CHECK(!e);
+    CHECK(mods.value("count", 0) == 2u);
+
+    json st = dbg({{"action", "ps4_status"}}, e);
+    CHECK(!e);
+    CHECK(st.value("fork_extensions", std::string{}) == "yes");
+    CHECK(st.value("capability_level", std::string{}) == "1.1");
+
+    const uint8_t marker[8] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
+    g.srv.mem_write(0x7FFF00002000, marker, sizeof(marker));
+    char tmp[MAX_PATH]{};
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string out = std::string(tmp) + "slop_ps4_snapshot_test.bin";
+    json sn = dbg({{"action", "ps4_snapshot"}, {"addr", 0x7FFF00002000}, {"len", 0x20},
+                   {"path", out}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_snapshot error: %s\n", sn.dump().c_str());
+    CHECK(sn.value("bytes", 0) == 0x20u);
+    {
+        std::ifstream f(out, std::ios::binary);
+        std::vector<uint8_t> head(8);
+        f.read(reinterpret_cast<char*>(head.data()), 8);
+        CHECK(std::memcmp(head.data(), marker, 8) == 0);
+    }
+    std::remove(out.c_str());
+
+    // console error codes are appended to tool errors
+    json bad = dbg({{"action", "ps4_modules"}, {"pid", 999}}, e);
+    CHECK(e);
+    CHECK(bad.dump().find("CMD_ERR_PID") != std::string::npos);
+
+    // a turbo session does not survive the payload dropping the connection
+    const uint32_t v = 77;
+    g.srv.mem_write(0x7FFF00000800, reinterpret_cast<const uint8_t*>(&v), 4);
+    json ts = dbg({{"action", "ps4_turbo_scan"}, {"addr", 0x7FFF00000000}, {"len", 0x1000},
+                   {"value_type", "u32"}, {"compare", "exact"}, {"value", 77}}, e);
+    CHECK(!e);
+    CHECK(ts.value("count", 0) == 1u);
+    dbg({{"action", "ps4_modules"}, {"pid", 999}}, e);   // drops the client
+    CHECK(e);
+    json rs = dbg({{"action", "ps4_turbo_rescan"}, {"compare", "unchanged"}}, e);
+    CHECK(e);
+    CHECK(rs.dump().find("dropped the connection") != std::string::npos);
+    json st2 = dbg({{"action", "ps4_status"}}, e);
+    CHECK(!e);
+    CHECK(st2.value("reconnects", uint64_t{0}) >= 2u);   // both drops recovered
 }

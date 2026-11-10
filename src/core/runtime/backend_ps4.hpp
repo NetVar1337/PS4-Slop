@@ -228,6 +228,25 @@ public:
     // and arms the payload's cancel flag for pid
     io_result_t ps4_turbo_cancel(uint32_t pid, std::string& err);
 
+    // ---- NetVar1337 fork extensions + connection bookkeeping ----------------
+    // bumped whenever the backend transparently reopened the command
+    // connection after the payload dropped it (which tears down the debug
+    // session and the Turbo Scan session on the console)
+    uint64_t ps4_connection_generation() const noexcept;
+    // last error status word the console sent (ps4::CMD_ERR_* etc.), then clear
+    uint32_t ps4_take_last_status() noexcept;
+    // fork extensions (CMD_PROC_MODULES / CMD_PROC_SNAPSHOT): -1 not probed
+    // yet, 0 upstream payload, 1 present
+    int ps4_fork_extensions() const noexcept;
+    // CMD_PROC_MODULES: one entry per backing file, base/size spanning all of
+    // its maps. error 100 = payload lacks the extension
+    io_result_t ps4_modules(uint32_t pid, std::vector<module_info_t>& out);
+    // CMD_PROC_SNAPSHOT: stream [addr, addr+len) in one round trip, any size;
+    // sink gets 64 KiB pieces (return false to stop). error 2 = range not
+    // fully readable, 100 = payload lacks the extension
+    io_result_t ps4_snapshot(uint32_t pid, uint64_t addr, uint64_t len,
+                             const std::function<bool(const uint8_t*, size_t)>& sink);
+
     // one on-device decoded instruction (CMD_PROC_DISASM_REGION)
     struct ps4_disasm_entry_t {
         uint64_t addr = 0;
