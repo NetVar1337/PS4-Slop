@@ -1726,7 +1726,7 @@ TEST_CASE(ps4_auth_and_native_scan) {
     uint64_t hit = 0;
     auto io3 = b.ps4_scan_aob(kFakePid, 0x401000, 0x40, pat, msk, 1, 0, hit);
     REQUIRE(io3.ok);
-    CHECK(hit == 0x401020ull);
+    CHECK(hit == 0x401010ull);   // 1000 = E8 03 00 00 matches there first
 
     // legacy whole-memory scan
     std::vector<uint64_t> addrs;

@@ -3318,8 +3318,8 @@ json tool_ps4_scan(const std::string& action, const json& args,
         const uint32_t pid = ps4_pid_arg(args);
         const uint8_t vt = ps4_valtype_arg(args);
         const uint8_t ct = ps4_cmptype_arg(args);
-        auto data = ps4_value_bytes(args, vt, ct);
-        if (!runtime::ps4::scan_cmp_needs_value(ct) && !data.empty()) data.clear();
+        auto data = runtime::ps4::scan_cmp_needs_value(ct)
+            ? ps4_value_bytes(args, vt, ct) : std::vector<uint8_t>{};
         std::vector<uint64_t> addrs;
         auto io = p.ps4_scan_all(pid, vt, ct, data, addrs);
         if (!io.ok) fail("ps4_scan_all failed (error " + std::to_string(io.error) +
@@ -3375,8 +3375,8 @@ json tool_ps4_scan(const std::string& action, const json& args,
         ? (ss.used ? ss.valtype : ps4_valtype_arg(args))
         : ps4_valtype_arg(args);
     const uint8_t ct = ps4_cmptype_arg(args);
-    auto data = ps4_value_bytes(args, vt, ct);
-    if (!runtime::ps4::scan_cmp_needs_value(ct)) data.clear();
+    auto data = runtime::ps4::scan_cmp_needs_value(ct)
+        ? ps4_value_bytes(args, vt, ct) : std::vector<uint8_t>{};
     if (action == "ps4_scan") {
         const uint64_t addr = parse_addr(args, "addr");
         const uint32_t len = static_cast<uint32_t>(parse_addr(args, "len"));
@@ -7611,6 +7611,27 @@ json tool_guide(const json& args) {
           {"debugger", "ps4_wait", R"({"timeout_ms":30000})", "wait for the DR trap"},
           {"debugger", "ps4_watch_list", "{}", "armed slots"},
           {"debugger", "ps4_watch_clear", R"({"addr":<addr>})", "release the slot"}}},
+        {"ps4_native_scan", "On-console value scan (Cheat-Engine flow running on the PS4 itself)",
+         "ps4debug-NG's scan family runs inside the payload (auth bit unlocked automatically by ps4_auth), so scans read game memory through the kernel, not over TCP per byte. ps4_scan seeds a range, ps4_rescan narrows with changed/decreased/exact..., ps4_scan_aob finds byte patterns with ?? wildcards, ps4_scan_all scans all readable maps.",
+         {{"debugger", "ps4_auth", "{}", "confirm the scan family is unlocked (runs on connect too)"},
+          {"debugger", "ps4_scan", R"({"addr":<region>,"len":<size>,"value_type":"u32","compare":"exact","value":100})", "first scan over a range (regions via target.regions)"},
+          {"debugger", "ps4_scan_state", "{}", "current hit set (addr+value hex)"},
+          {"debugger", "ps4_rescan", R"({"compare":"decreased"})", "narrow after the value changed in-game"},
+          {"debugger", "ps4_rescan", R"({"compare":"exact","value":87})", "pin it down"},
+          {"debugger", "ps4_scan_aob", R"({"addr":<module base>,"len":<size>,"pattern":"48 8B ?? ?? 90"})", "find code by byte pattern"},
+          {"debugger", "ps4_find_write", R"({"addr":<hit>})", "hardware watchpoint on the value -> writer callstack"},
+          {"memory", "read", R"({"addr":<hit>,"len":8,"format":"u64"})", "verify the hit over the wire"},
+          {"debugger", "ps4_scan_reset", "{}", "drop the scan session"}}},
+        {"ps4_dump_and_analyze", "Dump a game module from the PS4 and analyze it statically",
+         "ps4_dump_module reads the module's whole mapped range over ps4debug-NG and writes the raw image; ELF dumps load straight into the disasm engine (functions, xrefs, strings) with VAs matching the live console.",
+         {{"target", "ps4_dump_module", R"({"name":"eboot.bin","path":"C:/dumps/eboot.bin","load":true})", "dump + load into disasm"},
+          {"target", "modules", "{}", "module bases/sizes (ASLR runtime VAs)"},
+          {"disasm", "functions", R"({"limit":100})", "function index of the dumped ELF"},
+          {"disasm", "xrefs", R"({"from":<va>})", "who references an address"},
+          {"debugger", "ps4_disasm", R"({"addr":<va>,"len":256,"max":64})", "or disassemble live on-console (payload Zydis)"},
+          {"debugger", "ps4_xrefs_to", R"({"addr":<module base>,"len":<size>,"target":<va>})", "find all callers of a function in live memory"},
+          {"debugger", "ps4_assemble", R"({"asm":"mov rax, 1; ret"})", "assemble a patch on-console (Keystone)"},
+          {"memory", "write", R"({"addr":<va>,"hex":"<assembled bytes>"})", "apply the patch live"}}},
     };
 
     const std::string action = require_action(args);

@@ -361,7 +361,10 @@ callback) through a dedicated `PS4` backend:
   engine listens on port 755 for the server's event callback while a debug
   session is attached.
 - PS4 modules are ELF/SELF, not PE, so `dump_module`/PE loading stay local-only;
-  analyze live addresses with `disasm.disassemble` and `memory.read` instead.
+  pull a module's raw memory image off the console with
+  `target.ps4_dump_module {name|base, path, load?}` (load=true opens ELF dumps in
+  `disasm`), or analyze live addresses with `disasm.disassemble` and
+  `memory.read` instead.
 
 ### Live debugging on the PS4 (ps4debug-NG)
 
@@ -400,6 +403,32 @@ actions drive the payload's debug session live, no local target needed:
   `ps4_trace_steps {lwpid, count, timeout_ms}` (step+wait loop with rip and the
   disassembled instruction per step), and `ps4_bp_list` / `ps4_watch_list` to
   see the armed slots.
+- Register completeness: `ps4_fpregs {lwpid}` / `ps4_set_fpregs {lwpid, hex}`
+  read/write the 832-byte savefpu (XMM/YMM) block, `ps4_set_dbregs {lwpid,
+  hex}` writes the 128-byte DR set, `ps4_fsgs {lwpid}` /
+  `ps4_set_fsgs {lwpid, fs_base, gs_base}` read/write FS/GS base.
+- Console-side tooling (everything below runs inside the ps4debug-NG payload on
+  the console, not on the PC):
+  - Native memory scan, unlocked by `ps4_auth` (run automatically on connect;
+    the payload's challenge keystream is four LFSRs seeded 200/300/400/500):
+    `ps4_scan {addr, len, value_type, compare, value|hex}` seeds a scan over a
+    range, `ps4_rescan {compare, value?}` narrows the stored hit set
+    (exact/fuzzy/bigger/smaller/between/increased/decreased/changed/unchanged/
+    unknown), `ps4_scan_state` / `ps4_scan_reset` manage it, `ps4_scan_all`
+    scans every readable map, and `ps4_scan_aob {addr, len, pattern}` scans for
+    a byte pattern with `??` wildcards.
+  - On-device code analysis: `ps4_disasm {addr, len, max}` (payload-side Zydis:
+    kind flags, mem operands, rip-relative targets), `ps4_xrefs {addr, len}`
+    (all branch/call targets in a range), `ps4_xrefs_to {addr, len, target}`,
+    `ps4_stack {rbp?, rsp?, depth}` (server-side rbp-chain walk with frame
+    locals and a code window per frame).
+  - `ps4_assemble {asm, base?, syntax?}` assembles x86-64 on the console
+    (payload-side Keystone) — write the bytes with `memory.write`.
+  - `ps4_elf_rpc {path}` / `ps4_elf_load {path}` upload a raw ELF64 payload into
+    the game process and get its entry address / jump into it.
+  - `ps4_notify {msg, type?}` shows a system notification on the PS4 UI,
+    `ps4_print {msg}` writes to the console kernel log, `ps4_app` returns the
+    foreground game's pid/titleid/contentid/version.
 - The same controls exist in the ImGui debugger view: while a PS4 backend is
   active it shows a live panel with debug attach/detach, continue/step,
   breakpoint and watchpoint arming, the port-755 event feed, registers of the
@@ -410,7 +439,7 @@ actions drive the payload's debug session live, no local target needed:
   `ps4_step_trace`, `ps4_remote_call`, `find_health`, `find_damage_source`,
   `pointer_chain`, `runtime_decrypt`, `ps4_api_monitor`, `snapshot_diff`,
   `emulate_function`, `devirt_cflow`, `ps4_unpack_runtime`,
-  `ps4_hw_watchpoints`).
+  `ps4_hw_watchpoints`, `ps4_native_scan`, `ps4_dump_and_analyze`).
 
 ### Static analysis and decompilation
 
