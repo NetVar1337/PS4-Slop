@@ -155,7 +155,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
     const auto& tools = res.at("result").at("tools");
-    REQUIRE_EQ(tools.size(), 24u);
+    REQUIRE_EQ(tools.size(), 25u);
 
     bool seen_target = false, seen_memory = false, seen_disasm = false,
          seen_debugger = false, seen_driver = false, seen_inject = false,
@@ -165,7 +165,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
          seen_frida = false, seen_decomp = false, seen_xray = false,
          seen_patch = false,
          seen_types = false, seen_notes = false, seen_devirt = false,
-         seen_dotnet = false;
+         seen_dotnet = false, seen_guide = false;
     for (const auto& t : tools) {
         const std::string n = t.at("name").get<std::string>();
         if (n == "target")   seen_target = true;
@@ -189,6 +189,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
         if (n == "notes")    seen_notes = true;
         if (n == "devirt")   seen_devirt = true;
         if (n == "dotnet")   seen_dotnet = true;
+        if (n == "guide")    seen_guide = true;
         REQUIRE(t.contains("inputSchema"));
         REQUIRE(t.contains("description"));
         REQUIRE(t.at("description").is_string());
@@ -222,6 +223,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
     REQUIRE(seen_notes);
     REQUIRE(seen_devirt);
     REQUIRE(seen_dotnet);
+    REQUIRE(seen_guide);
 }
 
 TEST_CASE(mcp_dotnet_actions_and_no_image) {

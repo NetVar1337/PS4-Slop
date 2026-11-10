@@ -350,7 +350,10 @@ callback) through a dedicated `PS4` backend:
 - Connect from the ImGui targets view ("PS4..." button), the Tauri targets
   panel (gamepad button), or MCP with `target.ps4_connect {host, port=744,
   pid?}`; `target.ps4_disconnect` drops the console. `target.status` reports
-  the endpoint and the server branding string.
+  the endpoint and the server branding string. `target.ps4_auto {host,
+  port?}` does the whole setup in one call: connect, pick the game process
+  (the one with `/app0/` modules, eboot-named preferred), attach a session
+  and the ps4debug debug session, and return modules/threads/regions.
 - Once connected, `target.list` enumerates console processes and the existing
   attach button / `target.attach {pid}` opens a session over the wire; the
   backend badge reads `PS4`.
@@ -395,6 +398,24 @@ actions drive the payload's debug session live, no local target needed:
   six arguments (rdi, rsi, rdx, rcx, r8, r9), returning `rax` — remote function
   calls for dynamic analysis, e.g. resolving a function live and calling it
   with crafted arguments.
+- One-call "power actions" wrap the common dynamic-analysis moves:
+  `ps4_until {addr, timeout_ms}` (arm a one-shot bp, continue, wait, auto-clear),
+  `ps4_find_write {addr, len, timeout_ms, depth}` (write watchpoint + continue +
+  wait, returns the event and the writer callstack), `ps4_trace_calls {addr,
+  count, timeout_ms}` (bp arg logger: every hit with rdi/rsi/rdx/rcx/r8/r9),
+  `ps4_trace_steps {lwpid, count, timeout_ms}` (step+wait loop with rip and the
+  disassembled instruction per step), and `ps4_bp_list` / `ps4_watch_list` to
+  see the armed slots. The local `debugger.until {addr}` does the same for
+  Windows targets.
+- The same controls exist in the ImGui debugger view: while a PS4 backend is
+  active it shows a live panel with debug attach/detach, continue/step,
+  breakpoint and watchpoint arming, the port-755 event feed, registers of the
+  last stopped thread, and remote calls through the rpc stub.
+- The `guide` tool is the AI playbook index: `guide list` shows the topics and
+  `guide get {topic}` returns a ready-to-run tool-call sequence (e.g.
+  `ps4_setup`, `ps4_api_trace`, `ps4_find_write`, `find_health`,
+  `find_damage_source`, `pointer_chain`, `runtime_decrypt`, `snapshot_diff`,
+  `emulate_function`, `devirt_cflow`, `unpack_runtime`, `hw_breakpoints`).
 
 ### Static analysis and decompilation
 
@@ -718,10 +739,10 @@ operational guidance are returned by `tools/list`.
 
 | Tool | Actions |
 |---|---|
-| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon`, `ps4_connect`, `ps4_disconnect` |
+| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_auto` |
 | `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set` |
 | `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop` |
-| `debugger` | `attach`, `detach`, `status`, `suspend_all`, `resume_all`, `bp_set`, `bp_clear`, `continue`, `step_into`, `step_over`, `step_out`, `wait_halt`, `regs`, `events`, `callstack`, `seh`, `set_register`, `watchpoint_set`, `watchpoint_clear`, `watchpoints`, `trace_run`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call` |
+| `debugger` | `attach`, `detach`, `status`, `suspend_all`, `resume_all`, `bp_set`, `bp_clear`, `continue`, `step_into`, `step_over`, `step_out`, `wait_halt`, `regs`, `events`, `callstack`, `seh`, `set_register`, `watchpoint_set`, `watchpoint_clear`, `watchpoints`, `trace_run`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call`, `until`, `ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps`, `ps4_bp_list`, `ps4_watch_list` |
 | `driver` | `status`, `backend`, `kernel_modules`, `dump_driver`, `kernel_read`, `kernel_write`, `kernel_search`, `call`, `v2p`, `ssdt`, `peb`, `resolve_export`, `windows`, `find_references`, `heap_walk`, `heap_blocks`, `defer_call`, `defer_list`, `defer_execute`, `defer_results`, `defer_cancel`, `symbols_load`, `symbols_lookup`, `symbols_nearest`, `anti_debug_spoof`, `sandbox_protect`, `sandbox_unprotect`, `log_config`, `read_teb`, `peb_modules`, `integrity_checks`, `sniff_buffers` |
 | `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
 | `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |
@@ -740,6 +761,7 @@ operational guidance are returned by `tools/list`.
 | `fs` | `read_file`, `write_file`, `list_directory`, `create_directory`, `delete_path`, `search_files`, `grep_in_files` |
 | `web` | `fetch`, `post` |
 | `script` | `run` |
+| `guide` | `list`, `get` |
 | `frida` | `status`, `devices`, `remote_add`, `remote_remove`, `ps`, `find_process`, `applications`, `frontmost`, `spawn`, `spawn_output`, `resume`, `kill`, `input`, `spawn_gating`, `pending_spawn`, `pending_children`, `attach`, `detach`, `session_resume`, `child_gating`, `script_create`, `script_load`, `script_unload`, `script_destroy`, `script_post`, `script_debugger`, `messages`, `rpc`, `compile`, `compile_script`, `snapshot_script` |
 
 `app` is intentionally omitted from MCP `tools/list`; it is frontend plumbing
