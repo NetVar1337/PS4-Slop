@@ -1022,11 +1022,9 @@ TEST_CASE(ps4_mcp_debugger_flow) {
     }
 
     auto dbg = [](const json& args, bool& is_err) {
-        std::fprintf(stderr, "  [trace] debugger.%s
-", args.value("action", "?").c_str());
+        std::fprintf(stderr, "  [trace] debugger.%s\n", args.value("action", "?").c_str());
         auto r = slop::core::mcp::call_tool("debugger", args, is_err);
-        std::fprintf(stderr, "  [trace]   -> err=%d %s
-", (int)is_err, is_err ? r.dump().c_str() : "ok");
+        std::fprintf(stderr, "  [trace]   -> err=%d %s\n", (int)is_err, is_err ? r.dump().c_str() : "ok");
         return r;
     };
     bool e = false;
