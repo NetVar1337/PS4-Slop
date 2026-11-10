@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][long]$RunId,
-    [string]$Repository = 'kaizer1308/reverse-slap',
+    [string]$Repository = 'NetVar1337/PS4-Slop',
     [string]$OutputPath
 )
 $ErrorActionPreference = 'Stop'

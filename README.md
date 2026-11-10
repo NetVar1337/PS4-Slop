@@ -1,7 +1,7 @@
 <!-- logo pinned to a commit so github's image cache can't serve a stale one,
      bump the sha whenever the icon changes -->
 <p align="center">
-  <img src="https://raw.githubusercontent.com/kaizer1308/reverse-slap/a61180fb51fc19141104a13a2caf6c33b9661bcc/app/src-tauri/icons/256x256.png" width="144" alt="reverse-slop" />
+  <img src="https://raw.githubusercontent.com/NetVar1337/PS4-Slop/44599f2536ceb65c956152ad311e1cca090932a1/app/src-tauri/icons/256x256.png" width="144" alt="reverse-slop" />
 </p>
 
 # reverse-slop
@@ -17,12 +17,6 @@ game-RE workflows end to end.
 > authorized to test. Live debugging and memory writes on a PS4 can crash the
 > console or trip anti-cheat; host-side packet capture needs administrator
 > privileges on the analysis PC.
-
-## Inspiration and attribution
-
-reverse-slop is heavily inspired by [AiDA Private](https://github.com/sigwl/AiDAPrivate),
-created by [sigwl](https://github.com/sigwl) (ruarridh). Most, if not almost all,
-of reverse-slop's feature set and feature concepts are based on that project.
 
 ## Screenshots
 
