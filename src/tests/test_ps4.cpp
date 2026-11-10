@@ -89,6 +89,40 @@ struct fake_ps4_server_t {
     std::map<uint32_t, ps4::reg64_t> thread_regs;
     std::vector<ps4::vm_map_entry_t> maps;
 
+    // debug-session state observed by the tests
+    struct bp_t { bool enabled = false; uint64_t address = 0; };
+    struct wp_t { bool enabled = false; uint32_t length = 0; uint32_t breaktype = 0; uint64_t address = 0; };
+    std::map<uint32_t, bp_t> bps;
+    std::map<uint32_t, wp_t> wps;
+    uint32_t last_continue_stop = 0xFFFFFFFF;
+    uint32_t last_suspend = 0, last_resume = 0;
+    uint32_t last_proc_stop_pid = 0, last_proc_stop_state = 0xFFFFFFFF;
+    int intall_count = 0;
+    uint64_t rpcstub = 0x700000;
+    ps4::proc_call_packet_t last_call{};
+
+    // send one packed 0x4A0 debug event on the port-755 connection
+    void send_event(uint32_t lwpid, uint32_t status, const char* name, uint64_t rip_override) {
+        std::lock_guard lk(mu);
+        if (event_fd == INVALID_SOCKET) return;
+        ps4::debug_event_packet_t pkt{};
+        pkt.lwpid  = lwpid;
+        pkt.status = status;
+        std::strncpy(pkt.tdname, name, sizeof(pkt.tdname) - 1);
+        pkt.regs = thread_regs[lwpid];
+        if (pkt.regs.rip == 0) {
+            pkt.regs.rip = 0x400123;
+            pkt.regs.rsp = 0x7FFF00008000ull;
+            pkt.regs.rbp = 0x7FFF00007FF0ull;
+            pkt.regs.rax = 0x2A;
+            pkt.regs.rflags = 0x202;
+        }
+        if (rip_override) pkt.regs.rip = rip_override;
+        for (int i = 0; i < 16; ++i)
+            reinterpret_cast<uint64_t*>(pkt.dbregs)[i] = 0xD000 + i;
+        send_all(event_fd, &pkt, sizeof(pkt));
+    }
+
     fake_ps4_server_t() {
         wsa();
 
@@ -380,6 +414,130 @@ private:
             }
             thread_regs[p->lwpid] = r;
             return send_u32(c, ps4::CMD_SUCCESS);               // terminal
+        }
+
+        case ps4::CMD_DEBUG_SET_BREAKPOINT: {
+            const auto* p = reinterpret_cast<const ps4::debug_set_breakpoint_packet_t*>(body);
+            std::lock_guard lk(mu);
+            if (!debug_attached) {
+                send_u32(c, ps4::CMD_ERROR);
+                send_u32(c, ps4::CMD_ERROR);   // payload quirk: duplicated on error
+                return true;
+            }
+            if (p->index >= 30) return send_u32(c, ps4::CMD_ERROR), true;
+            bps[p->index] = {p->enabled != 0, p->address};
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_SET_WATCHPOINT: {
+            const auto* p = reinterpret_cast<const ps4::debug_set_watchpoint_packet_t*>(body);
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            if (p->index > 3) return send_u32(c, ps4::CMD_ERROR), true;
+            wps[p->index] = {p->enabled != 0, p->length, p->breaktype, p->address};
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_CONTINUE: {
+            const auto* p = reinterpret_cast<const ps4::debug_continue_packet_t*>(body);
+            uint64_t hit = 0;
+            {
+                std::lock_guard lk(mu);
+                last_continue_stop = p->stop;
+                if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+                for (const auto& [idx, bp] : bps)
+                    if (bp.enabled) { hit = bp.address; break; }
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            // resuming into an armed breakpoint stops the main thread with SIGTRAP
+            if (p->stop == 0 && hit) send_event(101, 5u << 8, "main", hit);
+            return true;
+        }
+
+        case ps4::CMD_DEBUG_STEP: {
+            uint64_t newrip = 0;
+            {
+                std::lock_guard lk(mu);
+                if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+                auto& r = thread_regs[101];
+                if (r.rip == 0) r.rip = 0x400123;
+                r.rip += 1;
+                newrip = r.rip;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            send_event(101, 5u << 8, "main", newrip);
+            return true;
+        }
+
+        case ps4::CMD_DEBUG_STEP_THREAD: {
+            const auto* p = reinterpret_cast<const ps4::debug_lwpid_packet_t*>(body);
+            uint64_t newrip = 0;
+            uint32_t lw = p->lwpid;
+            {
+                std::lock_guard lk(mu);
+                if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+                auto& r = thread_regs[lw];
+                if (r.rip == 0) r.rip = 0x400123;
+                r.rip += 1;
+                newrip = r.rip;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            send_event(lw, 5u << 8, "worker", newrip);
+            return true;
+        }
+
+        case ps4::CMD_DEBUG_SUSPEND: {
+            const auto* p = reinterpret_cast<const ps4::debug_lwpid_packet_t*>(body);
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            last_suspend = p->lwpid;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_RESUME: {
+            const auto* p = reinterpret_cast<const ps4::debug_lwpid_packet_t*>(body);
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            last_resume = p->lwpid;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_PROCESS_STOP: {
+            const auto* p = reinterpret_cast<const ps4::debug_process_stop_packet_t*>(body);
+            std::lock_guard lk(mu);
+            last_proc_stop_pid = p->pid;
+            last_proc_stop_state = p->state;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_DEBUG_GETDBREGS: {
+            std::lock_guard lk(mu);
+            if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            uint8_t dr[128]{};
+            for (int i = 0; i < 16; ++i)
+                reinterpret_cast<uint64_t*>(dr)[i] = 0xD000 + i;
+            return send_all(c, dr, sizeof(dr));
+        }
+
+        case ps4::CMD_PROC_INTALL: {
+            std::lock_guard lk(mu);
+            ++intall_count;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            return send_all(c, &rpcstub, sizeof(rpcstub));
+        }
+
+        case ps4::CMD_PROC_CALL: {
+            const auto* p = reinterpret_cast<const ps4::proc_call_packet_t*>(body);
+            {
+                std::lock_guard lk(mu);
+                last_call = *p;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            ps4::proc_call_response_t resp{};
+            resp.pid = p->pid;
+            resp.rax = p->rdi + 1;   // fake target function: return arg0 + 1
+            return send_all(c, &resp, sizeof(resp));
         }
         }
         return send_u32(c, ps4::CMD_ERROR), true;
@@ -718,4 +876,253 @@ TEST_CASE(ps4_connect_refuses_non_ps4debug_server) {
     ::shutdown(ls, SD_BOTH);
     closesocket(ls);
     th.join();
+}
+
+TEST_CASE(ps4_debug_control_and_events) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+
+    // explicit debug attach (starts the 755 listener, connects the fake back)
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    if (!err.empty()) std::printf("  attach err: %s\n", err.c_str());
+    CHECK(b.ps4_debug_attached());
+    CHECK(b.ps4_debug_pid() == kFakePid);
+
+    // software breakpoint + hardware watchpoint land on the fake console
+    auto io = b.ps4_set_breakpoint(0, true, 0x400500);
+    REQUIRE(io.ok);
+    CHECK(g.srv.bps[0].enabled);
+    CHECK(g.srv.bps[0].address == 0x400500);
+    io = b.ps4_set_watchpoint(1, true, 8, ps4::kWpRdWr, 0x7FFF00001000);
+    REQUIRE(io.ok);
+    CHECK(g.srv.wps[1].enabled);
+    CHECK(g.srv.wps[1].length == 8);
+    CHECK(g.srv.wps[1].breaktype == ps4::kWpRdWr);
+    CHECK(g.srv.wps[1].address == 0x7FFF00001000);
+
+    // continue into the breakpoint -> SIGTRAP event on port 755
+    io = b.ps4_continue(ps4::kStopResume);
+    REQUIRE(io.ok);
+    CHECK(g.srv.last_continue_stop == 0);
+    slop::core::runtime::ps4_event_t ev{};
+    REQUIRE(b.ps4_wait_event(ev, 3000));
+    CHECK(ev.lwpid == 101);
+    CHECK(ev.signal == 5);                 // SIGTRAP
+    CHECK(ev.ctx.rip == 0x400500);         // stopped at the breakpoint
+    REQUIRE_STR_EQ(ev.thread_name, "main");
+    CHECK(ev.dr[0] == 0xD000);
+    CHECK(b.ps4_pending_events() == 0);
+
+    // single-step all threads -> event with the advanced rip
+    io = b.ps4_step(0);
+    REQUIRE(io.ok);
+    REQUIRE(b.ps4_wait_event(ev, 3000));
+    CHECK(ev.lwpid == 101);
+    CHECK(ev.ctx.rip == 0x400124);
+
+    // single-step one thread
+    io = b.ps4_step(102);
+    REQUIRE(io.ok);
+    REQUIRE(b.ps4_wait_event(ev, 3000));
+    CHECK(ev.lwpid == 102);
+
+    // register read/write through the debug session
+    slop::core::runtime::thread_context_t ctx{};
+    REQUIRE(b.get_thread_context(101, ctx).ok);
+    ctx.rax = 0x777;
+    REQUIRE(b.set_thread_context(101, ctx).ok);
+    slop::core::runtime::thread_context_t ctx2{};
+    REQUIRE(b.get_thread_context(101, ctx2).ok);
+    CHECK(ctx2.rax == 0x777);
+
+    // thread suspend/resume + process signal
+    REQUIRE(b.ps4_suspend_thread(101).ok);
+    REQUIRE(b.ps4_resume_thread(101).ok);
+    CHECK(g.srv.last_suspend == 101);
+    CHECK(g.srv.last_resume == 101);
+    REQUIRE(b.ps4_process_stop(kFakePid, ps4::kStopStop).ok);
+    CHECK(g.srv.last_proc_stop_pid == kFakePid);
+    CHECK(g.srv.last_proc_stop_state == 1);
+
+    // debug registers
+    uint64_t dr[16]{};
+    REQUIRE(b.ps4_get_dbregs(101, dr).ok);
+    CHECK(dr[0] == 0xD000);
+    CHECK(dr[15] == 0xD00F);
+
+    // drain with nothing queued
+    CHECK(b.ps4_drain_events(64, true).empty());
+    // wait with nothing arriving times out
+    CHECK(!b.ps4_wait_event(ev, 200));
+
+    // clear breakpoint + watchpoint
+    REQUIRE(b.ps4_set_breakpoint(0, false, 0x400500).ok);
+    CHECK(!g.srv.bps[0].enabled);
+    REQUIRE(b.ps4_set_watchpoint(1, false, 8, ps4::kWpRdWr, 0).ok);
+    CHECK(!g.srv.wps[1].enabled);
+
+    REQUIRE(b.ps4_debug_detach());
+    CHECK(!b.ps4_debug_attached());
+    b.disconnect();
+}
+
+TEST_CASE(ps4_remote_call) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+
+    uint64_t stub = 0;
+    REQUIRE(b.ps4_install(kFakePid, stub).ok);
+    CHECK(stub == 0x700000);
+    // second install rides the client-side cache, not the wire
+    REQUIRE(b.ps4_install(kFakePid, stub).ok);
+    CHECK(g.srv.intall_count == 1);
+
+    uint64_t args[6] = {41, 2, 3, 4, 5, 6};
+    uint64_t rax = 0;
+    REQUIRE(b.ps4_call(kFakePid, stub, 0x400800, args, rax).ok);
+    CHECK(rax == 42);   // fake target returns rdi + 1
+    CHECK(g.srv.last_call.pid == kFakePid);
+    CHECK(g.srv.last_call.rpcstub == 0x700000);
+    CHECK(g.srv.last_call.rip == 0x400800);
+    CHECK(g.srv.last_call.rdi == 41);
+    CHECK(g.srv.last_call.rsi == 2);
+    CHECK(g.srv.last_call.rdx == 3);
+    CHECK(g.srv.last_call.rcx == 4);
+    CHECK(g.srv.last_call.r8 == 5);
+    CHECK(g.srv.last_call.r9 == 6);
+
+    b.disconnect();
+}
+
+TEST_CASE(ps4_mcp_debugger_flow) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+
+    std::string err;
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto s = slop::core::process::active_session();
+    REQUIRE(s && s->valid());
+
+    // seed an rbp frame chain at the default rbp 0x7FFF00007FF0:
+    //   [0x7FFF00007FF0] = 0x7FFF00007F00   [0x7FFF00007FF8] = ret 0x400111
+    //   [0x7FFF00007F00] = 0                [0x7FFF00007F08] = ret 0x400222
+    {
+        uint64_t v = 0x7FFF00007F00ull;
+        REQUIRE(s->write(0x7FFF00007FF0, &v, sizeof(v)).ok);
+        v = 0x400111;
+        REQUIRE(s->write(0x7FFF00007FF8, &v, sizeof(v)).ok);
+        v = 0;
+        REQUIRE(s->write(0x7FFF00007F00, &v, sizeof(v)).ok);
+        v = 0x400222;
+        REQUIRE(s->write(0x7FFF00007F08, &v, sizeof(v)).ok);
+    }
+
+    auto dbg = [](const json& args, bool& is_err) {
+        std::fprintf(stderr, "  [trace] debugger.%s
+", args.value("action", "?").c_str());
+        auto r = slop::core::mcp::call_tool("debugger", args, is_err);
+        std::fprintf(stderr, "  [trace]   -> err=%d %s
+", (int)is_err, is_err ? r.dump().c_str() : "ok");
+        return r;
+    };
+    bool e = false;
+
+    // ps4_attach through the debugger tool
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_attach error: %s\n", r.dump().c_str());
+    CHECK(r.value("attached", false) == true);
+    CHECK(r.value("pid", 0) == kFakePid);
+
+    // status
+    r = dbg({{"action", "ps4_status"}}, e);
+    CHECK(!e);
+    CHECK(r.value("attached", false) == true);
+    CHECK(r.value("backend", "") == "PS4");
+
+    // arm a breakpoint (index auto-allocated) and a watchpoint
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400500}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_bp_set error: %s\n", r.dump().c_str());
+    CHECK(r.value("set", false) == true);
+    CHECK(r.value("index", 999) == 0);
+    r = dbg({{"action", "ps4_watch_set"}, {"addr", 0x7FFF00001000}, {"len", 8}, {"type", 3}}, e);
+    CHECK(!e);
+    CHECK(r.value("set", false) == true);
+    CHECK(r.value("index", 999) == 0);
+
+    // continue into the breakpoint, then wait for the stop event
+    r = dbg({{"action", "ps4_continue"}, {"stop", 0}}, e);
+    CHECK(!e);
+    CHECK(r.value("continued", false) == true);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_wait error: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("signal", 0) == 5);
+    CHECK(r.value("lwpid", 0) == 101);
+    CHECK(r.value("rip", 0) == 0x400500);
+
+    // regs + set_reg
+    r = dbg({{"action", "ps4_regs"}, {"lwpid", 101}}, e);
+    CHECK(!e);
+    CHECK(r.value("rax", 0) == 0x2A);
+    r = dbg({{"action", "ps4_set_reg"}, {"lwpid", 101}, {"name", "rax"}, {"value", 0x999}}, e);
+    CHECK(!e);
+    CHECK(r.value("set", false) == true);
+    r = dbg({{"action", "ps4_regs"}, {"lwpid", 101}}, e);
+    CHECK(!e);
+    CHECK(r.value("rax", 0) == 0x999);
+
+    // callstack walks the seeded rbp chain over live memory reads
+    r = dbg({{"action", "ps4_callstack"}, {"lwpid", 101}, {"depth", 8}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_callstack error: %s\n", r.dump().c_str());
+    CHECK(r.value("count", 0) == 3);
+    REQUIRE(r["frames"].size() == 3);
+    CHECK(r["frames"][0].value("ret_addr", 0) == 0x400123);
+    CHECK(r["frames"][1].value("ret_addr", 0) == 0x400111);
+    CHECK(r["frames"][2].value("ret_addr", 0) == 0x400222);
+
+    // remote function call in the console process
+    r = dbg({{"action", "ps4_call"}, {"addr", 0x400800}, {"args", json::array({41, 0, 0, 0, 0, 0})}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_call error: %s\n", r.dump().c_str());
+    CHECK(r.value("called", false) == true);
+    CHECK(r.value("rax", 0) == 42);
+    CHECK(r.value("rpcstub", 0) == 0x700000);
+
+    // step the thread and catch the step event
+    r = dbg({{"action", "ps4_step"}, {"lwpid", 101}}, e);
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("rip", 0) == 0x400124);
+
+    // drain the event queue
+    r = dbg({{"action", "ps4_events"}, {"max", 16}, {"clear", true}}, e);
+    CHECK(!e);
+    CHECK(r.value("count", 999) == 0);
+
+    // dbregs
+    r = dbg({{"action", "ps4_dbregs"}, {"lwpid", 101}}, e);
+    CHECK(!e);
+    CHECK(r["dr"].size() == 16);
+    CHECK(r["dr"][0].get<uint64_t>() == 0xD000);
+
+    // clear bp + watchpoint, then detach
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", 0x400500}}, e);
+    CHECK(!e);
+    CHECK(r.value("cleared", false) == true);
+    r = dbg({{"action", "ps4_watch_clear"}, {"index", 0}}, e);
+    CHECK(!e);
+    CHECK(r.value("cleared", false) == true);
+    r = dbg({{"action", "ps4_detach"}}, e);
+    CHECK(!e);
+    CHECK(r.value("attached", true) == false);
 }

@@ -71,6 +71,7 @@
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/ps4_protocol.hpp"
+#include "core/runtime/backend_ps4.hpp"
 #include "core/runtime/backend_kernel.hpp"
 #include "core/runtime/scan_bridge.hpp"
 #include "core/runtime/session.hpp"
@@ -3192,8 +3193,9 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
             uint64_t next = 0, ret = 0;
             auto io1 = s.read(static_cast<uintptr_t>(rbp), &next, sizeof(next));
             auto io2 = s.read(static_cast<uintptr_t>(rbp + 8), &ret, sizeof(ret));
-            if (!io1.ok || !io2.ok || next <= rbp) break;   // chain must ascend
+            if (!io1.ok || !io2.ok) break;
             arr.push_back({{"index", i}, {"ret_addr", ret}, {"frame_ptr", rbp}});
+            if (next == 0 || next <= rbp) break;   // 0 = top; chain must ascend
             rbp = next;
         }
         return {{"lwpid", lwpid}, {"frames", arr}, {"count", arr.size()}};
