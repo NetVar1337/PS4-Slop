@@ -14,7 +14,12 @@
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/scan_bridge.hpp"
 
-#include <lua.hpp>
+// lua.hpp wraps the headers in extern "C", but slop_lua is compiled as C++
+// (see cmake/deps.cmake) — include the plain headers so the declarations
+// carry C++ linkage and match the library's symbols
+#include <lua.h>
+#include <lauxlib.h>
+#include <lualib.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>

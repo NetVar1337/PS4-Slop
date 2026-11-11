@@ -522,7 +522,8 @@ private:
             return send_u32(c, len) && send_all(c, b, len);
         }
         case ps4::CMD_FW_VERSION: {
-            uint16_t fw = 0x1100;   // 11.00 BCD
+            // the payload reports major * 100 + minor (see fw.c), so 11.00 is 1100
+            uint16_t fw = 1100;
             return send_all(c, &fw, sizeof(fw));
         }
         case ps4::CMD_PLATFORM_ID: {
@@ -1762,7 +1763,7 @@ TEST_CASE(ps4_backend_handshake_and_enums) {
     CHECK(b.kind() == backend_kind_t::ps4);
     REQUIRE_STR_EQ(b.badge(), "PS4");
     CHECK(b.branding().find("ps4debug-NG") != std::string::npos);
-    CHECK(b.fw_version() == 0x1100);
+    CHECK(b.fw_version() == 1100);
     CHECK(b.endpoint() == "127.0.0.1:" + std::to_string(g.srv.port));
 
     auto procs = b.enum_processes();
