@@ -1068,10 +1068,15 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         return err;
     }
     json out;
-    {
-        // broker gate: MCP tool calls serialize with every other console
-        // client (UI, the GDB-RSP bridge) on the one console connection
+    // broker gate: console-session actions serialize with every other console
+    // client (UI, the GDB-RSP bridge) on the one console connection; purely
+    // local tools (emulate/analyze/...) stay concurrent with a running call
+    const bool console_action = name == "gdb" || name == "debugger" ||
+        (name == "target" && action.rfind("ps4_", 0) == 0);
+    if (console_action) {
         std::lock_guard rg(slop::core::runtime::broker_gate());
+        out = call_tool_inner(name, args, is_error, cancel);
+    } else {
         out = call_tool_inner(name, args, is_error, cancel);
     }
     audit_log(name, args, out, is_error);
