@@ -164,7 +164,11 @@ if(MSVC)
     target_compile_options(slop_sqlite PRIVATE /W0)
 endif()
 
-add_library(slop_lua STATIC
+# Lua must build as C++: LUAI_THROW then raises a real C++ exception, so a
+# lua error unwinds host C++ frames with correct per-state destructor
+# tracking. As C (longjmp, a foreign RtlUnwind) every registered dtor in a
+# binding frame runs, constructed or not, and shared_ptr locals blow up.
+set(slop_lua_sources
     "${lua_SOURCE_DIR}/src/lapi.c"
     "${lua_SOURCE_DIR}/src/lauxlib.c"
     "${lua_SOURCE_DIR}/src/lbaselib.c"
@@ -198,6 +202,8 @@ add_library(slop_lua STATIC
     "${lua_SOURCE_DIR}/src/lvm.c"
     "${lua_SOURCE_DIR}/src/lzio.c"
 )
+set_source_files_properties(${slop_lua_sources} PROPERTIES LANGUAGE CXX)
+add_library(slop_lua STATIC ${slop_lua_sources})
 target_include_directories(slop_lua SYSTEM PUBLIC "${lua_SOURCE_DIR}/src")
 target_compile_definitions(slop_lua PRIVATE
     LUA_USE_WINDOWS

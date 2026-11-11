@@ -133,7 +133,7 @@ Varnode Lifter::operand_read(const Insn& insn, int idx, const AnalysisDB& /*db*/
         return vn;
     }
     case OpType::Imm:
-        return vn_const(op.val, op.size / 8 ? op.size / 8 : 8);
+        return vn_const(op.val, (op.size / 8) ? (op.size / 8) : 8);
     case OpType::Mem: {
         Varnode addr = effective_address(op, out, op.size);
         int sz = op.size / 8;

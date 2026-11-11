@@ -19,8 +19,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -157,7 +159,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
     const auto& tools = res.at("result").at("tools");
-    REQUIRE_EQ(tools.size(), 20u);
+    REQUIRE_EQ(tools.size(), 22u);
 
     bool seen_target = false, seen_memory = false, seen_disasm = false,
          seen_debugger = false,
@@ -167,7 +169,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
          seen_decomp = false, seen_xray = false,
          seen_patch = false,
          seen_types = false, seen_notes = false, seen_devirt = false,
-         seen_guide = false;
+         seen_guide = false, seen_host = false, seen_gdb = false;
     for (const auto& t : tools) {
         const std::string n = t.at("name").get<std::string>();
         if (n == "target")   seen_target = true;
@@ -188,6 +190,8 @@ TEST_CASE(mcp_tools_list_consolidated) {
         if (n == "notes")    seen_notes = true;
         if (n == "devirt")   seen_devirt = true;
         if (n == "guide")    seen_guide = true;
+        if (n == "host")     seen_host = true;
+        if (n == "gdb")      seen_gdb = true;
         REQUIRE(t.contains("inputSchema"));
         REQUIRE(t.contains("description"));
         REQUIRE(t.at("description").is_string());
@@ -218,6 +222,8 @@ TEST_CASE(mcp_tools_list_consolidated) {
     REQUIRE(seen_notes);
     REQUIRE(seen_devirt);
     REQUIRE(seen_guide);
+    REQUIRE(seen_host);
+    REQUIRE(seen_gdb);
 }
 TEST_CASE(mcp_devirt_exposes_themida_sidecars) {
     server_fixture_t fx;
@@ -2181,4 +2187,294 @@ TEST_CASE(mcp_stop_is_bounded_when_a_tool_ignores_cancel) {
     // the background join finished and a new server binds fine
     server_fixture_t again;
     REQUIRE(again.rpc("ping").contains("result"));
+}
+
+namespace {
+
+struct mcp_scratch_dir_t {
+    std::filesystem::path dir;
+    mcp_scratch_dir_t() {
+        dir = std::filesystem::temp_directory_path() /
+              ("slop_mcp_" + std::to_string(::GetCurrentProcessId()) + "_" +
+               std::to_string(slop::core::infra::steady_ms()) + "_" +
+               std::to_string(reinterpret_cast<uintptr_t>(this) & 0xFFFF));
+        std::filesystem::create_directories(dir);
+    }
+    ~mcp_scratch_dir_t() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    std::string str(const char* leaf = nullptr) const {
+        return leaf ? (dir / leaf).string() : dir.string();
+    }
+};
+
+std::string mcp_slurp(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)),
+                       std::istreambuf_iterator<char>());
+}
+
+uint16_t free_tcp_port() {
+    WSADATA d;
+    ::WSAStartup(MAKEWORD(2, 2), &d);
+    const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return 0;
+    sockaddr_in bound{};
+    int len = sizeof(bound);
+    ::getsockname(s, reinterpret_cast<sockaddr*>(&bound), &len);
+    const uint16_t port = ntohs(bound.sin_port);
+    ::closesocket(s);
+    return port;
+}
+
+} // namespace
+
+TEST_CASE(mcp_audit_log_and_confirm_gate) {
+    namespace settings = slop::core::infra::settings;
+    mcp_scratch_dir_t tmp;
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+    settings::set("mcp_audit_enabled", true);
+    settings::set("mcp_audit_path", tmp.str("audit.jsonl"));
+
+    server_fixture_t fx;
+    bool is_error = false;
+    // read-only call dispatches and is audited
+    json res = fx.call("target", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    // gate on: a mutating ps4_* action without confirm is refused
+    settings::set("mcp_require_confirm", true);
+    res = fx.call("debugger", {{"action", "ps4_bp_set"}, {"addr", 0x1000}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("confirm") != std::string::npos);
+    // with confirm it dispatches (and fails only because no console is connected)
+    res = fx.call("debugger",
+                  {{"action", "ps4_bp_set"}, {"addr", 0x1000}, {"confirm", true}},
+                  is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("confirm") == std::string::npos);
+    // gate off: the same call dispatches without confirm
+    settings::set("mcp_require_confirm", false);
+    res = fx.call("debugger", {{"action", "ps4_bp_set"}, {"addr", 0x1000}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("confirm") == std::string::npos);
+
+    // the audit log holds one JSONL line per call with tool/action/ok
+    const std::string log = mcp_slurp(tmp.dir / "audit.jsonl");
+    REQUIRE(!log.empty());
+    int lines = 0;
+    bool saw_refusal = false, saw_status = false;
+    std::istringstream ss(log);
+    for (std::string line; std::getline(ss, line);) {
+        if (line.empty()) continue;
+        ++lines;
+        const json j = json::parse(line);
+        REQUIRE(j.contains("ts_ms"));
+        REQUIRE(j.contains("tool"));
+        REQUIRE(j.contains("ok"));
+        if (j.at("tool") == "debugger" && j.at("action") == "ps4_bp_set" &&
+            j.at("ok") == false && j.at("error").get<std::string>().find("confirm") !=
+                                     std::string::npos)
+            saw_refusal = true;
+        if (j.at("tool") == "target" && j.at("action") == "status" && j.at("ok") == true)
+            saw_status = true;
+    }
+    REQUIRE_EQ(lines, 4);
+    REQUIRE(saw_refusal);
+    REQUIRE(saw_status);
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(mcp_ps4_discover_probe_answers_without_console) {
+    server_fixture_t fx;
+    bool is_error = false;
+    json res = fx.call("target", {{"action", "ps4_discover"}, {"timeout_ms", 300}},
+                       is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.contains("found"));
+    REQUIRE_GE(res.at("found").get<int>(), 0);
+    REQUIRE(res.contains("consoles"));
+    REQUIRE(res.contains("probe"));
+}
+
+TEST_CASE(mcp_host_serves_payload_dir_with_sha256_manifest) {
+    namespace settings = slop::core::infra::settings;
+    mcp_scratch_dir_t tmp;
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+    settings::set("mcp_audit_enabled", false);
+
+    const std::filesystem::path payloads = tmp.dir / "payloads";
+    std::filesystem::create_directories(payloads);
+    const std::string content = "hello ps4 payload \x01\x02\x03";
+    {
+        std::ofstream f(payloads / "hello.bin", std::ios::binary);
+        f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    }
+
+    server_fixture_t fx;
+    bool is_error = false;
+    const uint16_t port = free_tcp_port();
+    REQUIRE_GT(port, 0);
+    json res = fx.call("host", {{"action", "start"},
+                                {"port", port},
+                                {"bind", "127.0.0.1"},
+                                {"dir", payloads.string()}},
+                       is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.at("running").get<bool>());
+    REQUIRE_EQ(res.at("port").get<int>(), static_cast<int>(port));
+
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_connection_timeout(std::chrono::seconds(3));
+    cli.set_read_timeout(std::chrono::seconds(5));
+    auto m = cli.Get("/manifest.json");
+    REQUIRE(m);
+    REQUIRE_EQ(m->status, 200);
+    const json man = json::parse(m->body);
+    REQUIRE_EQ(man.at("files").size(), 1u);
+    REQUIRE_STR_EQ(man.at("files").at(0).at("name").get<std::string>().c_str(),
+                   "hello.bin");
+    REQUIRE_EQ(man.at("files").at(0).at("size").get<uint64_t>(), content.size());
+    const std::string sha = man.at("files").at(0).at("sha256").get<std::string>();
+    REQUIRE_EQ(sha.size(), 64u);
+
+    auto f = cli.Get("/files/hello.bin");
+    REQUIRE(f);
+    REQUIRE_EQ(f->status, 200);
+    REQUIRE(f->body == content);
+
+    auto idx = cli.Get("/");
+    REQUIRE(idx);
+    REQUIRE_EQ(idx->status, 200);
+    REQUIRE(idx->body.find("hello.bin") != std::string::npos);
+
+    // put is confirm-gated while mcp_require_confirm is on
+    settings::set("mcp_require_confirm", true);
+    res = fx.call("host", {{"action", "put"}, {"name", "note.txt"}, {"text", "hi"}},
+                  is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("confirm") != std::string::npos);
+    settings::set("mcp_require_confirm", false);
+
+    // put drops a file into the served dir and reports its sha256
+    res = fx.call("host", {{"action", "put"}, {"name", "note.txt"}, {"text", "hi"}},
+                  is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.at("written").get<bool>());
+    REQUIRE_EQ(res.at("sha256").get<std::string>().size(), 64u);
+    // path traversal via put is refused
+    res = fx.call("host", {{"action", "put"}, {"name", "../evil.bin"}, {"text", "x"}},
+                  is_error);
+    REQUIRE(is_error);
+
+    m = cli.Get("/manifest.json");
+    REQUIRE(m);
+    REQUIRE_EQ(json::parse(m->body).at("files").size(), 2u);
+
+    res = fx.call("host", {{"action", "stop"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(mcp_gdb_tool_and_broker_status) {
+    namespace settings = slop::core::infra::settings;
+    mcp_scratch_dir_t tmp;
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+    settings::set("mcp_audit_enabled", false);
+
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // status with the bridge down: the MCP server itself is a broker client
+    json res = fx.call("gdb", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    REQUIRE(res.at("console").at("connected") == false);
+    bool saw_mcp = false;
+    for (const auto& c : res.at("broker_clients"))
+        if (c.at("name") == "mcp") saw_mcp = true;
+    REQUIRE(saw_mcp);
+
+    const uint16_t port = free_tcp_port();
+    REQUIRE_GT(port, 0);
+
+    // start is confirm-gated while mcp_require_confirm is on
+    settings::set("mcp_require_confirm", true);
+    res = fx.call("gdb", {{"action", "start"}, {"port", port}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("confirm") != std::string::npos);
+    settings::set("mcp_require_confirm", false);
+
+    // non-loopback bind is refused (the bridge exposes the console session)
+    res = fx.call("gdb", {{"action", "start"}, {"port", port}, {"bind", "0.0.0.0"}},
+                  is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("loopback") != std::string::npos);
+
+    // start on loopback works even without a console attached
+    res = fx.call("gdb", {{"action", "start"}, {"port", port}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.at("running").get<bool>());
+    REQUIRE_EQ(res.at("port").get<int>(), static_cast<int>(port));
+
+    // a raw RSP client can handshake without any console session
+    {
+        WSADATA d;
+        ::WSAStartup(MAKEWORD(2, 2), &d);
+        const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        REQUIRE(s != INVALID_SOCKET);
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        ::inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+        REQUIRE(::connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
+        DWORD to = 3000;
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to),
+                     sizeof(to));
+        const std::string cmd = "qSupported";
+        uint8_t sum = 0;
+        for (char ch : cmd) sum = static_cast<uint8_t>(sum + static_cast<uint8_t>(ch));
+        char pkt[64];
+        std::snprintf(pkt, sizeof(pkt), "$%s#%02x", cmd.c_str(), sum);
+        REQUIRE(::send(s, pkt, static_cast<int>(std::strlen(pkt)), 0) != SOCKET_ERROR);
+        std::string reply;
+        char ch;
+        for (;;) {              // skip acks until the frame starts
+            if (::recv(s, &ch, 1, 0) != 1) break;
+            if (ch == '$') break;
+        }
+        for (;;) {
+            if (::recv(s, &ch, 1, 0) != 1) break;
+            if (ch == '#') { char cc[2]; ::recv(s, cc, 2, 0); break; }
+            reply += ch;
+        }
+        REQUIRE(reply.rfind("PacketSize=4000", 0) == 0);
+
+        // while connected, status shows the RSP client and the gdb broker entry
+        res = fx.call("gdb", {{"action", "status"}}, is_error);
+        REQUIRE(!is_error);
+        REQUIRE(res.at("running").get<bool>());
+        REQUIRE_GE(res.at("rsp_clients").get<int>(), 1);
+        bool saw_gdb = false;
+        for (const auto& c : res.at("broker_clients"))
+            if (c.at("name").get<std::string>().rfind("gdb:", 0) == 0) saw_gdb = true;
+        REQUIRE(saw_gdb);
+        ::closesocket(s);
+    }
+
+    res = fx.call("gdb", {{"action", "stop"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    res = fx.call("gdb", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    settings::set_file_for_testing({});
 }
