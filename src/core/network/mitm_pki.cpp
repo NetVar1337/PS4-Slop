@@ -107,7 +107,9 @@ struct ncrypt_key_t {
 
 struct ncrypt_prov_t {
     NCRYPT_PROV_HANDLE h = 0;
-    ncrypt_prov_t() { ::NCryptOpenStorageProvider(&h, MS_KEY_STORAGE_PROVIDER, 0); }
+    ncrypt_prov_t() {
+        if (::NCryptOpenStorageProvider(&h, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) h = 0;
+    }
     ~ncrypt_prov_t() {
         if (h) ::NCryptFreeObject(h);
     }
