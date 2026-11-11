@@ -173,6 +173,7 @@ add_library(slop_core STATIC
     mcp/tools_devirt.cpp
     mcp/tools_script.cpp
     mcp/tools_app_guide.cpp
+    mcp/tools_host.cpp
     infra/mcp_onboard.hpp
     infra/mcp_onboard.cpp
 )

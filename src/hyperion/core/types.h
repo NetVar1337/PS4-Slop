@@ -31,7 +31,7 @@ inline std::string default_func_name(va_t va) {
     do {
         rev[n++] = kHex[va & 0xF];
         va >>= 4;
-    } while (va);
+    } while (va && n < static_cast<int>(sizeof rev));   // bound n so the read below stays in range
     std::string out("sub_");
     while (n) out.push_back(rev[--n]);
     return out;

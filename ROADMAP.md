@@ -8,6 +8,16 @@ Prioritized from the full audit ([`docs/AUDIT.md`](docs/AUDIT.md), 115 items). S
 - [ ] Resolve the in-progress merge (`mcp_tools.cpp`, `backend_ps4.cpp`, `test_ps4.cpp`)
       and get `main` building green again.
 
+## Landed (ecosystem merge, see [`docs/MERGE.md`](docs/MERGE.md))
+
+- [x] MCP audit log (JSONL, every tool call) + `mcp_require_confirm` gate on mutating
+      actions — ps4debug-mcp safety model, now server-side.
+- [x] `target.ps4_discover` UDP broadcast discovery + `host:"auto"` for
+      `ps4_connect`/`ps4_auto`.
+- [x] `host` MCP tool: HTTP payload host with sha256 `/manifest.json`, token-gated
+      LAN binds — afterglow-web function built in.
+- [x] Homebrew injection recipe book: [`docs/injection/README.md`](docs/injection/README.md).
+
 ## Next milestone — v0.2 "agent-grade" (P1)
 
 Test visibility and agent-facing surface, because that is where the leverage is:
