@@ -53,6 +53,13 @@ Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
   get: () => 600,
 });
 Object.defineProperty(HTMLElement.prototype, "offsetWidth", { configurable: true, get: () => 800 });
+// @tanstack/virtual-core >= 3.19 measures via clientWidth/clientHeight rather
+// than getBoundingClientRect, and jsdom leaves both at 0
+Object.defineProperty(HTMLElement.prototype, "clientHeight", {
+  configurable: true,
+  get: () => 600,
+});
+Object.defineProperty(HTMLElement.prototype, "clientWidth", { configurable: true, get: () => 800 });
 
 class ResizeObserverStub {
   observe(): void {}
