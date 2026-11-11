@@ -101,7 +101,9 @@ function launch(cmd, args, env, cwd) {
 }
 
 // wait until the child prints a SLOP_ENGINE_READY line or dies; returns
-// { announced: port|null, alive: bool, log }
+// { announced: port|null, alive: bool, coalesced: bool, log }.
+// The engine prints SLOP_ENGINE_EXISTING right after READY when it coalesced
+// onto another live engine — the unambiguous signal (no exit-event race).
 async function awaitAnnounce(child, timeoutMs = 20_000) {
   let log = "";
   let announced = null;
@@ -115,7 +117,8 @@ async function awaitAnnounce(child, timeoutMs = 20_000) {
     if (m) announced = Number(m[1]);
     else await sleep(200);
   }
-  return { announced, alive: !dead, log };
+  await sleep(300); // let a trailing SLOP_ENGINE_EXISTING line arrive
+  return { announced, alive: !dead, coalesced: /SLOP_ENGINE_EXISTING/.test(log), log };
 }
 
 const healthAnswers = () =>
@@ -168,12 +171,24 @@ async function main() {
       const healthy = await poll(healthAnswers, 10_000).catch(() => false);
       if (healthy) {
         ready = true;
-        if (a.alive) {
-          ok("engine health", `${healthUrl} (owned)`);
-        } else {
+        if (a.coalesced) {
+          // not our process: never shut it down at the end
+          enginePid = 0;
           ok("engine health", `${healthUrl} (coalesced onto an existing engine; left running)`);
+        } else {
+          ok("engine health", `${healthUrl} (owned)`);
         }
         break;
+      }
+      if (a.coalesced) {
+        // a foreign engine owns the session and did not accept us; retrying
+        // just coalesces onto it again
+        console.error(
+          `existing engine at ${healthUrl} did not accept this driver\n` +
+            String(a.log).trim().slice(-300)
+        );
+        process.exitCode = 1;
+        return;
       }
       console.log(`attempt ${attempt}: ${healthUrl} announced but did not answer, retrying...`);
     } else {
@@ -182,7 +197,7 @@ async function main() {
       if (a.log.trim()) console.log("  engine said: " + JSON.stringify(a.log.trim().slice(-300)));
     }
 
-    killTree(enginePid); // ours or a stale coalesce target; best effort
+    killTree(enginePid); // only reaches here on the owned path (coalesced resets enginePid)
     enginePid = 0;
     await sleep(3000);
   }
