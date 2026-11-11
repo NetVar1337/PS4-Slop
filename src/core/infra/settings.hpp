@@ -56,4 +56,11 @@ std::string generate_token();           // 32 random bytes as 64 hex chars
 bool mcp_onboarded();
 void set_mcp_onboarded(bool v);
 
+// MCP audit trail + confirm gate (ps4debug-mcp safety model): every tool call
+// is appended as one JSONL line to mcp_audit_path(); when mcp_require_confirm
+// is on, mutating console/target actions refuse to run without "confirm": true
+bool        mcp_audit_enabled();      // default true
+std::string mcp_audit_path();         // default <app_data>\mcp_audit.jsonl, "" disables
+bool        mcp_require_confirm();    // default false (opt-in)
+
 } // namespace slop::core::infra::settings
