@@ -589,13 +589,14 @@ struct gdb_rsp_server_t::impl_t {
                 static_cast<size_t>(len) > kMaxPacket / 2)
                 return reply("E01");
             std::lock_guard g(broker_gate());
-            if (!ensure_session(p, pid)) return reply("E01");
+            if (!ensure_session(p, pid)) return reply("E02");
             if (len == 0) return reply("");
             const auto h = handle_for(pid);
+            if (!h.valid()) return reply("E03");
             std::vector<uint8_t> buf(static_cast<size_t>(len));
             const auto io = p->read_memory(h, static_cast<uintptr_t>(addr), buf.data(),
                                            buf.size());
-            if (!io.ok || io.bytes != buf.size()) return reply("E01");
+            if (!io.ok || io.bytes != buf.size()) return reply("E04");
             return reply(hex_encode(buf.data(), buf.size()));
         }
         // writes need explicit opt-in at server start
@@ -781,7 +782,7 @@ struct gdb_rsp_server_t::impl_t {
         uint32_t pid = 0;
         std::lock_guard g(broker_gate());
         if (!ensure_session(p, pid)) return "E01";
-        if (c.last_stop.empty()) return "E01";   // wait for a real stop first
+        if (c.last_stop.empty() && !p->ps4_debug_held()) return "E01";
         io_result_t io{};
         if (step) {
             uint32_t t = tid ? static_cast<uint32_t>(tid)
