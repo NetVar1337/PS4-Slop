@@ -187,6 +187,10 @@ packer_verdict_t packer_analyze(const disasm::pe_image_t& pe,
             static_cast<size_t>(sec.raw_offset) + sec.raw_size <= file.size()) {
             rep.entropy = entropy_sampled(file.data() + sec.raw_offset, sec.raw_size);
         }
+        // Capture the fields used below before the move; reading rep afterward
+        // is a use-after-move (benign for these trivial members, but UB-adjacent).
+        const auto entropy = rep.entropy;
+        const bool wx      = rep.writable_exec;
         out.sections.push_back(std::move(rep));
 
         if (const char* fam = family_for_section(sec.name)) {
@@ -198,28 +202,28 @@ packer_verdict_t packer_analyze(const disasm::pe_image_t& pe,
             out.detections.push_back(std::move(d));
             bump(fam == std::string("Generic packed section") ? 0.35 : 0.55, fam);
         }
-        if (rep.entropy >= 7.5 && sec.is_executable()) {
+        if (entropy >= 7.5 && sec.is_executable()) {
             packer_detection_t d;
             d.type   = "high_entropy";
             d.detail = "executable section '" + std::string(sec.name) + "' entropy " +
-                       std::to_string(rep.entropy).substr(0, 5);
+                       std::to_string(entropy).substr(0, 5);
             d.location = sec.rva;
             out.detections.push_back(std::move(d));
             bump(0.45, nullptr);
-        } else if (rep.entropy >= 7.0 && !sec.is_executable() && sec.raw_size > 4096) {
+        } else if (entropy >= 7.0 && !sec.is_executable() && sec.raw_size > 4096) {
             // Compressed resources (.rdata/.rsrc) in Rust/MSVC binaries
             // routinely hit 7.5-7.9 without any packing, so this is a weak
             // signal on its own and must not tip the verdict by itself.
             packer_detection_t d;
             d.type   = "high_entropy";
             d.detail = "data section '" + std::string(sec.name) + "' entropy " +
-                       std::to_string(rep.entropy).substr(0, 5) +
+                       std::to_string(entropy).substr(0, 5) +
                        " (weak alone: common in Rust/MSVC resources)";
             d.location = sec.rva;
             out.detections.push_back(std::move(d));
             bump(0.12, nullptr);
         }
-        if (rep.writable_exec && sec.raw_size > 0) {
+        if (wx && sec.raw_size > 0) {
             packer_detection_t d;
             d.type   = "wx_section";
             d.detail = "section '" + std::string(sec.name) + "' is writable+executable";

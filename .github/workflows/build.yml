@@ -148,9 +148,13 @@ jobs:
           restore-keys: |
             asan-deps-v1-${{ runner.os }}-
 
+      # The emu and mcp areas drive the in-process Unicorn CPU emulator, whose
+      # JIT execution and fault handling are incompatible with ASan (raw access
+      # violations with no ASan report), so they are excluded here. Both run in
+      # full under the plain `tests` lane.
       - name: build + run tests with /fsanitize=address
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel area
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestExclude "slop_tests_emu|slop_tests_mcp"
 
   # MSVC /analyze over first-party code (preset ninja-msvc-analyze). Findings
   # are listed in the run summary.
