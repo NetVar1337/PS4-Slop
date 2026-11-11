@@ -130,8 +130,15 @@ FetchContent_Declare(sqlite
     SYSTEM
 )
 
+# lua.org is the canonical host but is regularly unreachable from the CI
+# runners, which failed the configure step outright. The mirrors below serve
+# the byte-identical tarball (same SHA256), so CMake falls through to them
+# without changing the layout or weakening the integrity check.
 FetchContent_Declare(lua
     URL https://www.lua.org/ftp/lua-5.4.7.tar.gz
+        https://sources.buildroot.org/lua/lua-5.4.7.tar.gz
+        https://distfiles.macports.org/lua/lua-5.4.7.tar.gz
+        https://ftp.osuosl.org/pub/blfs/conglomeration/lua/lua-5.4.7.tar.gz
     URL_HASH SHA256=9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
     SYSTEM
 )
