@@ -1,0 +1,12 @@
+[submodule "external/ps4debug-NG"]
+	path = external/ps4debug-NG
+	url = https://github.com/NetVar1337/ps4debug-NG
+	branch = master
+[submodule "external/afterglow-web"]
+	path = external/afterglow-web
+	url = https://github.com/May-Ethereal/afterglow-web.git
+	branch = dev2/payload
+[submodule "external/ps4-injection-lab"]
+	path = external/ps4-injection-lab
+	url = https://github.com/NetVar1337/ps4-injection-lab.git
+	branch = feat/payload-sdk
