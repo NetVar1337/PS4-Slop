@@ -3,6 +3,11 @@
 # Vendored code (src/hyperion, _ext) is not analyzed.
 # The errors set is high-signal memory/lifetime/logic checks that must stay
 # clean; everything else is reported as a warning.
+#
+# NewDeleteLeaks is deliberately NOT in the errors set: it fires on MSVC's
+# std::string SSO internals inside _ext/httplib-src/httplib.h (field '_Myval2'),
+# and an error-level finding bypasses HeaderFilterRegex, so a vendored-header
+# false positive would fail the lane. It stays enabled as a warning.
 Checks: >
   -*,
   bugprone-*,
@@ -39,7 +44,6 @@ WarningsAsErrors: >
   bugprone-return-const-ref-from-parameter,
   clang-analyzer-core.*,
   clang-analyzer-cplusplus.NewDelete,
-  clang-analyzer-cplusplus.NewDeleteLeaks,
   clang-analyzer-unix.Malloc,
   misc-redundant-expression
 HeaderFilterRegex: '.*[/\\]src[/\\](core|engine|ui|app|live|target|tests)[/\\].*'

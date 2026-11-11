@@ -148,13 +148,14 @@ jobs:
           restore-keys: |
             asan-deps-v1-${{ runner.os }}-
 
-      # The emu and mcp areas drive the in-process Unicorn CPU emulator, whose
-      # JIT execution and fault handling are incompatible with ASan (raw access
-      # violations with no ASan report), so they are excluded here. Both run in
-      # full under the plain `tests` lane.
+      # The emu, mcp and xray areas drive the in-process Unicorn CPU emulator,
+      # whose JIT execution and fault handling are incompatible with ASan (raw
+      # access violations with no ASan report), so they are excluded here. xray
+      # reaches the emulator through recover::recover_flattened. All three run
+      # in full under the plain `tests` lane.
       - name: build + run tests with /fsanitize=address
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestExclude "slop_tests_emu|slop_tests_mcp"
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestExclude "slop_tests_emu|slop_tests_mcp|slop_tests_xray"
 
   # MSVC /analyze over first-party code (preset ninja-msvc-analyze). Findings
   # are listed in the run summary.
@@ -182,10 +183,17 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          $hits = @(Select-String -LiteralPath analyze.log -Pattern 'warning C(6|26|28)\d{3}' |
-            ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique)
+          $hits = @()
+          if (Test-Path -LiteralPath analyze.log) {
+            $hits = @(Select-String -LiteralPath analyze.log -Pattern 'warning C(6|26|28)\d{3}' |
+              ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique)
+          }
           "### MSVC /analyze: $($hits.Count) unique findings" | Add-Content $env:GITHUB_STEP_SUMMARY
-          if ($hits) { '```'; $hits | Select-Object -First 200; '```' } | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($hits) {
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+            $hits | Select-Object -First 200 | Add-Content $env:GITHUB_STEP_SUMMARY
+            '```' | Add-Content $env:GITHUB_STEP_SUMMARY
+          }
 
   # clang-tidy (.clang-tidy) over first-party code via compile_commands.json.
   clang-tidy:

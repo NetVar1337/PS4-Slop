@@ -451,7 +451,7 @@ void http_proxy_t::impl_t::pump(endpoint_t& a, endpoint_t& b, recorder_t* rec, b
             ok = service_b();
             progressed = true;
         } else {
-            WSAPOLLFD fds[2];
+            WSAPOLLFD fds[2]{};
             int nf = 0, ia = -1, ib = -1;
             if (a_read) { ia = nf; fds[nf++] = {static_cast<SOCKET>(a.s), POLLRDNORM, 0}; }
             if (b.rd_open) { ib = nf; fds[nf++] = {static_cast<SOCKET>(b.s), POLLRDNORM, 0}; }
