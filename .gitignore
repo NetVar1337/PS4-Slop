@@ -28,3 +28,11 @@ app/src-tauri/target-*/
 mcp_live_results.json
 __pycache__/
 *.pyc
+/build/
+/_ext/
+/.cache/
+
+# Local tool caches
+.cache/
+/.vite/
+app/e2e/node_modules/

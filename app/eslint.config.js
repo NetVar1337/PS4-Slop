@@ -35,6 +35,12 @@ export default tseslint.config(
     languageOptions: { globals: globals.node },
   },
   {
+    // e2e driver: Node script (console.log is its UI; fetch is Node 18+ global)
+    files: ["e2e/**/*.mjs"],
+    languageOptions: { globals: { ...globals.node, fetch: "readonly" } },
+    rules: { "no-console": "off" },
+  },
+  {
     files: ["scripts/**/*.{ts,tsx}"],
     languageOptions: { globals: globals.browser },
   },

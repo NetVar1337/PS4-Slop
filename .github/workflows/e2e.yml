@@ -1,0 +1,55 @@
+name: e2e
+
+# Nightly (and on demand) end-to-end smoke against the real engine + fixture.
+# Not PR-blocking: it builds the full engine tree. Promote to pull_request once
+# the build cache makes it cheap.
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_DISABLE_FIND_PACKAGE_PkgConfig: TRUE
+  CMAKE_DISABLE_FIND_PACKAGE_Doxygen: TRUE
+  SCCACHE_GHA_ENABLED: 'true'
+
+jobs:
+  smoke:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9  # yamllint disable-line rule:line-length
+
+      - name: cache _ext (cmake deps sources)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: _ext/*-src
+          key: ext-src-v3-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            ext-src-v3-${{ runner.os }}-
+
+      - name: build engine + fixture
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend
+
+      - name: setup node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0  # yamllint disable-line rule:line-length
+        with:
+          node-version: 22
+
+      - name: e2e smoke
+        shell: pwsh
+        run: |
+          npm --prefix app/e2e ci --prefer-offline --no-audit --no-fund
+          npm --prefix app/e2e run smoke

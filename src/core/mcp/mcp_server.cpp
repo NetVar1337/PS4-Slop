@@ -464,12 +464,14 @@ bool start(const server_config_t& cfg) {
     // one guard for every route: dns rebinding, foreign origins, cors, preflight
     srv->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
         if (!host_allowed(req.get_header_value("Host"), g_port.load())) {
+            res.set_header("Connection", "close");
             send_json(res, 403, {{"ok", false}, {"error", "host not allowed"}});
             return httplib::Server::HandlerResponse::Handled;
         }
         const std::string origin = req.get_header_value("Origin");
         if (!origin.empty()) {
             if (!origin_allowed(origin)) {
+                res.set_header("Connection", "close");
                 send_json(res, 403, {{"ok", false}, {"error", "origin not allowed"}});
                 return httplib::Server::HandlerResponse::Handled;
             }

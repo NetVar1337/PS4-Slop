@@ -532,6 +532,423 @@ json tool_ps4_scan(const std::string& action, const json& args,
             {"hits", ps4_hits_json(hits, 256)}, {"truncated", hits.size() > 256}};
 }
 
+
+json slots_json(const std::vector<runtime::backend_ps4_t::ps4_slot_t>& slots, bool wp) {
+    json arr = json::array();
+    for (const auto& s : slots) {
+        json o = {{"addr", s.addr}, {"addr_hex", addr_hex_str(s.addr)},
+                  {"index", s.index}, {"armed", s.armed}};
+        if (wp) { o["len"] = s.len; o["type"] = s.type; }
+        arr.push_back(std::move(o));
+    }
+    return arr;
+}
+
+json ps4_status_json(runtime::backend_ps4_t& p) {
+    const int ext = p.ps4_fork_extensions();
+    return {{"attached", p.ps4_debug_attached()},
+            {"pid", p.ps4_debug_pid()},
+            {"connected", p.connected()},
+            {"lost", p.lost()},
+            {"lost_reason", p.lost_reason()},
+            {"drops", p.drop_count()},
+            {"fw", p.fw_string()},
+            {"authed", p.ps4_authed()},
+            {"pending_events", p.ps4_pending_events()},
+            {"events_received", p.ps4_events_received()},
+            {"events_dropped", p.ps4_events_dropped()},
+            {"event_queue_cap", runtime::backend_ps4_t::kMaxQueuedEvents},
+            {"breakpoints", p.ps4_breakpoints().size()},
+            {"watchpoints", p.ps4_watchpoints().size()},
+            {"endpoint", runtime::registry_ps4_endpoint()},
+            {"branding", p.branding()},
+            {"capability_level", p.ps4_capability_level()},
+            {"fork_extensions", ext == 1 ? "yes" : ext == 0 ? "no (upstream payload)" : "not probed yet"},
+            {"reconnects", p.ps4_connection_generation()},
+            {"backend", "PS4"}};
+}
+
+json tool_ps4_turbo(const std::string& action, const json& args,
+                    runtime::backend_ps4_t& p);
+
+struct ps4_turbo_session_t {
+    bool     used = false;
+    uint32_t pid = 0;
+    uint64_t base = 0;
+    uint8_t  valtype = 0;
+    uint32_t vlen = 0;
+    uint32_t flags = 0;       // TS_* flags carried into rescans
+    bool     resident = false;
+    bool     snapshot = false;
+    uint64_t count = 0;
+    uint32_t passes = 0;
+    uint64_t generation = 0;  // connection generation the console session lives on
+    std::vector<runtime::backend_ps4_t::ps4_scan_hit_t> hits;
+};
+ps4_turbo_session_t& ps4_turbo_sess() { static ps4_turbo_session_t s; return s; }
+
+std::string ps4_value_text(uint8_t vt, const std::vector<uint8_t>& bytes) {
+    if (runtime::ps4::scan_value_size(vt) == 0 || bytes.size() > 8) return {};
+    uint64_t bits = 0;
+    for (size_t i = 0; i < bytes.size(); ++i) bits |= static_cast<uint64_t>(bytes[i]) << (8 * i);
+    return memory::format_value_text(ps4_width_of(vt), bits);
+}
+
+json ps4_turbo_records_json(uint8_t vt,
+                            const std::vector<runtime::backend_ps4_t::ps4_turbo_record_t>& recs) {
+    json arr = json::array();
+    for (const auto& r : recs) {
+        json j = {{"addr", r.addr}, {"addr_hex", addr_hex_str(r.addr)},
+                  {"value_hex", ps4_hex_str(r.current)}};
+        if (auto t = ps4_value_text(vt, r.current); !t.empty()) j["value"] = t;
+        if (r.previous != r.current) {
+            j["previous_hex"] = ps4_hex_str(r.previous);
+            if (auto t = ps4_value_text(vt, r.previous); !t.empty()) j["previous"] = t;
+        }
+        if (!r.first.empty()) {
+            j["first_hex"] = ps4_hex_str(r.first);
+            if (auto t = ps4_value_text(vt, r.first); !t.empty()) j["first"] = t;
+        }
+        arr.push_back(std::move(j));
+    }
+    return arr;
+}
+
+// first `limit` survivors of the current session, from the console when
+// resident or from the streamed hit list otherwise
+json ps4_turbo_preview(runtime::backend_ps4_t& p, const ps4_turbo_session_t& ts,
+                       uint32_t start, uint32_t limit) {
+    if (!ts.resident) {
+        json arr = json::array();
+        for (size_t i = start; i < ts.hits.size() && i < size_t{start} + limit; ++i) {
+            json j = {{"addr", ts.hits[i].addr}, {"addr_hex", addr_hex_str(ts.hits[i].addr)},
+                      {"value_hex", ps4_hex_str(ts.hits[i].value)}};
+            if (auto t = ps4_value_text(ts.valtype, ts.hits[i].value); !t.empty()) j["value"] = t;
+            arr.push_back(std::move(j));
+        }
+        return arr;
+    }
+    if (limit == 0 || ts.count == 0) return json::array();
+    std::vector<runtime::backend_ps4_t::ps4_turbo_record_t> recs;
+    auto io = p.ps4_turbo_get(start, limit, ts.vlen, recs);
+    if (!io.ok) fail("ps4_turbo GET failed (error " + std::to_string(io.error) + ")");
+    return ps4_turbo_records_json(ts.valtype, recs);
+}
+
+// segments for "scan the whole process": every map with the requested prot,
+// adjacent maps merged, each capped to the u32 segment length
+std::vector<runtime::backend_ps4_t::ps4_turbo_segment_t>
+ps4_turbo_segments_for(runtime::backend_ps4_t& p, uint32_t pid, const std::string& which) {
+    runtime::target_handle_t th;
+    th.pid = pid;
+    auto regs = p.enum_regions(th);
+    if (!regs.ok) fail("ps4_turbo_scan: cannot read the process maps (error " +
+                       std::to_string(regs.error) + ")");
+    const auto wanted = [&](uint32_t prot) {
+        const bool w = prot == 0x04 || prot == 0x08 || prot == 0x40 || prot == 0x80;
+        const bool r = prot != 0x01 && prot != 0x10;
+        if (which == "writable") return w;
+        if (which == "readable" || which == "all") return r;
+        fail("regions must be writable|readable|all");
+    };
+    std::vector<runtime::backend_ps4_t::ps4_turbo_segment_t> out;
+    for (const auto& rg : regs.items) {
+        if (!wanted(rg.protect) || rg.size == 0) continue;
+        uint64_t a = rg.base;
+        uint64_t left = rg.size;
+        if (!out.empty() && out.back().addr + out.back().len == a &&
+            uint64_t{out.back().len} + left <= 0xFFFFF000ull) {
+            out.back().len += static_cast<uint32_t>(left);
+            continue;
+        }
+        while (left > 0) {
+            const uint32_t n = static_cast<uint32_t>(std::min<uint64_t>(left, 0xFFFFF000ull));
+            out.push_back({a, n});
+            a += n;
+            left -= n;
+        }
+    }
+    if (out.empty()) fail("ps4_turbo_scan: no " + which + " regions in pid " + std::to_string(pid));
+    return out;
+}
+
+uint32_t ps4_turbo_float_flags(const json& args, uint8_t vt, uint32_t engines) {
+    if (vt != runtime::ps4::kValF32 && vt != runtime::ps4::kValF64) return 0;
+    if (!(engines & runtime::ps4::kTseFloatPolicy)) return 0;   // older payload: plain compare
+    const std::string mode = args.value("float", std::string{});
+    if (mode.empty() || mode == "default") return 0;
+    if (mode == "exact") return runtime::ps4::kTsFloatExact;
+    if (mode == "simple") {
+        uint32_t e = args.value("float_exponent", 11u);
+        if (e == 0 || e > 127) fail("float_exponent must be 1..127");
+        return runtime::ps4::kTsFloatSimple |
+               ((e << runtime::ps4::kTsFloatExponentShift) & runtime::ps4::kTsFloatExponentMask);
+    }
+    fail("float must be default|exact|simple");
+}
+
+json ps4_turbo_caps_json(const runtime::backend_ps4_t::ps4_turbo_caps_t& c) {
+    using namespace runtime::ps4;
+    json eng = json::array();
+    const std::pair<uint32_t, const char*> names[] = {
+        {kTseSimdCompare, "simd_compare"}, {kTseAliasing, "aliasing"},
+        {kTseServerResident, "server_resident"}, {kTseSnapshot, "snapshot"},
+        {kTseSnapshotSegments, "snapshot_segments"}, {kTseSnapshotConfig, "snapshot_config"},
+        {kTseSnapshotFirst, "snapshot_first"}, {kTseSnapshotPrevious, "snapshot_previous"},
+        {kTseParallelCompare, "parallel_compare"}, {kTseRescanAliasing, "rescan_aliasing"},
+        {kTseFloatPolicy, "float_policy"}, {kTseCompactSimpleSnapshot, "compact_simple_snapshot"}};
+    for (const auto& [bit, name] : names)
+        if (c.engines & bit) eng.push_back(name);
+    return {{"version", c.version}, {"engines_mask", c.engines},
+            {"engines", eng}, {"max_threads", c.max_threads}};
+}
+
+json tool_ps4_turbo(const std::string& action, const json& args,
+                    runtime::backend_ps4_t& p) {
+    using namespace runtime::ps4;
+    auto& ts = ps4_turbo_sess();
+
+    if (action == "ps4_turbo_caps") {
+        runtime::backend_ps4_t::ps4_turbo_caps_t caps;
+        auto io = p.ps4_turbo_caps(caps);
+        if (!io.ok)
+            return {{"supported", false},
+                    {"note", "payload has no Turbo Scan (error " + std::to_string(io.error) +
+                             "); use ps4_scan/ps4_rescan instead"}};
+        json j = ps4_turbo_caps_json(caps);
+        j["supported"] = true;
+        j["capability_level"] = p.ps4_capability_level();
+        return j;
+    }
+
+    if (action == "ps4_turbo_cancel") {
+        const uint32_t pid = ps4_pid_arg(args);
+        std::string err;
+        auto io = p.ps4_turbo_cancel(pid, err);
+        if (!io.ok) fail("ps4_turbo_cancel failed (" + err + ")");
+        // the cancelled session is indeterminate; the in-flight call returns
+        // partial results, so force a fresh scan
+        ts.used = false;
+        return {{"cancelled", true}, {"pid", pid},
+                {"note", "the running scan stops early with partial results; the session "
+                         "is now invalid - run ps4_turbo_end or a new ps4_turbo_scan"}};
+    }
+
+    if (action == "ps4_turbo_end") {
+        auto io = p.ps4_turbo_end();
+        ts = ps4_turbo_session_t{};
+        if (!io.ok) fail("ps4_turbo_end failed (error " + std::to_string(io.error) + ")");
+        return {{"ended", true}};
+    }
+
+    if (action == "ps4_turbo_config") {
+        const uint32_t mb = args.value("ram_mb", 0u);
+        const std::string dir = args.value("spill_path", std::string{});
+        auto io = p.ps4_turbo_config(mb, dir);
+        if (!io.ok) fail("ps4_turbo_config failed (error " + std::to_string(io.error) +
+                         "; spill_path max 63 chars, needs ps4_auth)");
+        return {{"ram_mb", mb ? mb : 512u}, {"spill_path", dir},
+                {"note", "applies to the next snapshot scan; ram_mb 0 = payload default (512)"}};
+    }
+
+    if (action == "ps4_turbo_regions") {
+        const uint32_t pid = ps4_pid_arg(args);
+        std::vector<runtime::backend_ps4_t::ps4_turbo_region_t> regs;
+        auto io = p.ps4_turbo_regions(pid, args.value("max", 0u), args.value("probe_bytes", 0u), regs);
+        if (!io.ok) fail("ps4_turbo_regions failed (error " + std::to_string(io.error) + ")");
+        json arr = json::array();
+        uint64_t slow = 0;
+        for (const auto& r : regs) {
+            const bool uncached = (r.flags & 1u) != 0;
+            if (uncached) ++slow;
+            arr.push_back({{"start", r.start}, {"start_hex", addr_hex_str(r.start)},
+                           {"end", r.end}, {"size", r.end - r.start}, {"prot", r.prot},
+                           {"uncached", uncached}, {"mbps", r.mbps}});
+        }
+        return {{"pid", pid}, {"count", regs.size()}, {"uncached", slow}, {"regions", arr},
+                {"note", "uncached (PCD) or low-mbps regions are slow to scan; pass the fast "
+                         "ones as ps4_turbo_scan segments"}};
+    }
+
+    // a resident session dies with the connection it was created on; a NOP
+    // makes the backend notice (and reopen) a connection the payload dropped
+    if (ts.used && ts.resident) p.ping();
+    if (ts.used && ts.resident && ts.generation != p.ps4_connection_generation()) {
+        ts = ps4_turbo_session_t{};
+        if (action == "ps4_turbo_results" || action == "ps4_turbo_rescan")
+            fail("the console dropped the connection since the last turbo scan, which "
+                 "freed its results; run ps4_turbo_scan again");
+    }
+
+    if (action == "ps4_turbo_results") {
+        if (!ts.used) fail("no turbo scan session; start with ps4_turbo_scan");
+        const uint32_t start = args.value("start", 0u);
+        const uint32_t count = std::min(args.value("count", 256u), 65536u);
+        json recs = ps4_turbo_preview(p, ts, start, count);
+        return {{"pid", ts.pid}, {"total", ts.count}, {"start", start},
+                {"returned", recs.size()}, {"results", recs}};
+    }
+
+    const uint32_t limit = std::min(args.value("limit", 256u), 65536u);
+
+    if (action == "ps4_turbo_rescan") {
+        if (!ts.used) fail("ps4_turbo_rescan needs a ps4_turbo_scan first");
+        const uint8_t ct = ps4_cmptype_arg(args);
+        auto data = scan_cmp_needs_value(ct) ? ps4_value_bytes(args, ts.valtype, ct)
+                                             : std::vector<uint8_t>{};
+        std::vector<uint8_t> mask;
+        if (ts.valtype == kValArrBytes && args.contains("mask_hex"))
+            mask = hex_decode(args.at("mask_hex").get<std::string>());
+        uint32_t flags = ts.flags & (kTsServerResident | kTsFloatSimple | kTsFloatExact |
+                                     kTsFloatExponentMask);
+        if (ts.flags & kTsUseAliasing) flags |= kTsRescanAliasing;
+        if (ts.resident) flags |= kTsServerResident;
+        else flags &= ~kTsServerResident;
+        runtime::backend_ps4_t::ps4_turbo_result_t res;
+        auto io = p.ps4_turbo_count(ts.pid, ts.base, ts.valtype, ct, flags, data, mask,
+                                    ts.hits, res);
+        if (!io.ok) fail("ps4_turbo_rescan failed (error " + std::to_string(io.error) + ")");
+        ts.count = res.count;
+        ++ts.passes;
+        if (!ts.resident) ts.hits = std::move(res.hits);
+        return {{"rescanned", true}, {"pid", ts.pid}, {"pass", ts.passes},
+                {"count", ts.count}, {"resident", ts.resident},
+                {"results", ps4_turbo_preview(p, ts, 0, limit)},
+                {"truncated", ts.count > limit}};
+    }
+
+    if (action == "ps4_turbo_scan") {
+        runtime::backend_ps4_t::ps4_turbo_caps_t caps;
+        if (!p.ps4_turbo_caps(caps).ok)
+            fail("payload has no Turbo Scan; use ps4_scan instead");
+        runtime::backend_ps4_t::ps4_turbo_start_t req;
+        req.pid = ps4_pid_arg(args);
+        req.valtype = ps4_valtype_arg(args);
+        req.cmptype = args.contains("compare") ? ps4_cmptype_arg(args) : kCmpExact;
+        req.alignment = static_cast<uint8_t>(args.value("alignment", 0u));
+        if (scan_cmp_needs_value(req.cmptype))
+            req.data = ps4_value_bytes(args, req.valtype, req.cmptype);
+        if (req.valtype == kValArrBytes && args.contains("mask_hex"))
+            req.mask = hex_decode(args.at("mask_hex").get<std::string>());
+
+        const bool unknown = req.cmptype == kCmpUnknown || req.cmptype == kCmpUnknownLow;
+        const bool snapshot = args.value("snapshot", unknown && !scan_cmp_needs_value(req.cmptype));
+        if (snapshot && !(caps.engines & kTseSnapshot))
+            fail("payload does not advertise snapshot scans");
+        const bool resident = args.value("resident", true) && (caps.engines & kTseServerResident);
+        if (resident) req.flags |= kTsServerResident;
+        if (args.value("aliasing", true) && (caps.engines & kTseAliasing)) req.flags |= kTsUseAliasing;
+        if (args.value("parallel", true) && (caps.engines & kTseParallelCompare))
+            req.flags |= kTsParallelCompare;
+        req.flags |= ps4_turbo_float_flags(args, req.valtype, caps.engines);
+        if (snapshot) {
+            req.flags |= kTsSnapshot;
+            if (args.value("keep_first", false) && (caps.engines & kTseSnapshotFirst))
+                req.flags |= kTsSnapshotKeepFirst;
+            if (args.value("keep_previous", true) && (caps.engines & kTseSnapshotPrevious))
+                req.flags |= kTsSnapshotKeepPrevious;
+            if (args.value("include_zeros", false)) req.flags |= kTsSnapshotIncludeZeros;
+        }
+
+        if (args.contains("regions")) {
+            if (!(caps.engines & kTseSnapshotSegments))
+                fail("payload does not advertise segmented scans; pass addr+len");
+            if (!snapshot && !resident) fail("regions needs a resident or snapshot scan");
+            req.segments = ps4_turbo_segments_for(p, req.pid, args.at("regions").get<std::string>());
+        } else {
+            req.addr = parse_addr(args, "addr");
+            req.len = static_cast<uint32_t>(parse_addr(args, "len"));
+        }
+
+        runtime::backend_ps4_t::ps4_turbo_result_t res;
+        auto io = p.ps4_turbo_start(req, res);
+        if (!io.ok) {
+            ts = ps4_turbo_session_t{};
+            if (io.error == 14)
+                fail("ps4_turbo_scan: too many hits for the resident store (256 MiB); "
+                     "narrow the range, add a value, or use snapshot:true");
+            fail("ps4_turbo_scan failed (error " + std::to_string(io.error) +
+                 (p.ps4_authed() ? ")" : "; Turbo Scan needs auth bit 1 - ps4_auth)"));
+        }
+        if (res.snapshot && !res.snapshot_ok) {
+            ts = ps4_turbo_session_t{};
+            fail("ps4_turbo_scan: the console could not build the snapshot (out of RAM/disk? "
+                 "see ps4_turbo_config)");
+        }
+        ts = ps4_turbo_session_t{};
+        ts.used = true;
+        ts.pid = req.pid;
+        ts.base = req.segments.empty() ? req.addr : req.segments.front().addr;
+        ts.valtype = req.valtype;
+        ts.vlen = scan_value_size(req.valtype)
+                      ? scan_value_size(req.valtype)
+                      : static_cast<uint32_t>(req.data.size());
+        ts.flags = req.flags;
+        ts.resident = res.resident;
+        ts.snapshot = res.snapshot;
+        ts.count = res.count;
+        ts.passes = 1;
+        ts.generation = p.ps4_connection_generation();
+        ts.hits = std::move(res.hits);
+        json j = {{"first_scan", true}, {"pid", ts.pid}, {"count", ts.count},
+                  {"resident", ts.resident}, {"snapshot", ts.snapshot},
+                  {"flags", req.flags}, {"segments", req.segments.size()},
+                  {"results", ps4_turbo_preview(p, ts, 0, limit)},
+                  {"truncated", ts.count > limit},
+                  {"note", "narrow with ps4_turbo_rescan {compare, value}; page with "
+                           "ps4_turbo_results {start,count}; free with ps4_turbo_end"}};
+        if (res.snapshot) {
+            j["slots"] = res.slot_count;
+            j["bytes"] = res.total_bytes;
+        }
+        return j;
+    }
+
+    if (action == "ps4_write_multi") {
+        const uint32_t pid = ps4_pid_arg(args);
+        if (!args.contains("writes") || !args.at("writes").is_array() || args.at("writes").empty())
+            fail("ps4_write_multi requires writes: [{addr, hex} | {addr, value, value_type}]");
+        std::vector<runtime::backend_ps4_t::ps4_write_entry_t> writes;
+        for (const auto& w : args.at("writes")) {
+            if (!w.is_object()) fail("each write must be an object");
+            runtime::backend_ps4_t::ps4_write_entry_t e;
+            e.addr = parse_addr(w, "addr");
+            if (w.contains("hex")) {
+                e.bytes = hex_decode(w.at("hex").get<std::string>());
+            } else {
+                const uint8_t vt = ps4_valtype_arg(w);
+                e.bytes = ps4_value_bytes(w, vt, kCmpExact);
+            }
+            if (e.bytes.empty()) fail("write at " + addr_hex_str(e.addr) + " has no bytes");
+            writes.push_back(std::move(e));
+        }
+        if (writes.size() > kWriteMultiMaxCount) fail("ps4_write_multi: at most 65535 writes");
+        const bool want_status = args.value("status", true);
+        std::vector<uint8_t> status;
+        auto io = p.ps4_write_multi(pid, writes, want_status, status);
+        if (!io.ok) {
+            if (io.error == 7) fail("ps4_write_multi: at least one write failed verification");
+            fail("ps4_write_multi failed (error " + std::to_string(io.error) +
+                 "; needs payload capability 1.0+, have '" + p.ps4_capability_level() + "')");
+        }
+        json failed = json::array();
+        for (size_t i = 0; i < status.size(); ++i) {
+            if (status[i] == kWriteStatusOk) continue;
+            const char* why = status[i] == kWriteStatusInvalid ? "invalid"
+                            : status[i] == kWriteStatusVerifyFailed ? "verify_failed"
+                            : status[i] == kWriteStatusRwFailed ? "rw_failed" : "unknown";
+            failed.push_back({{"index", i}, {"addr", writes[i].addr},
+                              {"addr_hex", addr_hex_str(writes[i].addr)},
+                              {"status", status[i]}, {"reason", why}});
+        }
+        return {{"pid", pid}, {"count", writes.size()}, {"bytes", io.bytes},
+                {"ok", failed.empty()}, {"failed", failed},
+                {"note", "non-atomic: each entry is written and read back independently"}};
+    }
+
+    fail("unknown turbo action");
+}
+
 uint64_t* ps4_reg_ptr(runtime::thread_context_t& c, const std::string& n) {
     if (n == "rip") return &c.rip;
     if (n == "rsp") return &c.rsp;
@@ -554,37 +971,6 @@ uint64_t* ps4_reg_ptr(runtime::thread_context_t& c, const std::string& n) {
     return nullptr;
 }
 
-json slots_json(const std::vector<runtime::backend_ps4_t::ps4_slot_t>& slots, bool wp) {
-    json arr = json::array();
-    for (const auto& s : slots) {
-        json o = {{"addr", s.addr}, {"addr_hex", addr_hex_str(s.addr)},
-                  {"index", s.index}, {"armed", s.armed}};
-        if (wp) { o["len"] = s.len; o["type"] = s.type; }
-        arr.push_back(std::move(o));
-    }
-    return arr;
-}
-
-json ps4_status_json(runtime::backend_ps4_t& p) {
-    return {{"attached", p.ps4_debug_attached()},
-            {"pid", p.ps4_debug_pid()},
-            {"connected", p.connected()},
-            {"lost", p.lost()},
-            {"lost_reason", p.lost_reason()},
-            {"drops", p.drop_count()},
-            {"fw", p.fw_string()},
-            {"authed", p.ps4_authed()},
-            {"pending_events", p.ps4_pending_events()},
-            {"events_received", p.ps4_events_received()},
-            {"events_dropped", p.ps4_events_dropped()},
-            {"event_queue_cap", runtime::backend_ps4_t::kMaxQueuedEvents},
-            {"breakpoints", p.ps4_breakpoints().size()},
-            {"watchpoints", p.ps4_watchpoints().size()},
-            {"endpoint", runtime::registry_ps4_endpoint()},
-            {"branding", p.branding()},
-            {"backend", "PS4"}};
-}
-
 json tool_debugger_ps4(const std::string& action, const json& args) {
     if (action == "ps4_status") {
         // also answers while the connection is down (connected=false)
@@ -594,6 +980,52 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
     auto& p = need_ps4();
 
+    if (action.rfind("ps4_turbo_", 0) == 0 || action == "ps4_write_multi")
+        return tool_ps4_turbo(action, args, p);
+
+    if (action == "ps4_modules") {
+        const uint32_t pid = ps4_pid_arg(args);
+        std::vector<runtime::module_info_t> mods;
+        auto io = p.ps4_modules(pid, mods);
+        if (!io.ok) {
+            if (io.error == 100)
+                fail("ps4_modules needs the NetVar1337 ps4debug-NG fork (CMD_PROC_MODULES); "
+                     "target.modules works on any payload");
+            fail("ps4_modules failed (error " + std::to_string(io.error) + ")");
+        }
+        json arr = json::array();
+        for (const auto& m : mods)
+            arr.push_back({{"name", m.name}, {"path", m.path}, {"base", static_cast<uint64_t>(m.base)},
+                           {"base_hex", addr_hex_str(m.base)}, {"size", m.size}});
+        return {{"pid", pid}, {"count", mods.size()}, {"modules", arr}};
+    }
+    if (action == "ps4_snapshot") {
+        const uint32_t pid = ps4_pid_arg(args);
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = parse_addr(args, "len");
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("ps4_snapshot requires output 'path'");
+        const std::string path = args.at("path").get<std::string>();
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) fail("cannot create " + path);
+        auto io = p.ps4_snapshot(pid, addr, len, [&](const uint8_t* d, size_t n) {
+            out.write(reinterpret_cast<const char*>(d), static_cast<std::streamsize>(n));
+            return static_cast<bool>(out);
+        });
+        out.close();
+        if (!io.ok) {
+            std::remove(path.c_str());
+            if (io.error == 100)
+                fail("ps4_snapshot needs the NetVar1337 ps4debug-NG fork (CMD_PROC_SNAPSHOT); "
+                     "use memory.read or target.ps4_dump_module instead");
+            if (io.error == 2)
+                fail("ps4_snapshot: range is not fully mapped and readable (target.regions)");
+            fail("ps4_snapshot failed after " + std::to_string(io.bytes) + " bytes (error " +
+                 std::to_string(io.error) + ")");
+        }
+        return {{"pid", pid}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                {"bytes", io.bytes}, {"path", path}};
+    }
     if (action == "ps4_attach") {
         const uint32_t pid = ps4_pid_arg(args);
         std::string err;
@@ -1107,7 +1539,30 @@ json tool_debugger(const json& args) {
         d.detach();
         return {{"attached", false}, {"debugger", "user"}, {"was_attached", was}};
     }
-    if (action.rfind("ps4_", 0) == 0) return tool_debugger_ps4(action, args);
+    if (action.rfind("ps4_", 0) == 0) {
+        // append the console's own status word (CMD_ERR_* from the
+        // NetVar1337 fork, CMD_DATA_NULL, ...) to failures so callers see
+        // why, and say when the payload dropped and the backend reconnected
+        auto* p4 = runtime::registry_ps4();
+        uint64_t gen = 0;
+        if (p4) {
+            p4->ps4_take_last_status();
+            gen = p4->ps4_connection_generation();
+        }
+        try {
+            return tool_debugger_ps4(action, args);
+        } catch (const std::runtime_error& ex) {
+            std::string msg = ex.what();
+            if (p4) {
+                if (const char* n = runtime::ps4::status_name(p4->ps4_take_last_status()); n[0])
+                    msg += std::string(" [console: ") + n + "]";
+                if (p4->ps4_connection_generation() != gen)
+                    msg += " [the console dropped the connection; reconnected - debug and "
+                           "turbo scan sessions were reset]";
+            }
+            throw std::runtime_error(msg);
+        }
+    }
     if (action == "status") {
         auto* p = runtime::registry_ps4();
         json out;

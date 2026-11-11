@@ -1,0 +1,14 @@
+{
+  "name": "reverse-slop-e2e",
+  "private": true,
+  "version": "0.1.1",
+  "type": "module",
+  "description": "E2E driver: real engine + SlopTarget fixture + real UI (screenshots)",
+  "scripts": {
+    "smoke": "node run.mjs smoke",
+    "screenshots": "node run.mjs screenshots"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

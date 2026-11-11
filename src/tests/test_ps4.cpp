@@ -206,6 +206,38 @@ struct fake_ps4_server_t {
         }
     }
 
+    // NetVar1337 fork behaviour
+    bool fork_ext = true;          // CMD_PROC_MODULES / CMD_PROC_SNAPSHOT present
+    int guard_rejects = 0;         // requests the fork's datalen guard refused
+    uint32_t last_guard_cmd = 0;
+    int commands_seen = 0;
+    int module_requests = 0;
+
+    // bulk write (0xBDAACC04) state
+    int write_multi_calls = 0;
+    uint32_t last_write_multi_count = 0;
+    uint64_t write_deny_addr = 0;   // entries at this address report verify_failed
+
+    // Turbo Scan state (one session, like the payload's per-connection slot)
+    struct turbo_rec_t {
+        uint64_t addr = 0;
+        std::vector<uint8_t> cur, prev, first;
+    };
+    bool turbo_supported = true;
+    bool turbo_used = false;
+    bool turbo_snapshot = false;
+    bool turbo_has_first = false;
+    uint32_t turbo_vlen = 0;
+    std::vector<turbo_rec_t> turbo_recs;
+    SOCKET turbo_owner = INVALID_SOCKET;
+    uint32_t last_turbo_flags = 0;
+    uint32_t last_turbo_nseg = 0;
+    size_t turbo_resident_cap = 1u << 20;   // shrink to force the overflow path
+    uint32_t turbo_cancel_pid = 0;
+    int turbo_end_calls = 0;
+    uint32_t turbo_cfg_mb = 0;
+    std::string turbo_cfg_dir;
+
     ps4::debug_event_packet_t make_event(uint32_t lwpid, uint32_t status, const char* name,
                                          uint64_t rip, uint64_t dr6) {
         std::lock_guard lk(mu);
@@ -297,6 +329,18 @@ struct fake_ps4_server_t {
             }
         }
         if (th.joinable()) th.join();
+        std::vector<std::thread> ths;
+        {
+            std::lock_guard lk(conn_mu);
+            for (SOCKET c : conn_socks) {
+                ::shutdown(c, SD_BOTH);
+                closesocket(c);
+            }
+            conn_socks.clear();
+            ths.swap(conn_threads);
+        }
+        for (auto& t : ths)
+            if (t.joinable()) t.join();
     }
 
     ~fake_ps4_server_t() { shutdown(); }
@@ -327,8 +371,50 @@ private:
             if (select(0, &rset, nullptr, nullptr, &tv) <= 0) continue;
             SOCKET c = accept(listen_fd, nullptr, nullptr);
             if (c == INVALID_SOCKET) continue;
-            handle_conn(c);
-            closesocket(c);
+            // one thread per connection: Turbo Scan CANCEL arrives on a
+            // second connection while the first is still open
+            std::lock_guard lk(conn_mu);
+            conn_socks.push_back(c);
+            conn_threads.emplace_back([this, c] { handle_conn(c); });
+        }
+    }
+
+    std::mutex conn_mu;
+    std::vector<SOCKET> conn_socks;
+    std::vector<std::thread> conn_threads;
+
+    // the NetVar1337 fork's cmd_guards.c table: requests shorter than this
+    // get CMD_DATA_NULL before dispatch (connection kept). Mirroring it makes
+    // every test check the backend's request sizes against the fork
+    static uint32_t fork_min_datalen(uint32_t cmd) {
+        switch (cmd) {
+        case ps4::CMD_PROC_READ: case ps4::CMD_PROC_WRITE: case ps4::CMD_PROC_FREE:
+        case ps4::CMD_PROC_ALLOC_HINTED:                        return 16;
+        case ps4::CMD_PROC_MAPS: case ps4::CMD_PROC_INTALL: case ps4::CMD_PROC_INFO:
+        case ps4::CMD_PROC_MODULES:                             return 4;
+        case ps4::CMD_PROC_CALL:                                return 68;
+        case ps4::CMD_PROC_ELF: case ps4::CMD_PROC_ELF_RPC:
+        case ps4::CMD_PROC_ALLOC: case ps4::CMD_PROC_AUTH:
+        case ps4::CMD_PROC_SCAN_GET:                            return 8;
+        case ps4::CMD_PROC_PROTECT: case ps4::CMD_PROC_DISASM_REGION:
+        case ps4::CMD_PROC_EXTRACT_CODE_XREFS: case ps4::CMD_PROC_SNAPSHOT: return 20;
+        case ps4::CMD_PROC_SCAN:                                return 10;
+        case ps4::CMD_PROC_FIND_XREFS_TO: case ps4::CMD_PROC_READ_STACK: return 24;
+        case ps4::CMD_PROC_ASSEMBLE: case ps4::CMD_PROC_WRITE_MULTI: return 12;
+        case ps4::CMD_PROC_SCAN_AOB:                            return 22;
+        case ps4::CMD_PROC_SCAN_AOB_MULTI:                      return 21;
+        case ps4::CMD_PROC_SCAN_START:                          return 23;
+        case ps4::CMD_PROC_SCAN_COUNT:                          return 18;
+        case ps4::CMD_DEBUG_PROCESS_STOP: case ps4::CMD_DEBUG_SETREGS:
+        case ps4::CMD_DEBUG_SETFPREGS: case ps4::CMD_DEBUG_SETDBREGS:
+        case ps4::CMD_DEBUG_SETFSGSBASE: case ps4::CMD_CONSOLE_NOTIFY: return 8;
+        case ps4::CMD_DEBUG_ATTACH: case ps4::CMD_DEBUG_SUSPEND: case ps4::CMD_DEBUG_RESUME:
+        case ps4::CMD_DEBUG_GETREGS: case ps4::CMD_DEBUG_GETFPREGS: case ps4::CMD_DEBUG_GETDBREGS:
+        case ps4::CMD_DEBUG_GETFSGSBASE: case ps4::CMD_DEBUG_CONTINUE:
+        case ps4::CMD_DEBUG_THREAD_INFO: case ps4::CMD_CONSOLE_PRINT:  return 4;
+        case ps4::CMD_DEBUG_SET_BREAKPOINT:                     return 16;
+        case ps4::CMD_DEBUG_SET_WATCHPOINT:                     return 24;
+        default:                                                return 0;
         }
     }
 
@@ -339,15 +425,15 @@ private:
             std::lock_guard lk(mu);
             ++connections;
         }
-        while (!stop_flag) {
-            ps4::packet_header_t hdr{};
-            if (!recv_all(c, &hdr, sizeof(hdr))) break;
-            if (hdr.magic != ps4::kPacketMagic) break;
-            std::vector<uint8_t> body(hdr.datalen);
-            if (hdr.datalen > 0 && !recv_all(c, body.data(), hdr.datalen)) break;
-            const bool ok = dispatch(c, hdr.cmd, body.data(), hdr.datalen);
-            tl_budget = -1;
-            if (!ok) break;
+        handle_conn_loop(c);
+        {
+            // free_client frees the dropped client's Turbo Scan session
+            std::lock_guard lk(mu);
+            if (turbo_owner == c) {
+                turbo_used = false;
+                turbo_recs.clear();
+                turbo_owner = INVALID_SOCKET;
+            }
         }
         // the payload keeps debug + auth state per connection: a dropped
         // client loses its debuggee, its breakpoints and its auth bits
@@ -361,6 +447,35 @@ private:
             ::shutdown(event_fd, SD_BOTH);
             closesocket(event_fd);
             event_fd = INVALID_SOCKET;
+        }
+        // like free_client: a failed handler closes the client. Shut the
+        // socket down so the backend sees the hang-up; the handle itself is
+        // closed in shutdown()
+        ::shutdown(c, SD_BOTH);
+    }
+
+    void handle_conn_loop(SOCKET c) {
+        while (!stop_flag) {
+            ps4::packet_header_t hdr{};
+            if (!recv_all(c, &hdr, sizeof(hdr))) return;
+            if (hdr.magic != ps4::kPacketMagic) return;
+            if (hdr.datalen > ps4::kMaxDatalen) { send_u32(c, ps4::CMD_TOO_MUCH_DATA); return; }
+            if (hdr.datalen < fork_min_datalen(hdr.cmd)) {
+                std::lock_guard lk(mu);
+                ++guard_rejects;
+                last_guard_cmd = hdr.cmd;
+                send_u32(c, ps4::CMD_DATA_NULL);
+                continue;   // the fork rejects before reading a body
+            }
+            std::vector<uint8_t> body(hdr.datalen);
+            if (hdr.datalen > 0 && !recv_all(c, body.data(), hdr.datalen)) return;
+            {
+                std::lock_guard lk(mu);
+                ++commands_seen;
+            }
+            const bool ok = dispatch(c, hdr.cmd, body.data(), hdr.datalen);
+            tl_budget = -1;
+            if (!ok) return;
         }
     }
 
@@ -1146,15 +1261,485 @@ private:
             std::memcpy(&last_fsgs_gs, buf + 8, 8);
             return send_u32(c, ps4::CMD_SUCCESS);
         }
+        case ps4::CMD_PROC_MODULES: {
+            {
+                std::lock_guard lk(mu);
+                ++module_requests;
+                if (!fork_ext) {   // upstream: unknown command -> CMD_ERROR + drop
+                    send_u32(c, ps4::CMD_ERROR);
+                    return false;
+                }
+            }
+            const auto* mp = reinterpret_cast<const ps4::proc_maps_packet_t*>(body);
+            if (static_cast<int32_t>(mp->pid) <= 0 || (mp->pid != kFakePid && mp->pid != 42)) {
+                send_u32(c, ps4::CMD_ERR_PID);
+                return false;      // the fork's handler returns 1 -> client dropped
+            }
+            std::vector<ps4::proc_module_entry_t> out;
+            {
+                std::lock_guard lk(mu);
+                std::vector<ps4::vm_map_entry_t> pm = maps;
+                if (mp->pid == 42) {   // same per-pid view as CMD_PROC_MAPS
+                    ps4::vm_map_entry_t m{};
+                    std::strncpy(m.name, "/system/privileged/SceShellCore", sizeof(m.name) - 1);
+                    m.start = 0x800000;
+                    m.end   = 0x900000;
+                    m.prot  = ps4::kVmProtRead | ps4::kVmProtExec;
+                    pm = {m};
+                }
+                for (const auto& m : pm) {
+                    if (!m.name[0]) continue;
+                    auto it = std::find_if(out.begin(), out.end(), [&](const auto& e) {
+                        return std::strncmp(e.name, m.name, sizeof(e.name)) == 0;
+                    });
+                    if (it == out.end()) {
+                        ps4::proc_module_entry_t e{};
+                        std::memcpy(e.name, m.name, sizeof(e.name));
+                        e.base = m.start;
+                        e.size = m.end - m.start;
+                        out.push_back(e);
+                    } else {
+                        const uint64_t lo = std::min(it->base, m.start);
+                        const uint64_t hi = std::max(it->base + it->size, m.end);
+                        it->base = lo;
+                        it->size = hi - lo;
+                    }
+                }
+            }
+            const uint32_t n = static_cast<uint32_t>(out.size());
+            return send_u32(c, ps4::CMD_SUCCESS) && send_u32(c, n) &&
+                   (n == 0 || send_all(c, out.data(), n * sizeof(out[0])));
+        }
+
+        case ps4::CMD_PROC_SNAPSHOT: {
+            {
+                std::lock_guard lk(mu);
+                if (!fork_ext) {
+                    send_u32(c, ps4::CMD_ERROR);
+                    return false;
+                }
+            }
+            const auto sp = *reinterpret_cast<const ps4::proc_snapshot_packet_t*>(body);
+            if (static_cast<int32_t>(sp.pid) <= 0 || sp.pid != kFakePid) {
+                send_u32(c, ps4::CMD_ERR_PID);
+                return false;
+            }
+            if (sp.length == 0 || sp.address + sp.length < sp.address) {
+                send_u32(c, ps4::CMD_ERR_RANGE);
+                return false;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            for (uint64_t off = 0; off < sp.length; off += ps4::kSnapshotChunk) {
+                const uint32_t n = static_cast<uint32_t>(
+                    std::min<uint64_t>(ps4::kSnapshotChunk, sp.length - off));
+                auto chunk = mem_read(sp.address + off, n);
+                if (!send_all(c, chunk.data(), chunk.size())) return false;
+            }
+            return true;
+        }
+
+        case ps4::CMD_PROC_WRITE_MULTI: {
+            if (bodylen < sizeof(ps4::proc_write_multi_packet_t))
+                return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* mp = reinterpret_cast<const ps4::proc_write_multi_packet_t*>(body);
+            if (mp->count > ps4::kWriteMultiMaxCount) return send_u32(c, ps4::CMD_ERROR), true;
+            const bool want_status = (mp->flags & ps4::kWriteMultiFlagStatus) != 0;
+            uint64_t deny;
+            {
+                std::lock_guard lk(mu);
+                ++write_multi_calls;
+                last_write_multi_count = mp->count;
+                deny = write_deny_addr;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> status(mp->count, ps4::kWriteStatusOk);
+            bool any_failed = false;
+            for (uint32_t i = 0; i < mp->count; ++i) {
+                ps4::proc_write_multi_entry_t e{};
+                if (!recv_all(c, &e, sizeof(e))) return false;
+                if (e.length > ps4::kWriteMultiMaxEntry) return send_u32(c, ps4::CMD_ERROR), false;
+                std::vector<uint8_t> data(e.length);
+                if (e.length && !recv_all(c, data.data(), e.length)) return false;
+                if (mp->pid != kFakePid) {
+                    status[i] = ps4::kWriteStatusInvalid;
+                } else if (deny && e.address == deny) {
+                    status[i] = ps4::kWriteStatusVerifyFailed;
+                } else {
+                    mem_write(e.address, data.data(), data.size());
+                }
+                if (status[i] != ps4::kWriteStatusOk) any_failed = true;
+            }
+            if (want_status && !status.empty() && !send_all(c, status.data(), status.size()))
+                return false;
+            return send_u32(c, !want_status && any_failed ? ps4::CMD_ERROR : ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_CAPS: {
+            bool sup;
+            { std::lock_guard lk(mu); sup = turbo_supported; }
+            if (!sup) return send_u32(c, ps4::CMD_ERROR), true;
+            ps4::turbo_caps_response_t r{};
+            r.version = 1;
+            r.engines = 0xFFF;
+            r.max_threads = 4;
+            return send_u32(c, ps4::CMD_SUCCESS) && send_all(c, &r, sizeof(r));
+        }
+
+        case ps4::CMD_TURBO_START: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (bodylen < sizeof(ps4::turbo_start_packet_t)) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto sp = *reinterpret_cast<const ps4::turbo_start_packet_t*>(body);
+            const bool snapshot = (sp.flags & ps4::kTsSnapshot) != 0;
+            const bool resident = (sp.flags & ps4::kTsServerResident) != 0;
+            if (sp.compareType > 12 || (sp.lenData == 0 && !snapshot))
+                return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const bool needs_val = ps4::scan_cmp_needs_value(sp.compareType);
+            const uint32_t vlen = ps4::scan_value_size(sp.valueType)
+                                      ? ps4::scan_value_size(sp.valueType) : sp.lenData;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> pattern(needs_val ? sp.lenData : 0);
+            if (!pattern.empty() && !recv_all(c, pattern.data(), pattern.size())) return false;
+            std::vector<uint8_t> mask;
+            if (sp.valueType == ps4::kValArrBytes) {
+                mask.resize(vlen);
+                if (!recv_all(c, mask.data(), vlen)) return false;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<ps4::turbo_snap_segment_t> segs;
+            const bool use_segs = (sp.flags & ps4::kTsSnapshotSegments) && (snapshot || resident);
+            if (use_segs) {
+                uint32_t n = 0;
+                if (!recv_all(c, &n, 4)) return false;
+                segs.resize(n);
+                if (n && !recv_all(c, segs.data(), n * sizeof(ps4::turbo_snap_segment_t))) return false;
+            } else {
+                segs.push_back({sp.address, sp.length});
+            }
+            {
+                std::lock_guard lk(mu);
+                last_turbo_flags = sp.flags;
+                last_turbo_nseg = static_cast<uint32_t>(segs.size());
+                if (turbo_cancel_pid == sp.pid) turbo_cancel_pid = 0;
+            }
+            const uint64_t step = sp.alignment ? sp.alignment : vlen;
+
+            if (snapshot) {
+                uint64_t slots = 0, total = 0;
+                for (const auto& g : segs) {
+                    total += g.length;
+                    if (g.length >= vlen) slots += (g.length - vlen) / step + 1;
+                }
+                ps4::turbo_snap_plan_t plan{slots, total};
+                if (!send_all(c, &plan, sizeof(plan))) return false;
+                if (!send_all(c, &total, 8)) return false;   // one progress word
+                const uint64_t sentinel = ps4::kTurboSentinel;
+                if (!send_all(c, &sentinel, 8)) return false;
+                const bool zeros = (sp.flags & ps4::kTsSnapshotIncludeZeros) != 0;
+                std::vector<turbo_rec_t> recs;
+                for (const auto& g : segs) {
+                    for (uint64_t a = 0; a + vlen <= g.length; a += step) {
+                        turbo_rec_t r;
+                        r.addr = g.address + a;
+                        r.cur = mem_read(r.addr, vlen);
+                        if (!zeros && std::all_of(r.cur.begin(), r.cur.end(), [](uint8_t b) { return b == 0; }))
+                            continue;
+                        r.prev = r.cur;
+                        r.first = r.cur;
+                        recs.push_back(std::move(r));
+                    }
+                }
+                ps4::turbo_snap_summary_t sum{1, recs.size()};
+                {
+                    std::lock_guard lk(mu);
+                    turbo_used = true;
+                    turbo_owner = c;
+                    turbo_snapshot = true;
+                    turbo_has_first = (sp.flags & ps4::kTsSnapshotKeepFirst) != 0;
+                    turbo_vlen = vlen;
+                    turbo_recs = std::move(recs);
+                }
+                return send_all(c, &sum, sizeof(sum)) && send_u32(c, ps4::CMD_SUCCESS);
+            }
+
+            std::vector<turbo_rec_t> hits;
+            for (const auto& g : segs) {
+                for (uint64_t a = 0; a + vlen <= g.length; a += step) {
+                    turbo_rec_t r;
+                    r.addr = g.address + a;
+                    r.cur = mem_read(r.addr, vlen);
+                    if (!turbo_match(sp.compareType, r.cur, r.cur, pattern, mask)) continue;
+                    r.prev = r.cur;
+                    hits.push_back(std::move(r));
+                }
+            }
+            if (resident) {
+                size_t cap;
+                { std::lock_guard lk(mu); cap = turbo_resident_cap; }
+                if (hits.size() <= cap) {
+                    ps4::turbo_resident_summary_t sum{1, hits.size()};
+                    {
+                        std::lock_guard lk(mu);
+                        turbo_used = true;
+                        turbo_owner = c;
+                        turbo_snapshot = false;
+                        turbo_has_first = false;
+                        turbo_vlen = vlen;
+                        turbo_recs = hits;
+                    }
+                    return send_all(c, &sum, sizeof(sum)) && send_u32(c, ps4::CMD_SUCCESS);
+                }
+                {
+                    std::lock_guard lk(mu);
+                    turbo_used = false;
+                    turbo_recs.clear();
+                }
+                ps4::turbo_resident_summary_t sum{0, 0};
+                if (!send_all(c, &sum, sizeof(sum))) return false;
+                if (use_segs) {
+                    const uint64_t sentinel = ps4::kTurboSentinel;
+                    return send_all(c, &sentinel, 8) && send_u32(c, ps4::CMD_SUCCESS);
+                }
+            }
+            // streamed runs relative to sp.address, split across two blocks
+            std::vector<uint8_t> blocks[2];
+            for (size_t i = 0; i < hits.size(); ++i) {
+                auto& b = blocks[i % 2 == 0 ? 0 : 1];
+                const uint32_t off = static_cast<uint32_t>(hits[i].addr - sp.address);
+                b.insert(b.end(), reinterpret_cast<const uint8_t*>(&off),
+                         reinterpret_cast<const uint8_t*>(&off) + 4);
+                b.insert(b.end(), hits[i].cur.begin(), hits[i].cur.end());
+            }
+            for (auto& b : blocks) {
+                if (b.empty()) continue;
+                const uint64_t blen = b.size();
+                if (!send_all(c, &blen, 8) || !send_all(c, b.data(), b.size())) return false;
+            }
+            const uint64_t sentinel = ps4::kTurboSentinel;
+            return send_all(c, &sentinel, 8) && send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_COUNT: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (bodylen < sizeof(ps4::turbo_count_packet_t)) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto cp = *reinterpret_cast<const ps4::turbo_count_packet_t*>(body);
+            if (cp.compareType > 12) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const bool needs_val = ps4::scan_cmp_needs_value(cp.compareType);
+            const bool needs_prev = ps4::scan_cmp_needs_previous(cp.compareType);
+            const uint32_t vlen = ps4::scan_value_size(cp.valueType)
+                                      ? ps4::scan_value_size(cp.valueType) : cp.lenData;
+            if (vlen == 0 || vlen > 0x1000) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            std::vector<uint8_t> pattern(needs_val ? cp.lenData : 0);
+            if (!pattern.empty() && !recv_all(c, pattern.data(), pattern.size())) return false;
+            std::vector<uint8_t> mask;
+            if (cp.valueType == ps4::kValArrBytes) {
+                mask.resize(vlen);
+                if (!recv_all(c, mask.data(), vlen)) return false;
+            }
+            {
+                std::lock_guard lk(mu);
+                last_turbo_flags = cp.flags;
+            }
+            if (cp.flags & ps4::kTsServerResident) {
+                std::vector<turbo_rec_t> recs;
+                { std::lock_guard lk(mu); recs = turbo_recs; }
+                std::vector<turbo_rec_t> keep;
+                for (auto& r : recs) {
+                    auto now = mem_read(r.addr, vlen);
+                    if (!turbo_match(cp.compareType, now, r.cur, pattern, mask)) continue;
+                    r.prev = r.cur;
+                    r.cur = std::move(now);
+                    keep.push_back(std::move(r));
+                }
+                const uint64_t n = keep.size();
+                { std::lock_guard lk(mu); turbo_recs = std::move(keep); }
+                const uint64_t progress = 1, sentinel = ps4::kTurboSentinel;
+                return send_all(c, &progress, 8) && send_all(c, &sentinel, 8) &&
+                       send_all(c, &n, 8) && send_u32(c, ps4::CMD_SUCCESS);
+            }
+            // client-driven chunk stream, like SCAN_COUNT
+            const size_t esz = 4 + (needs_prev ? vlen : 0);
+            for (;;) {
+                uint32_t clen = 0;
+                if (!recv_all(c, &clen, 4)) return false;
+                if (clen == 0xFFFFFFFFu) break;
+                std::vector<uint8_t> chunk(clen);
+                if (clen && !recv_all(c, chunk.data(), clen)) return false;
+                std::vector<uint8_t> res;
+                for (size_t off = 0; off + esz <= chunk.size(); off += esz) {
+                    uint32_t eo = 0;
+                    std::memcpy(&eo, chunk.data() + off, 4);
+                    const uint64_t a = cp.base_address + eo;
+                    auto now = mem_read(a, vlen);
+                    std::vector<uint8_t> prev = needs_prev
+                        ? std::vector<uint8_t>(chunk.begin() + off + 4, chunk.begin() + off + esz)
+                        : now;
+                    if (!turbo_match(cp.compareType, now, prev, pattern, mask)) continue;
+                    res.insert(res.end(), chunk.data() + off, chunk.data() + off + 4);
+                    res.insert(res.end(), now.begin(), now.end());
+                }
+                if (!res.empty()) {
+                    const uint64_t rlen = res.size();
+                    if (!send_all(c, &rlen, 8) || !send_all(c, res.data(), res.size())) return false;
+                }
+                const uint64_t s = ps4::kTurboSentinel;
+                if (!send_all(c, &s, 8)) return false;
+            }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_GET: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* gp = reinterpret_cast<const ps4::turbo_get_packet_t*>(body);
+            std::vector<turbo_rec_t> recs;
+            bool used, has_first;
+            uint32_t vlen;
+            {
+                std::lock_guard lk(mu);
+                recs = turbo_recs; used = turbo_used; has_first = turbo_has_first; vlen = turbo_vlen;
+            }
+            if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
+            if (!used) {
+                const uint32_t zero = 0;
+                return send_u32(c, zero) && send_u32(c, ps4::CMD_SUCCESS);
+            }
+            const size_t start = std::min<size_t>(gp->start_index, recs.size());
+            const size_t end = std::min<size_t>(start + gp->count, recs.size());
+            const uint32_t hdr = static_cast<uint32_t>(end - start) |
+                                 (has_first ? ps4::kTurboGetHasFirst : 0u);
+            if (!send_u32(c, hdr)) return false;
+            std::vector<uint8_t> out;
+            for (size_t i = start; i < end; ++i) {
+                const auto& r = recs[i];
+                out.insert(out.end(), reinterpret_cast<const uint8_t*>(&r.addr),
+                           reinterpret_cast<const uint8_t*>(&r.addr) + 8);
+                out.insert(out.end(), r.cur.begin(), r.cur.end());
+                out.insert(out.end(), r.prev.begin(), r.prev.end());
+                if (has_first) {
+                    auto f = r.first.empty() ? std::vector<uint8_t>(vlen, 0) : r.first;
+                    out.insert(out.end(), f.begin(), f.end());
+                }
+            }
+            if (!out.empty() && !send_all(c, out.data(), out.size())) return false;
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_END: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            {
+                std::lock_guard lk(mu);
+                turbo_used = false;
+                turbo_recs.clear();
+                ++turbo_end_calls;
+            }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_CONFIG: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (bodylen < sizeof(ps4::turbo_config_packet_t)) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            const auto* cp = reinterpret_cast<const ps4::turbo_config_packet_t*>(body);
+            if (cp->spill_path_len > 63 || sizeof(*cp) + cp->spill_path_len > bodylen)
+                return send_u32(c, ps4::CMD_DATA_NULL), true;
+            {
+                std::lock_guard lk(mu);
+                turbo_cfg_mb = cp->ram_thresh_mb;
+                turbo_cfg_dir.assign(reinterpret_cast<const char*>(body) + sizeof(*cp),
+                                     cp->spill_path_len);
+            }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_REGIONS: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            std::vector<ps4::turbo_region_info_t> out;
+            for (const auto& m : maps) {
+                if (!(m.prot & ps4::kVmProtRead)) continue;
+                ps4::turbo_region_info_t r{};
+                r.start = m.start;
+                r.end = m.end;
+                r.prot = m.prot;
+                r.flags = (m.prot & ps4::kVmProtExec) ? 1u : 0u;   // pretend code is uncached
+                r.mbps = 900;
+                out.push_back(r);
+            }
+            const uint32_t n = static_cast<uint32_t>(out.size());
+            return send_u32(c, ps4::CMD_SUCCESS) && send_u32(c, n) &&
+                   send_all(c, out.data(), out.size() * sizeof(out[0])) &&
+                   send_u32(c, ps4::CMD_SUCCESS);
+        }
+
+        case ps4::CMD_TURBO_CANCEL: {
+            if (!turbo_authed()) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            if (bodylen < 4) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            uint32_t pid = 0;
+            std::memcpy(&pid, body, 4);
+            if (pid == 0) return send_u32(c, ps4::CMD_DATA_NULL), true;
+            { std::lock_guard lk(mu); turbo_cancel_pid = pid; }
+            return send_u32(c, ps4::CMD_SUCCESS);
+        }
         }
         return send_u32(c, ps4::CMD_ERROR), true;
+    }
+
+    bool turbo_authed() {
+        std::lock_guard lk(mu);
+        return auth_ok;
+    }
+
+    std::vector<uint8_t> mem_read(uint64_t addr, uint32_t len) {
+        std::vector<uint8_t> v(len);
+        for (uint32_t i = 0; i < len; ++i) v[i] = mem_byte(addr + i);
+        return v;
+    }
+
+    static uint64_t le_u64(const std::vector<uint8_t>& b, size_t off = 0) {
+        uint64_t v = 0;
+        for (size_t i = 0; i < 8 && off + i < b.size(); ++i)
+            v |= static_cast<uint64_t>(b[off + i]) << (8 * i);
+        return v;
+    }
+
+    // unsigned little-endian compare, enough for the fake
+    static bool turbo_match(uint8_t ct, const std::vector<uint8_t>& now,
+                            const std::vector<uint8_t>& prev,
+                            const std::vector<uint8_t>& pattern,
+                            const std::vector<uint8_t>& mask) {
+        const uint64_t cur = le_u64(now), old = le_u64(prev);
+        const uint64_t pat = le_u64(pattern);
+        switch (ct) {
+        case ps4::kCmpExact:
+        case ps4::kCmpFuzzy:
+            if (!mask.empty()) {
+                for (size_t i = 0; i < now.size() && i < pattern.size(); ++i)
+                    if (mask[i] && now[i] != pattern[i]) return false;
+                return true;
+            }
+            return now == std::vector<uint8_t>(pattern.begin(), pattern.begin() +
+                                               std::min(pattern.size(), now.size()));
+        case ps4::kCmpBigger:    return cur > pat;
+        case ps4::kCmpSmaller:   return cur < pat;
+        case ps4::kCmpBetween:   return cur >= pat && cur <= le_u64(pattern, now.size());
+        case ps4::kCmpIncreased: return cur > old;
+        case ps4::kCmpDecreased: return cur < old;
+        case ps4::kCmpChanged:   return now != prev;
+        case ps4::kCmpUnchanged: return now == prev;
+        case ps4::kCmpUnknown:   return true;
+        default:                 return false;
+        }
     }
 };
 
 struct server_guard_t {
     fake_ps4_server_t srv;
     server_guard_t() { REQUIRE(srv.start()); }
-    ~server_guard_t() { srv.shutdown(); }
+    ~server_guard_t() {
+        srv.shutdown();
+        // no request may be shorter than the fork's cmd_guards.c minimum
+        if (srv.guard_rejects != 0)
+            std::printf("  fork datalen guard rejected cmd 0x%08X\n", srv.last_guard_cmd);
+        CHECK(srv.guard_rejects == 0);
+    }
 };
 
 // drop the global ps4 connection even when a REQUIRE throws mid-test
@@ -2106,7 +2691,7 @@ TEST_CASE(ps4_mcp_console_side_tooling) {
     }
 }
 
-// ===========================================================================
+// ====================================================================
 // wire fault injection, reconnect, events, slots, composites, heartbeat
 
 namespace {
@@ -3062,4 +3647,460 @@ TEST_CASE(ps4_target_icon_cache_is_bounded) {
     }
     CHECK(slop::core::mcp::detail::target_icon_cache_size() <= 256u);
     CHECK(slop::core::mcp::detail::target_icon_cache_size() >= 64u);
+}
+
+TEST_CASE(ps4_write_multi_bulk_poke) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    CHECK(b.ps4_capability_level() == "1.1");
+
+    std::vector<backend_ps4_t::ps4_write_entry_t> w(3);
+    w[0].addr = 0x7FFF00000100; w[0].bytes = {0x11, 0x22, 0x33, 0x44};
+    w[1].addr = 0x7FFF00000200; w[1].bytes = {0xAA};
+    w[2].addr = 0x7FFF00000300; w[2].bytes.assign(0x2000, 0x5C);   // multi-page entry
+    std::vector<uint8_t> status;
+    auto io = b.ps4_write_multi(kFakePid, w, true, status);
+    REQUIRE(io.ok);
+    CHECK(io.bytes == 4u + 1u + 0x2000u);
+    REQUIRE(status.size() == 3u);
+    CHECK(status[0] == ps4::kWriteStatusOk && status[1] == ps4::kWriteStatusOk &&
+          status[2] == ps4::kWriteStatusOk);
+    CHECK(g.srv.write_multi_calls == 1);       // one exchange for all three
+    CHECK(g.srv.last_write_multi_count == 3u);
+    CHECK(g.srv.mem_byte(0x7FFF00000103) == 0x44);
+    CHECK(g.srv.mem_byte(0x7FFF00000200) == 0xAA);
+    CHECK(g.srv.mem_byte(0x7FFF000022FF) == 0x5C);
+
+    // per-entry failure is reported through the status array, the rest lands
+    g.srv.write_deny_addr = 0x7FFF00000200;
+    w[0].bytes = {0x01, 0x02, 0x03, 0x04};
+    io = b.ps4_write_multi(kFakePid, w, true, status);
+    REQUIRE(io.ok);
+    REQUIRE(status.size() == 3u);
+    CHECK(status[1] == ps4::kWriteStatusVerifyFailed);
+    CHECK(status[0] == ps4::kWriteStatusOk);
+    CHECK(g.srv.mem_byte(0x7FFF00000100) == 0x01);
+
+    // without a status array a failed entry makes the call fail
+    io = b.ps4_write_multi(kFakePid, w, false, status);
+    CHECK(!io.ok);
+    CHECK(io.error == 7u);
+    CHECK(status.empty());
+
+    // caps are enforced locally so the stream never desyncs
+    std::vector<backend_ps4_t::ps4_write_entry_t> big(1);
+    big[0].addr = 0x7FFF00000000;
+    big[0].bytes.assign(ps4::kWriteMultiMaxEntry + 1, 0);
+    io = b.ps4_write_multi(kFakePid, big, true, status);
+    CHECK(!io.ok);
+    CHECK(b.ping());   // connection still in sync
+    b.disconnect();
+}
+
+TEST_CASE(ps4_turbo_scan_backend) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(b.ps4_authed());
+
+    backend_ps4_t::ps4_turbo_caps_t caps;
+    REQUIRE(b.ps4_turbo_caps(caps).ok);
+    CHECK(caps.version == 1u);
+    CHECK((caps.engines & ps4::kTseServerResident) != 0);
+
+    const auto put32 = [&](uint64_t a, uint32_t v) {
+        g.srv.mem_write(a, reinterpret_cast<const uint8_t*>(&v), 4);
+    };
+    put32(0x7FFF00000010, 100);
+    put32(0x7FFF00000020, 100);
+    put32(0x7FFF00000030, 7);
+
+    // resident known-value scan: only a count crosses the wire
+    backend_ps4_t::ps4_turbo_start_t req;
+    req.pid = kFakePid;
+    req.addr = 0x7FFF00000000;
+    req.len = 0x1000;
+    req.valtype = ps4::kValU32;
+    req.cmptype = ps4::kCmpExact;
+    req.flags = ps4::kTsServerResident | ps4::kTsUseAliasing;
+    req.data = {100, 0, 0, 0};
+    backend_ps4_t::ps4_turbo_result_t res;
+    auto io = b.ps4_turbo_start(req, res);
+    REQUIRE(io.ok);
+    CHECK(res.resident);
+    CHECK(res.count == 2u);
+    CHECK(res.hits.empty());
+    CHECK(g.srv.last_turbo_flags == (ps4::kTsServerResident | ps4::kTsUseAliasing));
+
+    std::vector<backend_ps4_t::ps4_turbo_record_t> recs;
+    REQUIRE(b.ps4_turbo_get(0, 16, 4, recs).ok);
+    REQUIRE(recs.size() == 2u);
+    CHECK(recs[0].addr == 0x7FFF00000010ull);
+    CHECK(recs[0].current == std::vector<uint8_t>({100, 0, 0, 0}));
+    CHECK(recs[0].first.empty());
+
+    // value drops in game -> narrow server-side
+    put32(0x7FFF00000020, 90);
+    io = b.ps4_turbo_count(kFakePid, req.addr, ps4::kValU32, ps4::kCmpDecreased,
+                           ps4::kTsServerResident, {}, {}, {}, res);
+    REQUIRE(io.ok);
+    CHECK(res.count == 1u);
+    REQUIRE(b.ps4_turbo_get(0, 16, 4, recs).ok);
+    REQUIRE(recs.size() == 1u);
+    CHECK(recs[0].addr == 0x7FFF00000020ull);
+    CHECK(recs[0].current == std::vector<uint8_t>({90, 0, 0, 0}));
+    CHECK(recs[0].previous == std::vector<uint8_t>({100, 0, 0, 0}));
+
+    REQUIRE(b.ps4_turbo_end().ok);
+    CHECK(g.srv.turbo_end_calls == 1);
+    REQUIRE(b.ps4_turbo_get(0, 16, 4, recs).ok);
+    CHECK(recs.empty());
+
+    // streamed (non-resident) start + client-driven count
+    req.flags = 0;
+    req.data = {90, 0, 0, 0};
+    io = b.ps4_turbo_start(req, res);
+    REQUIRE(io.ok);
+    CHECK(!res.resident);
+    REQUIRE(res.hits.size() == 1u);
+    CHECK(res.hits[0].addr == 0x7FFF00000020ull);
+    auto prev = res.hits;
+    put32(0x7FFF00000020, 95);
+    io = b.ps4_turbo_count(kFakePid, req.addr, ps4::kValU32, ps4::kCmpIncreased, 0,
+                           {}, {}, prev, res);
+    REQUIRE(io.ok);
+    REQUIRE(res.hits.size() == 1u);
+    CHECK(res.hits[0].value == std::vector<uint8_t>({95, 0, 0, 0}));
+
+    // resident overflow without segments falls back to streamed hits
+    g.srv.turbo_resident_cap = 0;
+    req.flags = ps4::kTsServerResident;
+    req.data = {95, 0, 0, 0};
+    io = b.ps4_turbo_start(req, res);
+    REQUIRE(io.ok);
+    CHECK(!res.resident);
+    CHECK(res.hits.size() == 1u);
+    // ...and with segments it is an error the caller can explain
+    req.segments = {{0x7FFF00000000, 0x800}, {0x7FFF00000800, 0x800}};
+    io = b.ps4_turbo_start(req, res);
+    CHECK(!io.ok);
+    CHECK(io.error == 14u);
+    CHECK(b.ping());
+    g.srv.turbo_resident_cap = 1u << 20;
+
+    // snapshot (unknown initial value) over two segments, keep first
+    backend_ps4_t::ps4_turbo_start_t snap;
+    snap.pid = kFakePid;
+    snap.valtype = ps4::kValU32;
+    snap.cmptype = ps4::kCmpUnknown;
+    snap.flags = ps4::kTsServerResident | ps4::kTsSnapshot | ps4::kTsSnapshotKeepFirst;
+    snap.segments = {{0x7FFF00000000, 0x20}, {0x7FFF00000020, 0x20}};
+    uint64_t progress_calls = 0;
+    io = b.ps4_turbo_start(snap, res, [&](uint64_t, uint64_t) { ++progress_calls; });
+    REQUIRE(io.ok);
+    CHECK(res.snapshot);
+    CHECK(res.snapshot_ok);
+    CHECK(res.slot_count == 16u);
+    CHECK(res.total_bytes == 0x40u);
+    CHECK(progress_calls == 1u);
+    CHECK(res.count == 3u);   // the three non-zero dwords
+    CHECK(g.srv.last_turbo_nseg == 2u);
+    CHECK((g.srv.last_turbo_flags & ps4::kTsSnapshotSegments) != 0);
+    put32(0x7FFF00000010, 50);
+    io = b.ps4_turbo_count(kFakePid, 0x7FFF00000000, ps4::kValU32, ps4::kCmpDecreased,
+                           ps4::kTsServerResident, {}, {}, {}, res);
+    REQUIRE(io.ok);
+    CHECK(res.count == 1u);
+    REQUIRE(b.ps4_turbo_get(0, 4, 4, recs).ok);
+    REQUIRE(recs.size() == 1u);
+    CHECK(recs[0].first == std::vector<uint8_t>({100, 0, 0, 0}));
+    CHECK(recs[0].current == std::vector<uint8_t>({50, 0, 0, 0}));
+
+    // regions / config / cancel
+    std::vector<backend_ps4_t::ps4_turbo_region_t> regs;
+    REQUIRE(b.ps4_turbo_regions(kFakePid, 0, 0, regs).ok);
+    CHECK(regs.size() == 6u);
+    REQUIRE(b.ps4_turbo_config(256, "/data/turbo").ok);
+    CHECK(g.srv.turbo_cfg_mb == 256u);
+    CHECK(g.srv.turbo_cfg_dir == "/data/turbo");
+    CHECK(!b.ps4_turbo_config(0, std::string(64, 'x')).ok);
+    REQUIRE(b.ps4_turbo_cancel(kFakePid, err).ok);   // rides a second connection
+    CHECK(g.srv.turbo_cancel_pid == kFakePid);
+    CHECK(b.ping());
+
+    // bad seed width is refused before anything is sent
+    req.segments.clear();
+    req.data = {1, 2};
+    CHECK(!b.ps4_turbo_start(req, res).ok);
+    CHECK(b.ping());
+    b.disconnect();
+}
+
+TEST_CASE(ps4_turbo_scan_mcp) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto dbg = [&](const json& a, bool& is_err) {
+        return slop::core::mcp::call_tool("debugger", a, is_err);
+    };
+    bool e = false;
+
+    json caps = dbg({{"action", "ps4_turbo_caps"}}, e);
+    CHECK(!e);
+    CHECK(caps.value("supported", false) == true);
+    CHECK(caps.value("capability_level", std::string{}) == "1.1");
+
+    const uint32_t hp = 500;
+    g.srv.mem_write(0x7FFF00000400, reinterpret_cast<const uint8_t*>(&hp), 4);
+    json r = dbg({{"action", "ps4_turbo_scan"}, {"regions", "writable"},
+                  {"value_type", "u32"}, {"compare", "exact"}, {"value", 500}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_turbo_scan error: %s\n", r.dump().c_str());
+    CHECK(r.value("count", 0) == 1u);
+    CHECK(r.value("resident", false) == true);
+    CHECK(r.value("segments", 0) == 2u);   // coalesced eboot RW + stack RW
+    REQUIRE(r.contains("results") && r["results"].size() == 1u);
+    CHECK(r["results"][0].value("value", std::string{}) == "500");
+
+    const uint32_t hp2 = 450;
+    g.srv.mem_write(0x7FFF00000400, reinterpret_cast<const uint8_t*>(&hp2), 4);
+    json rs = dbg({{"action", "ps4_turbo_rescan"}, {"compare", "decreased"}}, e);
+    CHECK(!e);
+    CHECK(rs.value("count", 0) == 1u);
+    CHECK((g.srv.last_turbo_flags & ps4::kTsRescanAliasing) != 0);
+    REQUIRE(rs["results"].size() == 1u);
+    CHECK(rs["results"][0].value("previous", std::string{}) == "500");
+
+    json page = dbg({{"action", "ps4_turbo_results"}, {"start", 0}, {"count", 10}}, e);
+    CHECK(!e);
+    CHECK(page.value("total", 0) == 1u);
+
+    // poke the found address plus a raw patch in one round-trip
+    json wm = dbg({{"action", "ps4_write_multi"},
+                   {"writes", json::array({
+                       {{"addr", 0x7FFF00000400}, {"value", 999}, {"value_type", "u32"}},
+                       {{"addr", 0x7FFF00000500}, {"hex", "90 90"}}})}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_write_multi error: %s\n", wm.dump().c_str());
+    CHECK(wm.value("ok", false) == true);
+    CHECK(wm.value("count", 0) == 2u);
+    CHECK(g.srv.mem_byte(0x7FFF00000400) == static_cast<uint8_t>(999 & 0xFF));
+    CHECK(g.srv.mem_byte(0x7FFF00000501) == 0x90);
+
+    g.srv.write_deny_addr = 0x7FFF00000500;
+    wm = dbg({{"action", "ps4_write_multi"},
+              {"writes", json::array({{{"addr", 0x7FFF00000500}, {"hex", "CC"}}})}}, e);
+    CHECK(!e);
+    CHECK(wm.value("ok", true) == false);
+    REQUIRE(wm["failed"].size() == 1u);
+    CHECK(wm["failed"][0].value("reason", std::string{}) == "verify_failed");
+
+    // unknown-value snapshot scan picks snapshot mode by itself
+    json sn = dbg({{"action", "ps4_turbo_scan"}, {"addr", 0x7FFF00000400}, {"len", 0x10},
+                   {"value_type", "u32"}, {"compare", "unknown"}, {"keep_first", true}}, e);
+    CHECK(!e);
+    if (e) std::printf("  snapshot error: %s\n", sn.dump().c_str());
+    CHECK(sn.value("snapshot", false) == true);
+    CHECK(sn.value("count", 0) == 1u);
+
+    json end = dbg({{"action", "ps4_turbo_end"}}, e);
+    CHECK(!e);
+    json none = dbg({{"action", "ps4_turbo_results"}}, e);
+    CHECK(e);   // no session after end
+
+    json cancel = dbg({{"action", "ps4_turbo_cancel"}, {"pid", kFakePid}}, e);
+    CHECK(!e);
+    CHECK(g.srv.turbo_cancel_pid == kFakePid);
+
+    // an old payload without Turbo Scan reports supported:false
+    g.srv.turbo_supported = false;
+    json old = dbg({{"action", "ps4_turbo_caps"}}, e);
+    CHECK(!e);
+    CHECK(old.value("supported", true) == false);
+}
+
+TEST_CASE(ps4_fork_modules_snapshot_and_errors) {
+    server_guard_t g;   // fork_ext on by default
+    backend_ps4_t b;
+    std::string err;
+    // a second eboot map (data segment) and more stack, added before any
+    // maps are cached
+    {
+        std::lock_guard lk(g.srv.mu);
+        ps4::vm_map_entry_t extra{};
+        std::strncpy(extra.name, "/app0/eboot.bin", sizeof(extra.name) - 1);
+        extra.start = 0x600000;
+        extra.end = 0x608000;
+        extra.prot = ps4::kVmProtRead | ps4::kVmProtWrite;
+        g.srv.maps.push_back(extra);
+        ps4::vm_map_entry_t stack2{};
+        stack2.start = 0x7FFF00010000ull;
+        stack2.end = 0x7FFF00030000ull;
+        stack2.prot = ps4::kVmProtRead | ps4::kVmProtWrite;
+        g.srv.maps.push_back(stack2);
+    }
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    CHECK(b.ps4_fork_extensions() == -1);
+
+    // server-side module list
+    std::vector<slop::core::runtime::module_info_t> mods;
+    REQUIRE(b.ps4_modules(kFakePid, mods).ok);
+    CHECK(b.ps4_fork_extensions() == 1);
+    REQUIRE(mods.size() == 2u);
+    CHECK(mods[0].name == "eboot.bin");
+    CHECK(mods[0].base == 0x400000u);
+    CHECK(mods[0].size == 0x208000u);   // text..data span
+
+    // enum_modules rides on it now
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    auto em = b.enum_modules(h);
+    REQUIRE(em.ok);
+    REQUIRE(em.items.size() == 2u);
+    CHECK(em.items[0].size == 0x208000u);
+    CHECK(g.srv.module_requests == 2);
+
+    // one-round-trip snapshot, larger than one 64 KiB chunk
+    std::vector<uint8_t> pat(0x18000);
+    for (size_t i = 0; i < pat.size(); ++i) pat[i] = static_cast<uint8_t>(i * 13 + 1);
+    g.srv.mem_write(0x7FFF00001000, pat.data(), pat.size());
+    std::vector<uint8_t> got;
+    auto io = b.ps4_snapshot(kFakePid, 0x7FFF00001000, pat.size(),
+                             [&](const uint8_t* d, size_t n) {
+                                 got.insert(got.end(), d, d + n);
+                                 return true;
+                             });
+    REQUIRE(io.ok);
+    CHECK(io.bytes == pat.size());
+    CHECK(got == pat);
+
+    // unreadable range is refused before the payload can drop us mid-stream
+    io = b.ps4_snapshot(kFakePid, 0x7FFF0002F000, 0x2000, {});
+    CHECK(!io.ok);
+    CHECK(io.error == 2u);
+
+    // structured error: bad pid -> CMD_ERR_PID, payload drops the client,
+    // the next command transparently reconnects (and re-auths)
+    const uint64_t gen0 = b.ps4_connection_generation();
+    b.ps4_take_last_status();
+    CHECK(!b.ps4_modules(999, mods).ok);
+    CHECK(b.ps4_take_last_status() == ps4::CMD_ERR_PID);
+    CHECK(std::string(ps4::status_name(ps4::CMD_ERR_PID)).find("CMD_ERR_PID") == 0);
+    CHECK(b.ping());
+    CHECK(b.ps4_connection_generation() == gen0 + 1);
+    CHECK(b.ps4_authed());
+    CHECK(b.ps4_fork_extensions() == 1);   // still known after the reconnect
+
+    // process stop is now 8 bytes and passes the fork's datalen guard
+    REQUIRE(b.ps4_process_stop(kFakePid, ps4::kStopStop).ok);
+    CHECK(g.srv.last_proc_stop_pid == kFakePid);
+    CHECK(g.srv.last_proc_stop_state == ps4::kStopStop);
+
+    b.detach(h);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_upstream_payload_fallback_and_reconnect) {
+    server_guard_t g;
+    g.srv.fork_ext = false;   // behave like Pharaoh2k upstream
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+
+    // first enum_modules probes CMD_PROC_MODULES once: upstream answers
+    // CMD_ERROR and drops the client; the backend falls back to grouping maps
+    auto em = b.enum_modules(h);
+    REQUIRE(em.ok);
+    CHECK(em.items.size() == 2u);
+    CHECK(b.ps4_fork_extensions() == 0);
+    CHECK(b.ps4_connection_generation() == 1u);
+    CHECK(g.srv.module_requests == 1);
+
+    // no further probes once the payload is known to be upstream
+    em = b.enum_modules(h);
+    REQUIRE(em.ok);
+    CHECK(g.srv.module_requests == 1);
+    CHECK(b.ps4_connection_generation() == 1u);
+    std::vector<slop::core::runtime::module_info_t> mods;
+    auto io = b.ps4_modules(kFakePid, mods);
+    CHECK(!io.ok);
+    CHECK(io.error == 100u);
+    io = b.ps4_snapshot(kFakePid, 0x7FFF00000000, 0x100, {});
+    CHECK(io.error == 100u);
+
+    // and memory I/O still works on the reopened connection
+    const uint8_t v[4] = {1, 2, 3, 4};
+    REQUIRE(b.write_memory(h, 0x7FFF00000040, v, 4).ok);
+    uint8_t back[4]{};
+    REQUIRE(b.read_memory(h, 0x7FFF00000040, back, 4).ok);
+    CHECK(std::memcmp(back, v, 4) == 0);
+    b.detach(h);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_fork_mcp_actions) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto dbg = [&](const json& a, bool& is_err) {
+        return slop::core::mcp::call_tool("debugger", a, is_err);
+    };
+    bool e = false;
+
+    json mods = dbg({{"action", "ps4_modules"}}, e);
+    CHECK(!e);
+    CHECK(mods.value("count", 0) == 2u);
+
+    json st = dbg({{"action", "ps4_status"}}, e);
+    CHECK(!e);
+    CHECK(st.value("fork_extensions", std::string{}) == "yes");
+    CHECK(st.value("capability_level", std::string{}) == "1.1");
+
+    const uint8_t marker[8] = {0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04};
+    g.srv.mem_write(0x7FFF00002000, marker, sizeof(marker));
+    char tmp[MAX_PATH]{};
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string out = std::string(tmp) + "slop_ps4_snapshot_test.bin";
+    json sn = dbg({{"action", "ps4_snapshot"}, {"addr", 0x7FFF00002000}, {"len", 0x20},
+                   {"path", out}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_snapshot error: %s\n", sn.dump().c_str());
+    CHECK(sn.value("bytes", 0) == 0x20u);
+    {
+        std::ifstream f(out, std::ios::binary);
+        std::vector<uint8_t> head(8);
+        f.read(reinterpret_cast<char*>(head.data()), 8);
+        CHECK(std::memcmp(head.data(), marker, 8) == 0);
+    }
+    std::remove(out.c_str());
+
+    // console error codes are appended to tool errors
+    json bad = dbg({{"action", "ps4_modules"}, {"pid", 999}}, e);
+    CHECK(e);
+    CHECK(bad.dump().find("CMD_ERR_PID") != std::string::npos);
+
+    // a turbo session does not survive the payload dropping the connection
+    const uint32_t v = 77;
+    g.srv.mem_write(0x7FFF00000800, reinterpret_cast<const uint8_t*>(&v), 4);
+    json ts = dbg({{"action", "ps4_turbo_scan"}, {"addr", 0x7FFF00000000}, {"len", 0x1000},
+                   {"value_type", "u32"}, {"compare", "exact"}, {"value", 77}}, e);
+    CHECK(!e);
+    CHECK(ts.value("count", 0) == 1u);
+    dbg({{"action", "ps4_modules"}, {"pid", 999}}, e);   // drops the client
+    CHECK(e);
+    json rs = dbg({{"action", "ps4_turbo_rescan"}, {"compare", "unchanged"}}, e);
+    CHECK(e);
+    CHECK(rs.dump().find("dropped the connection") != std::string::npos);
+    json st2 = dbg({{"action", "ps4_status"}}, e);
+    CHECK(!e);
+    CHECK(st2.value("reconnects", uint64_t{0}) >= 2u);   // both drops recovered
 }

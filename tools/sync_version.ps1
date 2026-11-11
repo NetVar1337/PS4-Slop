@@ -28,7 +28,9 @@ $targets = @(
     @{ Path = 'app/src-tauri/Cargo.toml'; Count = 1
        Pattern = '(?ms)\A(.*?^\[package\][^\[]*?^version\s*=\s*")([^"]*)(")' },
     @{ Path = 'app/src-tauri/Cargo.lock'; Count = 1
-       Pattern = '(?m)(^name = "reverse-slop-ui"\r?\nversion = ")([^"]*)(")' }
+       Pattern = '(?m)(^name = "reverse-slop-ui"\r?\nversion = ")([^"]*)(")' },
+    @{ Path = 'README.md'; Count = 1
+       Pattern = '(img\.shields\.io/badge/version-)(\d+\.\d+\.\d+)(-)' }
 )
 
 $bad = @()

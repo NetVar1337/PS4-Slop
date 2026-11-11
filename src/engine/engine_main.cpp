@@ -75,7 +75,7 @@ options_t parse_args(int argc, char** argv) {
         if (std::strcmp(a, "--no-onboard") == 0)  o.mcp_onboarding = false;
         else if (std::strcmp(a, "--quiet") == 0)       o.quiet = true;
         else if (std::strcmp(a, "--port") == 0 && i + 1 < argc)
-            ::SetEnvironmentVariableA("SLOP_MCP_PORT", argv[++i]);
+            ::_putenv_s("SLOP_MCP_PORT", argv[++i]); // CRT getenv() does not see SetEnvironmentVariable
         else if (std::strcmp(a, "--parent-pid") == 0 && i + 1 < argc)
             o.parent_pid = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         // accepted and ignored, this binary is always headless

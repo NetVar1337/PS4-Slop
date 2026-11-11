@@ -1,0 +1,59 @@
+# Roadmap
+
+Prioritized from the full audit ([`docs/AUDIT.md`](docs/AUDIT.md), 115 items). Severities:
+**P0** blocks everything · **P1** next milestone · **P2** following · **P3** polish.
+
+## Now (P0)
+
+- [ ] Resolve the in-progress merge (`mcp_tools.cpp`, `backend_ps4.cpp`, `test_ps4.cpp`)
+      and get `main` building green again.
+
+## Next milestone — v0.2 "agent-grade" (P1)
+
+Test visibility and agent-facing surface, because that is where the leverage is:
+
+- [ ] Code-coverage CI lane (engine core) with a ratchet on new code.
+- [ ] libFuzzer targets for the untrusted-input parsers: `elf_loader`, `pe_parser`,
+      `macho_loader`, `ipa`, `zip_reader`, ps4debug-NG packet parser.
+- [ ] E2E lane driving the real UI against the engine + `SlopTarget` fixture
+      (harness lands as `app/e2e`; promote from nightly to PR-blocking once stable).
+- [ ] MCP: `annotations` on every tool (read-only vs destructive), per-tool rate
+      limits, and an `/api/v1` prefix before the API surface freezes.
+- [ ] Proxy: redact `Authorization`/`Cookie` in captured traffic by default.
+- [ ] Scanner: host-side unknown-initial-value scan and "changed by more than N".
+- [ ] Debugger: conditional breakpoints and hit-count/logging breakpoints.
+- [ ] Encrypted-SELF strategy: document the partner-tooling flow or integrate
+      payload-side decryption.
+- [ ] Token policy: stop embedding the plaintext bearer token in MCP client configs
+      by default; prompt-on-connect alternative.
+
+## Following — v0.3 (P2)
+
+- [ ] Multi-console manager (saved endpoints, quick-switch, per-console profiles)
+      and automatic reconnect with backoff.
+- [ ] Pointer-scan multi-level chains with per-level wildcards and negative offsets.
+- [ ] CFG graph view in the UI; unify Hyperion/Zydis function detection.
+- [ ] `.pdata`-based stack unwinding; thread-aware stepping parity.
+- [ ] ARM64 emulation path for Mach-O/iOS images (Unicorn is x86-64 only today).
+- [ ] PCAP *import* (analyze console traffic from a tap without routing through the PC).
+- [ ] `sessions.db` schema versioning/migrations.
+- [ ] Decide the fate of the ImGui shell: ship as documented lightweight fallback or
+      remove; publish the feature-parity matrix either way.
+- [ ] Tutorial docs ("first console connect", "dump → rename → decompile") and a
+      hosted docs site generated from `docs/`.
+- [ ] Linux engine port (headless MCP server on an analysis VM): abstract
+      `backend_usermode`, raw-socket capture, WinHTTP and the Tauri supervisor.
+- [ ] Security CI: gitleaks + release-artifact import/section checks; document
+      binary hardening flags.
+
+## Later (P3, opportunistic)
+
+- [ ] PS5 backend (the backend registry is shaped for a second console backend).
+- [ ] Team workflows: self-hosted symbol/comment sharing or Git-based sync of
+      `symbols/<hash>.json`.
+- [ ] winget/choco/scoop packages + Tauri in-app updater.
+- [ ] Unpacker view and a ReClass-style struct editor in the Tauri UI.
+- [ ] Localization, user theme editor, script snippets library, Lua autocomplete.
+
+Items are checked off as they land; the audit doc carries the full detail and
+file-level pointers for each item.
