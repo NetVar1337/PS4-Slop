@@ -17,7 +17,7 @@ export const kBinaryFilters = [
 ];
 
 export async function openBinary(): Promise<void> {
-  let path: string | null = null;
+  let path: string | null;
 
   if (isTauri()) {
     const picked = await open({
