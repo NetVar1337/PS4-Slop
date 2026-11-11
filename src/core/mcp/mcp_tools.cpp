@@ -4,12 +4,106 @@
 
 #include "core/mcp/tools_common.hpp"
 #include "core/mcp/mcp_server.hpp"
+#include "core/runtime/broker.hpp"
+#include "core/runtime/gdb_rsp.hpp"
 
 namespace slop::core::mcp {
 
 using namespace detail;
 
 namespace {
+
+// ---- audit trail + confirm gate (ps4debug-mcp safety model) ----
+// every tool call is appended as one JSONL line to the audit log; when the
+// mcp_require_confirm setting is on, mutating console/target actions refuse
+// to run without "confirm": true in the args
+
+bool ps4_action_readonly(const std::string& a) {
+    static const std::unordered_set<std::string> ro = {
+        "status", "ps4_status", "ps4_console_info", "ps4_regs", "ps4_dbregs",
+        "ps4_fpregs", "ps4_fsgs", "ps4_events", "ps4_callstack", "ps4_stack",
+        "ps4_bp_list", "ps4_watch_list", "ps4_disasm", "ps4_xrefs", "ps4_xrefs_to",
+        "ps4_modules", "ps4_snapshot", "ps4_assemble", "ps4_wait",
+        "ps4_scan", "ps4_rescan", "ps4_scan_all", "ps4_scan_aob", "ps4_scan_state",
+        "ps4_turbo_caps", "ps4_turbo_scan", "ps4_turbo_rescan", "ps4_turbo_results",
+        "ps4_turbo_regions", "ps4_turbo_cancel"
+    };
+    return ro.count(a) != 0;
+}
+
+bool action_mutating(const std::string& tool, const std::string& action) {
+    if (tool == "debugger") {
+        if (action.rfind("ps4_", 0) == 0) return !ps4_action_readonly(action);
+        static const std::unordered_set<std::string> ro = {
+            "status", "regs", "callstack", "events", "wait", "bp_list", "watch_list"
+        };
+        return ro.count(action) == 0;
+    }
+    if (tool == "memory") {
+        static const std::unordered_set<std::string> ro = {
+            "read", "scan", "rescan", "scan_state", "aob", "pointerscan",
+            "pointerscan_verify", "snapshot", "snapshots", "diff", "siggen",
+            "live_crypto", "watch_list"
+        };
+        return ro.count(action) == 0;
+    }
+    if (tool == "target") {
+        static const std::unordered_set<std::string> ro = {
+            "list", "status", "modules", "threads", "regions", "handles",
+            "heaps", "heap_blocks", "icon", "ps4_connect", "ps4_discover",
+            "ps4_dump_module"
+        };
+        return ro.count(action) == 0;
+    }
+    if (tool == "patch" || tool == "persist" || tool == "notes" || tool == "types" ||
+        tool == "script")
+        return true;
+    if (tool == "host")
+        return action != "status" && action != "files" && action != "manifest";
+    if (tool == "gdb")
+        return action != "status";
+    if (tool == "proxy")
+        return action != "status" && action != "entries" && action != "entry" &&
+               action != "replay";
+    if (tool == "network")
+        return action != "packets" && action != "dns" && action != "stats" &&
+               action != "connections" && action != "streams" &&
+               action != "stream_data";
+    return false;
+}
+
+std::mutex g_audit_mu;
+
+void audit_log(const std::string& tool, const json& args, const json& out,
+               bool is_error) {
+    if (!infra::settings::mcp_audit_enabled()) return;
+    const std::string path = infra::settings::mcp_audit_path();
+    if (path.empty()) return;
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    const std::string args_dump = args.dump();
+    const std::string out_dump  = out.dump();
+    constexpr size_t kCap = 2048;
+    json line = {{"ts_ms", ms},
+                 {"tool", tool},
+                 {"action", args.is_object() ? args.value("action", std::string{})
+                                             : std::string{}},
+                 {"ok", !is_error}};
+    if (args_dump.size() <= kCap) line["args"] = args;
+    else line["args_truncated"] = args_dump.substr(0, kCap);
+    if (is_error) {
+        if (out.is_object() && out.contains("error")) line["error"] = out["error"];
+        else line["error"] = out_dump.substr(0, kCap);
+    } else if (out_dump.size() <= kCap) {
+        line["result"] = out;
+    } else {
+        line["result_truncated"] = out_dump.substr(0, kCap);
+    }
+    std::lock_guard lk(g_audit_mu);
+    std::ofstream f(path, std::ios::app);
+    if (f) f << line.dump() << "\n";
+}
 
 // ---- AI-rich output enrichment (additive only, never removes keys) ----
 // Every VA the server returns is a decimal u64. Agents copy/paste hex, need
@@ -719,14 +813,14 @@ void finalize_tool_entry(json& t) {
 
 void list_tools(json& out) {
     const char* target_schema =
-        R"json({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","heaps","heap_blocks","icon","ps4_connect","ps4_disconnect","ps4_reconnect","ps4_auto","ps4_dump_module"]},"pid":{"type":"integer"},"host":{"type":"string"},"port":{"type":"integer"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"heap_base":{"type":"integer"},"max_blocks":{"type":"integer","minimum":1,"maximum":1048576},"load":{"type":"boolean"},"strict":{"type":"boolean"},"format":{"type":"string","enum":["raw","elf"],"description":"ps4_dump_module output: raw mapped span (default) or a rebuilt loadable ELF64 (default when load=true)"}},"required":["action"]})json";
+        R"json({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","heaps","heap_blocks","icon","ps4_connect","ps4_disconnect","ps4_reconnect","ps4_auto","ps4_discover","ps4_dump_module"]},"pid":{"type":"integer"},"host":{"type":"string","description":"PS4 IP, or \"auto\"/\"discover\": UDP broadcast probe (255.255.255.255:1010, magic 0xFFFFAAAA) picks the first answering console"},"port":{"type":"integer"},"timeout_ms":{"type":"integer","description":"ps4_discover: probe listen time in ms (default 2000, max 60000)"},"confirm":{"type":"boolean","description":"required on mutating actions while the mcp_require_confirm setting is on"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"heap_base":{"type":"integer"},"max_blocks":{"type":"integer","minimum":1,"maximum":1048576},"load":{"type":"boolean"},"strict":{"type":"boolean"},"format":{"type":"string","enum":["raw","elf"],"description":"ps4_dump_module output: raw mapped span (default) or a rebuilt loadable ELF64 (default when load=true)"}},"required":["action"]})json";
     const char* memory_schema =
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","aob","pointerscan","pointerscan_verify","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"],"description":"value type; byte counts 1/2/4/8 are also accepted as u8/u16/u32/u64"},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"},"engine":{"type":"string","enum":["auto","console","host"],"description":"aob: console runs the search on the PS4 (all hits, needs ps4_auth), host streams memory over the wire; auto prefers console"},"chains":{"type":"array","description":"pointerscan_verify: chains to re-check ({addresses[],offsets[]} or {base,offsets[]}); default is the last pointerscan list","items":{"type":"object"}},"samples":{"type":"integer","minimum":1,"maximum":64,"description":"pointerscan_verify: passes; a chain survives only if it lands on target every time"},"interval_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"pointerscan_verify: wait between samples"}},"required":["action"]})json";
     const char* disasm_schema =
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop","managed"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer","description":"load: runtime base to rebase the image to, 0 keeps its own base"},"relocate":{"type":"boolean","description":"load: apply ELF/SELF relocations at the session base, default true; pass false for memory dumps"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer","description":"functions: index of the first matched row to return"},"filter":{"type":"string","description":"functions: case-insensitive substring of the function name or hex VA"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"},"method_token":{"type":"integer"},"type":{"type":"string"},"type_filter":{"type":"string"}},"required":["action"]})json";
     const char* debugger_schema =
 
-        R"json({"type":"object","properties":{"base":{"type":"integer","description":"module base used to rebase addresses for this action, default 0"},"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_console_info","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_turbo_caps","ps4_turbo_scan","ps4_turbo_rescan","ps4_turbo_results","ps4_turbo_end","ps4_turbo_config","ps4_turbo_regions","ps4_turbo_cancel","ps4_write_multi","ps4_modules","ps4_snapshot","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer","description":"ps4_scan_aob legacy form: return only the max_matches-th match; omit to get every match"},"limit":{"type":"integer","description":"ps4_scan_aob: most matches to return (default 4096)"},"unique":{"type":["boolean","integer"]},"asm":{"type":"string"},"syntax":{"type":"integer","description":"Keystone syntax: 0 default/Intel, 1 Intel, 2 ATT, 3 NASM, 4 MASM, 5 GAS"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"},"regions":{"type":"string"},"resident":{"type":"boolean"},"snapshot":{"type":"boolean"},"aliasing":{"type":"boolean"},"parallel":{"type":"boolean"},"keep_first":{"type":"boolean"},"keep_previous":{"type":"boolean"},"include_zeros":{"type":"boolean"},"float":{"type":"string"},"float_exponent":{"type":"integer"},"mask_hex":{"type":"string"},"start":{"type":"integer"},"ram_mb":{"type":"integer"},"spill_path":{"type":"string"},"probe_bytes":{"type":"integer"},"writes":{"type":"array","items":{"type":"object"}},"status":{"type":"boolean"}},"required":["action"]})json";
+        R"json({"type":"object","properties":{"base":{"type":"integer","description":"module base used to rebase addresses for this action, default 0"},"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_console_info","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_turbo_caps","ps4_turbo_scan","ps4_turbo_rescan","ps4_turbo_results","ps4_turbo_end","ps4_turbo_config","ps4_turbo_regions","ps4_turbo_cancel","ps4_write_multi","ps4_modules","ps4_snapshot","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer","description":"ps4_scan_aob legacy form: return only the max_matches-th match; omit to get every match"},"limit":{"type":"integer","description":"ps4_scan_aob: most matches to return (default 4096)"},"unique":{"type":["boolean","integer"]},"asm":{"type":"string"},"syntax":{"type":"integer","description":"Keystone syntax: 0 default/Intel, 1 Intel, 2 ATT, 3 NASM, 4 MASM, 5 GAS"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"},"regions":{"type":"string"},"resident":{"type":"boolean"},"snapshot":{"type":"boolean"},"aliasing":{"type":"boolean"},"parallel":{"type":"boolean"},"keep_first":{"type":"boolean"},"keep_previous":{"type":"boolean"},"include_zeros":{"type":"boolean"},"float":{"type":"string"},"float_exponent":{"type":"integer"},"mask_hex":{"type":"string"},"start":{"type":"integer"},"ram_mb":{"type":"integer"},"spill_path":{"type":"string"},"probe_bytes":{"type":"integer"},"writes":{"type":"array","items":{"type":"object"}},"status":{"type":"boolean"},"confirm":{"type":"boolean","description":"required on mutating ps4_* actions while the mcp_require_confirm setting is on"}},"required":["action"]})json";
 
     const char* xray_schema =
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["cfg","complexity","cff","obfuscation","strings_recon","indirect_calls","anti_analysis","hooks","syscalls","apihash","entropy","pages","crypto_range","gadgets"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"size":{"type":"integer"},"len":{"type":"integer"},"length":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"window_size":{"type":"integer"},"window":{"type":"integer"},"window_limit":{"type":"integer"},"page_size":{"type":"integer"},"max_functions":{"type":"integer"},"hash":{},"hashes":{"type":"array"},"algorithm":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})json";
@@ -760,7 +854,7 @@ void list_tools(json& out) {
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["fetch","post"]},"url":{"type":"string"},"body":{"description":"post: request body (a string is sent verbatim, other JSON values are serialized)"},"content_type":{"type":"string","description":"post: Content-Type (default application/json)"},"timeout_ms":{"type":"integer","minimum":1000,"maximum":60000},"offset":{"type":"integer","minimum":0,"description":"response body byte offset; page with next_offset"},"max_bytes":{"type":"integer","minimum":1,"maximum":1048576,"description":"body bytes returned per call (default 65536)"},"encoding":{"type":"string","enum":["auto","text","base64"],"description":"auto = text when the body is valid UTF-8, else base64"}},"required":["action"]})json";
 
     out.push_back({{"name", "target"},
-                   {"description", "PS4 toolkit target control. Connect a console with ps4_connect {host, port=744, pid?} (ps4debug-NG running on the PS4) or the one-call ps4_auto {host}, which connects, picks the game process (the one with /app0/ modules), attaches and debug-attaches; then list/attach/memory/regions/threads go over the wire. A failed send/receive drops the console socket (status ps4.connected=false, ps4.lost=true) so calls fail fast; ps4_reconnect re-opens it, re-authenticates, re-attaches the debugger and re-arms breakpoints while the session stays attached. ps4_disconnect drops the console; status reads the active backend (ps4.fw, ps4.drops). modules lists one record per console module (segments coalesced). ps4_dump_module {name|base, path, format=raw|elf, load?} dumps every segment of a module; format=elf rebuilds a loadable ELF64 from the console maps (the in-memory image has no ELF header) and load=true opens it for disasm.*. A hidden local user-mode backend remains for automated tests (list/attach/modules/threads/regions/handles/dump_module/icon); dump_module is PE-only."},
+                   {"description", "PS4 toolkit target control. Connect a console with ps4_connect {host, port=744, pid?} (ps4debug-NG running on the PS4; host \"auto\" discovers the console via UDP broadcast) or the one-call ps4_auto {host}, which connects, picks the game process (the one with /app0/ modules), attaches and debug-attaches; ps4_discover {timeout_ms} lists every console answering the broadcast probe (255.255.255.255:1010, magic 0xFFFFAAAA). Every call is appended to the JSONL audit log (mcp_audit_path setting); while mcp_require_confirm is on, mutating actions need confirm:true. Then list/attach/memory/regions/threads go over the wire. A failed send/receive drops the console socket (status ps4.connected=false, ps4.lost=true) so calls fail fast; ps4_reconnect re-opens it, re-authenticates, re-attaches the debugger and re-arms breakpoints while the session stays attached. ps4_disconnect drops the console; status reads the active backend (ps4.fw, ps4.drops). modules lists one record per console module (segments coalesced). ps4_dump_module {name|base, path, format=raw|elf, load?} dumps every segment of a module; format=elf rebuilds a loadable ELF64 from the console maps (the in-memory image has no ELF header) and load=true opens it for disasm.*. A hidden local user-mode backend remains for automated tests (list/attach/modules/threads/regions/handles/dump_module/icon); dump_module is PE-only."},
                    {"inputSchema", json::parse(target_schema)}, {"read_only", false}});
     out.push_back({{"name", "memory"},
                    {"description", "Read, search, compare, and modify memory in the process attached by target. Most actions require target.status attached=true; the active backend is chosen automatically (ps4 when a console is connected). Core actions: read/write bytes, protect/alloc/free pages, AOB pattern search, pointer scan, signature generation, and live crypto-constant search. CE-style scan creates per-PID scan state; follow it with rescan, inspect it with scan_state, and release it with scan_reset. snapshot returns an id; compare two ids with diff using a and b, list with snapshots, and release with snapshot_free. Scan filters cover numeric width/comparison/rounding, region type and protection, address bounds, alignment/tail, workers, chunks, and result caps. On a PS4 every action runs over the ps4debug-NG wire against the attached console process."},
@@ -820,11 +914,24 @@ void list_tools(json& out) {
                    {"description", "Run a Lua 5.4 automation script inside reverse-slop, the scripting layer over static analysis, like IDAPython for IDA. action='run' requires code; timeout_ms defaults to 5000 and is clamped to 10..60000 (the result reports the effective timeout_ms; pass a higher one when waiting for analysis). print() output is captured (capped at 4 MiB, output_truncated=true past it) and returned values are serialized as 'return: <value>'. Limits: the deadline and MCP notifications/cancelled are checked every 1000 VM instructions and inside blocking calls (wait_ready, mem.scan, debugger waits are cut to the remaining budget); the Lua heap is capped at 256 MiB (peak_mem reports usage). Scripts never hold the tool lock for their whole run: each slop.* call takes it briefly, so other tools keep answering. SANDBOX (sandboxed=true, the default): only base (no dofile/loadfile; load and the script itself accept text chunks only, never bytecode), string, table, math, utf8 and os.clock/os.time/os.difftime are available - no io, os.execute, package/require, debug or coroutine, and debugger actions that read host files (elf_rpc/elf_load) are refused. Setting script_unsafe=true (app.settings_set {key:'script_unsafe',value:true}) opts into the full standard library; treat that as host code execution. Scripts operate on the SAME shared binary session as the UI and every other MCP tool, so loads, renames, and comments are visible everywhere. Static-analysis API: slop.image.{load(path[,base]),load_from_target,unload,status,wait_ready([ms])}; slop.disasm.{decode(addr[,n]),functions([limit]),function_at(va),xrefs_to(va),strings([min_len[,limit]]) -- note min-length FIRST, so strings(4,3000) not strings(2000),pe(),bytes(addr[,len]),name(va),set_name(va,name),comment(va),set_comment(va,text),bookmark_toggle(va),bookmarks()}; unnamed functions are sub_<VA uppercase hex> as everywhere else; slop.decomp.{decompile(va),blocks(va),vtables(),globals(),rtti()} (decomp.* needs slop.image.wait_ready first). Live analysis: slop.target.{list,attach,status}, slop.mem.{read_hex(addr,len) -> lowercase hex string, read_bytes(addr,len) -> raw byte string, write_hex(addr,hex), scan(cfg)}, slop.disasm.disassemble(addr,count), slop.analyze.packer. PS4 console: slop.ps4.{connect(host[,port]),auto(host[,port]),disconnect(),status()}; slop.debugger.{status,attach(pid),detach,bp_set(addr[,index]),bp_clear(addr),bp_list,watch_set(addr[,len[,type]]),watch_clear(addr),watch_list,continue([stop]),step([lwpid]),suspend(lwpid),resume(lwpid),wait([ms]),events([max]),regs([lwpid]),set_reg(lwpid,name,value),callstack([lwpid[,depth]]),call(addr[,{args}[,pid]]),run_until(addr[,ms]),find_write(addr[,len[,ms]]),trace_calls(addr[,count[,ms]]),action(name,{params})} - each runs the matching target/debugger ps4_* MCP action and returns its result table (errors raise Lua errors). Typical flow: image.load(path) -> image.wait_ready() -> disasm.functions() -> decomp.decompile(va). Use direct MCP tools when one operation is sufficient."},
                    {"inputSchema", json::parse(script_schema)}, {"read_only", false}});
 
+    const char* host_schema =
+        R"json({"type":"object","properties":{"action":{"type":"string","enum":["start","stop","status","files","manifest","put"]},"port":{"type":"integer","description":"start: listen port (default 8080)"},"bind":{"type":"string","description":"start: listen address (default 127.0.0.1; a non-loopback bind requires a token)"},"dir":{"type":"string","description":"start: directory to serve (default %LOCALAPPDATA%\\reverse-slop\\payloads); created when missing"},"token":{"type":"string","description":"start: bearer token; required for non-loopback binds, else read from the host_token setting. Clients send Authorization: Bearer <token> or ?token=<token>"},"timeout_ms":{"type":"integer"},"name":{"type":"string","description":"put: relative path under the served dir"},"hex":{"type":"string","description":"put: file content as hex"},"text":{"type":"string","description":"put: file content as text"},"confirm":{"type":"boolean","description":"required on mutating actions (start/stop/put) while mcp_require_confirm is on"}},"required":["action"]})json";
+    out.push_back({{"name", "host"},
+                   {"description", "Serve a payload directory over HTTP (afterglow-web style payload host for a jailbroken PS4 / GoldHEN bin loader): start {port=8080, bind=127.0.0.1, dir, token?} serves GET / (index page), GET /manifest.json (auto-generated {files:[{name,size,sha256,url}]}), and GET /files/<name> (download, path-traversal guarded, 64 MiB per-file cap). A non-loopback bind always requires a token (arg or host_token setting) enforced as Authorization: Bearer / ?token=. stop ends the server; status reports the running endpoint; files/manifest return the manifest without HTTP; put {name, hex|text} drops a file into the served dir and returns its sha256. Payloads are your own homebrew files only."},
+                   {"inputSchema", json::parse(host_schema)}, {"read_only", false}});
+
+    const char* gdb_schema =
+        R"json({"type":"object","properties":{"action":{"type":"string","enum":["start","stop","status"]},"port":{"type":"integer","description":"start: listen port (default 2331)"},"bind":{"type":"string","description":"start: loopback only (default 127.0.0.1); non-loopback is refused"},"allow_writes":{"type":"boolean","description":"start: allow RSP memory/register writes (M/G/P packets); default false. Breakpoints (Z/z) are always allowed"},"confirm":{"type":"boolean","description":"required on start/stop while mcp_require_confirm is on"}},"required":["action"]})json";
+    out.push_back({{"name", "gdb"},
+                   {"description", "Control the GDB Remote Serial Protocol bridge (ported from PS4-MCP rsp.rs/broker): start {port=2331, bind=127.0.0.1, allow_writes=false} opens a TCP listener that speaks RSP so GDB/LLDB/Binary Ninja attach with 'target remote 127.0.0.1:2331' to the SAME console debug session the UI and MCP use (all clients serialize on the one ps4debug-NG connection via the broker gate). Supports qSupported, target.xml/memory-map/libraries qXfer, thread packets (qC/qfThreadInfo/Hg/Hc/T), register read g/p (GPRs + FPU via the debug session), memory read m, breakpoints/watchpoints Z/z (software bp + DR0-DR3 watchpoints), continue/step c/s/vCont with async T.. stop replies from the port-755 event stream, qAttached, vAttach, D (closes only the RSP connection, the shared session stays up). Writes M/G/P and kill/restart stay refused unless allow_writes=true at start. stop ends the bridge; status reports the bridge, the console debug session and the broker client list (mcp, gdb:<port>, ...). Requires debugger.ps4_attach {pid} first."},
+                   {"inputSchema", json::parse(gdb_schema)}, {"read_only", false}});
+
     for (auto& t : out) finalize_tool_entry(t);
 }
 
-nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
-                         bool& is_error, infra::cancel_token_t cancel) {
+static nlohmann::json call_tool_inner(const std::string& name,
+                                      const nlohmann::json& args, bool& is_error,
+                                      infra::cancel_token_t cancel) {
     is_error = false;
     try {
         if (name == "devirt") {
@@ -911,6 +1018,8 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         else if (name == "notes")    out = tool_notes(args);
         else if (name == "devirt")   out = tool_devirt(args);
         else if (name == "guide")    out = tool_guide(args);
+        else if (name == "host")     out = tool_host(args);
+        else if (name == "gdb")      out = tool_gdb(args);
         else found = false;
         if (!found) {
             is_error = true;
@@ -941,6 +1050,39 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
     }
 }
 
+nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
+                         bool& is_error, infra::cancel_token_t cancel) {
+    // ps4debug-mcp safety model: when mcp_require_confirm is on, mutating
+    // console/target actions need "confirm": true; every call (allowed or
+    // refused) is appended to the JSONL audit log
+    const std::string action =
+        args.is_object() ? args.value("action", std::string{}) : std::string{};
+    if (infra::settings::mcp_require_confirm() && action_mutating(name, action) &&
+        !(args.is_object() && args.value("confirm", false))) {
+        is_error = true;
+        json err = {{"error",
+                     "mutating action " + name + "." + action +
+                     " requires \"confirm\": true (mcp_require_confirm is on). "
+                     "Re-call with confirm:true only after the user agreed."}};
+        audit_log(name, args, err, true);
+        return err;
+    }
+    json out;
+    // broker gate: console-session actions serialize with every other console
+    // client (UI, the GDB-RSP bridge) on the one console connection; purely
+    // local tools (emulate/analyze/...) stay concurrent with a running call
+    const bool console_action = name == "gdb" || name == "debugger" ||
+        (name == "target" && action.rfind("ps4_", 0) == 0);
+    if (console_action) {
+        std::lock_guard rg(slop::core::runtime::broker_gate());
+        out = call_tool_inner(name, args, is_error, cancel);
+    } else {
+        out = call_tool_inner(name, args, is_error, cancel);
+    }
+    audit_log(name, args, out, is_error);
+    return out;
+}
+
 void shutdown_tools() {
     // a tool that ignores its cancel token must not wedge teardown: wait a bounded
     // time for the tool lock and leave shared state alone if it never frees up
@@ -956,6 +1098,7 @@ void shutdown_tools() {
     }
     std::lock_guard ilk(g_image_mu);
     g_proxy.stop();
+    runtime::gdb_rsp().stop();
     g_scan.engine.reset();
     g_scan.used = false;
     g_snaps.clear();

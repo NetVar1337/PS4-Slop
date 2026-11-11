@@ -100,7 +100,7 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
         img.image_base = rd32(d + opt_header_off + 28);
         img.entry_rva  = rd32(d + opt_header_off + 16);
     }
-    img.subsystem     = rd16(d + opt_header_off + (img.pe32plus ? 68 : 68));
+    img.subsystem     = rd16(d + opt_header_off + 68);   // Subsystem sits at +68 in PE32 and PE32+
     img.size_of_image = rd32(d + opt_header_off + 56);
 
     // Data directories: PE32+ at offset 112, PE32 at 96
@@ -116,7 +116,7 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
 
     // Sections
     const size_t sec_table = opt_header_off + opt_size;
-    const size_t sec_entry = img.pe32plus ? 40 : 40;
+    const size_t sec_entry = 40;   // section header is 40 bytes in PE32 and PE32+
     if (sec_table + static_cast<size_t>(num_sections) * sec_entry > len) return img;
 
     for (uint16_t i = 0; i < num_sections; ++i) {
