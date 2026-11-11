@@ -1172,7 +1172,7 @@ int l_decomp_function(lua_State* L) {
                           static_cast<unsigned long long>(va));
             err = buf;
         }
-        if (err.empty()) {
+        if (hype && f && err.empty()) {
             const uint64_t entry = f->entry;
 
             std::vector<hype::PseudoLine> lines;
@@ -1260,7 +1260,7 @@ int l_decomp_blocks(lua_State* L) {
                           static_cast<unsigned long long>(va));
             err = buf;
         }
-        if (err.empty()) {
+        if (hype && f && err.empty()) {
             lua_createtable(L, 0, 4);
             lua_pushinteger(L, static_cast<lua_Integer>(f->entry));
             lua_setfield(L, -2, "entry");
