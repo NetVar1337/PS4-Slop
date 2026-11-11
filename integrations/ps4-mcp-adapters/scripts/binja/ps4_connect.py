@@ -1,19 +1,19 @@
-"""Connect Binary Ninja to the PS4-MCP shared broker as an analysis agent.
+"""Connect Binary Ninja to the PS4-Slop MCP server as an analysis agent.
 
 Run inside Binary Ninja's Python (plugin / Script Manager), where the open
 BinaryView is the global `bv`:
 
-    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/integrations/binja/ps4_connect.py").read())
+    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-Slop/integrations/ps4-mcp-adapters/scripts/binja/ps4_connect.py").read())
 
 or headless with Binary Ninja's bundled Python:
 
     import binaryninja
     bv = binaryninja.load(r"D:/dumps/eboot.bin")
-    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-MCP/integrations/binja/ps4_connect.py").read())
+    exec(open(r"C:/Users/Admin/Desktop/GithubProjects/PS4-Slop/integrations/ps4-mcp-adapters/scripts/binja/ps4_connect.py").read())
 
 Environment:
-    PS4_MCP_ROOT  repository root (default is this checkout)
-    PS4_BROKER_URL      broker URL (default http://127.0.0.1:8765)
+    PS4_SLOP_ROOT  adapter root (default: auto-detected)
+    PS4_SLOP_URL   MCP server URL (default http://127.0.0.1:8765)
 """
 
 import os
@@ -22,12 +22,12 @@ from pathlib import Path
 
 
 def _repository_root():
-    configured = os.environ.get("PS4_MCP_ROOT")
+    configured = os.environ.get("PS4_SLOP_ROOT") or os.environ.get("PS4_MCP_ROOT")
     if configured:
         root = Path(configured).expanduser().resolve()
         if (root / "ps4_mcp" / "adapters" / "binja.py").is_file():
             return root
-        raise RuntimeError("PS4_MCP_ROOT does not point at a PS4-MCP checkout")
+        raise RuntimeError("PS4_SLOP_ROOT does not point at the ps4-mcp-adapters directory")
     candidates = [Path.cwd()]
     script = globals().get("__file__")
     if script:
@@ -37,7 +37,7 @@ def _repository_root():
             if (root / "ps4_mcp" / "adapters" / "binja.py").is_file():
                 return root
     raise RuntimeError(
-        "Cannot locate PS4-MCP; set PS4_MCP_ROOT to the repository root"
+        "Cannot locate the ps4_mcp adapters package; set PS4_SLOP_ROOT to the ps4-mcp-adapters directory"
     )
 
 repository = str(_repository_root())
@@ -48,8 +48,7 @@ from ps4_mcp.adapters.binja import BinjaWorkbench
 
 
 def connect(bv=None, url=None, token_path=None):
-    url = url or os.environ.get("PS4_BROKER_URL", "http://127.0.0.1:8765")
-    token_path = token_path or os.path.join(repository, "profiles", "broker-token.local")
+    url = url or os.environ.get("PS4_SLOP_URL") or os.environ.get("PS4_BROKER_URL", "http://127.0.0.1:8765")
     ps4 = BinjaWorkbench(url, token_path, bv=bv)
     ps4.start_analysis()
     return ps4
@@ -57,5 +56,5 @@ def connect(bv=None, url=None, token_path=None):
 
 if "bv" in globals():
     ps4 = connect(bv)
-    print("PS4 shared broker connected; Binary Ninja analysis agent registered.")
+    print("PS4-Slop MCP server connected; Binary Ninja analysis agent registered.")
     print("No console attach or write performed. Use ps4.client.call(...), ps4.events(), ps4.extract(path), ps4.refresh_shadow(..., apply=False).")
