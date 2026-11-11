@@ -12,17 +12,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 # keep tauri-build / tauri / tauri-plugin-dialog on the same minors as the npm
-# side (@tauri-apps/cli 2.11.x, @tauri-apps/api 2.11.x, plugin-dialog 2.7.x);
+# side (@tauri-apps/cli 2.12.x, @tauri-apps/api 2.12.x, plugin-dialog 2.8.x);
 # the tauri CLI refuses mismatched major.minor pairs
-tauri-build = { version = "~2.6", features = [] }
+tauri-build = { version = "~2.7.4", features = [] }
 # build.rs parses tauri.conf.json to keep index.html's CSP in lockstep
 serde_json = "1"
 
 [dependencies]
 # no "devtools" feature: tauri enables devtools in debug builds on its own,
 # release builds ship without them
-tauri = { version = "~2.11.5", features = [] }
-tauri-plugin-dialog = "~2.7.3"
+tauri = { version = "~2.12.5", features = [] }
+tauri-plugin-dialog = "~2.8.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
