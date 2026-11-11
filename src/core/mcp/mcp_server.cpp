@@ -399,6 +399,28 @@ bool origin_allowed(std::string_view origin) {
     return false;
 }
 
+// dns rebinding + foreign origin rejection. Returns false and fills res with a
+// 403 when the request must not reach a handler.
+//
+// Callers with a request body must run this from inside the handler, not from
+// the pre-routing hook: httplib invokes that hook before it reads the body, so
+// answering there closes the connection with the body still unread and the
+// client sees a reset instead of the 403.
+bool guard_request(const httplib::Request& req, httplib::Response& res) {
+    if (!host_allowed(req.get_header_value("Host"), g_port.load())) {
+        res.set_header("Connection", "close");
+        send_json(res, 403, {{"ok", false}, {"error", "host not allowed"}});
+        return false;
+    }
+    const std::string origin = req.get_header_value("Origin");
+    if (!origin.empty() && !origin_allowed(origin)) {
+        res.set_header("Connection", "close");
+        send_json(res, 403, {{"ok", false}, {"error", "origin not allowed"}});
+        return false;
+    }
+    return true;
+}
+
 bool request_used_primary_token() { return t_used_primary; }
 
 void set_primary_token(std::string token) {
@@ -462,20 +484,13 @@ bool start(const server_config_t& cfg) {
         send_json(res, 500, rpc_error(-32603, msg, nullptr));
     });
 
-    // one guard for every route: dns rebinding, foreign origins, cors, preflight
+    // cors for the webview, plus the preflight answer. The host/origin guard
+    // itself lives in guard_request() and is called from each handler: this
+    // hook runs before httplib reads the request body, so rejecting a POST here
+    // would close the connection with the body unread.
     srv->set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res) {
-        if (!host_allowed(req.get_header_value("Host"), g_port.load())) {
-            res.set_header("Connection", "close");
-            send_json(res, 403, {{"ok", false}, {"error", "host not allowed"}});
-            return httplib::Server::HandlerResponse::Handled;
-        }
         const std::string origin = req.get_header_value("Origin");
-        if (!origin.empty()) {
-            if (!origin_allowed(origin)) {
-                res.set_header("Connection", "close");
-                send_json(res, 403, {{"ok", false}, {"error", "origin not allowed"}});
-                return httplib::Server::HandlerResponse::Handled;
-            }
+        if (!origin.empty() && origin_allowed(origin)) {
             res.set_header("Access-Control-Allow-Origin", origin);
             res.set_header("Vary", "Origin");
             res.set_header("Access-Control-Allow-Headers",
@@ -485,6 +500,8 @@ bool start(const server_config_t& cfg) {
             res.set_header("Access-Control-Max-Age", "600");
         }
         if (req.method == "OPTIONS") {
+            // a preflight never carries a body, so it is safe to reject here
+            if (!guard_request(req, res)) return httplib::Server::HandlerResponse::Handled;
             res.status = 204;
             return httplib::Server::HandlerResponse::Handled;
         }
@@ -492,11 +509,13 @@ bool start(const server_config_t& cfg) {
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    srv->Get("/health", [](const httplib::Request&, httplib::Response& res) {
+    srv->Get("/health", [](const httplib::Request& req, httplib::Response& res) {
+        if (!guard_request(req, res)) return;
         send_json(res, 200, {{"ok", true}, {"server", kServerName}, {"version", kServerVersion}});
     });
 
     srv->Post("/mcp", [](const httplib::Request& req, httplib::Response& res) {
+        if (!guard_request(req, res)) return;
         if (!require_auth(req, res, /*rpc_shape=*/true)) return;
         json req_json = json::parse(req.body, nullptr, false);
         if (req_json.is_discarded()) {
@@ -553,6 +572,7 @@ bool start(const server_config_t& cfg) {
     });
 
     srv->Delete("/mcp", [](const httplib::Request& req, httplib::Response& res) {
+        if (!guard_request(req, res)) return;
         if (!require_auth(req, res, /*rpc_shape=*/true)) return;
         const std::string sid = req.get_header_value("Mcp-Session-Id");
         if (sid.empty() || !session_known(sid)) {
@@ -564,6 +584,7 @@ bool start(const server_config_t& cfg) {
     });
 
     srv->Post("/api", [](const httplib::Request& req, httplib::Response& res) {
+        if (!guard_request(req, res)) return;
         if (!require_auth(req, res, /*rpc_shape=*/false)) return;
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded()) {
@@ -585,6 +606,7 @@ bool start(const server_config_t& cfg) {
     });
 
     srv->Get("/mcp", [](const httplib::Request& req, httplib::Response& res) {
+        if (!guard_request(req, res)) return;
         // gate the stream too or it leaks to anyone when a token is set
         if (!require_auth(req, res, /*rpc_shape=*/true)) return;
         if (!claim_stream(res)) return;
@@ -609,6 +631,7 @@ bool start(const server_config_t& cfg) {
 
     // event stream for the ui, way better than polling every bit of state 60 times a second
     srv->Get("/events", [](const httplib::Request& req, httplib::Response& res) {
+        if (!guard_request(req, res)) return;
         // eventsource cant send headers, so the ui trades its bearer for a single
         // use ticket (app.events_ticket) and passes that instead of the token
         if (!consume_ticket(req.get_param_value("ticket")) &&

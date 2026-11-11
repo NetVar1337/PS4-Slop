@@ -139,6 +139,9 @@ struct stream_t::impl_t {
     size_t plain_off = 0;
     bool closed = false;
     std::string error;
+    // 16 KiB recv scratch, kept on the heap: a stack buffer of this size trips
+    // MSVC /analyze C6262 (function uses 16396 bytes of stack)
+    std::vector<uint8_t> recv_buf = std::vector<uint8_t>(16384);
 
     ~impl_t() {
         if (has_ctx) ::DeleteSecurityContext(&ctx);
@@ -146,9 +149,9 @@ struct stream_t::impl_t {
     }
 
     int recv_more() {
-        uint8_t buf[16384];
-        const int r = ::recv(s, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        if (r > 0) in.insert(in.end(), buf, buf + r);
+        const int r = ::recv(s, reinterpret_cast<char*>(recv_buf.data()),
+                             static_cast<int>(recv_buf.size()), 0);
+        if (r > 0) in.insert(in.end(), recv_buf.begin(), recv_buf.begin() + r);
         return r;
     }
 

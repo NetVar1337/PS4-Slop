@@ -86,7 +86,9 @@ std::vector<uint8_t> encode_name(const std::vector<std::pair<LPCSTR, std::wstrin
 // of the last byte keeps the INTEGER positive and setting 0x40 keeps it 16 bytes
 std::vector<uint8_t> random_serial() {
     std::vector<uint8_t> s(16);
-    ::BCryptGenRandom(nullptr, s.data(), static_cast<ULONG>(s.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (::BCryptGenRandom(nullptr, s.data(), static_cast<ULONG>(s.size()),
+                          BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
+        return {};   // caller reports the failure, never a predictable serial
     s[15] = static_cast<uint8_t>((s[15] & 0x7F) | 0x40);
     return s;
 }
@@ -105,7 +107,9 @@ struct ncrypt_key_t {
 
 struct ncrypt_prov_t {
     NCRYPT_PROV_HANDLE h = 0;
-    ncrypt_prov_t() { ::NCryptOpenStorageProvider(&h, MS_KEY_STORAGE_PROVIDER, 0); }
+    ncrypt_prov_t() {
+        if (::NCryptOpenStorageProvider(&h, MS_KEY_STORAGE_PROVIDER, 0) != ERROR_SUCCESS) h = 0;
+    }
     ~ncrypt_prov_t() {
         if (h) ::NCryptFreeObject(h);
     }
@@ -168,6 +172,10 @@ struct cert_spec_t {
 
 std::vector<uint8_t> sign_cert(NCRYPT_KEY_HANDLE signer, const cert_spec_t& spec, DWORD* gle) {
     std::vector<uint8_t> serial = random_serial();
+    if (serial.empty()) {
+        *gle = ERROR_GEN_FAILURE;
+        return {};
+    }
     CERT_INFO info{};
     info.dwVersion = CERT_V3;
     info.SerialNumber = {static_cast<DWORD>(serial.size()), serial.data()};
