@@ -98,13 +98,19 @@ export const useOutput = create<OutputStore>((set, get) => ({
       });
       if (res.lines.length === 0) return;
       get().flush();
-      set((s) => ({
-        lines: appendBounded(
-          s.lines,
-          res.lines.filter((l) => l.seq > s.revision),
-        ),
-        revision: Math.max(s.revision, res.revision),
-      }));
+      set((s) => {
+        // Live output can advance `revision` past this replay window while the
+        // request is in flight. Merge by seq instead of dropping everything
+        // already <= revision, or the missed backlog would never appear.
+        const have = new Set(s.lines.map((l) => l.seq));
+        const add = res.lines.filter((l) => !have.has(l.seq));
+        if (add.length === 0) return s;
+        const merged = s.lines.concat(add).sort((a, b) => a.seq - b.seq);
+        return {
+          lines: merged.slice(-kMaxLines),
+          revision: Math.max(s.revision, res.revision),
+        };
+      });
       pendingRevision = Math.max(pendingRevision, get().revision);
     } catch {
       // Nothing to show is better than a thrown error in a log pane

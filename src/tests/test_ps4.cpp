@@ -12,6 +12,7 @@
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_ps4.hpp"
 #include "core/runtime/backend_registry.hpp"
+#include "core/runtime/gdb_rsp.hpp"
 #include "core/runtime/ps4_protocol.hpp"
 
 #include <winsock2.h>
@@ -522,7 +523,8 @@ private:
             return send_u32(c, len) && send_all(c, b, len);
         }
         case ps4::CMD_FW_VERSION: {
-            uint16_t fw = 0x1100;   // 11.00 BCD
+            // the payload reports major * 100 + minor (see fw.c), so 11.00 is 1100
+            uint16_t fw = 1100;
             return send_all(c, &fw, sizeof(fw));
         }
         case ps4::CMD_PLATFORM_ID: {
@@ -1762,7 +1764,7 @@ TEST_CASE(ps4_backend_handshake_and_enums) {
     CHECK(b.kind() == backend_kind_t::ps4);
     REQUIRE_STR_EQ(b.badge(), "PS4");
     CHECK(b.branding().find("ps4debug-NG") != std::string::npos);
-    CHECK(b.fw_version() == 0x1100);
+    CHECK(b.fw_version() == 1100);
     CHECK(b.endpoint() == "127.0.0.1:" + std::to_string(g.srv.port));
 
     auto procs = b.enum_processes();
@@ -2095,6 +2097,7 @@ TEST_CASE(ps4_debug_control_and_events) {
 
     // explicit debug attach (starts the 755 listener, connects the fake back)
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    std::fprintf(stderr, "after attach: att=%d pid=%u", (int)b.ps4_debug_attached(), b.ps4_debug_pid());
     if (!err.empty()) std::printf("  attach err: %s\n", err.c_str());
     CHECK(b.ps4_debug_attached());
     CHECK(b.ps4_debug_pid() == kFakePid);
@@ -4103,4 +4106,158 @@ TEST_CASE(ps4_fork_mcp_actions) {
     json st2 = dbg({{"action", "ps4_status"}}, e);
     CHECK(!e);
     CHECK(st2.value("reconnects", uint64_t{0}) >= 2u);   // both drops recovered
+}
+
+namespace {
+
+// minimal RSP client for the bridge tests: framed send + frame reader that
+// skips ack/nak bytes
+std::string rsp_send_pkt(SOCKET s, const std::string& cmd) {
+    uint8_t sum = 0;
+    std::string f = "$";
+    for (char ch : cmd) {
+        sum = static_cast<uint8_t>(sum + static_cast<uint8_t>(ch));
+        f += ch;
+    }
+    char tail[8];
+    std::snprintf(tail, sizeof(tail), "#%02x", sum);
+    f += tail;
+    if (::send(s, f.data(), static_cast<int>(f.size()), 0) == SOCKET_ERROR) return "";
+    return f;
+}
+
+std::string rsp_read_frame(SOCKET s) {
+    std::string payload;
+    bool in_pkt = false;
+    for (;;) {
+        char ch;
+        const int n = ::recv(s, &ch, 1, 0);
+        if (n <= 0) return "";
+        if (!in_pkt) {
+            if (ch == '$') in_pkt = true;
+            continue;   // skip '+', '-', anything else
+        }
+        if (ch == '#') {
+            char cc[2];
+            if (::recv(s, cc, 2, 0) != 2) return "";
+            return payload;
+        }
+        payload += ch;
+    }
+}
+
+uint16_t rsp_free_port() {
+    const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return 0;
+    sockaddr_in b{};
+    int len = sizeof(b);
+    ::getsockname(s, reinterpret_cast<sockaddr*>(&b), &len);
+    const uint16_t p = ntohs(b.sin_port);
+    ::closesocket(s);
+    return p;
+}
+
+} // namespace
+
+TEST_CASE(ps4_gdb_rsp_bridge) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+
+    // seed memory so the RSP 'm' read has known content (done before the
+    // debug attach: the lazy handle attach used here is not the debug session)
+    {
+        auto h = b.attach(kFakePid);
+        const uint8_t data[4] = {0xde, 0xad, 0xbe, 0xef};
+        REQUIRE(b.write_memory(h, 0x400100, data, 4).ok);
+        b.detach(h);
+    }
+
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    REQUIRE(b.ps4_debug_attached());
+
+    slop::core::runtime::gdb_rsp_server_t rsp;
+    const uint16_t rport = rsp_free_port();
+    REQUIRE_GT(rport, 0);
+    REQUIRE(rsp.start("127.0.0.1", rport, false, err, &b));
+    REQUIRE(rsp.running());
+
+    const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE(s != INVALID_SOCKET);
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(rport);
+    ::inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+    REQUIRE(::connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
+    DWORD to = 5000;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to), sizeof(to));
+
+    auto xchg = [&](const std::string& cmd) {
+        rsp_send_pkt(s, cmd);
+        return rsp_read_frame(s);
+    };
+
+    // handshake + target description (no console session needed for these)
+    REQUIRE(xchg("qSupported").rfind("PacketSize=4000", 0) == 0);
+    REQUIRE_STR_EQ(xchg("QStartNoAckMode").c_str(), "OK");
+    const auto xml = xchg("qXfer:features:read:target.xml:0,fff");
+    REQUIRE(xml.size() > 10);
+    REQUIRE((xml[0] == 'l' || xml[0] == 'm'));
+    REQUIRE(xml.substr(1).rfind("<?xml", 0) == 0);
+    REQUIRE_STR_EQ(xchg("qAttached").c_str(), "1");
+    REQUIRE_STR_EQ(xchg("qHostInfo").find("ostype:freebsd") != std::string::npos
+                       ? "ok" : "", "ok");
+
+    // threads: fixture has lwpid 101 (0x65) and 102 (0x66)
+    REQUIRE_STR_EQ(xchg("qfThreadInfo").c_str(), "m65,66");
+    REQUIRE_STR_EQ(xchg("qsThreadInfo").c_str(), "l");
+    REQUIRE_STR_EQ(xchg("qC").c_str(), "QC65");
+    REQUIRE_STR_EQ(xchg("Hg66").c_str(), "OK");
+    REQUIRE_STR_EQ(xchg("T65").c_str(), "OK");
+    REQUIRE_STR_EQ(xchg("T1234").c_str(), "E01");
+
+    // registers: fixture defaults rax=0x2A, rip=0x400123
+    const auto gblk = xchg("g");
+    REQUIRE(gblk.size() > 1000);
+    REQUIRE(gblk.substr(0, 16) == "2a00000000000000");       // rax LE
+    REQUIRE_STR_EQ(xchg("p10").c_str(), "2301400000000000"); // rip (regnum 16)
+
+    // memory read over RSP
+    REQUIRE_STR_EQ(xchg("m400100,4").c_str(), "deadbeef");
+    // writes refused without allow_writes
+    REQUIRE_STR_EQ(xchg("M400100,4:01020304").c_str(), "E01");
+    REQUIRE_STR_EQ(xchg("P0=0100000000000000").c_str(), "E01");
+
+    // breakpoint via Z0 lands on the fake console
+    REQUIRE_STR_EQ(xchg("Z0,400600,1").c_str(), "OK");
+    CHECK(g.srv.bps[0].enabled);
+    CHECK(g.srv.bps[0].address == 0x400600);
+
+    // continue: no immediate reply, the T.. stop reply arrives async
+    rsp_send_pkt(s, "c");
+    const auto stop = rsp_read_frame(s);
+    REQUIRE_STR_EQ(stop.c_str(), "T05thread:65;");
+
+    // step
+    rsp_send_pkt(s, "s");
+    const auto stop2 = rsp_read_frame(s);
+    REQUIRE(stop2.rfind("T05thread:65;", 0) == 0);
+
+    // clear the breakpoint
+    REQUIRE_STR_EQ(xchg("z0,400600,1").c_str(), "OK");
+    CHECK(!g.srv.bps[0].enabled);
+
+    // D closes only the RSP connection; the shared debug session stays up
+    REQUIRE_STR_EQ(xchg("D").c_str(), "OK");
+    ::closesocket(s);
+    CHECK(b.ps4_debug_attached());
+
+    rsp.stop();
+    CHECK(!rsp.running());
+    REQUIRE(b.ps4_debug_detach());
+    b.disconnect();
 }
