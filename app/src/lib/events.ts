@@ -91,7 +91,7 @@ const statusHandlers = new Set<(open: boolean) => void>();
 function emit(name: EventName, raw: string): void {
   const set = handlers.get(name);
   if (!set || set.size === 0) return;
-  let parsed: unknown = null;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
