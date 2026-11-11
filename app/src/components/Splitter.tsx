@@ -10,16 +10,22 @@ import {
   useState,
   type KeyboardEvent,
   type PointerEvent as ReactPointerEvent,
-  type RefObject,
 } from "react";
 import { kLayoutVars, useUi, type LayoutVar } from "@/store/ui";
+
+/**
+ * Read-only view of a ref. Splitter only reads `current`, never writes it, so
+ * taking the readonly shape keeps `RefObject<HTMLDivElement | null>` assignable
+ * (a mutable `RefObject<HTMLElement>` would be invariant under React 19 types).
+ */
+type RefTarget = { readonly current: HTMLElement | null };
 
 type Props = {
   axis: "x" | "y";
   /** CSS variable to drive, e.g. "--left-w". */
   variable: LayoutVar;
   /** Element the variable is set on. Defaults to the app root. */
-  target?: RefObject<HTMLElement>;
+  target?: RefTarget;
   min: number;
   max: number;
   /** Drag right/down shrinks instead of grows (handles on a panel's left edge). */

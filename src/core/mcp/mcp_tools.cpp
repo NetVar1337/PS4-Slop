@@ -82,8 +82,10 @@ void audit_log(const std::string& tool, const json& args, const json& out,
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch())
                         .count();
-    const std::string args_dump = args.dump();
-    const std::string out_dump  = out.dump();
+    // memory reads can hand back junk bytes, so never let the audit sink throw
+    // on invalid utf8 (that would turn a good tool call into a 500)
+    const std::string args_dump = args.dump(-1, ' ', false, json::error_handler_t::replace);
+    const std::string out_dump  = out.dump(-1, ' ', false, json::error_handler_t::replace);
     constexpr size_t kCap = 2048;
     json line = {{"ts_ms", ms},
                  {"tool", tool},
@@ -102,7 +104,7 @@ void audit_log(const std::string& tool, const json& args, const json& out,
     }
     std::lock_guard lk(g_audit_mu);
     std::ofstream f(path, std::ios::app);
-    if (f) f << line.dump() << "\n";
+    if (f) f << line.dump(-1, ' ', false, json::error_handler_t::replace) << "\n";
 }
 
 // ---- AI-rich output enrichment (additive only, never removes keys) ----
