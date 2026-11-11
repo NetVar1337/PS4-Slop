@@ -368,21 +368,23 @@ struct gdb_rsp_server_t::impl_t {
     }
 
     std::string stop_reply(const ps4_event_t& ev) {
-        // wait4 status: stopped = (status & 0xFF) == 0x7F, signal = (status>>8)&0xFF
-        const uint32_t status = ev.status;
+        // ps4debug-NG event status carries the stop signal in the high byte
+        // (ps4_decode_event: signal = (status>>8)&0xFF); zero signal = exited.
         char buf[64];
-        if ((status & 0xFF) == 0x7F) {
-            int sig = ev.signal;
-            if (sig == 19) sig = 17;
-            if (!(sig == 2 || sig == 4 || sig == 5 || sig == 8 || sig == 10 ||
-                  sig == 11 || sig == 17))
-                sig = 5;
-            std::snprintf(buf, sizeof(buf), "T%02xthread:%x;", sig, ev.lwpid);
-        } else if ((status & 0x7F) == 0) {
-            std::snprintf(buf, sizeof(buf), "W%02x;", (status >> 8) & 0xFF);
-        } else {
-            std::snprintf(buf, sizeof(buf), "T%02xthread:%x;", ev.signal & 0xFF, ev.lwpid);
+        int sig = ev.signal & 0xFF;
+        if (sig == 0) {
+            std::snprintf(buf, sizeof(buf), "W%02x;", ev.status & 0xFF);
+            return buf;
         }
+        if (sig == 9) {   // SIGKILL: the process died
+            std::snprintf(buf, sizeof(buf), "X%02x;", sig);
+            return buf;
+        }
+        if (sig == 19) sig = 17;   // SIGSTOP in GDB numbering
+        if (!(sig == 2 || sig == 4 || sig == 5 || sig == 8 || sig == 10 ||
+              sig == 11 || sig == 17))
+            sig = 5;
+        std::snprintf(buf, sizeof(buf), "T%02xthread:%x;", sig, ev.lwpid);
         return buf;
     }
 
@@ -589,14 +591,13 @@ struct gdb_rsp_server_t::impl_t {
                 static_cast<size_t>(len) > kMaxPacket / 2)
                 return reply("E01");
             std::lock_guard g(broker_gate());
-            if (!ensure_session(p, pid)) return reply("E02");
+            if (!ensure_session(p, pid)) return reply("E01");
             if (len == 0) return reply("");
             const auto h = handle_for(pid);
-            if (!h.valid()) return reply("E03");
             std::vector<uint8_t> buf(static_cast<size_t>(len));
             const auto io = p->read_memory(h, static_cast<uintptr_t>(addr), buf.data(),
                                            buf.size());
-            if (!io.ok || io.bytes != buf.size()) return reply("E04");
+            if (!io.ok || io.bytes != buf.size()) return reply("E01");
             return reply(hex_encode(buf.data(), buf.size()));
         }
         // writes need explicit opt-in at server start

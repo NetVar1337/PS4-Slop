@@ -159,7 +159,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
     server_fixture_t fx;
     json res = fx.rpc("tools/list");
     const auto& tools = res.at("result").at("tools");
-    REQUIRE_EQ(tools.size(), 21u);
+    REQUIRE_EQ(tools.size(), 22u);
 
     bool seen_target = false, seen_memory = false, seen_disasm = false,
          seen_debugger = false,
@@ -169,7 +169,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
          seen_decomp = false, seen_xray = false,
          seen_patch = false,
          seen_types = false, seen_notes = false, seen_devirt = false,
-         seen_guide = false, seen_host = false;
+         seen_guide = false, seen_host = false, seen_gdb = false;
     for (const auto& t : tools) {
         const std::string n = t.at("name").get<std::string>();
         if (n == "target")   seen_target = true;
@@ -191,6 +191,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
         if (n == "devirt")   seen_devirt = true;
         if (n == "guide")    seen_guide = true;
         if (n == "host")     seen_host = true;
+        if (n == "gdb")      seen_gdb = true;
         REQUIRE(t.contains("inputSchema"));
         REQUIRE(t.contains("description"));
         REQUIRE(t.at("description").is_string());
@@ -222,6 +223,7 @@ TEST_CASE(mcp_tools_list_consolidated) {
     REQUIRE(seen_devirt);
     REQUIRE(seen_guide);
     REQUIRE(seen_host);
+    REQUIRE(seen_gdb);
 }
 TEST_CASE(mcp_devirt_exposes_themida_sidecars) {
     server_fixture_t fx;
@@ -2376,6 +2378,102 @@ TEST_CASE(mcp_host_serves_payload_dir_with_sha256_manifest) {
     REQUIRE_EQ(json::parse(m->body).at("files").size(), 2u);
 
     res = fx.call("host", {{"action", "stop"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(mcp_gdb_tool_and_broker_status) {
+    namespace settings = slop::core::infra::settings;
+    mcp_scratch_dir_t tmp;
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+    settings::set("mcp_audit_enabled", false);
+
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // status with the bridge down: the MCP server itself is a broker client
+    json res = fx.call("gdb", {{"action", "status"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    REQUIRE(res.at("console").at("connected") == false);
+    bool saw_mcp = false;
+    for (const auto& c : res.at("broker_clients"))
+        if (c.at("name") == "mcp") saw_mcp = true;
+    REQUIRE(saw_mcp);
+
+    const uint16_t port = free_tcp_port();
+    REQUIRE_GT(port, 0);
+
+    // start is confirm-gated while mcp_require_confirm is on
+    settings::set("mcp_require_confirm", true);
+    res = fx.call("gdb", {{"action", "start"}, {"port", port}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("confirm") != std::string::npos);
+    settings::set("mcp_require_confirm", false);
+
+    // non-loopback bind is refused (the bridge exposes the console session)
+    res = fx.call("gdb", {{"action", "start"}, {"port", port}, {"bind", "0.0.0.0"}},
+                  is_error);
+    REQUIRE(is_error);
+    REQUIRE(res.at("error").get<std::string>().find("loopback") != std::string::npos);
+
+    // start on loopback works even without a console attached
+    res = fx.call("gdb", {{"action", "start"}, {"port", port}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.at("running").get<bool>());
+    REQUIRE_EQ(res.at("port").get<int>(), static_cast<int>(port));
+
+    // a raw RSP client can handshake without any console session
+    {
+        WSADATA d;
+        ::WSAStartup(MAKEWORD(2, 2), &d);
+        const SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        REQUIRE(s != INVALID_SOCKET);
+        sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        ::inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+        REQUIRE(::connect(s, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) == 0);
+        DWORD to = 3000;
+        ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to),
+                     sizeof(to));
+        const std::string cmd = "qSupported";
+        uint8_t sum = 0;
+        for (char ch : cmd) sum = static_cast<uint8_t>(sum + static_cast<uint8_t>(ch));
+        char pkt[64];
+        std::snprintf(pkt, sizeof(pkt), "$%s#%02x", cmd.c_str(), sum);
+        REQUIRE(::send(s, pkt, static_cast<int>(std::strlen(pkt)), 0) != SOCKET_ERROR);
+        std::string reply;
+        char ch;
+        for (;;) {              // skip acks until the frame starts
+            if (::recv(s, &ch, 1, 0) != 1) break;
+            if (ch == '$') break;
+        }
+        for (;;) {
+            if (::recv(s, &ch, 1, 0) != 1) break;
+            if (ch == '#') { char cc[2]; ::recv(s, cc, 2, 0); break; }
+            reply += ch;
+        }
+        REQUIRE(reply.rfind("PacketSize=4000", 0) == 0);
+
+        // while connected, status shows the RSP client and the gdb broker entry
+        res = fx.call("gdb", {{"action", "status"}}, is_error);
+        REQUIRE(!is_error);
+        REQUIRE(res.at("running").get<bool>());
+        REQUIRE_GE(res.at("rsp_clients").get<int>(), 1);
+        bool saw_gdb = false;
+        for (const auto& c : res.at("broker_clients"))
+            if (c.at("name").get<std::string>().rfind("gdb:", 0) == 0) saw_gdb = true;
+        REQUIRE(saw_gdb);
+        ::closesocket(s);
+    }
+
+    res = fx.call("gdb", {{"action", "stop"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(!res.at("running").get<bool>());
+    res = fx.call("gdb", {{"action", "status"}}, is_error);
     REQUIRE(!is_error);
     REQUIRE(!res.at("running").get<bool>());
     settings::set_file_for_testing({});

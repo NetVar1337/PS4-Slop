@@ -4173,7 +4173,7 @@ TEST_CASE(ps4_gdb_rsp_bridge) {
     {
         auto h = b.attach(kFakePid);
         const uint8_t data[4] = {0xde, 0xad, 0xbe, 0xef};
-        REQUIRE(b.write_memory(h, 0x5000, data, 4).ok);
+        REQUIRE(b.write_memory(h, 0x400100, data, 4).ok);
         b.detach(h);
     }
 
@@ -4227,9 +4227,9 @@ TEST_CASE(ps4_gdb_rsp_bridge) {
     REQUIRE_STR_EQ(xchg("p10").c_str(), "2301400000000000"); // rip (regnum 16)
 
     // memory read over RSP
-    REQUIRE_STR_EQ(xchg("m5000,4").c_str(), "deadbeef");
+    REQUIRE_STR_EQ(xchg("m400100,4").c_str(), "deadbeef");
     // writes refused without allow_writes
-    REQUIRE_STR_EQ(xchg("M5000,4:01020304").c_str(), "E01");
+    REQUIRE_STR_EQ(xchg("M400100,4:01020304").c_str(), "E01");
     REQUIRE_STR_EQ(xchg("P0=0100000000000000").c_str(), "E01");
 
     // breakpoint via Z0 lands on the fake console
