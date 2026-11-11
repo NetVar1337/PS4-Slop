@@ -1,0 +1,20 @@
+import os
+import sys
+
+
+repository = os.environ.get("PS4_MCP_ROOT", "C:/Users/Admin/Desktop/GithubProjects/PS4-MCP")
+if repository not in sys.path:
+    sys.path.insert(0, repository)
+
+from ps4_mcp.adapters.ghidra import GhidraWorkbench
+
+try:
+    plugin_tool = state.getTool()  # noqa: F821 - provided by the Ghidra script environment; None when headless
+except NameError:
+    plugin_tool = None
+
+ps4 = GhidraWorkbench(currentProgram, "http://127.0.0.1:8765", os.path.join(repository, "profiles", "broker-token.local"),
+                      tool=plugin_tool)
+ps4.start_analysis()
+print("PS4 shared broker connected; Ghidra static analysis agent registered. No console attach or write performed.")
+print("Use ps4.client.call(...), ps4.events(), ps4.extract(path), and ps4.refresh_shadow(..., apply=False).")
