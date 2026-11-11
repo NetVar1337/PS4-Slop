@@ -5,6 +5,7 @@
 // the bridge was started with allow_writes=true.
 
 #include "core/mcp/tools_common.hpp"
+#include "core/runtime/broker.hpp"
 #include "core/runtime/gdb_rsp.hpp"
 
 namespace slop::core::mcp::detail {

@@ -241,6 +241,10 @@ struct conn_t {
     bool libs_cached = false;
 };
 
+} // namespace
+
+// impl_t is a nested class of gdb_rsp_server_t, so its definition must live
+// at namespace scope (an anonymous namespace would make it a different type)
 struct gdb_rsp_server_t::impl_t {
     backend_ps4_t* test_backend = nullptr;   // tests inject a direct backend
     SOCKET listen_sock = INVALID_SOCKET;
@@ -295,7 +299,7 @@ struct gdb_rsp_server_t::impl_t {
     }
 
     // full 'g' register block as hex (LE per register)
-    std::string register_block(uint32_t pid, uint64_t tid) {
+    std::string register_block(uint64_t tid) {
         auto* p = backend();
         thread_context_t ctx{};
         if (p && p->get_thread_context(static_cast<uint32_t>(tid), ctx).ok) {}
@@ -565,7 +569,7 @@ struct gdb_rsp_server_t::impl_t {
             if (!ensure_session(p, pid)) return reply("E01");
             const uint64_t tid = current_thread(pid, c);
             if (!tid) return reply("E01");
-            const std::string block = register_block(pid, tid);
+            const std::string block = register_block(tid);
             if (cmd == "g") return reply(block);
             int64_t idx = 0;
             if (!parse_hex(cmd.substr(1), idx) || idx < 0 ||
@@ -847,7 +851,8 @@ struct gdb_rsp_server_t::impl_t {
                         send_all(c->sock, c->last_frame.data(), c->last_frame.size());
                     continue;
                 case decoder_t::msg_t::bad:
-                    if (!c->no_ack) send_all(c->sock, "-", 1);
+                    if (!c->no_ack)
+                        send_all(c->sock, reinterpret_cast<const uint8_t*>("-"), 1);
                     continue;
                 case decoder_t::msg_t::interrupt: {
                     // Ctrl-C: report the last stop (no async halt on the payload)
@@ -862,7 +867,8 @@ struct gdb_rsp_server_t::impl_t {
                 case decoder_t::msg_t::packet: break;
                 }
                 const std::string payload(m.payload.begin(), m.payload.end());
-                if (!c->no_ack) send_all(c->sock, "+", 1);
+                if (!c->no_ack)
+                    send_all(c->sock, reinterpret_cast<const uint8_t*>("+"), 1);
                 if (c->unacknowledged && payload.size() == c->last_request.size() &&
                     payload == std::string(c->last_request.begin(), c->last_request.end())) {
                     if (!c->last_frame.empty())
@@ -991,8 +997,6 @@ struct gdb_rsp_server_t::impl_t {
         broker_client_detach("gdb:" + std::to_string(port));
     }
 };
-
-} // namespace
 
 gdb_rsp_server_t::gdb_rsp_server_t() : p_(std::make_unique<impl_t>()) {}
 gdb_rsp_server_t::~gdb_rsp_server_t() { stop(); }
