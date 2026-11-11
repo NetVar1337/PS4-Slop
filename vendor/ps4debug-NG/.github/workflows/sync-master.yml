@@ -1,0 +1,46 @@
+name: sync-fork-master
+
+# Keeps the fork's master permanently merged with every branch. Runs on a
+# schedule and on demand; pushes to master also refresh it.
+on:
+  schedule:
+    - cron: '17 * * * *'   # hourly
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+jobs:
+  merge-all:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Merge every branch into master
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin --prune
+          merged_any=0
+          for ref in $(git branch -r --format='%(refname:short)' | grep '^origin/' | grep -v '^origin/master$' | grep -v '^origin/HEAD'); do
+            branch="${ref#origin/}"
+            # skip branches GitHub keeps for closed PRs is not possible here;
+            # merge and abort cleanly on conflict, reporting it.
+            if git merge --no-edit "$ref" >/dev/null 2>&1; then
+              echo "merged: $branch"
+              merged_any=1
+            else
+              git merge --abort
+              echo "::warning::conflict with $branch - left unmerged"
+            fi
+          done
+          if [ "$merged_any" = "1" ]; then
+            git push origin master
+          else
+            echo "master already up to date"
+          fi
