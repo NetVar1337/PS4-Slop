@@ -35,10 +35,11 @@ Test visibility and agent-facing surface, because that is where the leverage is:
 - [ ] CFG graph view in the UI; unify Hyperion/Zydis function detection.
 - [ ] `.pdata`-based stack unwinding; thread-aware stepping parity.
 - [ ] ARM64 emulation path for Mach-O/iOS images (Unicorn is x86-64 only today).
-- [ ] PCAP *import* (analyze console traffic from a tap without routing through the PC).
+- [ ] PCAP _import_: analyze console traffic from a tap without routing
+      it through the PC.
 - [ ] `sessions.db` schema versioning/migrations.
-- [ ] Decide the fate of the ImGui shell: ship as documented lightweight fallback or
-      remove; publish the feature-parity matrix either way.
+- [ ] Decide the fate of the ImGui shell: ship it as a documented lightweight
+      fallback or remove it; publish the parity matrix either way.
 - [ ] Tutorial docs ("first console connect", "dump → rename → decompile") and a
       hosted docs site generated from `docs/`.
 - [ ] Linux engine port (headless MCP server on an analysis VM): abstract

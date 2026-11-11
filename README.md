@@ -34,17 +34,17 @@ scanning) are shown in their waiting state; connect a PS4 and they come alive.</
 
 ## What it does
 
-| Area                   | Summary                                                                                                                                                                                                                     |
-| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Console connection** | Speaks the [ps4debug-NG](https://github.com/NetVar1337/ps4debug-NG) wire protocol directly (TCP 744 + the port-755 event callback; upstream Pharaoh2k builds work too). Nothing is installed on the PC side of the wire. |
-| **Live memory**        | Process list, attach, regions, modules, threads, read/write/protect/alloc, Cheat Engine-style scans, AOB search, pointer chains, snapshots and diffs, a shared watchlist with freeze.                                       |
-| **Live debugging**     | Software breakpoints, DR0–DR3 hardware watchpoints, continue/step/suspend, stop events with full register sets, callstacks, FP/FS-GS registers, remote function calls, one-call trace actions.                              |
+| Area                   | Summary                                                                                                                                                                                                                                    |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Console connection** | Speaks the [ps4debug-NG](https://github.com/NetVar1337/ps4debug-NG) wire protocol directly (TCP 744 + the port-755 event callback; upstream Pharaoh2k builds work too). Nothing is installed on the PC side of the wire.                   |
+| **Live memory**        | Process list, attach, regions, modules, threads, read/write/protect/alloc, Cheat Engine-style scans, AOB search, pointer chains, snapshots and diffs, a shared watchlist with freeze.                                                      |
+| **Live debugging**     | Software breakpoints, DR0–DR3 hardware watchpoints, continue/step/suspend, stop events with full register sets, callstacks, FP/FS-GS registers, remote function calls, one-call trace actions.                                             |
 | **On-console tooling** | Native scan/rescan, **Turbo Scan** (server-resident SIMD/aliasing scans + snapshots), verified bulk writes (`ps4_write_multi`), fork `ps4_modules` / `ps4_snapshot`, Zydis disassembly, xrefs, stack walks, Keystone assembly, ELF upload. |
-| **Static analysis**    | ELF64 (SCE imports with **NID→name resolution**, relocations), decrypted-SELF extraction, PE and Mach-O/`.ipa`; function, xref and string indexes; Xray passes; patching with a journal; binary diffing; packer heuristics. |
-| **Decompiler**         | Hyperion p-code lifting, SSA, DCE, type inference and structuring to C-like output (SysV AMD64, Win64, AAPCS64).                                                                                                            |
-| **Emulation**          | Isolated Unicorn x86-64 runs with demand paging from the loaded image or live memory, tracing and byte-level taint.                                                                                                         |
-| **Automation**         | Lua 5.4 against the same shared session as the UI, plus an MCP server with 20 action-based tools and task playbooks (`guide`).                                                                                              |
-| **Host network**       | Raw-socket capture, DNS log, stream reassembly, PCAP export, and a localhost HTTP inspection proxy.                                                                                                                         |
+| **Static analysis**    | ELF64 (SCE imports with **NID→name resolution**, relocations), decrypted-SELF extraction, PE and Mach-O/`.ipa`; function, xref and string indexes; Xray passes; patching with a journal; binary diffing; packer heuristics.                |
+| **Decompiler**         | Hyperion p-code lifting, SSA, DCE, type inference and structuring to C-like output (SysV AMD64, Win64, AAPCS64).                                                                                                                           |
+| **Emulation**          | Isolated Unicorn x86-64 runs with demand paging from the loaded image or live memory, tracing and byte-level taint.                                                                                                                        |
+| **Automation**         | Lua 5.4 against the same shared session as the UI, plus an MCP server with 20 action-based tools and task playbooks (`guide`).                                                                                                             |
+| **Host network**       | Raw-socket capture, DNS log, stream reassembly, PCAP export, and a localhost HTTP inspection proxy.                                                                                                                                        |
 
 Two desktop shells drive the same C++ core: the **Tauri v2 + React** app (the one that
 ships) and a legacy **ImGui/DX11** shell. The engine also runs headless for MCP/HTTP
@@ -499,8 +499,8 @@ src/
 ├── target/    deterministic live-analysis fixture (SlopTarget.exe)
 ├── tests/     core test harness (slop_tests.exe)
 └── live/      live probes
-app/           Tauri v2 supervisor and React/TypeScript frontend
-tools/         build, Magicmida installer, live-test and benchmark scripts
+app/           Tauri v2 supervisor and React/TypeScript frontend (e2e/ = e2e driver)
+tools/         build, Magicmida installer, live-test, benchmark and screenshot scripts
 examples/      Lua scripts (PS4 breakpoints, eboot overview, find-value)
 ```
 
@@ -618,6 +618,11 @@ wire/schemas, analysis, emulation, the capture store, persistence, RTTI/types, L
 dumping, Hyperion/decompilation, Mach-O/`.ipa`, Xray/patching and Magicmida supervision.
 Weekly CI benchmarks guard the hot paths against regressions
 ([`docs/benchmarks`](docs/benchmarks)).
+
+An end-to-end smoke (`app/e2e`, nightly CI lane) spawns the real engine and the
+`SlopTarget` fixture and drives attach → read → watchlist → Lua → detach over the HTTP
+API; the same driver regenerates the README screenshots
+(`powershell -File tools/screenshots.ps1`).
 
 `tools/mcp_live_test.py` is a destructive-capable integration battery for a running engine
 with `SlopTarget` loaded; read it before running — it writes memory, patches images, and
