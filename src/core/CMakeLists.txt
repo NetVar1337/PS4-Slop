@@ -174,6 +174,11 @@ add_library(slop_core STATIC
     mcp/tools_script.cpp
     mcp/tools_app_guide.cpp
     mcp/tools_host.cpp
+    mcp/tools_gdb.cpp
+    runtime/broker.hpp
+    runtime/broker.cpp
+    runtime/gdb_rsp.hpp
+    runtime/gdb_rsp.cpp
     infra/mcp_onboard.hpp
     infra/mcp_onboard.cpp
 )

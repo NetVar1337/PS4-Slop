@@ -210,6 +210,7 @@ json tool_script(const json& args, infra::cancel_token_t cancel);
 json tool_app(const json& args);
 json tool_guide(const json& args);
 json tool_host(const json& args);
+json tool_gdb(const json& args);
 
 } // namespace detail
 

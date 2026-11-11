@@ -31,8 +31,11 @@ inline std::string default_func_name(va_t va) {
     do {
         rev[n++] = kHex[va & 0xF];
         va >>= 4;
-    } while (va && n < static_cast<int>(sizeof rev));   // bound n so the read below stays in range
+    } while (va && n < static_cast<int>(sizeof rev));   // va_t is <= 64-bit -> at most 16 nibbles
     std::string out("sub_");
+    // n is provably in [1,16] here, but /analyze cannot prove the rev[--n]
+    // index's lower bound and reports a false C6385.
+#pragma warning(suppress : 6385)
     while (n) out.push_back(rev[--n]);
     return out;
 }

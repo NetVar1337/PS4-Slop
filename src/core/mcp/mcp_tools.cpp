@@ -4,6 +4,8 @@
 
 #include "core/mcp/tools_common.hpp"
 #include "core/mcp/mcp_server.hpp"
+#include "core/runtime/broker.hpp"
+#include "core/runtime/gdb_rsp.hpp"
 
 namespace slop::core::mcp {
 
@@ -58,6 +60,8 @@ bool action_mutating(const std::string& tool, const std::string& action) {
         return true;
     if (tool == "host")
         return action != "status" && action != "files" && action != "manifest";
+    if (tool == "gdb")
+        return action != "status";
     if (tool == "proxy")
         return action != "status" && action != "entries" && action != "entry" &&
                action != "replay";
@@ -916,6 +920,12 @@ void list_tools(json& out) {
                    {"description", "Serve a payload directory over HTTP (afterglow-web style payload host for a jailbroken PS4 / GoldHEN bin loader): start {port=8080, bind=127.0.0.1, dir, token?} serves GET / (index page), GET /manifest.json (auto-generated {files:[{name,size,sha256,url}]}), and GET /files/<name> (download, path-traversal guarded, 64 MiB per-file cap). A non-loopback bind always requires a token (arg or host_token setting) enforced as Authorization: Bearer / ?token=. stop ends the server; status reports the running endpoint; files/manifest return the manifest without HTTP; put {name, hex|text} drops a file into the served dir and returns its sha256. Payloads are your own homebrew files only."},
                    {"inputSchema", json::parse(host_schema)}, {"read_only", false}});
 
+    const char* gdb_schema =
+        R"json({"type":"object","properties":{"action":{"type":"string","enum":["start","stop","status"]},"port":{"type":"integer","description":"start: listen port (default 2331)"},"bind":{"type":"string","description":"start: loopback only (default 127.0.0.1); non-loopback is refused"},"allow_writes":{"type":"boolean","description":"start: allow RSP memory/register writes (M/G/P packets); default false. Breakpoints (Z/z) are always allowed"},"confirm":{"type":"boolean","description":"required on start/stop while mcp_require_confirm is on"}},"required":["action"]})json";
+    out.push_back({{"name", "gdb"},
+                   {"description", "Control the GDB Remote Serial Protocol bridge (ported from PS4-MCP rsp.rs/broker): start {port=2331, bind=127.0.0.1, allow_writes=false} opens a TCP listener that speaks RSP so GDB/LLDB/Binary Ninja attach with 'target remote 127.0.0.1:2331' to the SAME console debug session the UI and MCP use (all clients serialize on the one ps4debug-NG connection via the broker gate). Supports qSupported, target.xml/memory-map/libraries qXfer, thread packets (qC/qfThreadInfo/Hg/Hc/T), register read g/p (GPRs + FPU via the debug session), memory read m, breakpoints/watchpoints Z/z (software bp + DR0-DR3 watchpoints), continue/step c/s/vCont with async T.. stop replies from the port-755 event stream, qAttached, vAttach, D (closes only the RSP connection, the shared session stays up). Writes M/G/P and kill/restart stay refused unless allow_writes=true at start. stop ends the bridge; status reports the bridge, the console debug session and the broker client list (mcp, gdb:<port>, ...). Requires debugger.ps4_attach {pid} first."},
+                   {"inputSchema", json::parse(gdb_schema)}, {"read_only", false}});
+
     for (auto& t : out) finalize_tool_entry(t);
 }
 
@@ -1009,6 +1019,7 @@ static nlohmann::json call_tool_inner(const std::string& name,
         else if (name == "devirt")   out = tool_devirt(args);
         else if (name == "guide")    out = tool_guide(args);
         else if (name == "host")     out = tool_host(args);
+        else if (name == "gdb")      out = tool_gdb(args);
         else found = false;
         if (!found) {
             is_error = true;
@@ -1056,7 +1067,13 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         audit_log(name, args, err, true);
         return err;
     }
-    json out = call_tool_inner(name, args, is_error, cancel);
+    json out;
+    {
+        // broker gate: MCP tool calls serialize with every other console
+        // client (UI, the GDB-RSP bridge) on the one console connection
+        std::lock_guard rg(slop::core::runtime::broker_gate());
+        out = call_tool_inner(name, args, is_error, cancel);
+    }
     audit_log(name, args, out, is_error);
     return out;
 }
@@ -1076,6 +1093,7 @@ void shutdown_tools() {
     }
     std::lock_guard ilk(g_image_mu);
     g_proxy.stop();
+    runtime::gdb_rsp().stop();
     g_scan.engine.reset();
     g_scan.used = false;
     g_snaps.clear();
