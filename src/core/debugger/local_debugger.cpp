@@ -153,6 +153,9 @@ struct local_debugger_t::impl_t {
         ev.status = code;
         if (HANDLE worker = thread_handle(tid)) {
             alignas(16) CONTEXT c;
+            // NOLINTNEXTLINE(misc-redundant-expression) - CONTEXT_FULL and
+            // CONTEXT_DEBUG_REGISTERS share the CONTEXT_AMD64 base bit; the OR
+            // is intentional (adds the debug-register set to a full context).
             if (get_ctx(worker, c, CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS)) {
                 runtime::context_from_win(ev.ctx, c);
                 ev.dr[0] = c.Dr0; ev.dr[1] = c.Dr1; ev.dr[2] = c.Dr2; ev.dr[3] = c.Dr3;
