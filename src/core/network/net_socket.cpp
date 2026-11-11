@@ -60,7 +60,10 @@ void ensure_wsa() {
     static std::once_flag once;
     std::call_once(once, [] {
         WSADATA d{};
-        ::WSAStartup(MAKEWORD(2, 2), &d);   // intentionally never cleaned up
+        // best effort: if winsock init fails every later socket call reports
+        // its own error, so the status is deliberately not propagated
+        const int rc = ::WSAStartup(MAKEWORD(2, 2), &d);
+        (void)rc;   // intentionally never cleaned up
     });
 }
 
