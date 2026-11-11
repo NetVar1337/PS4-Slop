@@ -419,7 +419,7 @@ json tool_memory(const json& args) {
             out["text"] = text;
         } else if (fmt == "u8" || fmt == "u32" || fmt == "u64" || fmt == "f32" || fmt == "f64") {
             json arr = json::array();
-            const size_t w = fmt == "u8" ? 1 : fmt == "u32" ? 4 : fmt == "f32" ? 4 : fmt == "f64" ? 8 : 8;
+            const size_t w = fmt == "u8" ? 1 : fmt == "u32" ? 4 : fmt == "f32" ? 4 : 8;
             for (size_t off = 0; off + w <= got; off += w) {
                 if (fmt == "u8")  arr.push_back(buf[off]);
                 if (fmt == "u32") { uint32_t v; memcpy(&v, buf.data() + off, 4); arr.push_back(v); }

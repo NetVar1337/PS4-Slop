@@ -141,4 +141,16 @@ bool mcp_onboarded() { return get<bool>("mcp_onboarded", false); }
 
 void set_mcp_onboarded(bool v) { set("mcp_onboarded", v); }
 
+bool mcp_audit_enabled() { return get<bool>("mcp_audit_enabled", true); }
+
+std::string mcp_audit_path() {
+    const std::string p = get<std::string>("mcp_audit_path", {});
+    if (!p.empty()) return p;
+    const std::string& ad = paths::app_data();
+    if (ad.empty()) return {};
+    return ad + "\\mcp_audit.jsonl";
+}
+
+bool mcp_require_confirm() { return get<bool>("mcp_require_confirm", false); }
+
 } // namespace slop::core::infra::settings

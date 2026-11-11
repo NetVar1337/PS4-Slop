@@ -2,12 +2,68 @@
 // tool: target (processes, attach, modules, ps4 connect)
 
 #include "core/mcp/tools_common.hpp"
+#include "core/network/net_socket.hpp"
 
 #include <list>
 
 namespace slop::core::mcp::detail {
 
 namespace {
+
+// UDP broadcast discovery (ps4debug-mcp convention): send kBroadcastMagic to
+// 255.255.255.255:kBroadcastPort in little-endian byte order (same as the
+// Python client's struct.pack("<I")) and collect every payload that answers
+// with the same magic
+std::vector<std::string> discover_ps4(int timeout_ms) {
+    std::vector<std::string> out;
+    network::sock::ensure_wsa();
+    SOCKET s = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return out;
+    BOOL bc = TRUE;
+    ::setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bc),
+                 sizeof(bc));
+    const DWORD to = timeout_ms > 0 ? static_cast<DWORD>(timeout_ms) : 2000;
+    ::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&to),
+                 sizeof(to));
+    sockaddr_in dst{};
+    dst.sin_family      = AF_INET;
+    dst.sin_port        = htons(runtime::ps4::kBroadcastPort);
+    dst.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    const uint32_t magic = runtime::ps4::kBroadcastMagic;   // host (LE) order on the wire
+    ::sendto(s, reinterpret_cast<const char*>(&magic), sizeof(magic), 0,
+             reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(to);
+    for (;;) {
+        char buf[64];
+        sockaddr_in from{};
+        int fromlen = sizeof(from);
+        const int n = ::recvfrom(s, buf, sizeof(buf), 0,
+                                 reinterpret_cast<sockaddr*>(&from), &fromlen);
+        if (n == SOCKET_ERROR) break;   // receive timeout: stop collecting
+        if (n >= static_cast<int>(sizeof(magic)) &&
+            std::memcmp(buf, &magic, sizeof(magic)) == 0) {
+            char ip[INET_ADDRSTRLEN]{};
+            ::inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip));
+            if (std::find(out.begin(), out.end(), ip) == out.end())
+                out.emplace_back(ip);
+        }
+        if (std::chrono::steady_clock::now() >= deadline) break;
+    }
+    ::closesocket(s);
+    return out;
+}
+
+// host "auto"/"discover": pick the first console answering the broadcast probe
+std::string resolve_host_arg(const std::string& host, int timeout_ms = 2000) {
+    if (host != "auto" && host != "discover") return host;
+    const auto found = discover_ps4(timeout_ms);
+    if (found.empty())
+        fail("discovery found no console (UDP broadcast 255.255.255.255:" +
+             std::to_string(runtime::ps4::kBroadcastPort) +
+             ", magic 0xFFFFAAAA); pass an explicit PS4 IP as host");
+    return found.front();
+}
 
 const char* elevation_name(runtime::elevation_t e) {
     switch (e) {
@@ -166,10 +222,33 @@ json tool_target(const json& args) {
         return {{"attached", false}};
     }
 
+    if (action == "ps4_discover") {
+        const uint64_t t =
+            args.contains("timeout_ms") ? parse_addr(args, "timeout_ms") : 2000;
+        const int timeout_ms = t > 60000 ? 60000 : static_cast<int>(t);
+        const auto found = discover_ps4(timeout_ms);
+        json consoles = json::array();
+        for (const auto& ip : found) consoles.push_back({{"ip", ip}});
+        json out = {{"found", found.size()}, {"consoles", consoles},
+                    {"probe", "udp broadcast 255.255.255.255:" +
+                                  std::to_string(runtime::ps4::kBroadcastPort) +
+                                  " magic 0xFFFFAAAA"}};
+        if (found.empty())
+            out["hint"] = "No payload answered. The console must run ps4debug-NG "
+                          "(or GoldHEN) with the discovery listener, and the PC "
+                          "must be on the same subnet. Pass an explicit host to "
+                          "ps4_connect instead.";
+        else
+            out["hint"] = "Use target.ps4_connect or ps4_auto with host=\"" +
+                          found.front() + "\" (or host=\"auto\" to pick the first).";
+        return out;
+    }
+
     if (action == "ps4_connect") {
         if (!args.contains("host") || !args.at("host").is_string())
-            fail("ps4_connect requires string 'host' (the PS4 IP)");
-        const std::string host = args.at("host").get<std::string>();
+            fail("ps4_connect requires string 'host' (the PS4 IP, or \"auto\" to "
+                 "discover via UDP broadcast)");
+        const std::string host = resolve_host_arg(args.at("host").get<std::string>());
         if (host.empty()) fail("ps4_connect: 'host' is empty");
         const uint64_t port = args.contains("port") ? parse_addr(args, "port")
                                                     : runtime::ps4::kDefaultPort;
@@ -251,8 +330,9 @@ json tool_target(const json& args) {
         // /app0/ in its executable path), attach a session, debug-attach, and
         // return a full summary
         if (!args.contains("host") || !args.at("host").is_string())
-            fail("ps4_auto requires string 'host' (the PS4 IP)");
-        const std::string host = args.at("host").get<std::string>();
+            fail("ps4_auto requires string 'host' (the PS4 IP, or \"auto\" to "
+                 "discover via UDP broadcast)");
+        const std::string host = resolve_host_arg(args.at("host").get<std::string>());
         if (host.empty()) fail("ps4_auto: 'host' is empty");
         const uint64_t port = args.contains("port") ? parse_addr(args, "port")
                                                     : runtime::ps4::kDefaultPort;

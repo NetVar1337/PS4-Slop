@@ -60,6 +60,10 @@ std::string io_error_str(uint32_t code);
 constexpr uint32_t kPacketMagic   = 0xFFAABBCC;
 constexpr uint16_t kDefaultPort   = 744;    // main command server (TCP)
 constexpr uint16_t kDebugPort     = 755;    // server->client debug events (TCP)
+// UDP discovery probe (ps4debug-mcp convention): a payload listening on
+// kBroadcastPort answers the magic with the same magic
+constexpr uint32_t kBroadcastMagic = 0xFFFFAAAA;
+constexpr uint16_t kBroadcastPort  = 1010;
 constexpr uint32_t kHeaderSize    = 12;     // magic + cmd + datalen
 constexpr uint32_t kChunkSize     = 0x10000; // server streams payloads in 64 KiB chunks
 constexpr size_t   kMaxIoLen      = 16u * 1024u * 1024u; // sanity cap for one transfer
