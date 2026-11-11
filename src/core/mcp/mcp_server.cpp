@@ -8,6 +8,7 @@
 #include "core/infra/clock.hpp"
 #include "core/infra/event_bus.hpp"
 #include "core/infra/settings.hpp"
+#include "core/runtime/broker.hpp"
 
 #include <httplib.h>
 
@@ -666,11 +667,13 @@ bool start(const server_config_t& cfg) {
         g_port = 0;
         return false;
     }
+    runtime::broker_client_attach("mcp");
     return true;
 }
 
 void stop() {
     if (!g_running.exchange(false)) return;
+    runtime::broker_client_detach("mcp");
     // nudge the parked event streams so the join below is instant
     infra::event_bus::publish("server.stopping", nlohmann::json::object());
     std::vector<std::shared_ptr<infra::cancel_source_t>> active;

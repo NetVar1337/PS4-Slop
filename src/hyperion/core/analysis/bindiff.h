@@ -1,5 +1,6 @@
 #pragma once
 #include "analysis_db.h"
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <vector>
@@ -40,8 +41,15 @@ public:
         size_t pairs_skipped_size = 0;
     };
     std::vector<DiffResult> compare(const AnalysisDB& a, const AnalysisDB& b);
+    // no default argument here: options_t is a nested class and its default
+    // member initializers are not in scope inside the enclosing class (clang
+    // diagnoses `opt = {}`; MSVC accepts it as an extension). The 2-arg
+    // overload forwards from a member body, where the class is complete.
+    outcome_t compare_budgeted(const AnalysisDB& a, const AnalysisDB& b) {
+        return compare_budgeted(a, b, options_t{});
+    }
     outcome_t compare_budgeted(const AnalysisDB& a, const AnalysisDB& b,
-                               const options_t& opt = {});
+                               const options_t& opt);
 
 private:
     float compute_similarity(const Function& fa, const Function& fb);

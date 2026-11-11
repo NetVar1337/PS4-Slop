@@ -927,11 +927,19 @@ struct backend_ps4_t::impl_t {
 
     // the debug session is over (detach, SIGKILL, channel closed): drop
     // every per-session record. Caller holds dbg_mu.
-    void end_debug_session_locked(const std::string& why) {
+    // keep_slots: the console connection died with the session — the
+    // records still describe what was armed and are re-armed after a
+    // reconnect, so they are only marked stale instead of wiped.
+    void end_debug_session_locked(const std::string& why, bool keep_slots = false) {
         if (dbg_pid.exchange(0) != 0 && !why.empty())
             infra::diag::info("ps4", "debug session ended: " + why);
         dbg_held.store(false);
-        wipe_slots();
+        if (keep_slots) {
+            std::lock_guard lk(slot_mu);
+            slots_stale = true;
+        } else {
+            wipe_slots();
+        }
     }
 
     // ---- events -------------------------------------------------------
@@ -961,7 +969,8 @@ struct backend_ps4_t::impl_t {
         // only the channel of the live attach means "session gone"; failed
         // attach attempts and earlier sessions close their channels too
         if (attach_id != 0 && attach_id == live_attach && dbg_pid.load() != 0)
-            end_debug_session_locked("the payload closed the debug-event channel");
+            end_debug_session_locked("the payload closed the debug-event channel",
+                                     /*keep_slots=*/conn->peer_gone());
     }
 
     void clear_events() {
@@ -1641,10 +1650,12 @@ uint16_t backend_ps4_t::fw_version() const noexcept {
 
 std::string backend_ps4_t::fw_string() const {
     const uint16_t fw = fw_version();
-    if (fw == 0) return {};
-    char b[8];
-    std::snprintf(b, sizeof(b), "%X.%02X", static_cast<unsigned>(fw >> 8),
-                  static_cast<unsigned>(fw & 0xFF));
+    // the payload reports major*100+minor (fw.c: cached = major * 100 + minor),
+    // so 1400 is 14.00 and 505 is 5.05. 0xFFFF is the payload's "unknown" sentinel.
+    if (fw == 0 || fw == 0xFFFFu) return {};
+    char b[16];
+    std::snprintf(b, sizeof(b), "%u.%02u", static_cast<unsigned>(fw / 100u),
+                  static_cast<unsigned>(fw % 100u));
     return b;
 }
 

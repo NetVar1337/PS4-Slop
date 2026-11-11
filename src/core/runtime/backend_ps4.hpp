@@ -89,8 +89,8 @@ public:
     std::string branding() const;   // server branding string or ""
     std::string server_caps() const;    // capability tail of the branding blob
     std::string server_version() const; // CMD_VERSION string or ""
-    uint16_t    fw_version() const noexcept;  // BCD (e.g. 0x1100 = 11.00), 0 if unknown
-    std::string fw_string() const;            // "11.00" or "" if unknown
+    uint16_t    fw_version() const noexcept;  // major*100+minor (e.g. 1400 = 14.00), 0 if unknown
+    std::string fw_string() const;            // "14.00" or "" if unknown
 
     // any send/recv failure (error, peer close, timeout, desync) closes the
     // socket so connected() goes false and callers fail fast. lost() then

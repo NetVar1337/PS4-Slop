@@ -235,3 +235,33 @@ Severity legend: **P0** fix now · **P1** next milestone · **P2** roadmap · **
 - **P3:** ~45 polish/parity/community items
 
 **Theme of the audit:** the _engineering floor_ (build, CI, tests, pinning, signing) is already better than most commercial tooling; the leverage is now in (a) closing the test-visibility gap (coverage, fuzz, e2e), (b) debugger/scanner parity with Cheat Engine-class expectations (conditions, counts, unknown-value, pointer chains), (c) agent-facing upgrades to the MCP surface (annotations, versioning, rate limits, elicitation), and (d) deciding the fate of the ImGui shell and the multi-console roadmap.
+
+---
+
+## Addendum — implementation pass (same day)
+
+Landed from this audit:
+
+- Items 2, 4, 6, 9: `.gitignore` covers `.cache/`; `CODEOWNERS`; `ROADMAP.md`;
+  `tools/sync_version.ps1` also validates the README version badge.
+- Items 80 + 97: `app/e2e` driver (smoke + screenshots modes), `tools/screenshots.ps1`,
+  nightly `.github/workflows/e2e.yml`. Both modes verified green against the real
+  engine + fixture, with no leaked processes.
+- README: new screenshots regenerated through the committed driver; Tests section
+  documents the e2e lane; screenshot disclaimer updated.
+- CHANGELOG updated under Unreleased.
+
+New findings surfaced while building the e2e harness:
+
+- **P2 — `--port` ignored by the current build.** The engine announces/binds the
+  settings port even with `--port <n>` on the command line; the `SLOP_MCP_PORT`
+  environment variable works. Either the checked-in binary predates the flag or the
+  flag plumbing regressed; rebuild and re-test (the e2e driver passes both and trusts
+  the engine's own `SLOP_ENGINE_READY` announce instead of the requested port).
+- **P2 — spawner can report a dead endpoint.** Under process churn, `engine.json` can
+  name a pid that is alive-but-not-serving (or reused); a spawner then prints
+  `SLOP_ENGINE_READY <port>` for an endpoint that 401s/times out. The e2e driver works
+  around it (probes health + detects `SLOP_ENGINE_EXISTING`); the engine should verify
+  the registration round-trip before announcing (or liveness-probe the endpoint).
+- **P3 — `/health` is unauthenticated** (liveness, by design) — automation must treat
+  the first `/api` call as the real readiness gate.

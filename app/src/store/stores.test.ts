@@ -255,6 +255,44 @@ describe("output batching (item 104)", () => {
     events.disconnect();
     await flushPromises();
   });
+
+  it("keeps the replayed backlog when live output races the reconnect replay", async () => {
+    vi.useFakeTimers();
+    // Engine ring holds the gap 5..7; replayFrom(since) returns what is newer.
+    mockApi((c) => {
+      if (c.tool === "app" && c.action === "output") {
+        const since = Number(c.params.since ?? 0);
+        return {
+          revision: 7,
+          lines: [5, 6, 7].filter((s) => s > since).map((seq) => ({ seq, ms: 0, text: `g${seq}` })),
+        };
+      }
+      return {};
+    });
+    events.connect();
+    const stream = EventSourceStub.instances.at(-1);
+    const detach = useOutput.getState().attach();
+    stream?.emit("output.cleared", {}); // reset module-level seq cursor from prior tests
+    for (let seq = 1; seq <= 4; seq++) stream?.emit("output", { seq, ms: 0, text: `l${seq}` });
+    await vi.advanceTimersByTimeAsync(kFlushMs + 1);
+    expect(useOutput.getState().revision).toBe(4);
+
+    // Reconnect: hello kicks off the async replayFrom(4); before it resolves,
+    // live lines 8,9 flush and advance revision past the replay window.
+    stream?.emit("hello", { output_revision: 7 });
+    for (const seq of [8, 9]) stream?.emit("output", { seq, ms: 0, text: `live${seq}` });
+    await vi.advanceTimersByTimeAsync(kFlushMs + 1);
+    expect(useOutput.getState().revision).toBe(9);
+
+    // The replay reply (5,6,7) must not be dropped just because revision is now 9.
+    await flushPromises();
+    await vi.advanceTimersByTimeAsync(kFlushMs + 1);
+    expect(useOutput.getState().lines.map((l) => l.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+    detach();
+    events.disconnect();
+    await flushPromises();
+  });
 });
 
 describe("layout + themes (items 107, 116, 117)", () => {
