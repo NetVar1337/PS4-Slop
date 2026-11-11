@@ -21,6 +21,9 @@ Prioritized from the full audit ([`docs/AUDIT.md`](docs/AUDIT.md), 115 items). S
       `src/core/runtime` (`broker.*`, `gdb_rsp.*`): the UI, the MCP server and a
       GDB/LLDB client now share one console connection; exposed as the `gdb` MCP
       tool (`start`/`stop`/`status`, loopback-only, writes opt-in).
+- [x] PS4-MCP IDA/Ghidra/Binary Ninja/iaito adapters merged under
+      `integrations/ps4-mcp-adapters/` with an MCP shim client for the built-in
+      server (see its README for the op mapping).
 
 ## Next milestone — v0.2 "agent-grade" (P1)
 
