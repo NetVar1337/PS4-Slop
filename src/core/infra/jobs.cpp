@@ -33,6 +33,18 @@ struct job_context_t::impl_t {
     bool               join_claimed = false;   // guarded by jobs g_mu, one joiner only
 
     impl_t() : tok(cancel_src.token()) {}
+
+    // A joinable std::thread destroyed without join/detach calls std::terminate.
+    // A job context can outlive any explicit reap - e.g. g_jobs is torn down at
+    // process exit when jobs::shutdown() was never called - so settle the thread
+    // here. Finished bodies join instantly; a still-running one (or self, when
+    // the body's own captured ref is last) is detached, matching shutdown().
+    ~impl_t() {
+        if (!thread.joinable()) return;
+        if (thread.get_id() == std::this_thread::get_id()) thread.detach();
+        else if (exited.load(std::memory_order_acquire)) thread.join();
+        else thread.detach();
+    }
 };
 
 const cancel_token_t& job_context_t::cancel() const noexcept { return impl_->tok; }

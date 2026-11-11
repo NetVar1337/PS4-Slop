@@ -267,7 +267,10 @@ export const useDisasm = create<DisasmStore>((set, get) => {
       // on the not-ready -> ready edge so the panel isn't stuck on that stale,
       // native-only view.
       const wasReady = get().hypeReady;
-      set({ hypeReady: ready });
+      // Only emit when it actually changes: hype.progress streams continuously
+      // during analysis, and an unconditional set re-renders every wholesale
+      // store subscriber (e.g. the Strings filter) on each tick.
+      if (ready !== wasReady) set({ hypeReady: ready });
       if (ready && !wasReady && hasImage && get().image.ready) {
         void get().refreshLoaded();
         void get().refreshFunctions();

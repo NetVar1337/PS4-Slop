@@ -8,6 +8,23 @@ Prioritized from the full audit ([`docs/AUDIT.md`](docs/AUDIT.md), 115 items). S
 - [ ] Resolve the in-progress merge (`mcp_tools.cpp`, `backend_ps4.cpp`, `test_ps4.cpp`)
       and get `main` building green again.
 
+## Landed (ecosystem merge, see [`docs/MERGE.md`](docs/MERGE.md))
+
+- [x] MCP audit log (JSONL, every tool call) + `mcp_require_confirm` gate on mutating
+      actions — ps4debug-mcp safety model, now server-side.
+- [x] `target.ps4_discover` UDP broadcast discovery + `host:"auto"` for
+      `ps4_connect`/`ps4_auto`.
+- [x] `host` MCP tool: HTTP payload host with sha256 `/manifest.json`, token-gated
+      LAN binds — afterglow-web function built in.
+- [x] Homebrew injection recipe book: [`docs/injection/README.md`](docs/injection/README.md).
+- [x] Session broker + GDB Remote (RSP) bridge ported from PS4-MCP into
+      `src/core/runtime` (`broker.*`, `gdb_rsp.*`): the UI, the MCP server and a
+      GDB/LLDB client now share one console connection; exposed as the `gdb` MCP
+      tool (`start`/`stop`/`status`, loopback-only, writes opt-in).
+- [x] PS4-MCP IDA/Ghidra/Binary Ninja/iaito adapters merged under
+      `integrations/ps4-mcp-adapters/` with an MCP shim client for the built-in
+      server (see its README for the op mapping).
+
 ## Next milestone — v0.2 "agent-grade" (P1)
 
 Test visibility and agent-facing surface, because that is where the leverage is:
@@ -35,10 +52,11 @@ Test visibility and agent-facing surface, because that is where the leverage is:
 - [ ] CFG graph view in the UI; unify Hyperion/Zydis function detection.
 - [ ] `.pdata`-based stack unwinding; thread-aware stepping parity.
 - [ ] ARM64 emulation path for Mach-O/iOS images (Unicorn is x86-64 only today).
-- [ ] PCAP *import* (analyze console traffic from a tap without routing through the PC).
+- [ ] PCAP _import_: analyze console traffic from a tap without routing
+      it through the PC.
 - [ ] `sessions.db` schema versioning/migrations.
-- [ ] Decide the fate of the ImGui shell: ship as documented lightweight fallback or
-      remove; publish the feature-parity matrix either way.
+- [ ] Decide the fate of the ImGui shell: ship it as a documented lightweight
+      fallback or remove it; publish the parity matrix either way.
 - [ ] Tutorial docs ("first console connect", "dump → rename → decompile") and a
       hosted docs site generated from `docs/`.
 - [ ] Linux engine port (headless MCP server on an analysis VM): abstract
