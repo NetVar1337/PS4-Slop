@@ -14,6 +14,9 @@ param(
     [string]$Targets = '',
     # CTest label selecting the test entries -Test runs ('area' = every area)
     [string]$TestLabel = 'area',
+    # Regex of CTest entries to exclude (ctest -E); used to skip areas that
+    # cannot run under a given preset (e.g. the Unicorn emulator under ASan)
+    [string]$TestExclude = '',
     # Visual Studio install root; defaults to $env:SLOP_VS_ROOT, then vswhere
     [string]$VsRoot = $env:SLOP_VS_ROOT
 )
@@ -166,8 +169,10 @@ if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE), log: $(Join
 if ($Test) {
     # ctest from the same VS toolset (the vcvars PATH also carries the ASan
     # runtime DLLs an asan preset build needs)
-    Write-Host "==> running tests (label '$TestLabel')"
-    & $vsCTest --test-dir $binaryDir --output-on-failure --no-tests=error -L $TestLabel
+    Write-Host "==> running tests (label '$TestLabel'$(if ($TestExclude) { ", excluding /$TestExclude/" }))"
+    $ctestArgs = @('--test-dir', $binaryDir, '--output-on-failure', '--no-tests=error', '-L', $TestLabel)
+    if ($TestExclude) { $ctestArgs += @('-E', $TestExclude) }
+    & $vsCTest @ctestArgs
     if ($LASTEXITCODE -ne 0) { throw "tests failed (exit $LASTEXITCODE)" }
 }
 
