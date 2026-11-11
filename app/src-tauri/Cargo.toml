@@ -31,7 +31,7 @@ serde_json = "1"
 # for the per-launch engine token. The supervisor stops the engine gracefully
 # on exit; the job object is the OS-enforced backstop so a wedged engine can
 # never outlive the UI and keep holding the MCP port and console sockets.
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Cryptography",
