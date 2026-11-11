@@ -1,7 +1,32 @@
-# Monorepo layout
+# One project, four runtimes
 
-PS4-Slop is the umbrella repo. The companion projects live here as **git
-subtrees** (full history preserved), each buildable in place:
+PS4-Slop is a single project. It is built from four runtimes that each target a
+different machine, so they keep their own build but are driven from one place:
+
+```
+exploit (PS4 browser) ──loads──▶ payload (on console)
+                                     ▲
+                                     │ TCP 744 + port-755 events
+                                     ▼
+                              app (analysis PC) ──/mcp──▶ AI agents
+                                     ▲
+                                     └── mcp servers (Python, for other agents)
+```
+
+Drive the whole project from the root:
+
+```powershell
+./slop.ps1 app       # build the C++/Tauri analyzer
+./slop.ps1 payload   # build the ps4debug-NG payload
+./slop.ps1 mcp       # set up the Python MCP servers (venv + editable installs)
+./slop.ps1 exploit   # serve afterglow-web to the PS4 browser
+./slop.ps1 all       # app + payload + mcp
+```
+
+## Where each runtime lives
+
+The companion projects live here as **git subtrees** (full history preserved),
+each buildable in place:
 
 | Path                     | Source fork                                   | What it is |
 |--------------------------|-----------------------------------------------|------------|
