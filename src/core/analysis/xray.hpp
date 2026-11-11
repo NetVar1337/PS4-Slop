@@ -15,12 +15,18 @@
 
 namespace slop::core::analysis::xray {
 
+// which kernel's syscall numbering the image targets: Windows NT stubs
+// (mov r10, rcx ; mov eax, ssn) or Orbis/FreeBSD for PS4 ELF images
+// (libkernel's mov rax, n ; mov r10, rcx ; syscall)
+enum class syscall_abi_t : uint8_t { windows, ps4 };
+
 struct image_ref_t {
     const disasm::pe_image_t*   pe   = nullptr;
     const std::vector<uint8_t>* file = nullptr;
     uint64_t                    base = 0;              // VA base of the session
     disasm::engine_t*           eng  = nullptr;
     const disasm::function_index_t* fns = nullptr;    // optional (hooks/gadgets)
+    syscall_abi_t               abi  = syscall_abi_t::windows;
 };
 
 // shared decode helpers
@@ -156,12 +162,18 @@ std::vector<hook_hit_t> detect_hooks_at(const image_ref_t& img,
                                         const std::vector<uint64_t>& vas,
                                         size_t max_functions = 500);
 
-// direct syscalls
+// direct syscalls: every `syscall` (and `int 2e` on Windows) whose number is
+// loaded by an immediate mov right before it, optionally with the
+// `mov r10, rcx` argument shuffle on either side of the number load
 
 struct syscall_hit_t {
-    uint64_t address = 0;
+    uint64_t address = 0;                // first instruction of the stub
     uint32_t ssn     = 0;
-    std::string pattern;                 // mov_r10_rcx|mov_eax_syscall|int_2e
+    // mov_r10_rcx (r10 shuffle then mov eax) | mov_r10_rcx_rax (then mov rax)
+    // | mov_eax_r10_syscall | mov_rax_r10_syscall (number then shuffle,
+    // libkernel) | mov_eax_syscall | mov_rax_syscall | int_2e (Windows only)
+    std::string pattern;
+    std::string name;                    // ps4 abi: Orbis syscall name, "" if unknown
 };
 
 std::vector<syscall_hit_t> detect_syscalls(const image_ref_t& img,

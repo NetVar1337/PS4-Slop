@@ -8,9 +8,11 @@ import "@fontsource/jetbrains-mono/400.css";
 import "@fontsource/jetbrains-mono/500.css";
 import "@/styles/tokens.css";
 import "@/styles/app.css";
-// Imported for its side effect: the store applies `data-motion` to <html> on
-// creation, before first paint, so nothing animates against the wrong setting
+// Imported for their side effect: the stores apply `data-motion` / `data-theme`
+// to <html> on creation, before first paint, so nothing renders against the
+// wrong setting
 import "@/store/motion";
+import "@/store/theme";
 
 const root = document.getElementById("root");
 if (root === null) throw new Error("#root missing from index.html");

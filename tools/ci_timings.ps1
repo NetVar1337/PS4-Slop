@@ -1,10 +1,18 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][long]$RunId,
-    [string]$Repository = 'kaizer1308/reverse-slap',
+    # owner/name; defaults to this checkout's `origin` remote
+    [string]$Repository = '',
     [string]$OutputPath
 )
 $ErrorActionPreference = 'Stop'
+if (-not $Repository) {
+    $origin = & git -C (Split-Path -Parent $PSScriptRoot) remote get-url origin 2>$null
+    if ($LASTEXITCODE -ne 0 -or $origin -notmatch 'github\.com[:/]([^/]+/[^/]+?)(\.git)?/?$') {
+        throw 'cannot derive the GitHub repository from the origin remote; pass -Repository owner/name'
+    }
+    $Repository = $Matches[1]
+}
 $base = "https://api.github.com/repos/$Repository/actions/runs/$RunId"
 $run = Invoke-RestMethod $base
 $jobs = @()

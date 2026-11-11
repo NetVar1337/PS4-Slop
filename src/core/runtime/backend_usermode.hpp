@@ -41,6 +41,7 @@ public:
     // Query
     arch_t      query_arch(const target_handle_t& h) override;
     elevation_t query_elevation() override;
+    bool        handle_info(const target_handle_t& h, process_info_t& out) override;
 };
 
 } // namespace slop::core::runtime

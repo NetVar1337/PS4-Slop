@@ -1,6 +1,7 @@
 // src/core/disasm/engine.cpp
 
 #include "core/disasm/engine.hpp"
+#include "core/types.h"
 
 #include <algorithm>
 #include <cstring>
@@ -118,6 +119,10 @@ std::optional<insn_t> engine_t::decode(uint64_t va, const uint8_t* buf,
     }
 
     return out;
+}
+
+std::string default_function_name(uint64_t va) {
+    return hype::default_func_name(va);
 }
 
 } // namespace slop::core::disasm

@@ -2,6 +2,7 @@
 
 #include "core/disasm/xrefs.hpp"
 
+#include <algorithm>
 #include <cmath>
 
 namespace slop::core::disasm {
@@ -19,20 +20,38 @@ namespace {
 // most for. Packed and encrypted payloads sit at 7.5 and up
 constexpr double kPackedEntropy = 7.2;
 
-double section_entropy(const uint8_t* data, size_t len) {
+double entropy(const uint8_t* data, size_t len) {
     if (!data || len == 0) return 0.0;
-    // Sample up to 64 KiB from the section for speed
-    const size_t sample = std::min<size_t>(len, 65536);
     uint32_t hist[256] = {};
-    for (size_t i = 0; i < sample; ++i) ++hist[data[i]];
+    for (size_t i = 0; i < len; ++i) ++hist[data[i]];
     double e = 0.0;
-    const double n = static_cast<double>(sample);
+    const double n = static_cast<double>(len);
     for (uint32_t c : hist) {
         if (!c) continue;
         const double p = static_cast<double>(c) / n;
         e -= p * std::log2(p);
     }
     return e;
+}
+
+// The gate is judged per region, not per section: a plain code head with a
+// packed tail (or the reverse) only loses the packed part. A region shorter
+// than kMinRegion measures low no matter what it holds, so it inherits its
+// predecessor's verdict (sections that small are never skipped)
+constexpr size_t kRegion    = 64 * 1024;
+constexpr size_t kMinRegion = 4096;
+
+std::vector<bool> packed_regions(const uint8_t* data, size_t len) {
+    std::vector<bool> packed((len + kRegion - 1) / kRegion, false);
+    if (len <= kMinRegion) return packed;
+    for (size_t r = 0; r < packed.size(); ++r) {
+        const size_t off = r * kRegion;
+        const size_t n = std::min(kRegion, len - off);
+        packed[r] = (n < kMinRegion && r > 0)
+            ? packed[r - 1]
+            : entropy(data + off, n) > kPackedEntropy;
+    }
+    return packed;
 }
 
 } // namespace
@@ -50,14 +69,17 @@ bool xref_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& file,
         const uint8_t* data = file.data() + s.raw_offset;
         const uint64_t sec_va = base + s.rva;
 
-        // Skip high-entropy sections (compressed/encrypted blobs produce
+        // Skip high-entropy regions (compressed/encrypted blobs produce
         // only noise refs and burn through the max_refs budget)
-        if (s.raw_size > 4096 && section_entropy(data, s.raw_size) > kPackedEntropy)
-            continue;
+        const auto packed = packed_regions(data, s.raw_size);
 
         size_t off = 0;
         while (off < s.raw_size) {
             if (total_ >= max_refs) return true;   // index full, still usable
+            if (packed[off / kRegion]) {
+                off = (off / kRegion + 1) * kRegion;
+                continue;
+            }
 
             auto insn = eng.decode(sec_va + off, data + off, s.raw_size - off, false);
             if (!insn) { ++off; continue; }        // resync by one byte

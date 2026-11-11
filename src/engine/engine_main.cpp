@@ -1,8 +1,13 @@
 // src/engine/engine_main.cpp
 // headless host for the core, same boot and same mcp surface minus the window
-// prints SLOP_ENGINE_READY port token on stdout when listening and
-// exits clean on ctrl c or shutdown so the driver never gets stranded
-// if something is already listening we hand over that endpoint and leave
+// prints SLOP_ENGINE_READY <port> on stdout when listening and exits clean
+// on ctrl c or shutdown so the driver never gets stranded
+//
+// token handshake: a spawner that sets SLOP_MCP_TOKEN brings its own bearer,
+// the engine accepts it and the READY line carries no token. without it the
+// legacy "SLOP_ENGINE_READY <port> <token>" form is printed
+// if something is already listening we hand over that endpoint and leave; with
+// SLOP_MCP_TOKEN set the spawner's token is registered with the running engine
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -20,6 +25,9 @@
 #include "core/infra/event_bus.hpp"
 #include "core/infra/lifecycle.hpp"
 #include "core/infra/settings.hpp"
+
+#include <httplib.h>
+#include <nlohmann/json.hpp>
 
 namespace {
 
@@ -49,6 +57,11 @@ BOOL WINAPI ctrl_handler(DWORD type) {
     }
 }
 
+std::string env_token() {
+    const char* t = std::getenv("SLOP_MCP_TOKEN");
+    return (t && *t) ? std::string(t) : std::string{};
+}
+
 void emit(const char* line) {
     std::fputs(line, stdout);
     std::fputc('\n', stdout);
@@ -76,8 +89,29 @@ int main(int argc, char** argv) {
     const options_t opts = parse_args(argc, argv);
 
     // already served, hand the caller that endpoint and get out of the way
+    const std::string own_token = env_token();
     if (lifecycle::endpoint_t live; lifecycle::read_endpoint(live)) {
-        emit(("SLOP_ENGINE_READY " + std::to_string(live.port) + " " + live.token).c_str());
+        if (own_token.empty()) {
+            emit(("SLOP_ENGINE_READY " + std::to_string(live.port) + " " + live.token).c_str());
+        } else {
+            // teach the running engine the spawner's token instead of leaking ours
+            httplib::Client cli("127.0.0.1", live.port);
+            cli.set_connection_timeout(std::chrono::seconds(2));
+            cli.set_read_timeout(std::chrono::seconds(5));
+            httplib::Headers h;
+            if (!live.token.empty()) h.emplace("Authorization", "Bearer " + live.token);
+            const nlohmann::json body = {{"tool", "app"},
+                                         {"action", "register_token"},
+                                         {"params", {{"token", own_token}}}};
+            auto res = cli.Post("/api", h, body.dump(), "application/json");
+            const auto reply = res ? nlohmann::json::parse(res->body, nullptr, false)
+                                   : nlohmann::json();
+            if (!res || res->status != 200 || !reply.is_object() || !reply.value("ok", false)) {
+                emit("SLOP_ENGINE_FAILED running engine refused the spawner token");
+                return 1;
+            }
+            emit(("SLOP_ENGINE_READY " + std::to_string(live.port)).c_str());
+        }
         emit(("SLOP_ENGINE_EXISTING " + std::to_string(live.pid)).c_str());
         return 0;
     }
@@ -117,9 +151,12 @@ int main(int argc, char** argv) {
         if (!announced) {
             const auto boot = lifecycle::result();
             if (boot.mcp_ok) {
-                emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port) + " " +
-                      slop::core::infra::settings::mcp_token())
-                         .c_str());
+                if (own_token.empty())
+                    emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port) + " " +
+                          slop::core::infra::settings::mcp_token())
+                             .c_str());
+                else
+                    emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port)).c_str());
                 announced = true;
             } else if (lifecycle::booted()) {
                 emit("SLOP_ENGINE_FAILED mcp server did not bind");

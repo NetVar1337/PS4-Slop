@@ -1,0 +1,46 @@
+# clang-tidy profile for reverse-slop's first-party code (run by
+# tools/clang_tidy.ps1 and the `clang-tidy` CI lane over compile_commands.json).
+# Vendored code (src/hyperion, _ext) is not analyzed.
+# The errors set is high-signal memory/lifetime/logic checks that must stay
+# clean; everything else is reported as a warning.
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-branch-clone,
+  -bugprone-reserved-identifier,
+  -bugprone-exception-escape,
+  -bugprone-unchecked-optional-access,
+  -bugprone-switch-missing-default-case,
+  -bugprone-macro-parentheses,
+  -bugprone-assignment-in-if-condition,
+  clang-analyzer-*,
+  -clang-analyzer-security.insecureAPI.*,
+  -clang-analyzer-optin.*,
+  performance-*,
+  -performance-enum-size,
+  -performance-avoid-endl,
+  misc-redundant-expression,
+  misc-misplaced-const,
+  misc-throw-by-value-catch-by-reference,
+  misc-unconventional-assign-operator,
+  misc-uniqueptr-reset-release
+WarningsAsErrors: >
+  bugprone-use-after-move,
+  bugprone-dangling-handle,
+  bugprone-undefined-memory-manipulation,
+  bugprone-sizeof-expression,
+  bugprone-infinite-loop,
+  bugprone-suspicious-memset-usage,
+  bugprone-string-constructor,
+  bugprone-unhandled-self-assignment,
+  bugprone-return-const-ref-from-parameter,
+  clang-analyzer-core.*,
+  clang-analyzer-cplusplus.NewDelete,
+  clang-analyzer-cplusplus.NewDeleteLeaks,
+  clang-analyzer-unix.Malloc,
+  misc-redundant-expression
+HeaderFilterRegex: '.*[/\\]src[/\\](core|engine|ui|app|live|target|tests)[/\\].*'
+FormatStyle: none

@@ -6,6 +6,8 @@
 
 #include "core/disasm/hyperion_session.hpp"
 #include "core/infra/diag.hpp"
+#include "core/infra/event_bus.hpp"
+#include "core/loader/elf_loader.h"
 #include "core/process/target_service.hpp"
 #include "core/re/type_catalog.hpp"
 #include "core/runtime/backend_registry.hpp"
@@ -167,6 +169,7 @@ void unload_locked() {
     g_bin.arch = disasm::image_arch_t::x64;
     g_bin.encrypted = false;
     g_bin.bundle.reset();
+    g_bin.relocations_applied = 0;
     g_bin.name.clear();
     g_bin.path.clear();
     g_bin.fns = {};
@@ -217,13 +220,16 @@ bool has_binary() { return g_bin.ready; }
 
 void unload() {
     std::lock_guard lk(g_mu);
+    const bool had = g_bin.ready;
     unload_locked();
+    if (had)
+        slop::core::infra::event_bus::publish("image.changed", json{{"loaded", false}});
 }
 
 namespace {
 
 // load_file body, caller holds g_mu. Failures leave the reason in g_load_error
-bool load_locked(const std::string& path, uint64_t base_override) {
+bool load_locked(const std::string& path, uint64_t base_override, bool apply_relocs) {
     unload_locked();
     g_load_error.clear();
     const auto fail = [&](std::string why) {
@@ -259,8 +265,22 @@ bool load_locked(const std::string& path, uint64_t base_override) {
     const bool x86  = g_bin.is_x86();
     if (x86 && !g_bin.eng.init(g_bin.pe.pe32plus)) return fail("zydis engine init failed");
 
-    // runtime base override so session vas match what the live process maps
+    // runtime base override so session vas match what the live process maps.
+    // An ELF whose header page sits below its first segment can be named by
+    // either address; both mean "already at these vas", never a shift
     g_bin.base = base_override ? base_override : g_bin.pe.image_base;
+    const bool elf = g_bin.format == disasm::image_format_t::elf ||
+                     g_bin.format == disasm::image_format_t::self;
+    if (elf && base_override && base_override == opened.header_base)
+        g_bin.base = g_bin.pe.image_base;
+
+    // a file on disk is unrelocated: write RELATIVE/64/GLOB_DAT slots for
+    // the session base so data pointers and vtables resolve (after the hash,
+    // so annotations key on the original bytes)
+    if (elf && apply_relocs) {
+        const auto st = hype::ELFLoader::apply_relocations(g_bin.file, g_bin.base);
+        g_bin.relocations_applied = st.applied;
+    }
     g_bin.path = path;
 
     const size_t slash = path.find_last_of("\\/");
@@ -393,7 +413,7 @@ bool load_locked(const std::string& path, uint64_t base_override) {
 
 } // namespace
 
-bool load_file(const std::string& path, uint64_t base_override) {
+bool load_file(const std::string& path, uint64_t base_override, bool apply_relocs) {
     // cheap check outside the lock before we tear down the current session
     {
         std::ifstream probe(path, std::ios::binary);
@@ -411,18 +431,27 @@ bool load_file(const std::string& path, uint64_t base_override) {
     }
 
     std::lock_guard lk(g_mu);
+    const bool had = g_bin.ready;
+    bool ok = false;
     try {
-        const bool ok = load_locked(path, base_override);
+        ok = load_locked(path, base_override, apply_relocs);
         if (!ok)
             slop::core::infra::diag::warn("disasm", "cannot load " + path + ": " + g_load_error);
-        return ok;
     } catch (...) {
         // bad_alloc on an image bigger than the machine can hold: fail the
         // load instead of throwing across the lua, mcp and ui callers
         unload_locked();
         g_load_error = "out of memory";
-        return false;
     }
+    // a failed load tears the previous image down too
+    if (ok)
+        slop::core::infra::event_bus::publish("image.changed", json{
+            {"loaded", true}, {"name", g_bin.name},
+            {"format", disasm::image_format_name(g_bin.format)},
+            {"arch", disasm::image_arch_name(g_bin.arch)}});
+    else if (had)
+        slop::core::infra::event_bus::publish("image.changed", json{{"loaded", false}});
+    return ok;
 }
 
 std::string last_load_error() {

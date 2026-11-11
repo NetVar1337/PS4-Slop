@@ -429,6 +429,7 @@ bool MachOLoader::parse_header(PEImage& img) {
     }
     if (size_ < header_size_) return false;
 
+    img.format = ImageFormat::MachO;
     switch (hdr.cputype) {
     case CPU_TYPE_X86_64: img.arch = Arch::X64;   break;
     case CPU_TYPE_X86:    img.arch = Arch::X86;   break;

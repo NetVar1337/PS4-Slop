@@ -4,7 +4,7 @@
 // Every call maps to a debugger ps4_* MCP action
 
 import { create } from "zustand";
-import { call } from "@/lib/rpc";
+import { batch, batchData, call, errorText } from "@/lib/rpc";
 
 export type Ps4Status = {
   backend: string;
@@ -12,6 +12,10 @@ export type Ps4Status = {
   debug_attached: boolean;
   debug_pid: number;
   pending_events: number;
+  /** Console firmware, e.g. "11.00" (debugger.ps4_status). */
+  fw?: string;
+  /** Stop events the engine discarded because its queue was full. */
+  events_dropped?: number;
 };
 
 export type Regs = Record<string, number>;
@@ -31,6 +35,10 @@ export type Ps4Event = {
   rip?: number;
   dr?: number[];
 };
+
+/** `debugger.ps4_wait`: the stop event with its register context inline. */
+export type WaitResult = Partial<Ps4Event> &
+  Partial<Regs> & { halted: boolean; pending?: number; timeout_ms?: number };
 
 export type SlotEntry = { addr: number; index: number };
 
@@ -55,6 +63,27 @@ export type AppInfo = {
   running?: boolean;
 };
 
+export const kRegOrder = [
+  "rip",
+  "rsp",
+  "rbp",
+  "rax",
+  "rbx",
+  "rcx",
+  "rdx",
+  "rsi",
+  "rdi",
+  "r8",
+  "r9",
+  "r10",
+  "r11",
+  "r12",
+  "r13",
+  "r14",
+  "r15",
+  "flags",
+] as const;
+
 const kIdle: Ps4Status = {
   backend: "user",
   ps4_connected: false,
@@ -62,6 +91,19 @@ const kIdle: Ps4Status = {
   debug_pid: 0,
   pending_events: 0,
 };
+
+const kMaxEvents = 200;
+
+/** Register file out of an event / wait reply that carries the context inline. */
+export function regsFrom(source: Record<string, unknown>): Regs | null {
+  const regs: Regs = {};
+  for (const name of kRegOrder) {
+    const v = source[name];
+    if (typeof v !== "number") return null;
+    regs[name] = v;
+  }
+  return regs;
+}
 
 type DebuggerStore = {
   status: Ps4Status;
@@ -74,6 +116,8 @@ type DebuggerStore = {
   scan: ScanState | null;
   app: AppInfo | null;
   error: string | null;
+  /** Result line of the last wait ("halted lwp 101 sig 5" / "no stop in 5s"). */
+  waitNote: string | null;
   busy: boolean;
 
   refresh: () => Promise<void>;
@@ -88,9 +132,20 @@ type DebuggerStore = {
   wpClear: (addr: number) => Promise<void>;
   readRegs: (lwpid: number) => Promise<void>;
   readStack: (lwpid: number) => Promise<void>;
-  scanFirst: (a: { addr: number; len: number; value_type: string; compare: string; value?: number | string; hex?: string }) => Promise<void>;
+  scanFirst: (a: {
+    addr: number;
+    len: number;
+    value_type: string;
+    compare: string;
+    value?: number | string;
+    hex?: string;
+  }) => Promise<void>;
   scanRescan: (compare: string, value?: number | string) => Promise<void>;
-  scanAob: (addr: number, len: number, pattern: string) => Promise<{ found?: boolean; addr?: number; addr_hex?: string } | null>;
+  scanAob: (
+    addr: number,
+    len: number,
+    pattern: string,
+  ) => Promise<{ found?: boolean; addr?: number; addr_hex?: string } | null>;
   scanReset: () => Promise<void>;
   scanRefreshInternal: () => Promise<void>;
   notify: (msg: string) => Promise<void>;
@@ -99,254 +154,275 @@ type DebuggerStore = {
   reset: () => void;
 };
 
-export const useDebugger = create<DebuggerStore>((set, get) => ({
-  status: kIdle,
-  regs: null,
-  regsLwpid: 0,
-  frames: [],
-  events: [],
-  breakpoints: [],
-  watchpoints: [],
-  scan: null,
-  app: null,
-  error: null,
-  busy: false,
-
-  refresh: async () => {
+export const useDebugger = create<DebuggerStore>((set, get) => {
+  /** Run a mutating action with busy/error bookkeeping. */
+  const guarded = async (fn: () => Promise<void>, busy = true): Promise<void> => {
+    if (busy) set({ busy: true });
     try {
-      const status = await call<Ps4Status>("debugger", "status");
-      set({ status, error: null });
-      if (status.ps4_connected) {
-        void get().scanRefreshInternal();
-        void get().readApp();
+      await fn();
+      set({ error: null });
+    } catch (e) {
+      set({ error: errorText(e) });
+    } finally {
+      if (busy) set({ busy: false });
+    }
+  };
+
+  return {
+    status: kIdle,
+    regs: null,
+    regsLwpid: 0,
+    frames: [],
+    events: [],
+    breakpoints: [],
+    watchpoints: [],
+    scan: null,
+    app: null,
+    error: null,
+    waitNote: null,
+    busy: false,
+
+    refresh: async () => {
+      // One round trip for the whole view instead of six stacked ones;
+      // per-request failures (not connected, not attached) come back inline
+      try {
+        const [st, ps4, bps, wps, evs, scan, app] = await batch([
+          { tool: "debugger", action: "status" },
+          { tool: "debugger", action: "ps4_status" },
+          { tool: "debugger", action: "ps4_bp_list" },
+          { tool: "debugger", action: "ps4_watch_list" },
+          { tool: "debugger", action: "ps4_events", params: { max: 64, clear: true } },
+          { tool: "debugger", action: "ps4_scan_state" },
+          { tool: "debugger", action: "ps4_app" },
+        ]);
+        const base = batchData<Ps4Status>(st);
+        if (base === undefined) throw new Error("debugger.status failed");
+        const extra = batchData<{ fw?: string; events_dropped?: number }>(ps4);
+        const status: Ps4Status = {
+          ...base,
+          ...(extra?.fw !== undefined ? { fw: extra.fw } : {}),
+          ...(extra?.events_dropped !== undefined ? { events_dropped: extra.events_dropped } : {}),
+        };
+        set({
+          status,
+          error: null,
+          scan: status.ps4_connected ? (batchData<ScanState>(scan) ?? null) : null,
+          app: status.ps4_connected ? (batchData<AppInfo>(app) ?? null) : null,
+        });
+        if (!status.ps4_connected || !status.debug_attached) {
+          set({ regs: null, frames: [], breakpoints: [], watchpoints: [] });
+          return;
+        }
+        // ps4_events returns oldest first; the feed shows newest first
+        const fresh = [...(batchData<{ events?: Ps4Event[] }>(evs)?.events ?? [])].reverse();
+        set((s) => ({
+          breakpoints: batchData<{ breakpoints?: SlotEntry[] }>(bps)?.breakpoints ?? [],
+          watchpoints: batchData<{ watchpoints?: SlotEntry[] }>(wps)?.watchpoints ?? [],
+          events: [...fresh, ...s.events].slice(0, kMaxEvents),
+        }));
+        // after a stop event, pull registers + callstack of the stopped thread
+        const last = fresh[0];
+        if (last !== undefined) {
+          const inline = regsFrom(last as unknown as Record<string, unknown>);
+          if (inline !== null) set({ regs: inline, regsLwpid: last.lwpid });
+          else await get().readRegs(last.lwpid);
+          await get().readStack(last.lwpid);
+        }
+      } catch (e) {
+        set({ status: kIdle, error: errorText(e) });
       }
-      if (!status.ps4_connected || !status.debug_attached) {
-        set({ regs: null, frames: [], breakpoints: [], watchpoints: [] });
-        return;
+    },
+
+    attach: (pid) =>
+      guarded(async () => {
+        await call("debugger", "ps4_attach", { pid });
+        await get().refresh();
+      }),
+
+    detach: async () => {
+      try {
+        await call("debugger", "ps4_detach");
+      } catch (e) {
+        set({ error: errorText(e) });
+      } finally {
+        set({ regs: null, frames: [], breakpoints: [], watchpoints: [], waitNote: null });
+        await get().refresh();
       }
-      const [bps, wps, evs] = await Promise.allSettled([
-        call<{ breakpoints?: SlotEntry[] }>("debugger", "ps4_bp_list"),
-        call<{ watchpoints?: SlotEntry[] }>("debugger", "ps4_watch_list"),
-        call<{ events?: Ps4Event[] }>("debugger", "ps4_events", { max: 64, clear: true }),
-      ]);
-      const events =
-        evs.status === "fulfilled" ? (evs.value.events ?? []) : [];
+    },
+
+    cont: () =>
+      guarded(async () => {
+        await call("debugger", "ps4_continue", { stop: 0 });
+        set({ regs: null, frames: [], waitNote: null });
+      }),
+
+    step: (lwpid) =>
+      guarded(async () => {
+        await call("debugger", "ps4_step", { lwpid });
+      }),
+
+    waitHalt: (timeoutMs) =>
+      guarded(async () => {
+        // ps4_wait pops the stop event off the engine queue, so the result IS
+        // the halt: render it directly. A refresh afterwards would drain an
+        // already-empty queue and never show the registers
+        const res = await call<WaitResult>(
+          "debugger",
+          "ps4_wait",
+          { timeout_ms: timeoutMs },
+          { timeoutMs: timeoutMs + 15_000 },
+        );
+        set((s) => ({
+          status: { ...s.status, pending_events: res.pending ?? s.status.pending_events },
+        }));
+        if (!res.halted || res.lwpid === undefined) {
+          set({ waitNote: `no stop event within ${Math.round(timeoutMs / 1000)}s` });
+          return;
+        }
+        const ev: Ps4Event = {
+          lwpid: res.lwpid,
+          signal: res.signal ?? 0,
+          ...(res.status !== undefined ? { status: res.status } : {}),
+          ...(res.thread !== undefined ? { thread: res.thread } : {}),
+          ...(res.rip !== undefined ? { rip: res.rip } : {}),
+          ...(res.dr !== undefined ? { dr: res.dr } : {}),
+        };
+        const regs = regsFrom(res as Record<string, unknown>);
+        set((s) => ({
+          events: [ev, ...s.events].slice(0, kMaxEvents),
+          regs,
+          regsLwpid: ev.lwpid,
+          waitNote: `halted lwp ${ev.lwpid}${ev.thread ? ` (${ev.thread})` : ""} · signal ${ev.signal}`,
+        }));
+        if (regs === null) await get().readRegs(ev.lwpid);
+        await get().readStack(ev.lwpid);
+      }),
+
+    bpSet: (addr) =>
+      guarded(async () => {
+        await call("debugger", "ps4_bp_set", { addr });
+        await get().refresh();
+      }, false),
+
+    bpClear: (addr) =>
+      guarded(async () => {
+        await call("debugger", "ps4_bp_clear", { addr });
+        set((s) => ({ breakpoints: s.breakpoints.filter((b) => b.addr !== addr) }));
+      }, false),
+
+    wpSet: (addr, type, len) =>
+      guarded(async () => {
+        await call("debugger", "ps4_watch_set", { addr, type, len });
+        await get().refresh();
+      }, false),
+
+    wpClear: (addr) =>
+      guarded(async () => {
+        await call("debugger", "ps4_watch_clear", { addr });
+        set((s) => ({ watchpoints: s.watchpoints.filter((w) => w.addr !== addr) }));
+      }, false),
+
+    readRegs: async (lwpid) => {
+      try {
+        const regs = await call<Regs>("debugger", "ps4_regs", { lwpid });
+        set({ regs, regsLwpid: lwpid, error: null });
+      } catch (e) {
+        set({ regs: null, error: errorText(e) });
+      }
+    },
+
+    readStack: async (lwpid) => {
+      try {
+        const stack = await call<{ frames?: Frame[] }>("debugger", "ps4_callstack", {
+          lwpid,
+          depth: 32,
+        });
+        set({ frames: stack.frames ?? [] });
+      } catch {
+        set({ frames: [] });
+      }
+    },
+
+    scanFirst: (a) =>
+      guarded(async () => {
+        await call("debugger", "ps4_scan", a, { timeoutMs: 300_000 });
+        await get().scanRefreshInternal();
+      }),
+
+    scanRescan: (compare, value) =>
+      guarded(async () => {
+        const args: Record<string, unknown> = { compare };
+        if (value !== undefined) args.value = value;
+        await call("debugger", "ps4_rescan", args, { timeoutMs: 300_000 });
+        await get().scanRefreshInternal();
+      }),
+
+    scanAob: async (addr, len, pattern) => {
+      set({ busy: true });
+      try {
+        const r = await call<{ found?: boolean; addr?: number; addr_hex?: string }>(
+          "debugger",
+          "ps4_scan_aob",
+          { addr, len, pattern },
+          { timeoutMs: 300_000 },
+        );
+        set({ error: null });
+        return r;
+      } catch (e) {
+        set({ error: errorText(e) });
+        return null;
+      } finally {
+        set({ busy: false });
+      }
+    },
+
+    scanReset: () =>
+      guarded(async () => {
+        await call("debugger", "ps4_scan_reset");
+        set({ scan: null });
+      }, false),
+
+    scanRefreshInternal: async () => {
+      try {
+        const scan = await call<ScanState>("debugger", "ps4_scan_state");
+        set({ scan });
+      } catch {
+        set({ scan: null });
+      }
+    },
+
+    notify: (msg) =>
+      guarded(async () => {
+        await call("debugger", "ps4_notify", { msg });
+      }, false),
+
+    readApp: async () => {
+      try {
+        const app = await call<AppInfo>("debugger", "ps4_app");
+        set({ app });
+      } catch {
+        set({ app: null });
+      }
+    },
+
+    dumpModule: (name, path, load) =>
+      guarded(async () => {
+        await call("target", "ps4_dump_module", { name, path, load }, { timeoutMs: 600_000 });
+      }),
+
+    reset: () =>
       set({
-        breakpoints: bps.status === "fulfilled" ? (bps.value.breakpoints ?? []) : [],
-        watchpoints: wps.status === "fulfilled" ? (wps.value.watchpoints ?? []) : [],
-        events: [...events.reverse(), ...get().events].slice(0, 200),
-      });
-      // after a stop event, pull registers + callstack of the stopped thread
-      const last = events[0];
-      if (last !== undefined) {
-        await get().readRegs(last.lwpid);
-        await get().readStack(last.lwpid);
-      }
-    } catch (e) {
-      set({ status: kIdle, error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  attach: async (pid) => {
-    set({ busy: true, error: null });
-    try {
-      await call("debugger", "ps4_attach", { pid });
-      await get().refresh();
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  detach: async () => {
-    await call("debugger", "ps4_detach").catch(() => undefined);
-    set({ regs: null, frames: [], breakpoints: [], watchpoints: [] });
-    await get().refresh();
-  },
-
-  cont: async () => {
-    set({ busy: true });
-    try {
-      await call("debugger", "ps4_continue", { stop: 0 });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  step: async (lwpid) => {
-    set({ busy: true });
-    try {
-      await call("debugger", "ps4_step", { lwpid });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  waitHalt: async (timeoutMs) => {
-    set({ busy: true });
-    try {
-      await call("debugger", "ps4_wait", { timeout_ms: timeoutMs });
-      await get().refresh();
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  bpSet: async (addr) => {
-    try {
-      await call("debugger", "ps4_bp_set", { addr });
-      set({ error: null });
-      await get().refresh();
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  bpClear: async (addr) => {
-    await call("debugger", "ps4_bp_clear", { addr }).catch(() => undefined);
-    set((s) => ({ breakpoints: s.breakpoints.filter((b) => b.addr !== addr) }));
-  },
-
-  wpSet: async (addr, type, len) => {
-    try {
-      await call("debugger", "ps4_watch_set", { addr, type, len });
-      set({ error: null });
-      await get().refresh();
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  wpClear: async (addr) => {
-    await call("debugger", "ps4_watch_clear", { addr }).catch(() => undefined);
-    set((s) => ({ watchpoints: s.watchpoints.filter((w) => w.addr !== addr) }));
-  },
-
-  readRegs: async (lwpid) => {
-    try {
-      const regs = await call<Regs>("debugger", "ps4_regs", { lwpid });
-      set({ regs, regsLwpid: lwpid, error: null });
-    } catch {
-      set({ regs: null });
-    }
-  },
-
-  readStack: async (lwpid) => {
-    try {
-      const stack = await call<{ frames?: Frame[] }>("debugger", "ps4_callstack", {
-        lwpid,
-        depth: 32,
-      });
-      set({ frames: stack.frames ?? [] });
-    } catch {
-      set({ frames: [] });
-    }
-  },
-
-  scanFirst: async (a) => {
-    set({ busy: true });
-    try {
-      await call("debugger", "ps4_scan", a);
-      await get().scanRefreshInternal();
-      set({ error: null });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  scanRescan: async (compare, value) => {
-    set({ busy: true });
-    try {
-      const args: Record<string, unknown> = { compare };
-      if (value !== undefined) args.value = value;
-      await call("debugger", "ps4_rescan", args);
-      await get().scanRefreshInternal();
-      set({ error: null });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  scanAob: async (addr, len, pattern) => {
-    set({ busy: true });
-    try {
-      const r = await call<{ found?: boolean; addr?: number; addr_hex?: string }>(
-        "debugger", "ps4_scan_aob", { addr, len, pattern });
-      set({ error: null });
-      return r;
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-      return null;
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  scanReset: async () => {
-    await call("debugger", "ps4_scan_reset").catch(() => undefined);
-    set({ scan: null });
-  },
-
-  scanRefreshInternal: async () => {
-    try {
-      const scan = await call<ScanState>("debugger", "ps4_scan_state");
-      set({ scan });
-    } catch {
-      set({ scan: null });
-    }
-  },
-
-  notify: async (msg) => {
-    try {
-      await call("debugger", "ps4_notify", { msg });
-      set({ error: null });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  readApp: async () => {
-    try {
-      const app = await call<AppInfo>("debugger", "ps4_app");
-      set({ app, error: null });
-    } catch {
-      set({ app: null });
-    }
-  },
-
-  dumpModule: async (name, path, load) => {
-    set({ busy: true });
-    try {
-      await call("target", "ps4_dump_module", { name, path, load });
-      set({ error: null });
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ busy: false });
-    }
-  },
-
-  reset: () =>
-    set({
-      status: kIdle,
-      regs: null,
-      regsLwpid: 0,
-      frames: [],
-      events: [],
-      breakpoints: [],
-      watchpoints: [],
-      scan: null,
-      app: null,
-    }),
-}));
+        status: kIdle,
+        regs: null,
+        regsLwpid: 0,
+        frames: [],
+        events: [],
+        breakpoints: [],
+        watchpoints: [],
+        scan: null,
+        app: null,
+        waitNote: null,
+        error: null,
+      }),
+  };
+});

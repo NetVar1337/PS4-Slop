@@ -24,6 +24,8 @@ enum class copy_dialect_t : uint8_t {
 const char* dialect_label(copy_dialect_t d) noexcept;
 
 std::string format_hex(std::span<const uint8_t> data, bool uppercase = true);
+// "deadbeef": no separators, lowercase by default
+std::string format_hex_packed(std::span<const uint8_t> data, bool uppercase = false);
 std::string format_as(std::span<const uint8_t> data, copy_dialect_t dialect);
 
 // plain base64 for binary that has to survive json

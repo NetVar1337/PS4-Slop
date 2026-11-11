@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <vector>
 
 namespace {
@@ -177,4 +178,165 @@ TEST_CASE(module_dump_captures_live_test_process) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
     session.close();
+}
+
+namespace {
+
+// a fake address space: three segments with an unmapped gap and a hole
+struct fake_space_t {
+    std::map<uint64_t, uint8_t> bytes;   // sparse; absent = 0
+    uint64_t bad_lo = 0, bad_hi = 0;     // reads touching this range fail
+    slop::core::runtime::io_result_t read(uintptr_t a, void* dst, size_t n) const {
+        slop::core::runtime::io_result_t r;
+        if (a < bad_hi && a + n > bad_lo) { r.error = 5; return r; }
+        auto* out = static_cast<uint8_t*>(dst);
+        for (size_t i = 0; i < n; ++i) {
+            auto it = bytes.find(a + i);
+            out[i] = it == bytes.end() ? 0 : it->second;
+        }
+        r.ok = true;
+        r.bytes = n;
+        return r;
+    }
+};
+
+template <typename T>
+T rd(const std::vector<uint8_t>& v, size_t off) {
+    T x{};
+    std::memcpy(&x, v.data() + off, sizeof(T));
+    return x;
+}
+
+} // namespace
+
+TEST_CASE(module_dump_rebuilds_elf_from_segments) {
+    using namespace slop::core;
+    fake_space_t mem;
+    mem.bytes[0x400000] = 0xC3;
+    mem.bytes[0x401234] = 0x90;
+    mem.bytes[0x480010] = 0xAB;
+    mem.bytes[0x4C8FFF] = 0xEE;
+    const std::vector<process::mapped_segment_t> segs = {
+        {0x400000, 0x480000, 5},    // r-x
+        {0x480000, 0x4C0000, 1},    // r--
+        {0x4C8000, 0x500000, 3},    // rw-
+    };
+    std::vector<uint8_t> out;
+    process::elf_rebuild_info_t info;
+    auto res = process::reconstruct_elf_from_segments(
+        segs, [&](uintptr_t a, void* d, size_t n) { return mem.read(a, d, n); }, out, {}, &info);
+    REQUIRE(res.ok);
+    REQUIRE(res.complete);
+    CHECK(res.module_base == 0x400000u);
+    CHECK(info.segments == 3u);
+    CHECK(!info.had_header);
+    CHECK(info.entry == 0u);
+    CHECK(!res.warnings.empty());   // says the header was rebuilt
+    REQUIRE(out.size() > 64u);
+    CHECK(std::memcmp(out.data(), "\x7f" "ELF", 4) == 0);
+    CHECK(out[4] == 2);
+    CHECK(out[5] == 1);
+    CHECK(rd<uint16_t>(out, 16) == 2);    // ET_EXEC
+    CHECK(rd<uint16_t>(out, 18) == 62);   // EM_X86_64
+    CHECK(rd<uint64_t>(out, 24) == 0u);   // entry unknown
+    CHECK(rd<uint64_t>(out, 32) == 64u);  // phoff
+    CHECK(rd<uint16_t>(out, 54) == 56);   // phentsize
+    REQUIRE(rd<uint16_t>(out, 56) == 3);  // phnum
+    CHECK(rd<uint16_t>(out, 60) == 0);    // no section headers
+    const uint32_t want_flags[3] = {5, 4, 6};
+    uint64_t prev_end = 0;
+    for (size_t i = 0; i < 3; ++i) {
+        const size_t ph = 64 + i * 56;
+        const uint64_t off = rd<uint64_t>(out, ph + 8);
+        const uint64_t va = rd<uint64_t>(out, ph + 16);
+        const uint64_t fsz = rd<uint64_t>(out, ph + 32);
+        CHECK(rd<uint32_t>(out, ph) == 1u);   // PT_LOAD
+        CHECK(rd<uint32_t>(out, ph + 4) == want_flags[i]);
+        CHECK(va == segs[i].start);
+        CHECK(fsz == segs[i].end - segs[i].start);
+        CHECK(rd<uint64_t>(out, ph + 40) == fsz);
+        CHECK(off % 0x4000 == va % 0x4000);
+        CHECK(off >= prev_end);
+        prev_end = off + fsz;
+        REQUIRE(off + fsz <= out.size());
+        // every byte sits at p_offset + (va - p_vaddr)
+        for (const auto& [a, b] : mem.bytes)
+            if (a >= va && a < va + fsz) CHECK(out[off + (a - va)] == b);
+    }
+}
+
+TEST_CASE(module_dump_elf_keeps_in_memory_header_entry) {
+    using namespace slop::core;
+    fake_space_t mem;
+    // an in-memory ELF header with a PIE-relative entry (ET_SCE_DYNEXEC style)
+    const uint8_t ident[8] = {0x7F, 'E', 'L', 'F', 2, 1, 1, 9};
+    for (size_t i = 0; i < sizeof(ident); ++i) mem.bytes[0x800000 + i] = ident[i];
+    const uint16_t type = 0xFE10;
+    mem.bytes[0x800010] = static_cast<uint8_t>(type & 0xFF);
+    mem.bytes[0x800011] = static_cast<uint8_t>(type >> 8);
+    const uint64_t entry = 0x1230;
+    for (int i = 0; i < 8; ++i) mem.bytes[0x800018 + i] = static_cast<uint8_t>(entry >> (8 * i));
+    const std::vector<process::mapped_segment_t> segs = {{0x800000, 0x810000, 5}};
+    std::vector<uint8_t> out;
+    process::elf_rebuild_info_t info;
+    auto res = process::reconstruct_elf_from_segments(
+        segs, [&](uintptr_t a, void* d, size_t n) { return mem.read(a, d, n); }, out, {}, &info);
+    REQUIRE(res.ok);
+    CHECK(info.had_header);
+    CHECK(info.source_type == 0xFE10);
+    CHECK(info.entry == 0x801230u);
+    CHECK(rd<uint64_t>(out, 24) == 0x801230u);
+}
+
+TEST_CASE(module_dump_elf_unreadable_pages_strict_and_lenient) {
+    using namespace slop::core;
+    fake_space_t mem;
+    mem.bytes[0x400000] = 0x11;
+    mem.bad_lo = 0x404000;
+    mem.bad_hi = 0x405000;
+    const std::vector<process::mapped_segment_t> segs = {{0x400000, 0x410000, 5}};
+    auto rf = [&](uintptr_t a, void* d, size_t n) { return mem.read(a, d, n); };
+    std::vector<uint8_t> out;
+    process::module_dump_options_t strict;
+    strict.chunk_size = 0x1000;
+    strict.strict_reads = true;
+    auto res = process::reconstruct_elf_from_segments(segs, rf, out, strict);
+    CHECK(!res.ok);
+    CHECK(res.error.find("0x404000") != std::string::npos);
+    CHECK(out.empty());
+
+    process::module_dump_options_t lenient = strict;
+    lenient.strict_reads = false;
+    res = process::reconstruct_elf_from_segments(segs, rf, out, lenient);
+    REQUIRE(res.ok);
+    CHECK(!res.complete);
+    bool named = false;
+    for (const auto& w : res.warnings)
+        if (w.find("0x404000..0x405000") != std::string::npos) named = true;
+    CHECK(named);
+
+    // bad layouts are refused
+    std::vector<process::mapped_segment_t> overlap = {{0x400000, 0x402000, 1}, {0x401000, 0x403000, 1}};
+    CHECK(!process::reconstruct_elf_from_segments(overlap, rf, out).ok);
+    CHECK(!process::reconstruct_elf_from_segments({}, rf, out).ok);
+}
+
+TEST_CASE(module_dump_raw_span_zero_fills_gaps) {
+    using namespace slop::core;
+    fake_space_t mem;
+    mem.bytes[0x400000] = 0x01;
+    mem.bytes[0x401FFF] = 0x02;
+    mem.bytes[0x403000] = 0x03;
+    mem.bytes[0x402800] = 0x77;   // inside the gap: must not appear
+    const std::vector<process::mapped_segment_t> segs = {{0x400000, 0x402000, 5}, {0x403000, 0x404000, 3}};
+    std::vector<uint8_t> out;
+    auto res = process::dump_raw_span(
+        segs, [&](uintptr_t a, void* d, size_t n) { return mem.read(a, d, n); }, out);
+    REQUIRE(res.ok);
+    REQUIRE(out.size() == 0x4000u);
+    CHECK(out[0] == 0x01);
+    CHECK(out[0x1FFF] == 0x02);
+    CHECK(out[0x2800] == 0x00);
+    CHECK(out[0x3000] == 0x03);
+    CHECK(res.section_count == 2u);
 }

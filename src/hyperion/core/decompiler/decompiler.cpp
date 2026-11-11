@@ -22,13 +22,7 @@ std::vector<PseudoLine> Decompiler::decompile(const Function& func, const Analys
                 va_t t = insn.branch_target();
                 if (!t) continue;
                 auto nit = db.names.find(t);
-                std::string name;
-                if (nit != db.names.end())
-                    name = nit->second;
-                else if (db.image_base && t >= db.image_base)
-                    name = fmt::format("sub_{:X}", t - db.image_base);
-                else
-                    name = fmt::format("sub_{:X}", t);
+                std::string name = nit != db.names.end() ? nit->second : default_func_name(t);
                 if (calls_seen.insert(name).second)
                     out.push_back({1, fmt::format("{}();", name), insn.addr});
             }

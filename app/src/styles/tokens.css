@@ -1,9 +1,9 @@
 /* app/src/styles/tokens.css
  *
- * Direct port of src/ui/tokens.hpp and the three palettes in src/ui/theme.cpp.
- * The ImGui theme engine already stored the design system as data (16 named
- * colours plus spacing/radius/type scales per theme), so this is a transcription
- * rather than a redesign, same values, converted from 0..1 floats to sRGB.
+ * The three dark palettes are a direct port of src/ui/tokens.hpp and
+ * src/ui/theme.cpp (the ImGui theme engine stored the design system as data,
+ * so those are transcriptions converted from 0..1 floats to sRGB). Daylight
+ * (light) and High contrast exist only here.
  *
  * Swap themes by setting `data-theme` on <html>. The accent override the Theme
  * menu offered maps to setting --accent inline on the same element; the hover
@@ -33,14 +33,19 @@
   --rail-w: 46px;
   --tabbar-h: 34px;
 
-  --font-ui: "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI",
-    system-ui, sans-serif;
+  --font-ui: "Inter Variable", "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Mono", "Consolas", ui-monospace, monospace;
 
   /* Derived from --accent so an override stays consistent */
   --accent-hover: color-mix(in srgb, var(--accent) 82%, white);
   --accent-active: color-mix(in srgb, var(--accent) 64%, white);
   --selection: color-mix(in srgb, var(--accent) 35%, transparent);
+
+  /* Row hover / zebra tints and text on solid fills. Dark palettes lighten
+     rows; the light palette overrides these to darken them instead */
+  --hover-tint: rgb(255 255 255 / 4%);
+  --stripe: rgb(255 255 255 / 3%);
+  --on-danger: #fff;
 }
 
 [data-theme="obsidian"] {
@@ -89,4 +94,49 @@
   --success: #99c76b;
   --warning: #facc52;
   --danger: #e64d4d;
+}
+
+/* Light palette. Accent and status colours are darkened so text on them and
+   them on the background both keep at least 4.5:1 */
+[data-theme="daylight"] {
+  --bg-0: #ffffff;
+  --bg-1: #f6f7f9;
+  --bg-2: #e9ebef;
+  --surface: rgb(255 255 255 / 98%);
+  --border: #c9ced6;
+  --border-soft: #dfe2e8;
+  --text: #15171c;
+  --text-dim: #3d434d;
+  --text-faint: #5f6672;
+  --accent: #00756a;
+  --success: #1e7a32;
+  --warning: #8a5a00;
+  --danger: #b3261e;
+  --hover-tint: rgb(0 0 0 / 5%);
+  --stripe: rgb(0 0 0 / 3%);
+  --selection: color-mix(in srgb, var(--accent) 22%, transparent);
+  --accent-hover: color-mix(in srgb, var(--accent) 82%, black);
+  --accent-active: color-mix(in srgb, var(--accent) 64%, black);
+}
+
+/* High contrast: pure black / white, saturated signal colours, visible
+   borders everywhere. Pairs with the thicker focus ring in app.css */
+[data-theme="high-contrast"] {
+  --bg-0: #000000;
+  --bg-1: #000000;
+  --bg-2: #1a1a1a;
+  --surface: #000000;
+  --border: #ffffff;
+  --border-soft: #9a9a9a;
+  --text: #ffffff;
+  --text-dim: #ffffff;
+  --text-faint: #d6d6d6;
+  --accent: #ffd400;
+  --success: #4dff7a;
+  --warning: #ffb000;
+  --danger: #ff6b6b;
+  --hover-tint: rgb(255 255 255 / 14%);
+  --stripe: rgb(255 255 255 / 7%);
+  --selection: color-mix(in srgb, var(--accent) 40%, transparent);
+  --on-danger: #000000;
 }

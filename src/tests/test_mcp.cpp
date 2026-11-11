@@ -8,6 +8,8 @@
 #include "core/mcp/mcp_server.hpp"
 #include "core/mcp/mcp_tools.hpp"
 #include "core/disasm/binary_state.hpp"
+#include "core/infra/settings.hpp"
+#include "core/mcp/tools_common.hpp"
 
 #include <windows.h>
 
@@ -28,8 +30,8 @@ namespace {
 using json = nlohmann::json;
 
 struct server_fixture_t {
-    server_fixture_t() {
-        slop::core::mcp::server_config_t cfg;
+    server_fixture_t() : server_fixture_t(slop::core::mcp::server_config_t{}) {}
+    explicit server_fixture_t(slop::core::mcp::server_config_t cfg) {
         cfg.port = 0;   // ephemeral
         REQUIRE(slop::core::mcp::start(cfg));
         port_ = slop::core::mcp::port();
@@ -987,7 +989,7 @@ TEST_CASE(mcp_network_shape_host_side_store) {
 
     payload = fx.call("network", {{"action", "reassemble_stream"}}, is_error);
     REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("packets", -1u), 0u);
+    REQUIRE_EQ(payload.value("packets", ~0u), 0u);
 
     payload = fx.call("network", {{"action", "connections"}}, is_error);
     REQUIRE(!is_error);
@@ -1740,4 +1742,443 @@ TEST_CASE(mcp_disasm_load_unload_shared_session) {
     payload = fx.call("disasm", {{"action", "unload"}}, is_error);
     REQUIRE(!is_error);
     REQUIRE_FALSE(ds::has_binary());
+}
+
+// === transport: auth, host/origin guard, cors, sessions, notifications, sse ===
+
+namespace {
+
+const std::string kTok   = std::string(64, 'a');
+const std::string kExtra = std::string(64, 'b');
+
+json rpc_body(const std::string& method, const json& id = 1, const json& params = json::object()) {
+    json r = {{"jsonrpc", "2.0"}, {"method", method}, {"params", params}};
+    if (!id.is_null()) r["id"] = id;
+    return r;
+}
+
+httplib::Headers bearer(const std::string& t) { return {{"Authorization", "Bearer " + t}}; }
+
+slop::core::mcp::server_config_t token_cfg() {
+    slop::core::mcp::server_config_t cfg;
+    cfg.token = kTok;
+    cfg.extra_tokens = {kExtra};
+    return cfg;
+}
+
+// scratch settings file so app.* settings actions never touch the real profile
+struct scratch_settings_t {
+    std::filesystem::path dir;
+    std::string old_profile, old_appdata;
+    scratch_settings_t() {
+        dir = std::filesystem::temp_directory_path() /
+              ("slop_mcp_settings_" + std::to_string(::GetCurrentProcessId()));
+        std::filesystem::create_directories(dir);
+        slop::core::infra::settings::set_file_for_testing((dir / "settings.json").string());
+        slop::core::infra::settings::load();
+        // rotate_token refreshes onboarded client configs: sandbox them too
+        char buf[32768];
+        DWORD n = ::GetEnvironmentVariableA("USERPROFILE", buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) old_profile.assign(buf, n);
+        n = ::GetEnvironmentVariableA("APPDATA", buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) old_appdata.assign(buf, n);
+        ::SetEnvironmentVariableA("USERPROFILE", (dir / "profile").string().c_str());
+        ::SetEnvironmentVariableA("APPDATA", (dir / "appdata").string().c_str());
+    }
+    ~scratch_settings_t() {
+        ::SetEnvironmentVariableA("USERPROFILE", old_profile.empty() ? nullptr : old_profile.c_str());
+        ::SetEnvironmentVariableA("APPDATA", old_appdata.empty() ? nullptr : old_appdata.c_str());
+        slop::core::infra::settings::set_file_for_testing({});
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+};
+
+} // namespace
+
+TEST_CASE(mcp_auth_rejects_missing_or_bad_tokens_with_rpc_shape) {
+    server_fixture_t fx(token_cfg());
+    const std::string body = rpc_body("ping").dump();
+
+    auto none = fx.cli_->Post("/mcp", body, "application/json");
+    REQUIRE(none);
+    REQUIRE_EQ(none->status, 401);
+    REQUIRE_STR_EQ(none->get_header_value("WWW-Authenticate").c_str(), "Bearer");
+    const json err = json::parse(none->body);
+    REQUIRE_STR_EQ(err.at("jsonrpc").get<std::string>().c_str(), "2.0");
+    REQUIRE_EQ(err.at("error").at("code").get<int>(), -32001);
+
+    auto bad = fx.cli_->Post("/mcp", bearer(std::string(64, 'c')), body, "application/json");
+    REQUIRE(bad);
+    REQUIRE_EQ(bad->status, 401);
+    auto prefix = fx.cli_->Post("/mcp", bearer(kTok.substr(0, 63)), body, "application/json");
+    REQUIRE(prefix);
+    REQUIRE_EQ(prefix->status, 401);
+
+    auto good = fx.cli_->Post("/mcp", bearer(kTok), body, "application/json");
+    REQUIRE(good);
+    REQUIRE_EQ(good->status, 200);
+    auto extra = fx.cli_->Post("/mcp", bearer(kExtra), body, "application/json");
+    REQUIRE(extra);
+    REQUIRE_EQ(extra->status, 200);
+
+    // /api keeps the ui's {ok,error} shape
+    const json api = {{"tool", "app"}, {"action", "status"}};
+    auto api_bad = fx.cli_->Post("/api", api.dump(), "application/json");
+    REQUIRE(api_bad);
+    REQUIRE_EQ(api_bad->status, 401);
+    REQUIRE(!json::parse(api_bad->body).value("ok", true));
+    // the stream routes are gated too
+    auto stream = fx.cli_->Get("/mcp");
+    REQUIRE(stream);
+    REQUIRE_EQ(stream->status, 401);
+    // health stays open for the startup probe
+    auto health = fx.cli_->Get("/health");
+    REQUIRE(health);
+    REQUIRE_EQ(health->status, 200);
+}
+
+TEST_CASE(mcp_host_and_origin_guard_and_cors) {
+    server_fixture_t fx;
+    const std::string body = rpc_body("ping").dump();
+
+    // dns rebinding: a foreign Host never reaches a handler
+    auto rebind = fx.cli_->Post("/mcp", {{"Host", "evil.example:" + std::to_string(fx.port())}},
+                                body, "application/json");
+    REQUIRE(rebind);
+    REQUIRE_EQ(rebind->status, 403);
+    auto local = fx.cli_->Post("/mcp", {{"Host", "localhost:" + std::to_string(fx.port())}},
+                               body, "application/json");
+    REQUIRE(local);
+    REQUIRE_EQ(local->status, 200);
+    REQUIRE(slop::core::mcp::host_allowed("[::1]:" + std::to_string(fx.port()), fx.port()));
+    REQUIRE(!slop::core::mcp::host_allowed("127.0.0.1:1", fx.port()));
+    REQUIRE(!slop::core::mcp::host_allowed("127.0.0.1.evil.example", fx.port()));
+
+    // a web page cannot drive /mcp
+    auto foreign = fx.cli_->Post("/mcp", {{"Origin", "https://evil.example"}}, body,
+                                 "text/plain");
+    REQUIRE(foreign);
+    REQUIRE_EQ(foreign->status, 403);
+
+    // the webview gets cors on every route, including the startup /health probe
+    const httplib::Headers tauri = {{"Origin", "http://tauri.localhost"}};
+    auto health = fx.cli_->Get("/health", tauri);
+    REQUIRE(health);
+    REQUIRE_EQ(health->status, 200);
+    REQUIRE_STR_EQ(health->get_header_value("Access-Control-Allow-Origin").c_str(),
+                   "http://tauri.localhost");
+    auto pre = fx.cli_->Options("/mcp", {{"Origin", "http://localhost:1420"},
+                                         {"Access-Control-Request-Method", "POST"}});
+    REQUIRE(pre);
+    REQUIRE_EQ(pre->status, 204);
+    REQUIRE(pre->get_header_value("Access-Control-Allow-Headers").find("Authorization") !=
+            std::string::npos);
+    REQUIRE(pre->get_header_value("Access-Control-Expose-Headers").find("Mcp-Session-Id") !=
+            std::string::npos);
+    auto pre_bad = fx.cli_->Options("/api", {{"Origin", "https://evil.example"}});
+    REQUIRE(pre_bad);
+    REQUIRE_EQ(pre_bad->status, 403);
+}
+
+TEST_CASE(mcp_notifications_never_get_replies) {
+    server_fixture_t fx;
+    auto single = fx.cli_->Post("/mcp", rpc_body("notifications/whatever", nullptr).dump(),
+                                "application/json");
+    REQUIRE(single);
+    REQUIRE_EQ(single->status, 202);
+    REQUIRE(single->body.empty());
+
+    const json batch_only = json::array({rpc_body("notifications/initialized", nullptr),
+                                         rpc_body("bogus/notification", nullptr)});
+    auto only = fx.cli_->Post("/mcp", batch_only.dump(), "application/json");
+    REQUIRE(only);
+    REQUIRE_EQ(only->status, 202);
+
+    const json mixed = json::array({rpc_body("ping", 7), rpc_body("bogus/notification", nullptr),
+                                    rpc_body("bogus/method", 8)});
+    auto res = fx.cli_->Post("/mcp", mixed.dump(), "application/json");
+    REQUIRE(res);
+    REQUIRE_EQ(res->status, 200);
+    const json arr = json::parse(res->body);
+    REQUIRE(arr.is_array());
+    REQUIRE_EQ(arr.size(), 2u);
+    REQUIRE_EQ(arr.at(0).at("id").get<int>(), 7);
+    REQUIRE_EQ(arr.at(1).at("error").at("code").get<int>(), -32601);
+
+    auto empty = fx.cli_->Post("/mcp", "[]", "application/json");
+    REQUIRE(empty);
+    REQUIRE_EQ(empty->status, 400);
+}
+
+TEST_CASE(mcp_initialize_negotiates_version_and_issues_sessions) {
+    server_fixture_t fx;
+    auto old = fx.cli_->Post("/mcp",
+                             rpc_body("initialize", 1, {{"protocolVersion", "2024-11-05"}}).dump(),
+                             "application/json");
+    REQUIRE(old);
+    REQUIRE_EQ(old->status, 200);
+    REQUIRE_STR_EQ(json::parse(old->body).at("result").at("protocolVersion")
+                       .get<std::string>().c_str(), "2024-11-05");
+    const std::string sid = old->get_header_value("Mcp-Session-Id");
+    REQUIRE_EQ(sid.size(), 64u);
+
+    auto future_ver = fx.cli_->Post("/mcp",
+                                    rpc_body("initialize", 2, {{"protocolVersion", "2099-01-01"}}).dump(),
+                                    "application/json");
+    REQUIRE(future_ver);
+    REQUIRE_STR_EQ(json::parse(future_ver->body).at("result").at("protocolVersion")
+                       .get<std::string>().c_str(), "2025-06-18");
+    REQUIRE_NE(future_ver->get_header_value("Mcp-Session-Id"), sid);
+
+    // a known session is accepted, an unknown one must re-initialize
+    auto ok = fx.cli_->Post("/mcp", {{"Mcp-Session-Id", sid}}, rpc_body("ping").dump(),
+                            "application/json");
+    REQUIRE(ok);
+    REQUIRE_EQ(ok->status, 200);
+    auto unknown = fx.cli_->Post("/mcp", {{"Mcp-Session-Id", "forged"}}, rpc_body("ping").dump(),
+                                 "application/json");
+    REQUIRE(unknown);
+    REQUIRE_EQ(unknown->status, 404);
+
+    auto del = fx.cli_->Delete("/mcp", {{"Mcp-Session-Id", sid}});
+    REQUIRE(del);
+    REQUIRE_EQ(del->status, 204);
+    auto gone = fx.cli_->Post("/mcp", {{"Mcp-Session-Id", sid}}, rpc_body("ping").dump(),
+                              "application/json");
+    REQUIRE(gone);
+    REQUIRE_EQ(gone->status, 404);
+}
+
+TEST_CASE(mcp_cancel_is_scoped_to_the_issuing_session) {
+    server_fixture_t fx;
+    auto init_a = fx.cli_->Post("/mcp", rpc_body("initialize").dump(), "application/json");
+    auto init_b = fx.cli_->Post("/mcp", rpc_body("initialize").dump(), "application/json");
+    REQUIRE(init_a && init_b);
+    const std::string sa = init_a->get_header_value("Mcp-Session-Id");
+    const std::string sb = init_b->get_header_value("Mcp-Session-Id");
+
+    json reply;
+    std::thread runner([&] {
+        httplib::Client cli("127.0.0.1", fx.port());
+        cli.set_read_timeout(std::chrono::seconds(20));
+        const json req = rpc_body("tools/call", 99,
+                                  {{"name", "emulate"},
+                                   {"arguments", {{"action", "run"}, {"hex", "EBFE"},
+                                                  {"count", 1ull << 40}, {"timeout_ms", 1500}}}});
+        if (auto r = cli.Post("/mcp", {{"Mcp-Session-Id", sa}}, req.dump(), "application/json"))
+            reply = json::parse(r->body, nullptr, false);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    const json cancel = rpc_body("notifications/cancelled", nullptr, {{"requestId", 99}});
+    // session b cannot cancel session a's request 99
+    for (int i = 0; i < 3; ++i)
+        fx.cli_->Post("/mcp", {{"Mcp-Session-Id", sb}}, cancel.dump(), "application/json");
+    runner.join();
+    REQUIRE(reply.is_object());
+    const json payload =
+        json::parse(reply.at("result").at("content").at(0).at("text").get<std::string>());
+    REQUIRE(payload.value("stopped_reason", "") != "cancelled");
+}
+
+TEST_CASE(mcp_tools_carry_annotations_closed_schemas_and_structured_content) {
+    server_fixture_t fx;
+    const json list = fx.rpc("tools/list");
+    for (const auto& t : list.at("result").at("tools")) {
+        REQUIRE(t.contains("annotations"));
+        REQUIRE(t.at("annotations").contains("readOnlyHint"));
+        REQUIRE(t.at("annotations").at("readOnlyHint") == t.at("read_only"));
+        REQUIRE(t.at("inputSchema").at("additionalProperties") == false);
+        REQUIRE(t.contains("outputSchema"));
+        for (const auto& [k, p] : t.at("inputSchema").at("properties").items())
+            REQUIRE(p.contains("description"));
+        if (t.at("name") == "memory") {
+            const auto& addr = t.at("inputSchema").at("properties").at("addr").at("type");
+            REQUIRE(addr.is_array());   // integer or "0x..." string
+        }
+    }
+    const json call = fx.rpc("tools/call", {{"name", "target"}, {"arguments", {{"action", "status"}}}});
+    const json& result = call.at("result");
+    REQUIRE(result.contains("structuredContent"));
+    REQUIRE(result.at("structuredContent").is_object());
+    REQUIRE(result.at("structuredContent") ==
+            json::parse(result.at("content").at(0).at("text").get<std::string>()));
+}
+
+TEST_CASE(mcp_events_ticket_is_single_use) {
+    server_fixture_t fx(token_cfg());
+    const json req = {{"tool", "app"}, {"action", "events_ticket"}};
+    auto res = fx.cli_->Post("/api", bearer(kTok), req.dump(), "application/json");
+    REQUIRE(res);
+    REQUIRE_EQ(res->status, 200);
+    const std::string ticket = json::parse(res->body).at("data").at("ticket").get<std::string>();
+    REQUIRE_EQ(ticket.size(), 64u);
+
+    auto open_stream = [&](const std::string& path) {
+        httplib::Client cli("127.0.0.1", fx.port());
+        cli.set_read_timeout(std::chrono::seconds(5));
+        std::string got;
+        auto r = cli.Get(path, [&](const char* data, size_t len) {
+            got.append(data, len);
+            return got.find("event: hello") == std::string::npos;   // stop after hello
+        });
+        return std::make_pair(r ? r->status : (got.empty() ? -1 : 200), got);
+    };
+    const auto first = open_stream("/events?ticket=" + ticket);
+    REQUIRE(first.second.find("event: hello") != std::string::npos);
+    const auto reuse = open_stream("/events?ticket=" + ticket);
+    REQUIRE_EQ(reuse.first, 401);
+    const auto legacy = open_stream("/events?token=" + kTok);
+    REQUIRE_EQ(legacy.first, 401);   // the query-string token is gone
+}
+
+TEST_CASE(mcp_stream_cap_keeps_workers_free) {
+    slop::core::mcp::server_config_t cfg;
+    cfg.max_streams = 1;
+    server_fixture_t fx(cfg);
+    std::atomic<bool> stop_first{false};
+    std::atomic<bool> first_open{false};
+    std::thread holder([&] {
+        httplib::Client cli("127.0.0.1", fx.port());
+        cli.set_read_timeout(std::chrono::seconds(10));
+        cli.Get("/events", [&](const char*, size_t) {
+            first_open = true;
+            return !stop_first.load();
+        });
+    });
+    for (int i = 0; i < 200 && !first_open.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(first_open.load());
+    REQUIRE_EQ(slop::core::mcp::active_streams(), 1u);
+    auto second = fx.cli_->Get("/events");
+    REQUIRE(second);
+    REQUIRE_EQ(second->status, 503);
+    // plain requests still flow while the stream is parked
+    REQUIRE(fx.rpc("ping").contains("result"));
+    stop_first = true;
+    slop::core::infra::event_bus::publish("test.nudge", json::object());
+    holder.join();
+    for (int i = 0; i < 300 && slop::core::mcp::active_streams() != 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE_EQ(slop::core::mcp::active_streams(), 0u);
+}
+
+TEST_CASE(mcp_app_settings_api_redacts_and_validates) {
+    scratch_settings_t scratch;
+    server_fixture_t fx;
+    bool is_error = false;
+    json got = fx.call("app", {{"action", "settings_get"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_STR_EQ(got.at("mcp_token").get<std::string>().c_str(), "set");
+
+    fx.call("app", {{"action", "settings_set"}, {"key", "mcp_token"}, {"value", "x"}}, is_error);
+    REQUIRE(is_error);
+    fx.call("app", {{"action", "settings_set"}, {"key", "mcp_port"}, {"value", 70000}}, is_error);
+    REQUIRE(is_error);
+    json set = fx.call("app", {{"action", "settings_set"}, {"key", "script_unsafe"}, {"value", true}},
+                       is_error);
+    REQUIRE(!is_error);
+    REQUIRE(set.value("ok", false));
+    REQUIRE(slop::core::infra::settings::get<bool>("script_unsafe", false));
+    set = fx.call("app", {{"action", "settings_set"}, {"key", "mcp_port"}, {"value", 9100}}, is_error);
+    REQUIRE(set.value("restart_required", false));
+}
+
+TEST_CASE(mcp_rotate_token_applies_live) {
+    scratch_settings_t scratch;
+    slop::core::mcp::server_config_t cfg;
+    cfg.token = slop::core::infra::settings::mcp_token();
+    cfg.extra_tokens = {kExtra};
+    server_fixture_t fx(cfg);
+    const std::string old_tok = cfg.token;
+    const json req = {{"tool", "app"}, {"action", "rotate_token"}};
+
+    // a supervisor-token caller rotates; its own bearer keeps working
+    auto sup = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
+    REQUIRE(sup);
+    const json sup_out = json::parse(sup->body).at("data");
+    REQUIRE(sup_out.value("rotated", false));
+    REQUIRE(!sup_out.value("caller_must_switch", true));
+    const std::string mid = slop::core::infra::settings::mcp_token();
+    REQUIRE_STR_EQ(sup_out.at("token").get<std::string>().c_str(), mid.c_str());
+    REQUIRE_NE(mid, old_tok);
+    auto sup_again = fx.cli_->Post("/mcp", bearer(kExtra), rpc_body("ping").dump(), "application/json");
+    REQUIRE_EQ(sup_again->status, 200);
+    auto stale = fx.cli_->Post("/mcp", bearer(old_tok), rpc_body("ping").dump(), "application/json");
+    REQUIRE(stale);
+    REQUIRE_EQ(stale->status, 401);
+
+    // the primary holder gets the new token back and the old one dies
+    auto prim = fx.cli_->Post("/api", bearer(mid), req.dump(), "application/json");
+    REQUIRE(prim);
+    const json prim_out = json::parse(prim->body).at("data");
+    REQUIRE(prim_out.value("caller_must_switch", false));
+    const std::string fresh = prim_out.at("token").get<std::string>();
+    REQUIRE_STR_EQ(fresh.c_str(), slop::core::infra::settings::mcp_token().c_str());
+    auto ok = fx.cli_->Post("/mcp", bearer(fresh), rpc_body("ping").dump(), "application/json");
+    REQUIRE(ok);
+    REQUIRE_EQ(ok->status, 200);
+
+    // register_token needs the primary token
+    const json reg = {{"tool", "app"}, {"action", "register_token"},
+                      {"params", {{"token", std::string(64, 'd')}}}};
+    auto denied = fx.cli_->Post("/api", bearer(kExtra), reg.dump(), "application/json");
+    REQUIRE(!json::parse(denied->body).value("ok", true));
+    auto granted = fx.cli_->Post("/api", bearer(fresh), reg.dump(), "application/json");
+    REQUIRE(json::parse(granted->body).value("ok", false));
+    auto with_new = fx.cli_->Post("/mcp", bearer(std::string(64, 'd')), rpc_body("ping").dump(),
+                                  "application/json");
+    REQUIRE_EQ(with_new->status, 200);
+}
+
+TEST_CASE(mcp_fs_read_file_pages) {
+    server_fixture_t fx;
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("slop_mcp_fs_" + std::to_string(::GetCurrentProcessId()));
+    std::filesystem::create_directories(dir);
+    const std::string file = (dir / "page.txt").string();
+    { std::ofstream(file, std::ios::binary) << "hello paged world"; }
+    bool is_error = true;
+    json a = fx.call("fs", {{"action", "read_file"}, {"path", file}, {"max_bytes", 6}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(a.at("size").get<uint64_t>(), 17u);
+    REQUIRE_STR_EQ(a.at("text").get<std::string>().c_str(), "hello ");
+    REQUIRE_EQ(a.at("next_offset").get<uint64_t>(), 6u);
+    json b = fx.call("fs", {{"action", "read_file"}, {"path", file}, {"offset", "0x6"},
+                            {"max_bytes", 64}, {"encoding", "hex"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(b.value("eof", false));
+    REQUIRE_STR_EQ(b.at("hex").get<std::string>().c_str(), "706167656420776f726c64");
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+}
+
+TEST_CASE(mcp_stop_is_bounded_when_a_tool_ignores_cancel) {
+    using clock = std::chrono::steady_clock;
+    auto* fx = new server_fixture_t;
+    const uint16_t p = fx->port();
+    // hold the tool lock so a locked tool call parks inside a server worker
+    std::unique_lock held(slop::core::mcp::detail::tool_mutex());
+    std::thread caller([p] {
+        httplib::Client cli("127.0.0.1", p);
+        cli.set_read_timeout(std::chrono::seconds(30));
+        cli.Post("/mcp", rpc_body("tools/call", 5, {{"name", "target"},
+                                                    {"arguments", {{"action", "status"}}}}).dump(),
+                 "application/json");
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    fx->cli_->stop();
+    fx->cli_.reset();
+    const auto t0 = clock::now();
+    slop::core::mcp::stop();
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+    REQUIRE_LT(ms, 9000);
+    REQUIRE(!slop::core::mcp::running());
+    held.unlock();
+    caller.join();
+    delete fx;   // stop() already ran; the destructor's stop is a no-op
+    // the background join finished and a new server binds fine
+    server_fixture_t again;
+    REQUIRE(again.rpc("ping").contains("result"));
 }

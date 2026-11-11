@@ -5,6 +5,7 @@
 #include "core/infra/diag.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -36,28 +37,51 @@ const exec_range_t* range_for_va(const std::vector<exec_range_t>& rs, uint64_t v
     return nullptr;
 }
 
-// Common MSVC/GCC x64 prologues
+// Common x64 prologues: MSVC home-space spills / stack reservation, and the
+// frame-pointer prologue clang emits for SysV targets (the Orbis SDK keeps
+// frame pointers, so nearly every PS4 function opens with it)
 bool looks_like_prologue(const uint8_t* p, size_t avail) {
     if (avail < 5) return false;
     static constexpr uint8_t kP1[] = {0x48, 0x89, 0x5C, 0x24}; // mov [rsp+x],rbx
     static constexpr uint8_t kP2[] = {0x48, 0x89, 0x4C, 0x24}; // mov [rsp+x],rcx
     static constexpr uint8_t kP3[] = {0x48, 0x89, 0x74, 0x24}; // mov [rsp+x],rsi
     static constexpr uint8_t kP4[] = {0x4C, 0x89, 0x44, 0x24}; // mov [rsp+x],r8
+    static constexpr uint8_t kP8[] = {0x55, 0x48, 0x89, 0xE5}; // push rbp ; mov rbp,rsp
     static constexpr uint8_t kP5[] = {0x48, 0x83, 0xEC};       // sub rsp, imm8
     static constexpr uint8_t kP6[] = {0x48, 0x81, 0xEC};       // sub rsp, imm32
     static constexpr uint8_t kP7[] = {0x48, 0x8B, 0xC4};       // mov rax,rsp
-    for (const auto* pat : {kP1, kP2, kP3, kP4}) {
+    for (const auto* pat : {kP1, kP2, kP3, kP4, kP8}) {
         if (std::memcmp(p, pat, 4) == 0) return true;
     }
-    if (avail >= 3 && (std::memcmp(p, kP5, 3) == 0 || std::memcmp(p, kP6, 3) == 0 ||
-                       std::memcmp(p, kP7, 3) == 0))
+    if (std::memcmp(p, kP5, 3) == 0 || std::memcmp(p, kP6, 3) == 0 ||
+        std::memcmp(p, kP7, 3) == 0)
         return true;
     return false;
 }
 
-bool good_preceding_boundary(const uint8_t* prev) noexcept {
-    const uint8_t c = *prev;
-    return c == 0xCC /* int3 pad */ || c == 0xC3 /* ret */;
+// Alignment NOPs LLVM pads between functions (x86 multi-byte NOP forms);
+// longer runs are these with extra 0x66 prefixes, which end the same way
+bool ends_with_nop_pad(const uint8_t* end, size_t before) noexcept {
+    static constexpr uint8_t kNop3[]  = {0x0F, 0x1F, 0x00};
+    static constexpr uint8_t kNop4[]  = {0x0F, 0x1F, 0x40, 0x00};
+    static constexpr uint8_t kNop5[]  = {0x0F, 0x1F, 0x44, 0x00, 0x00};
+    static constexpr uint8_t kNop7[]  = {0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00};
+    static constexpr uint8_t kNop8[]  = {0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+    static constexpr uint8_t kNop10[] = {0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00};
+    if (before >= 1 && end[-1] == 0x90) return true;
+    const auto ends = [&](const uint8_t* pat, size_t n) {
+        return before >= n && std::memcmp(end - n, pat, n) == 0;
+    };
+    return ends(kNop3, sizeof(kNop3)) || ends(kNop4, sizeof(kNop4)) ||
+           ends(kNop5, sizeof(kNop5)) || ends(kNop7, sizeof(kNop7)) ||
+           ends(kNop8, sizeof(kNop8)) || ends(kNop10, sizeof(kNop10));
+}
+
+// int3 padding (MSVC), a ret, or LLVM's NOP padding right before `p`
+bool good_preceding_boundary(const uint8_t* p, size_t before) noexcept {
+    if (before == 0) return false;
+    const uint8_t c = p[-1];
+    return c == 0xCC || c == 0xC3 || ends_with_nop_pad(p, before);
 }
 
 } // namespace
@@ -190,20 +214,22 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
         return it != covered.begin() && va < std::prev(it)->second;
     };
 
-    // Prologue heuristic sweep over unclaimed bytes
+    // Prologue heuristic sweep over unclaimed bytes. Progress is the
+    // fraction of executable bytes swept (the slow part of a large image)
+    size_t sweep_total = 0, sweep_done = 0;
+    for (const auto& rng : ranges) sweep_total += rng.len;
     for (const auto& rng : ranges) {
         if (fns_.size() >= max_functions) { stats_.truncated = true; break; }
 
         const size_t scan_end = rng.len > 1 ? rng.len - 1 : 0;
         for (size_t off = 1; off < scan_end; ++off) {
-            if ((off & 0xFFF) == 0) {
-                if (progress) progress(static_cast<float>(fns_.size()) /
-                                       static_cast<float>(max_functions));
-            }
+            if ((off & 0xFFF) == 0 && progress && sweep_total)
+                progress(static_cast<float>(sweep_done + off) /
+                         static_cast<float>(sweep_total));
             if (fns_.size() >= max_functions) { stats_.truncated = true; break; }
 
             const uint8_t* p = file.data() + rng.file_off + off;
-            if (!good_preceding_boundary(p - 1)) continue;
+            if (!good_preceding_boundary(p, off)) continue;
             if (!looks_like_prologue(p, rng.len - off)) continue;
 
             const uint64_t cand = rng.va + off;
@@ -226,7 +252,9 @@ bool function_index_t::build(const pe_image_t& pe, const std::vector<uint8_t>& f
             fns_.push_back({cand, static_cast<size_t>(va + 1 - cand)});
             ++stats_.heuristic_fns;
         }
+        sweep_done += rng.len;
     }
+    if (progress) progress(1.0f);
 
     // Merge + sort; sizes clipped at next function start
     std::sort(fns_.begin(), fns_.end(),

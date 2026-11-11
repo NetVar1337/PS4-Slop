@@ -8,6 +8,7 @@
 #include <unordered_set>
 #include <cstring>
 #include <Zydis/Zydis.h>
+#include <capstone/capstone.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -62,14 +63,28 @@ std::string demangle(const std::string& name) {
         return name.substr(1);
     return name;
 }
+} // namespace
+
+CapstoneDisasm& thread_capstone(Arch arch) {
+    struct handles_t {
+        CapstoneDisasm h[6];
+        bool           open[6] = {};
+    };
+    thread_local handles_t tl;
+    const size_t i = static_cast<size_t>(arch) < 6 ? static_cast<size_t>(arch) : 0;
+    if (!tl.open[i]) {
+        tl.h[i].set_arch(arch);
+        tl.open[i] = true;
+    }
+    return tl.h[i];
 }
 
 Analyzer::Analyzer(PEImage& img, WorkerPool& pool)
     : img_(img), pool_(pool), sched_(pool) {
     disasm_.set_arch(img.arch);
-    cap_disasm_.set_arch(img.arch);
     db_.image_base = img.base;
     db_.arch = img.arch;
+    db_.abi = default_callconv(img.arch, img.format);
     build_segment_index();
 }
 
@@ -180,7 +195,7 @@ void Analyzer::run() {
                     Function function;
                     function.entry = method;
                     auto name = db_.names.find(method);
-                    function.name = name != db_.names.end() ? name->second : fmt::format("sub_{:X}", method - img_.base);
+                    function.name = name != db_.names.end() ? name->second : default_func_name(method);
                     db_.add_func(std::move(function));
                 }
                 if (db_.insns.count(method)) continue;
@@ -407,7 +422,7 @@ void Analyzer::detect_functions() {
     for (va_t e : entries) {
         Function func;
         func.entry = e;
-        func.name = fmt::format("sub_{:X}", e - img_.base);
+        func.name = default_func_name(e);
         db_.add_func(std::move(func));
     }
 
@@ -641,7 +656,7 @@ void Analyzer::discover_cfg_fixed_point() {
         for (va_t entry : new_functions) {
             Function function;
             function.entry = entry;
-            function.name = fmt::format("sub_{:X}", entry - img_.base);
+            function.name = default_func_name(entry);
             db_.add_func(std::move(function));
         }
 
@@ -806,11 +821,26 @@ void Analyzer::build_xrefs() {
                 const bool read = op.read || !op.write;
                 if (read) db_.add_xref_unlocked({addr, op.val, XrefType::DataRead});
                 if (op.write) db_.add_xref_unlocked({addr, op.val, XrefType::DataWrite});
-            } else if (op.type == OpType::Imm && op.val > img_.base &&
-                     op.val < img_.base + 0x10000000)
+            } else if (op.type == OpType::Imm && imm_is_address(insn, op.val))
                 db_.add_xref_unlocked({addr, op.val, XrefType::DataOffset});
         }
     }
+}
+
+bool Analyzer::imm_is_address(const Insn& insn, va_t v) const {
+    // branch/call immediates are code targets, recorded above
+    if (insn.is_call() || insn.is_branch()) return false;
+    // adrp yields a 4 KiB page, the real address comes from the pairing pass
+    if (img_.arch == Arch::ARM64 && insn.mnemonic_id == ARM64_INS_ADRP) return false;
+    // must land inside a mapped segment (a fixed window past the base both
+    // floods base-0 ELFs and drops refs in images over 256 MB)
+    if (v < 0x1000 || !span_for(v)) return false;
+    // with a base under 64 KiB (PS4 eboots map at 0) ordinary constants
+    // alias addresses: only address-materializing forms count there
+    if (img_.base < 0x10000)
+        return insn.type == InsnType::Mov || insn.type == InsnType::Push ||
+               insn.type == InsnType::Lea;
+    return true;
 }
 
 void Analyzer::find_strings() {
@@ -850,6 +880,11 @@ void Analyzer::find_string_refs() {
 
     // Serial like build_xrefs above: the LEA scan is too cheap to fan out.
     u32 refs_added = 0;
+    if (img_.arch == Arch::ARM64) {
+        refs_added = find_arm64_page_refs(str_addrs);
+        spdlog::info("found {} string refs via adrp/adr pairs", refs_added);
+        return;
+    }
     for (auto& [addr, insn] : db_.insns) {
         if (insn.type != InsnType::Lea) continue;
         // LEA reg, [rip+X] — operand 1 is mem with computed VA
@@ -862,6 +897,63 @@ void Analyzer::find_string_refs() {
         }
     }
     spdlog::info("found {} string refs via LEA", refs_added);
+}
+
+// AArch64 materializes addresses as `adrp xN, page` followed by
+// `add xM, xN, #lo12` or a load/store `[xN, #lo12]` (or a single `adr`).
+// Walk each block in order, remember adrp pages per register, and resolve
+// the pair into a data xref (DataOffset for address forms, DataRead/Write for
+// memory forms). Returns how many of them target a string
+u32 Analyzer::find_arm64_page_refs(const std::unordered_set<va_t>& str_addrs) {
+    u32 string_refs = 0;
+    std::unordered_set<u64> seen;   // (from, to) pairs already recorded
+    auto record = [&](va_t from, va_t to, XrefType type) {
+        if (!span_for(to)) return;
+        const u64 key = (from * 0x9E3779B97F4A7C15ull) ^ to ^ (static_cast<u64>(type) << 61);
+        if (!seen.insert(key).second) return;
+        db_.add_xref_unlocked({from, to, type});
+        if (str_addrs.count(to)) ++string_refs;
+    };
+    for (auto& [entry, func] : db_.funcs) {
+        for (auto& [ba, bb] : func.blocks) {
+            std::unordered_map<u16, va_t> page;
+            for (const auto& insn : bb.insns) {
+                const unsigned id = insn.mnemonic_id;
+                if (id == ARM64_INS_ADRP && insn.op_count >= 2 &&
+                    insn.ops[0].type == OpType::Reg && insn.ops[1].type == OpType::Imm) {
+                    page[insn.ops[0].reg] = insn.ops[1].val;
+                    continue;
+                }
+                if (id == ARM64_INS_ADR && insn.op_count >= 2 && insn.ops[1].type == OpType::Imm) {
+                    record(insn.addr, insn.ops[1].val, XrefType::DataOffset);
+                } else if (id == ARM64_INS_ADD && insn.op_count >= 3 &&
+                           insn.ops[1].type == OpType::Reg && insn.ops[2].type == OpType::Imm) {
+                    const auto it = page.find(insn.ops[1].reg);
+                    if (it != page.end())
+                        record(insn.addr, it->second + insn.ops[2].val, XrefType::DataOffset);
+                } else {
+                    for (u8 i = 0; i < insn.op_count; ++i) {
+                        const auto& op = insn.ops[i];
+                        if (op.type != OpType::Mem || !op.mem.base || op.mem.index) continue;
+                        const auto it = page.find(op.mem.base);
+                        if (it == page.end()) continue;
+                        const va_t to = it->second + static_cast<u64>(op.mem.disp);
+                        // stores list the data register first (read), loads
+                        // write it; the memory operand itself has no access bits
+                        const bool store = insn.op_count > 0 && insn.ops[0].type == OpType::Reg &&
+                                           !insn.ops[0].write;
+                        record(insn.addr, to, store ? XrefType::DataWrite : XrefType::DataRead);
+                    }
+                }
+                // a write to a tracked register ends its pairing window
+                for (u8 i = 0; i < insn.op_count; ++i)
+                    if (insn.ops[i].type == OpType::Reg && insn.ops[i].write)
+                        page.erase(insn.ops[i].reg);
+                if (insn.is_call()) page.clear();
+            }
+        }
+    }
+    return string_refs;
 }
 
 void Analyzer::detect_vtables() {
@@ -1160,11 +1252,14 @@ void Analyzer::detect_tail_calls() {
 }
 
 void Analyzer::detect_calling_conventions() {
-    bool is_x64 = (img_.arch == Arch::X64 || img_.arch == Arch::ARM64 || img_.arch == Arch::PPC);
+    // 64-bit and ARM images follow the platform ABI picked from arch and
+    // container (SysV AMD64 for PS4/ELF, Win64 for PE, AAPCS64/AAPCS on ARM);
+    // only 32-bit x86 varies per function
+    const bool per_function = img_.arch == Arch::X86;
 
     for (auto& [entry, func] : db_.funcs) {
-        if (is_x64) {
-            func.callconv = CallConv::X64;
+        if (!per_function) {
+            func.callconv = db_.abi;
             continue;
         }
 
@@ -1187,7 +1282,85 @@ void Analyzer::detect_calling_conventions() {
         else
             func.callconv = CallConv::Cdecl;
     }
-    spdlog::info("calling conventions assigned (x64={})", is_x64 ? "yes" : "no");
+    spdlog::info("calling conventions assigned (abi={})", static_cast<int>(db_.abi));
+}
+
+int Analyzer::param_reg_index(u16 reg) const {
+    switch (db_.abi) {
+    case CallConv::X64:
+    case CallConv::SysV: {
+        const ZydisRegister full = ZydisRegisterGetLargestEnclosing(
+            ZYDIS_MACHINE_MODE_LONG_64, static_cast<ZydisRegister>(reg));
+        static constexpr ZydisRegister kWin64[] = {
+            ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_RDX, ZYDIS_REGISTER_R8, ZYDIS_REGISTER_R9};
+        static constexpr ZydisRegister kSysV[] = {
+            ZYDIS_REGISTER_RDI, ZYDIS_REGISTER_RSI, ZYDIS_REGISTER_RDX,
+            ZYDIS_REGISTER_RCX, ZYDIS_REGISTER_R8, ZYDIS_REGISTER_R9};
+        const bool sysv = db_.abi == CallConv::SysV;
+        const ZydisRegister* regs = sysv ? kSysV : kWin64;
+        const int n = sysv ? 6 : 4;
+        for (int i = 0; i < n; ++i)
+            if (regs[i] == full) return i;
+        return -1;
+    }
+    case CallConv::AAPCS64:
+        if (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X7) return reg - ARM64_REG_X0;
+        if (reg >= ARM64_REG_W0 && reg <= ARM64_REG_W7) return reg - ARM64_REG_W0;
+        return -1;
+    case CallConv::AAPCS:
+        if (reg >= ARM_REG_R0 && reg <= ARM_REG_R3) return reg - ARM_REG_R0;
+        return -1;
+    default:
+        return -1;
+    }
+}
+
+// Register arguments a function consumes: the highest ABI argument register
+// read before anything in the function writes it (calls clobber them all).
+// Blocks are visited entry first, then by address: flow-insensitive, which
+// can only under-count when a later block writes before an earlier one reads
+int Analyzer::count_register_params(const Function& func) const {
+    std::vector<va_t> order;
+    order.reserve(func.blocks.size());
+    for (const auto& [ba, bb] : func.blocks) order.push_back(ba);
+    std::sort(order.begin(), order.end(), [&](va_t a, va_t b) {
+        if (a == func.entry || b == func.entry) return a == func.entry && b != func.entry;
+        return a < b;
+    });
+
+    u32 written = 0;
+    int highest = -1;
+    auto read_reg = [&](u16 reg) {
+        const int i = param_reg_index(reg);
+        if (i >= 0 && !(written >> i & 1u)) highest = std::max(highest, i);
+    };
+    auto write_reg = [&](u16 reg) {
+        const int i = param_reg_index(reg);
+        if (i >= 0) written |= 1u << i;
+    };
+    for (va_t ba : order) {
+        const auto& bb = func.blocks.at(ba);
+        for (const auto& insn : bb.insns) {
+            // xor/sub reg, reg only zeroes: a write, not a use
+            const bool zeroing = (insn.type == InsnType::Xor || insn.type == InsnType::Sub) &&
+                                 insn.op_count >= 2 && insn.ops[0].type == OpType::Reg &&
+                                 insn.ops[1].type == OpType::Reg &&
+                                 insn.ops[0].reg == insn.ops[1].reg;
+            for (u8 i = 0; i < insn.op_count && !zeroing; ++i) {
+                const auto& op = insn.ops[i];
+                if (op.type == OpType::Reg && op.read) read_reg(op.reg);
+                if (op.type == OpType::Mem) {
+                    if (op.mem.base) read_reg(op.mem.base);
+                    if (op.mem.index) read_reg(op.mem.index);
+                }
+            }
+            for (u8 i = 0; i < insn.op_count; ++i)
+                if (insn.ops[i].type == OpType::Reg && insn.ops[i].write) write_reg(insn.ops[i].reg);
+            if (insn.is_call()) written = ~0u;
+        }
+        if (written == ~0u && highest >= 0) break;
+    }
+    return highest + 1;
 }
 
 void Analyzer::propagate_dataflow(const std::unordered_set<va_t>* only) {
@@ -1704,26 +1877,7 @@ void Analyzer::propagate_interproc_types() {
             }
             if (!func.analyzed) continue;
 
-            int param_reg_count = 0;
-            bool uses_rcx = false, uses_rdx = false, uses_r8 = false, uses_r9 = false;
-
-            for (auto& [ba, bb] : func.blocks) {
-                for (auto& insn : bb.insns) {
-                    for (u8 i = 0; i < insn.op_count; ++i) {
-                        if (insn.ops[i].type == OpType::Reg) {
-                            if (insn.ops[i].reg == 1) uses_rcx = true;
-                            if (insn.ops[i].reg == 2) uses_rdx = true;
-                            if (insn.ops[i].reg == 8) uses_r8 = true;
-                            if (insn.ops[i].reg == 9) uses_r9 = true;
-                        }
-                    }
-                }
-            }
-
-            if (uses_r9) param_reg_count = 4;
-            else if (uses_r8) param_reg_count = 3;
-            else if (uses_rdx) param_reg_count = 2;
-            else if (uses_rcx) param_reg_count = 1;
+            const int param_reg_count = count_register_params(func);
 
             FuncSignature sig;
             sig.param_count = param_reg_count;
@@ -1773,13 +1927,8 @@ void Analyzer::propagate_interproc_types() {
 }
 
 bool Analyzer::decode_insn(va_t addr, const u8* data, size_t len, Insn& out) {
-    if (use_capstone()) {
-        // Capstone's shared handle carries decode state: serialize. The
-        // x86/x64 Zydis path below stays lock-free (const decoder,
-        // formatter skipped), which is where the time goes.
-        std::lock_guard lk(cap_mu_);
-        return cap_disasm_.decode(addr, data, len, out);
-    }
+    if (use_capstone())
+        return thread_capstone(img_.arch).decode(addr, data, len, out);
     // Analysis never reads mnemonic/op_str text (classification keys off
     // InsnType/mnemonic_id/operands), so skip the formatter per instruction.
     // Decompile/display paths re-render on demand via format_text().
@@ -1788,7 +1937,7 @@ bool Analyzer::decode_insn(va_t addr, const u8* data, size_t len, Insn& out) {
 
 std::vector<Insn> Analyzer::decode_insn_range(va_t start, const u8* data, size_t len) {
     if (use_capstone())
-        return cap_disasm_.decode_range(start, data, len);
+        return thread_capstone(img_.arch).decode_range(start, data, len);
     return disasm_.decode_range(start, data, len);
 }
 

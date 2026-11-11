@@ -110,8 +110,28 @@ Varnode Lifter::operand_read(const Insn& insn, int idx, const AnalysisDB& /*db*/
     if (idx >= insn.op_count) return vn_const(0);
     auto& op = insn.ops[idx];
     switch (op.type) {
-    case OpType::Reg:
-        return reg_vn(op.reg, op.size);
+    case OpType::Reg: {
+        Varnode vn = reg_vn(op.reg, op.size);
+        // A narrow read of a register whose last write defined only the wide
+        // view (every x64 sub-register write re-defines the full register as
+        // its last op) must read the low piece of that wide def. Without the
+        // projection the read lands on an SSA version with no matching-width
+        // definition: def/use matching disconnects the chain, copy
+        // propagation treats the value as a live-in, and every argument the
+        // chain reads disappears from the lifted body.
+        if (arch_ == Arch::X64 && vn.is_reg() && vn.size > 0 && vn.size < 8 &&
+            vn.id >= 0 && vn.id < 16 && reg_last_width_[vn.id] == 8) {
+            static const char* kFullNames[16] = {
+                "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                "r8","r9","r10","r11","r12","r13","r14","r15"
+            };
+            Varnode full = vn_reg(vn.id, kFullNames[vn.id], 8);
+            Varnode lo = alloc_temp(vn.size);
+            emit(out, PcodeOp::SUBPIECE, lo, {full, vn_const(0, 8)});
+            return lo;
+        }
+        return vn;
+    }
     case OpType::Imm:
         return vn_const(op.val, op.size / 8 ? op.size / 8 : 8);
     case OpType::Mem: {
@@ -160,6 +180,10 @@ void Lifter::operand_write(const Insn& insn, int idx, Varnode val, PcodeBlock& o
         } else {
             emit(out, PcodeOp::COPY, dst, {val});
         }
+        // on x64 every register write above ends with the full-register view
+        // as its last definition (the zero-extend / combine copy), so narrow
+        // reads must project from it
+        if (arch_ == Arch::X64 && dst.id >= 0 && dst.id < 16) reg_last_width_[dst.id] = 8;
     } else if (op.type == OpType::Mem) {
         emit(out, PcodeOp::STORE, {}, {effective_address(op, out, op.size), val});
     }
@@ -320,6 +344,16 @@ Varnode Lifter::emit_condition(const Insn& insn, PcodeBlock& out) {
         // surprising fallback and keeps the branch visible.
         return not_v(zf);
     }
+}
+
+// Integer argument registers of the image ABI (System V AMD64 on PS4/ELF and
+// Mach-O, Microsoft x64 on PE); the analyzer picks db.abi per image
+static std::vector<Varnode> abi_arg_regs(const AnalysisDB& db) {
+    if (db.abi == CallConv::SysV)
+        return {vn_reg(REG_RDI, "rdi"), vn_reg(REG_RSI, "rsi"), vn_reg(REG_RDX, "rdx"),
+                vn_reg(REG_RCX, "rcx"), vn_reg(REG_R8, "r8"), vn_reg(REG_R9, "r9")};
+    return {vn_reg(REG_RCX, "rcx"), vn_reg(REG_RDX, "rdx"),
+            vn_reg(REG_R8, "r8"), vn_reg(REG_R9, "r9")};
 }
 
 void Lifter::lift_insn(const Insn& insn, const AnalysisDB& db, PcodeBlock& out) {
@@ -507,12 +541,7 @@ void Lifter::lift_insn(const Insn& insn, const AnalysisDB& db, PcodeBlock& out) 
         std::string name;
         if (target) {
             auto nit = db.names.find(target);
-            if (nit != db.names.end())
-                name = nit->second;
-            else if (db.image_base && target >= db.image_base)
-                name = fmt::format("sub_{:X}", target - db.image_base);
-            else
-                name = fmt::format("sub_{:X}", target);
+            name = nit != db.names.end() ? nit->second : default_func_name(target);
         } else {
             name = fmt::format("indirect_{:X}", insn.addr);
         }
@@ -523,10 +552,14 @@ void Lifter::lift_insn(const Insn& insn, const AnalysisDB& db, PcodeBlock& out) 
             // cdecl/stdcall: arguments travel on the stack, no register args.
             emit(out, PcodeOp::CALL, rax_v, {fn_addr});
         } else {
-            emit(out, PcodeOp::CALL, rax_v, {fn_addr,
-                vn_reg(REG_RCX, "rcx"), vn_reg(REG_RDX, "rdx"),
-                vn_reg(REG_R8, "r8"), vn_reg(REG_R9, "r9")});
+            std::vector<Varnode> args{fn_addr};
+            for (auto& a : abi_arg_regs(db)) args.push_back(std::move(a));
+            emit(out, PcodeOp::CALL, rax_v, std::move(args));
         }
+        // the call defines rax and clobbers every other caller-saved GPR:
+        // narrow reads after it must not project from pre-call definitions
+        for (int r = 0; r < 16; ++r) reg_last_width_[r] = 0;
+        reg_last_width_[REG_RAX] = 8;
         break;
     }
     case InsnType::Ret: {
@@ -561,17 +594,13 @@ void Lifter::lift_block(const BasicBlock& bb, const AnalysisDB& db, PcodeBlock& 
 
 PcodeFunc Lifter::lift(const Function& func, const AnalysisDB& db) {
     next_temp_ = 256;
+    std::fill(std::begin(reg_last_width_), std::end(reg_last_width_), 0);
     arch_ = db.arch;
     stack_vars_.clear();
 
     PcodeFunc pf;
     pf.entry = func.entry;
-    if (!func.name.empty())
-        pf.name = func.name;
-    else if (db.image_base && func.entry >= db.image_base)
-        pf.name = fmt::format("sub_{:X}", func.entry - db.image_base);
-    else
-        pf.name = fmt::format("sub_{:X}", func.entry);
+    pf.name = func.name.empty() ? default_func_name(func.entry) : func.name;
 
     std::vector<va_t> order;
     for (auto& [addr, _] : func.blocks)
@@ -605,10 +634,7 @@ PcodeFunc Lifter::lift(const Function& func, const AnalysisDB& db) {
 
     pf.next_temp = next_temp_;
     pf.locals = stack_vars_;
-    pf.params = {
-        vn_reg(REG_RCX, "rcx"), vn_reg(REG_RDX, "rdx"),
-        vn_reg(REG_R8, "r8"), vn_reg(REG_R9, "r9")
-    };
+    pf.params = abi_arg_regs(db);
 
     addr_to_block_.clear();
     return pf;

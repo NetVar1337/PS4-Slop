@@ -19,6 +19,30 @@ void Propagate::replace_uses(PcodeFunc& func, const Varnode& old_vn, const Varno
     }
 }
 
+// Register varnodes carry no SSA version (a 32-bit and the matching 64-bit
+// view even share the id), so a whole-function replacement would rewrite uses
+// that a later definition of the same register was supposed to feed. For
+// registers the copy only reaches later ops in its own block, up to the next
+// redefinition of that register id.
+static void replace_uses_in_live_range(PcodeFunc& func, int def_blk, int def_idx,
+                                       const Varnode& old_vn, const Varnode& new_vn) {
+    auto& blk = func.blocks[def_blk];
+    for (int oi = def_idx + 1; oi < (int)blk.ops.size(); ++oi) {
+        auto& op = blk.ops[oi];
+        // a redefinition of the same register view (id and width) ends the
+        // copy's reach; the zero-extend bookkeeping writes to the wider view
+        // of the register do not
+        if (op.output.valid() && op.output.is_reg() && op.output.id == old_vn.id &&
+            op.output.size == old_vn.size)
+            break;
+        for (auto& in : op.inputs) {
+            if (in.kind == old_vn.kind && in.id == old_vn.id &&
+                in.offset == old_vn.offset && in.size == old_vn.size)
+                in = new_vn;
+        }
+    }
+}
+
 void Propagate::copy_propagation(PcodeFunc& func) {
     for (int pass = 0; pass < 8; ++pass) {
         bool changed = false;
@@ -36,7 +60,10 @@ void Propagate::copy_propagation(PcodeFunc& func) {
                 if (!src.valid()) continue;
                 if (src.is_const() && op.output.is_reg() && op.output.id == 4) continue;
 
-                replace_uses(func, op.output, src, bi, oi);
+                if (op.output.is_reg())
+                    replace_uses_in_live_range(func, bi, oi, op.output, src);
+                else
+                    replace_uses(func, op.output, src, bi, oi);
                 if (!has_use(uses, op.output)) {
                     op.op = PcodeOp::NOP;
                     changed = true;
@@ -52,6 +79,15 @@ void Propagate::copy_propagation(PcodeFunc& func) {
 void Propagate::constant_fold(PcodeFunc& func) {
     for (auto& blk : func.blocks) {
         for (auto& op : blk.ops) {
+            // low piece of a value is the value truncated to the result size:
+            // fold the projection away so the chain reads the register directly
+            if (op.op == PcodeOp::SUBPIECE && op.inputs.size() == 2 &&
+                op.inputs[1].is_const() && op.inputs[1].offset == 0 &&
+                op.output.valid()) {
+                op.op = PcodeOp::COPY;
+                op.inputs = {op.inputs[0]};
+                continue;
+            }
             if (op.inputs.size() != 2) continue;
             if (!op.inputs[0].is_const() || !op.inputs[1].is_const()) continue;
 

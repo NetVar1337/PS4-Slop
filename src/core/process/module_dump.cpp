@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <limits>
@@ -290,6 +291,229 @@ module_dump_result_t dump_module_pe(
         return result;
     }
     return result;
+}
+
+namespace {
+
+constexpr uint64_t kElfPage = 0x4000;   // PS4 page size; also a multiple of 4 KiB
+
+#pragma pack(push, 1)
+struct elf64_ehdr_t {
+    uint8_t  e_ident[16];
+    uint16_t e_type;
+    uint16_t e_machine;
+    uint32_t e_version;
+    uint64_t e_entry;
+    uint64_t e_phoff;
+    uint64_t e_shoff;
+    uint32_t e_flags;
+    uint16_t e_ehsize;
+    uint16_t e_phentsize;
+    uint16_t e_phnum;
+    uint16_t e_shentsize;
+    uint16_t e_shnum;
+    uint16_t e_shstrndx;
+};
+struct elf64_phdr_t {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+};
+#pragma pack(pop)
+static_assert(sizeof(elf64_ehdr_t) == 64);
+static_assert(sizeof(elf64_phdr_t) == 56);
+
+uint64_t align_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
+
+// copy [start, end) through read into dst; unreadable chunks zero-fill (non
+// strict) or fail. Returns false only on a strict failure
+bool read_segment(const module_read_fn_t& read, uint64_t start, uint64_t end, uint8_t* dst,
+                  const module_dump_options_t& options, module_dump_result_t& result) {
+    const size_t chunk = std::max<size_t>(options.chunk_size, 4096);
+    uint64_t failed_from = 0, failed_bytes = 0;
+    auto flush_warning = [&] {
+        if (!failed_bytes) return;
+        char b[96];
+        std::snprintf(b, sizeof(b), "unreadable 0x%llX..0x%llX zero-filled",
+                      static_cast<unsigned long long>(failed_from),
+                      static_cast<unsigned long long>(failed_from + failed_bytes));
+        result.warnings.emplace_back(b);
+        failed_bytes = 0;
+    };
+    for (uint64_t a = start; a < end;) {
+        const size_t take = static_cast<size_t>(std::min<uint64_t>(chunk, end - a));
+        uint8_t* out = dst + (a - start);
+        const auto io = read(static_cast<uintptr_t>(a), out, take);
+        if (!io.ok || io.bytes != take) {
+            if (options.strict_reads) {
+                char b[96];
+                std::snprintf(b, sizeof(b), "read failed at 0x%llX (%zu bytes)",
+                              static_cast<unsigned long long>(a), take);
+                result.error = b;
+                return false;
+            }
+            std::memset(out, 0, take);
+            result.complete = false;
+            if (!failed_bytes) failed_from = a;
+            failed_bytes += take;
+        } else {
+            flush_warning();
+        }
+        a += take;
+    }
+    flush_warning();
+    return true;
+}
+
+bool validate_segments(const std::vector<mapped_segment_t>& segs, std::string& error) {
+    if (segs.empty()) { error = "no segments to dump"; return false; }
+    uint64_t total = 0;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        const auto& s = segs[i];
+        if (s.end <= s.start) { error = "empty or inverted segment"; return false; }
+        if (i > 0 && s.start < segs[i - 1].end) { error = "segments overlap or are unsorted"; return false; }
+        total += s.end - s.start;
+        if (total > kMaxOutputBytes) { error = "module larger than the dump cap (512 MiB)"; return false; }
+    }
+    return true;
+}
+
+} // namespace
+
+module_dump_result_t reconstruct_elf_from_segments(
+    const std::vector<mapped_segment_t>& segments, const module_read_fn_t& read,
+    std::vector<uint8_t>& output, const module_dump_options_t& options,
+    elf_rebuild_info_t* info) {
+    module_dump_result_t result;
+    output.clear();
+    elf_rebuild_info_t meta;
+    if (!validate_segments(segments, result.error)) return result;
+    if (segments.size() >= 0xFFFF) {
+        result.error = "too many segments for one ELF program header table";
+        return result;
+    }
+    const uint64_t base = segments.front().start;
+    const uint64_t end  = segments.back().end;
+    result.module_base = base;
+    result.complete = true;
+
+    // layout: ehdr, phdrs, then every segment at a page-aligned offset whose
+    // residue matches its vaddr (p_offset % p_align == p_vaddr % p_align)
+    const size_t n = segments.size();
+    uint64_t off = align_up(sizeof(elf64_ehdr_t) + n * sizeof(elf64_phdr_t), kElfPage);
+    std::vector<uint64_t> offsets(n);
+    for (size_t i = 0; i < n; ++i) {
+        off += (segments[i].start - off) & (kElfPage - 1);   // match the residue
+        offsets[i] = off;
+        off += segments[i].end - segments[i].start;
+    }
+    if (off > kMaxOutputBytes) {
+        result.error = "reconstructed ELF larger than the dump cap (512 MiB)";
+        return result;
+    }
+    output.assign(static_cast<size_t>(off), 0);
+
+    for (size_t i = 0; i < n; ++i) {
+        if (!read_segment(read, segments[i].start, segments[i].end,
+                          output.data() + offsets[i], options, result)) {
+            output.clear();
+            result.complete = false;
+            return result;
+        }
+    }
+
+    // an in-memory ELF header (rare on PS4: the SELF loader maps only the
+    // segments) tells us the entry point and the original type
+    const uint8_t* first = output.data() + offsets[0];
+    const uint64_t first_len = segments[0].end - segments[0].start;
+    if (first_len >= sizeof(elf64_ehdr_t) && std::memcmp(first, "\x7f" "ELF", 4) == 0 &&
+        first[4] == 2 /*ELFCLASS64*/) {
+        elf64_ehdr_t src{};
+        std::memcpy(&src, first, sizeof(src));
+        meta.had_header = true;
+        meta.source_type = src.e_type;
+        const uint64_t span = end - base;
+        if (src.e_entry >= base && src.e_entry < end) meta.entry = src.e_entry;          // absolute
+        else if (src.e_entry != 0 && src.e_entry < span) meta.entry = base + src.e_entry; // PIE-relative
+    }
+
+    elf64_ehdr_t eh{};
+    const uint8_t ident[16] = {0x7F, 'E', 'L', 'F', 2 /*64-bit*/, 1 /*LE*/, 1 /*version*/,
+                               9 /*FreeBSD*/, 0, 0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(eh.e_ident, ident, sizeof(ident));
+    eh.e_type      = 2;      // ET_EXEC: p_vaddr are the runtime addresses
+    eh.e_machine   = 62;     // EM_X86_64
+    eh.e_version   = 1;
+    eh.e_entry     = meta.entry;
+    eh.e_phoff     = sizeof(elf64_ehdr_t);
+    eh.e_shoff     = 0;
+    eh.e_ehsize    = sizeof(elf64_ehdr_t);
+    eh.e_phentsize = sizeof(elf64_phdr_t);
+    eh.e_phnum     = static_cast<uint16_t>(n);
+    eh.e_shentsize = 64;
+    eh.e_shnum     = 0;
+    eh.e_shstrndx  = 0;
+    std::memcpy(output.data(), &eh, sizeof(eh));
+    for (size_t i = 0; i < n; ++i) {
+        const auto& s = segments[i];
+        elf64_phdr_t ph{};
+        ph.p_type   = 1;   // PT_LOAD
+        ph.p_flags  = ((s.prot & 1) ? 4u : 0u) | ((s.prot & 2) ? 2u : 0u) | ((s.prot & 4) ? 1u : 0u);
+        ph.p_offset = offsets[i];
+        ph.p_vaddr  = s.start;
+        ph.p_paddr  = s.start;
+        ph.p_filesz = s.end - s.start;
+        ph.p_memsz  = s.end - s.start;
+        ph.p_align  = kElfPage;
+        std::memcpy(output.data() + sizeof(eh) + i * sizeof(ph), &ph, sizeof(ph));
+    }
+    meta.segments = n;
+    result.ok = true;
+    result.bytes_written = output.size();
+    result.section_count = n;
+    if (!meta.had_header)
+        result.warnings.emplace_back("no ELF header in memory: rebuilt one from the console maps "
+                                     "(entry unknown, no section headers/symbols)");
+    if (info) *info = meta;
+    return result;
+}
+
+module_dump_result_t dump_raw_span(const std::vector<mapped_segment_t>& segments,
+                                   const module_read_fn_t& read, std::vector<uint8_t>& output,
+                                   const module_dump_options_t& options) {
+    module_dump_result_t result;
+    output.clear();
+    if (!validate_segments(segments, result.error)) return result;
+    const uint64_t base = segments.front().start;
+    const uint64_t span = segments.back().end - base;
+    if (span > kMaxOutputBytes) {
+        result.error = "module span larger than the dump cap (512 MiB)";
+        return result;
+    }
+    result.module_base = base;
+    result.complete = true;
+    output.assign(static_cast<size_t>(span), 0);   // gaps stay zero
+    for (const auto& s : segments) {
+        if (!read_segment(read, s.start, s.end, output.data() + (s.start - base), options, result)) {
+            output.clear();
+            result.complete = false;
+            return result;
+        }
+    }
+    result.ok = true;
+    result.bytes_written = output.size();
+    result.section_count = segments.size();
+    return result;
+}
+
+bool write_dump_file(const std::string& output_path, const std::vector<uint8_t>& data,
+                     std::string& error) {
+    return write_atomic(output_path, data, error);
 }
 
 } // namespace slop::core::process

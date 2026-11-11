@@ -6,9 +6,20 @@
 #include "harness.hpp"
 
 #include "core/disasm/binary_state.hpp"
+#include "core/infra/settings.hpp"
+#include "core/process/target_service.hpp"
+#include "core/runtime/backend_registry.hpp"
 #include "core/script/lua_engine.hpp"
 
+#include <windows.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <filesystem>
+#include <mutex>
 #include <string>
+#include <thread>
 
 using namespace slop::core::script;
 namespace ds = slop::core::disasm::binary_state;
@@ -74,6 +85,8 @@ TEST_CASE(lua_slop_table_exists_with_expected_surface) {
         assert(type(slop.target.list) == "function")
         assert(type(slop.target.attach) == "function")
         assert(type(slop.mem.read_hex) == "function")
+        assert(type(slop.mem.read_bytes) == "function")
+        assert(type(slop.mem.write_hex) == "function")
         assert(type(slop.mem.scan) == "function")
         assert(type(slop.disasm.disassemble) == "function")
         assert(type(slop.analyze.packer) == "function")
@@ -100,6 +113,17 @@ TEST_CASE(lua_slop_table_exists_with_expected_surface) {
         assert(type(slop.decomp.vtables) == "function")
         assert(type(slop.decomp.globals) == "function")
         assert(type(slop.decomp.rtti) == "function")
+        -- console + debugger surface
+        for _, fn in ipairs({"connect", "disconnect", "auto", "status"}) do
+            assert(type(slop.ps4[fn]) == "function", "slop.ps4." .. fn)
+        end
+        for _, fn in ipairs({"status", "attach", "detach", "bp_set", "bp_clear",
+                             "bp_list", "watch_set", "watch_clear", "watch_list",
+                             "continue", "step", "suspend", "resume", "wait",
+                             "events", "regs", "set_reg", "callstack", "call",
+                             "run_until", "find_write", "trace_calls", "action"}) do
+            assert(type(slop.debugger[fn]) == "function", "slop.debugger." .. fn)
+        end
     )");
     REQUIRE(r.ok);
     dump_on_fail(r);
@@ -384,4 +408,320 @@ TEST_CASE(lua_decomp_before_ready_reports_pending_state) {
         "return ok3", 60000);
     REQUIRE(r.ok);   // pcall guards either outcome; the point is no crash/lockup
     dump_on_fail(r);
+}
+
+// === sandbox (item 6) ========================================================
+
+namespace {
+
+lua_run_result_t run_with(const std::string& code, bool unsafe, int timeout_ms = 5000) {
+    lua_run_options_t opt;
+    opt.timeout_ms = timeout_ms;
+    opt.unsafe = unsafe;
+    return lua_run(code, opt);
+}
+
+int64_t elapsed_ms(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - t0).count();
+}
+
+} // namespace
+
+TEST_CASE(lua_sandbox_hides_host_libraries) {
+    auto r = run_with(R"(
+        assert(io == nil, "io")
+        assert(package == nil and require == nil, "package")
+        assert(debug == nil, "debug")
+        assert(coroutine == nil, "coroutine")
+        assert(dofile == nil and loadfile == nil, "file loaders")
+        assert(os.execute == nil and os.remove == nil and os.getenv == nil, "os")
+        assert(type(os.clock) == "function" and type(os.time) == "function")
+        assert(type(os.difftime) == "function")
+        assert(string.format("%d", 7) == "7")
+        assert(table.concat({1, 2}, ",") == "1,2")
+        assert(math.floor(2.5) == 2)
+        assert(utf8.char(65) == "A")
+        -- text chunks load, precompiled ones are refused
+        assert(load("return 1 + 1")() == 2)
+        local env = { x = 5 }
+        assert(load("return x", "c", "t", env)() == 5)
+        local f, err = load(string.dump(function() return 1 end))
+        assert(f == nil and err:find("binary"), "binary chunk loaded")
+        local f2 = load(string.dump(function() return 1 end), "c", "b")
+        assert(f2 == nil, "mode override bypassed the sandbox")
+        return "sandboxed"
+    )", false);
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+    REQUIRE_FALSE(r.unsafe);
+    REQUIRE(r.output.find("sandboxed") != std::string::npos);
+}
+
+TEST_CASE(lua_sandbox_refuses_binary_main_chunk) {
+    auto r = run_with(std::string("\x1bLua\x54\x00garbage", 12), false);
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.error.find("binary") != std::string::npos);
+}
+
+TEST_CASE(lua_unsafe_option_opens_full_stdlib) {
+    auto r = run_with(R"(
+        assert(type(io) == "table" and type(io.open) == "function")
+        assert(type(os.execute) == "function")
+        assert(type(package) == "table" and type(require) == "function")
+        assert(type(debug) == "table")
+        return true
+    )", true);
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+    REQUIRE(r.unsafe);
+}
+
+TEST_CASE(lua_unsafe_follows_script_unsafe_setting) {
+    namespace settings = slop::core::infra::settings;
+    const std::string old = settings::file();
+    const auto scratch = (std::filesystem::temp_directory_path() /
+                          ("slop_test_script_settings_" +
+                           std::to_string(GetCurrentProcessId()) + ".json")).string();
+    settings::set_file_for_testing(scratch);
+
+    REQUIRE(settings::set("script_unsafe", true));
+    auto on = lua_run("return io ~= nil");
+    REQUIRE(on.ok);
+    REQUIRE(on.unsafe);
+    REQUIRE(on.output.find("return: true") != std::string::npos);
+
+    REQUIRE(settings::set("script_unsafe", false));
+    auto off = lua_run("return io ~= nil");
+    REQUIRE(off.ok);
+    REQUIRE_FALSE(off.unsafe);
+    REQUIRE(off.output.find("return: false") != std::string::npos);
+
+    settings::set_file_for_testing(old);
+    std::error_code ec;
+    std::filesystem::remove(scratch, ec);
+}
+
+// === limits: timeout clamp, hook granularity, cancel, memory, output (77, 150)
+
+TEST_CASE(lua_timeout_clamp_is_symmetric) {
+    REQUIRE_EQ(clamp_timeout_ms(100), 100);          // no silent raise to 500
+    REQUIRE_EQ(clamp_timeout_ms(0), kMinTimeoutMs);
+    REQUIRE_EQ(clamp_timeout_ms(-5), kMinTimeoutMs);
+    REQUIRE_EQ(clamp_timeout_ms(int64_t(1) << 40), kMaxTimeoutMs);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = lua_run("while true do end", 100);
+    const int64_t took = elapsed_ms(t0);
+    REQUIRE_FALSE(r.ok);
+    REQUIRE_EQ(r.timeout_ms, 100);
+    REQUIRE(r.error.find("timed out") != std::string::npos);
+    REQUIRE(took < 2000);
+}
+
+TEST_CASE(lua_timeout_fires_inside_string_heavy_loop) {
+    // few vm instructions per iteration but each one is a sizeable c call;
+    // the 1000-instruction hook still lands close to the deadline
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = lua_run(R"(
+        local s = string.rep("ab", 4096)
+        while true do s = s:upper():lower() end
+    )", 200);
+    const int64_t took = elapsed_ms(t0);
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.error.find("timed out") != std::string::npos);
+    REQUIRE(took < 1500);
+}
+
+TEST_CASE(lua_cancel_token_stops_script) {
+    slop::core::infra::cancel_source_t src;
+    lua_run_options_t opt;
+    opt.timeout_ms = 30000;
+    opt.cancel = src.token();
+    std::thread canceller([&src] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        src.request();
+    });
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = lua_run("while true do end", opt);
+    canceller.join();
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.error.find("cancelled") != std::string::npos);
+    REQUIRE(elapsed_ms(t0) < 5000);
+}
+
+TEST_CASE(lua_memory_cap_fails_allocations) {
+    lua_run_options_t opt;
+    opt.mem_limit = 8u << 20;
+    auto big = lua_run("local s = string.rep('x', 64 * 1024 * 1024) return #s", opt);
+    REQUIRE_FALSE(big.ok);
+    REQUIRE(big.error.find("memory limit") != std::string::npos);
+
+    auto grow = lua_run(R"(
+        local t = {}
+        for i = 1, 10000000 do t[i] = string.rep("y", 64) .. i end
+    )", opt);
+    REQUIRE_FALSE(grow.ok);
+    REQUIRE(grow.error.find("memory limit") != std::string::npos);
+    REQUIRE(grow.peak_mem <= opt.mem_limit);
+
+    // pcall catches the memory error and the state stays usable
+    auto rec = lua_run(R"(
+        local ok = pcall(string.rep, "z", 64 * 1024 * 1024)
+        assert(not ok)
+        return "recovered"
+    )", opt);
+    dump_on_fail(rec);
+    REQUIRE(rec.ok);
+    REQUIRE(rec.output.find("recovered") != std::string::npos);
+}
+
+TEST_CASE(lua_output_is_capped) {
+    auto r = lua_run(R"(
+        local line = string.rep("o", 1000)
+        for i = 1, 6000 do print(line) end
+        return 1
+    )", 20000);
+    REQUIRE(r.ok);
+    REQUIRE(r.output_truncated);
+    REQUIRE(r.output.size() <= kMaxOutputBytes + 64);
+    REQUIRE(r.output.find("[output truncated]") != std::string::npos);
+}
+
+TEST_CASE(lua_tool_mutex_is_per_binding_not_per_script) {
+    std::mutex mu;
+    lua_run_options_t opt;
+    opt.tool_mutex = &mu;
+    opt.timeout_ms = 5000;
+
+    // a busy script that never calls a binding leaves the mutex free
+    std::atomic<bool> grabbed{false};
+    std::thread prober([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (mu.try_lock()) {
+            grabbed = true;
+            mu.unlock();
+        }
+    });
+    auto busy = lua_run(R"(
+        local t0 = os.clock()
+        while os.clock() - t0 < 0.4 do end
+        return slop.target.status().backend ~= nil
+    )", opt);
+    prober.join();
+    dump_on_fail(busy);
+    REQUIRE(busy.ok);
+    REQUIRE(grabbed.load());
+    REQUIRE(busy.output.find("return: true") != std::string::npos);
+
+    // a binding waiting for a held mutex gives up at the script deadline
+    // instead of hanging, and plain lua keeps running meanwhile
+    std::unique_lock held(mu);
+    opt.timeout_ms = 300;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto blocked = lua_run("local x = 1 + 1 return slop.target.status()", opt);
+    held.unlock();
+    REQUIRE_FALSE(blocked.ok);
+    REQUIRE(blocked.error.find("tool lock") != std::string::npos);
+    REQUIRE(elapsed_ms(t0) < 3000);
+
+    // errors raised inside a locked binding release the mutex
+    opt.timeout_ms = 5000;
+    auto failing = lua_run("return pcall(slop.mem.read_hex, 0x1000, 0)", opt);
+    REQUIRE(failing.ok);
+    REQUIRE(mu.try_lock());
+    mu.unlock();
+}
+
+// === memory read helpers (178) ===============================================
+
+namespace {
+alignas(16) volatile unsigned char g_lua_probe[8] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x7F, 0x80, 0xFF};
+} // namespace
+
+TEST_CASE(lua_read_hex_returns_hex_and_read_bytes_raw) {
+    using namespace slop::core;
+    auto none = lua_run("return slop.mem.read_bytes(0x1000, 4)");
+    REQUIRE_FALSE(none.ok);
+    REQUIRE(none.error.find("no target") != std::string::npos);
+
+    if (runtime::active_kind() != runtime::backend_kind_t::user_mode) {
+        std::printf("  [skip] live read needs the user-mode backend\n");
+        return;
+    }
+    REQUIRE(process::target_attach(GetCurrentProcessId()));
+    char addr[32];
+    std::snprintf(addr, sizeof(addr), "0x%llX",
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&g_lua_probe[0])));
+    auto r = lua_run(std::string(R"(
+        local a = )") + addr + R"(
+        local hex = slop.mem.read_hex(a, 8)
+        assert(hex == "deadbeef007f80ff", "read_hex gave " .. tostring(hex))
+        local raw = slop.mem.read_bytes(a, 8)
+        assert(#raw == 8, "read_bytes length")
+        assert(raw:byte(1) == 0xDE and raw:byte(8) == 0xFF, "read_bytes content")
+        return hex
+    )");
+    process::target_detach();
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+}
+
+// === canonical names (179) ===================================================
+
+TEST_CASE(lua_auto_names_are_canonical_sub_va) {
+    auto r = run_static(R"(
+        assert(slop.image.wait_ready(30000), "hyperion not ready")
+        local fns = slop.disasm.functions()
+        local checked = 0
+        for _, f in ipairs(fns) do
+            if f.name:sub(1, 4) == "sub_" then
+                local want = string.format("sub_%X", f.va)
+                assert(f.name == want, f.name .. " ~= " .. want)
+                local owner = slop.disasm.function_at(f.va)
+                if owner and owner.va == f.va then
+                    assert(owner.name == want, "function_at " .. owner.name)
+                end
+                assert(slop.disasm.name(f.va) == want, "name() differs")
+                checked = checked + 1
+                if checked >= 25 then break end
+            end
+        end
+        assert(checked > 0, "fixture has no auto-named functions")
+        return checked
+    )");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+}
+
+// === debugger / ps4 bindings (177) ===========================================
+
+TEST_CASE(lua_debugger_bindings_route_through_mcp_actions) {
+    // no console in unit tests: status works locally, debug actions fail
+    // with the mcp error text as a catchable lua error
+    auto r = lua_run(R"(
+        local st = slop.ps4.status()
+        assert(type(st) == "table", "status not a table")
+        assert(type(st.backend) == "string", "backend missing")
+        assert(st.ps4_connected == false, "unexpected console")
+
+        local ok, err = pcall(slop.debugger.bp_set, 0x401000)
+        assert(not ok and tostring(err):find("connected console"), tostring(err))
+        ok, err = pcall(slop.debugger.wait, 100)
+        assert(not ok and tostring(err):find("connected console"), tostring(err))
+        ok, err = pcall(slop.debugger.bp_set)
+        assert(not ok and tostring(err):find("addr required"), tostring(err))
+        ok, err = pcall(slop.debugger.call, 0x1000, {1, 2, 3, 4, 5, 6, 7})
+        assert(not ok and tostring(err):find("at most 6"), tostring(err))
+        ok, err = pcall(slop.debugger.action, "bp_list", {})
+        assert(not ok and tostring(err):find("connected console"), tostring(err))
+        -- host-file actions stay closed in the sandbox
+        ok, err = pcall(slop.debugger.action, "elf_load", {path = "C:/x.elf"})
+        assert(not ok and tostring(err):find("script_unsafe"), tostring(err))
+        ok, err = pcall(slop.debugger.action, "bp_set", {addr = print})
+        assert(not ok and tostring(err):find("cannot pass"), tostring(err))
+        return st.backend
+    )");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
 }

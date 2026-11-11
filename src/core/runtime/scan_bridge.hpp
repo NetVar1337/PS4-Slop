@@ -7,6 +7,7 @@
 
 #include "core/memory/memscan.hpp"
 #include "core/memory/reader.hpp"
+#include "core/memory/session_reader.hpp"
 #include "core/runtime/backend.hpp"
 
 namespace slop::core::runtime {
@@ -20,6 +21,11 @@ public:
     bool read(uintptr_t addr, void* dst, size_t len) override {
         auto io = backend_.read_memory(handle_, addr, dst, len);
         return io.ok && io.bytes == len;
+    }
+
+    // remote backends get one worker and large read-ahead chunks
+    memory::reader_hints_t hints() const noexcept override {
+        return memory::hints_for_backend(backend_.kind());
     }
 
 private:

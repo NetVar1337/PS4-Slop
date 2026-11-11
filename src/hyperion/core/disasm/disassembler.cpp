@@ -156,6 +156,7 @@ bool Disassembler::decode(va_t addr, const u8* data, size_t len, Insn& out,
         }
         ++out.op_count;
     }
+    out.ops_total = out.op_count;
     return true;
 }
 

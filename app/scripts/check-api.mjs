@@ -28,6 +28,10 @@ const kAppActions = {
   log: ["text"],
   diag: ["since_revision", "limit"],
   shutdown: ["reason"],
+  settings_get: [],
+  settings_set: ["key", "value"],
+  rotate_token: [],
+  events_ticket: [],
 };
 
 async function schemas() {
@@ -109,7 +113,10 @@ let bad = 0;
 for (const s of sites) {
   const spec =
     s.tool === "app"
-      ? { actions: new Set(Object.keys(kAppActions)), params: new Set(Object.values(kAppActions).flat()) }
+      ? {
+          actions: new Set(Object.keys(kAppActions)),
+          params: new Set(Object.values(kAppActions).flat()),
+        }
       : known.get(s.tool);
 
   if (spec === undefined) {

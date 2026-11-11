@@ -80,6 +80,16 @@ public:
         it->second.members.push_back({name, value});
     }
 
+    // Adds a copy of `td` under a fresh id (td.id is ignored), returns it.
+    // Type references inside td are taken as already valid in this system
+    u32 insert(TypeDef td) {
+        const u32 id = next_id_++;
+        td.id = id;
+        by_name_.emplace(td.name, id);
+        types_[id] = std::move(td);
+        return id;
+    }
+
     TypeDef* get(u32 id) {
         auto it = types_.find(id);
         return it != types_.end() ? &it->second : nullptr;

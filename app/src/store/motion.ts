@@ -15,7 +15,9 @@ const kStorageKey = "reverse-slop.motion";
 
 function initial(): MotionPref {
   const saved = localStorage.getItem(kStorageKey);
-  return saved === "on" || saved === "auto" || saved === "off" ? saved : "on";
+  // Unset means "auto": the OS reduced-motion setting decides until the user
+  // explicitly overrides it here
+  return saved === "on" || saved === "auto" || saved === "off" ? saved : "auto";
 }
 
 /** CSS reads `data-motion` on <html>; see the motion section of app.css. */

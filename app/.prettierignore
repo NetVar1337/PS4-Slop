@@ -1,0 +1,8 @@
+dist
+node_modules
+coverage
+src-tauri
+# owned by the Tauri shell (CSP lives there and in tauri.conf.json)
+index.html
+package-lock.json
+src/assets

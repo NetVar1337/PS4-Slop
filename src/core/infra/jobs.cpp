@@ -28,7 +28,9 @@ struct job_context_t::impl_t {
     std::string        owner;
     bool               cancellable = true;
     std::thread        thread;
-    bool               joined = false;
+    std::atomic<bool>  exited{false};          // the thread body returned, join is instant
+    bool               joined = false;         // guarded by jobs g_mu
+    bool               join_claimed = false;   // guarded by jobs g_mu, one joiner only
 
     impl_t() : tok(cancel_src.token()) {}
 };
@@ -133,6 +135,7 @@ uint64_t submit(job_desc_t d) {
             }
             impl->finished_ms = steady_ms();
         }
+        impl->exited.store(true, std::memory_order_release);
     });
 
     g_jobs.push_back(std::move(impl));
@@ -165,19 +168,34 @@ std::shared_ptr<const jobs_view_t> snapshot() {
     return g_published.get();
 }
 
+namespace {
+
+// fail() marks a job failed while its body may still run, so joinability
+// keys off the thread having actually returned
+bool finished(const job_context_t::impl_t& j) {
+    return j.exited.load(std::memory_order_acquire);
+}
+
+} // namespace
+
 void reap() {
-    std::lock_guard lk(g_mu);
-    bool changed = false;
-    for (auto& j : g_jobs) {
-        if (j->joined) continue;
-        std::lock_guard jlk(j->mu);
-        if (j->state == job_state_t::queued || j->state == job_state_t::running)
-            continue;
-        // finished, join it
-        if (j->thread.joinable()) j->thread.join();
-        j->joined = true;
-        changed = true;
+    // claim finished jobs under the lock, join them without it: a job body that
+    // calls submit/cancel/alive while finishing would otherwise deadlock here
+    std::vector<std::shared_ptr<job_context_t::impl_t>> to_join;
+    {
+        std::lock_guard lk(g_mu);
+        for (auto& j : g_jobs) {
+            if (j->joined || j->join_claimed || !finished(*j)) continue;
+            j->join_claimed = true;
+            to_join.push_back(j);
+        }
     }
+    for (auto& j : to_join)
+        if (j->thread.joinable()) j->thread.join();
+
+    std::lock_guard lk(g_mu);
+    bool changed = !to_join.empty();
+    for (auto& j : to_join) j->joined = true;
     // keep the last 32 finished jobs
     while (g_jobs.size() > 32) {
         auto it = std::find_if(g_jobs.begin(), g_jobs.end(), [](auto& j) { return j->joined; });
@@ -196,26 +214,30 @@ void reset() {
 void shutdown(uint32_t deadline_ms) {
     g_shutting_down.store(true, std::memory_order_release);
 
-    std::lock_guard lk(g_mu);
-    // cancel everything
-    for (auto& j : g_jobs) {
-        j->cancel_src.request();
-    }
-
-    const auto deadline = std::chrono::steady_clock::now()
-                        + std::chrono::milliseconds(deadline_ms);
-
-    for (auto& j : g_jobs) {
-        if (j->joined || !j->thread.joinable()) continue;
-        const auto remaining = deadline - std::chrono::steady_clock::now();
-        if (remaining > std::chrono::milliseconds(0)) {
-            j->thread.join();
-        } else {
-            j->thread.detach();
+    std::vector<std::shared_ptr<job_context_t::impl_t>> mine;
+    {
+        std::lock_guard lk(g_mu);
+        for (auto& j : g_jobs) {
+            j->cancel_src.request();
+            if (j->joined || j->join_claimed) continue;   // a concurrent reap owns it
+            j->join_claimed = true;
+            mine.push_back(j);
         }
-        j->joined = true;
+        g_jobs.clear();
+        rebuild_snapshot();
     }
-    g_jobs.clear();
+
+    // the deadline bounds the whole sweep: wait for each body to finish, join the
+    // finished ones, detach whatever is still running when time is up (the thread
+    // keeps its impl alive through the captured shared_ptr)
+    const int64_t deadline = steady_ms() + static_cast<int64_t>(deadline_ms);
+    for (auto& j : mine) {
+        if (!j->thread.joinable()) continue;
+        while (!finished(*j) && steady_ms() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        if (finished(*j)) j->thread.join();
+        else j->thread.detach();
+    }
 }
 
 } // namespace jobs

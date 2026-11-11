@@ -22,7 +22,7 @@ bool plausible_code(disasm::engine_t& eng, reader_t& rdr, uint64_t va) {
 } // namespace
 
 std::vector<frame_t> walk_stack(disasm::engine_t& eng, reader_t& rdr,
-                                uint64_t rip, uint64_t rsp, uint64_t rbp,
+                                uint64_t /*rip*/, uint64_t rsp, uint64_t rbp,
                                 size_t max_frames) {
     std::vector<frame_t> out;
     if (max_frames == 0) return out;

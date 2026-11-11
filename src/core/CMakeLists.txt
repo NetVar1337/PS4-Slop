@@ -35,6 +35,9 @@ add_library(slop_core STATIC
     memory/pointer_scan.cpp
     memory/snapshot.hpp
     memory/snapshot.cpp
+    memory/console_scan.hpp
+    memory/console_scan.cpp
+    memory/session_reader.hpp
     analysis/packer.hpp
     analysis/packer.cpp
     analysis/signatures.hpp
@@ -45,6 +48,8 @@ add_library(slop_core STATIC
     analysis/libsig.cpp
     analysis/xray.hpp
     analysis/xray.cpp
+    analysis/ps4_syscalls.hpp
+    analysis/ps4_syscalls.cpp
     analysis/imgpatch.hpp
     analysis/imgpatch.cpp
     analysis/recover.hpp
@@ -59,6 +64,12 @@ add_library(slop_core STATIC
     network/capture_service.cpp
     network/http_proxy.hpp
     network/http_proxy.cpp
+    network/parsers.hpp
+    network/parsers.cpp
+    network/net_socket.hpp
+    network/net_socket.cpp
+    network/tls_stream.hpp
+    network/tls_stream.cpp
     persist/session_store.hpp
     persist/session_store.cpp
     re/rtti.hpp
@@ -105,6 +116,13 @@ add_library(slop_core STATIC
     disasm/hyperion_session.cpp
     debugger/callstack.hpp
     debugger/callstack.cpp
+    debugger/debug_target.hpp
+    debugger/composite.hpp
+    debugger/composite.cpp
+    debugger/ps4_debug_target.hpp
+    debugger/ps4_debug_target.cpp
+    debugger/local_debugger.hpp
+    debugger/local_debugger.cpp
     runtime/context.hpp
     runtime/backend.hpp
     runtime/backend_usermode.hpp
@@ -136,6 +154,25 @@ add_library(slop_core STATIC
     mcp/mcp_server.cpp
     mcp/mcp_tools.hpp
     mcp/mcp_tools.cpp
+    mcp/tools_common.hpp
+    mcp/tools_common.cpp
+    mcp/tools_target.cpp
+    mcp/tools_memory.cpp
+    mcp/tools_disasm.cpp
+    mcp/tools_debugger.cpp
+    mcp/tools_emulate.cpp
+    mcp/tools_analyze.cpp
+    mcp/tools_network.cpp
+    mcp/tools_fs_web.cpp
+    mcp/tools_decomp.cpp
+    mcp/tools_persist.cpp
+    mcp/tools_re.cpp
+    mcp/tools_xray.cpp
+    mcp/tools_patch.cpp
+    mcp/tools_types_notes.cpp
+    mcp/tools_devirt.cpp
+    mcp/tools_script.cpp
+    mcp/tools_app_guide.cpp
     infra/mcp_onboard.hpp
     infra/mcp_onboard.cpp
 )
@@ -166,5 +203,5 @@ target_compile_definitions(slop_core PUBLIC
 )
 
 if(MSVC)
-    target_compile_options(slop_core PRIVATE /W4 /EHsc)
+    target_compile_options(slop_core PRIVATE /W4 /WX /EHsc)
 endif()

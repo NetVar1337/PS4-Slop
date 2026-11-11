@@ -4,14 +4,30 @@
 #include "harness.hpp"
 
 #include "core/infra/limits.hpp"
+#include "core/mcp/mcp_tools.hpp"
 #include "core/memory/aob.hpp"
+#include "core/memory/console_scan.hpp"
 #include "core/memory/memscan.hpp"
 #include "core/memory/pointer_scan.hpp"
+#include "core/memory/read_util.hpp"
 #include "core/memory/snapshot.hpp"
+#include "core/memory/watch_service.hpp"
+#include "core/process/target_service.hpp"
 
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -792,4 +808,716 @@ TEST_CASE(snapshot_diff_invalid_on_mismatch) {
     b.base = 0x2000;
     d = snapshot_diff(a, b);
     REQUIRE(!d.valid);
+}
+
+// ===========================================================================
+// Remote-aware scheduling, read-ahead, coalescing (audit items 39/40)
+// ===========================================================================
+
+namespace {
+
+// Wraps a fake reader, reports chosen hints and records every read
+struct hinted_reader_t final : public reader_t {
+    fake_reader_t& inner;
+    reader_hints_t h;
+    std::atomic<int> in_flight{0};
+    std::atomic<int> max_in_flight{0};
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<std::pair<uintptr_t, size_t>> calls;
+
+    hinted_reader_t(fake_reader_t& r, reader_hints_t hints) : inner(r), h(hints) {}
+
+    bool read(uintptr_t addr, void* dst, size_t len) override {
+        const int now = ++in_flight;
+        int prev = max_in_flight.load();
+        while (now > prev && !max_in_flight.compare_exchange_weak(prev, now)) {}
+        // widen the window so concurrent workers would visibly overlap
+        std::this_thread::sleep_for(std::chrono::microseconds(300));
+        const bool ok = inner.read(addr, dst, len);
+        {
+            std::lock_guard lk(mu);
+            calls.push_back({addr, len});
+        }
+        cv.notify_all();
+        --in_flight;
+        return ok;
+    }
+    reader_hints_t hints() const noexcept override { return h; }
+
+    size_t call_count() {
+        std::lock_guard lk(mu);
+        return calls.size();
+    }
+    void reset_calls() {
+        std::lock_guard lk(mu);
+        calls.clear();
+    }
+};
+
+scan_config_t exact_u32(uint32_t v) {
+    scan_config_t c;
+    c.type   = scan_type_t::exact_value;
+    c.width  = value_width_t::u32;
+    c.value1 = static_cast<double>(v);
+    c.value2 = static_cast<double>(v);
+    return c;
+}
+
+} // namespace
+
+TEST_CASE(memory_remote_hints_single_worker_big_chunks) {
+    fake_reader_t r;
+    std::vector<scan_region_t> regions;
+    std::vector<uint8_t> zeros(64 * 1024, 0);
+    const uint32_t needle = 0x5EED5EED;
+    for (uintptr_t i = 0; i < 16; ++i) {
+        const uintptr_t base = 0x1000000 + i * 0x20000;
+        r.write(base, zeros.data(), zeros.size());
+        r.write(base + 0x100, &needle, 4);
+        regions.push_back(rw_region(base, zeros.size()));
+    }
+    // one big region: the first wire read must use the remote chunk size
+    const uintptr_t big = 0x4000000;
+    std::vector<uint8_t> big_bytes(9u << 20, 0);
+    r.write(big, big_bytes.data(), big_bytes.size());
+    r.write(big + (8u << 20) + 0x40, &needle, 4);
+    regions.push_back(rw_region(big, big_bytes.size()));
+
+    hinted_reader_t hr(r, remote_reader_hints());
+    memscan_t engine;
+    scan_config_t cfg = exact_u32(needle);
+    cfg.threads = 16;   // asked for many, the serialized reader caps it at 1
+    REQUIRE(engine.first_scan(hr, regions, cfg, cancel_token_t{}));
+    REQUIRE_EQ(engine.results().size(), 17u);
+    REQUIRE_EQ(hr.max_in_flight.load(), 1);
+
+    bool saw_big_chunk = false;
+    for (const auto& c : hr.calls) {
+        REQUIRE_LE(c.second, kRemoteChunkBytes + 3);   // chunk + u32 overlap tail
+        if (c.first == big && c.second == kRemoteChunkBytes + 3) saw_big_chunk = true;
+    }
+    REQUIRE(saw_big_chunk);
+    REQUIRE_EQ(engine.stats().regions_scanned, 17u);
+}
+
+TEST_CASE(memory_read_ahead_prefetches_next_chunk) {
+    fake_reader_t r;
+    const uintptr_t base = 0x2000000;
+    const size_t chunk = 0x4000;
+    std::vector<uint8_t> bytes(chunk * 4);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i * 7);
+    r.write(base, bytes.data(), bytes.size());
+
+    hinted_reader_t hr(r, {});
+    detail::chunk_walk_t walk;
+    walk.chunk = chunk;
+    walk.read_ahead = true;
+
+    std::vector<uint8_t> seen;
+    bool prefetched = false;
+    detail::chunked_read(hr, {{base, bytes.size()}}, walk, cancel_token_t{},
+        [&](size_t range, uintptr_t addr, const uint8_t* data, size_t len,
+            uintptr_t limit) {
+            REQUIRE_EQ(range, 0u);
+            REQUIRE_EQ(addr, base + seen.size());
+            REQUIRE_EQ(limit, addr + len);
+            if (addr == base) {
+                // while chunk 0 is being processed the producer must already
+                // be fetching chunk 1 (double buffering)
+                std::unique_lock lk(hr.mu);
+                prefetched = hr.cv.wait_for(lk, std::chrono::seconds(10), [&] {
+                    for (const auto& c : hr.calls) if (c.first == base + chunk) return true;
+                    return false;
+                });
+            }
+            seen.insert(seen.end(), data, data + len);
+            return true;
+        });
+    REQUIRE(prefetched);
+    REQUIRE(seen == bytes);
+}
+
+TEST_CASE(memory_read_ahead_stops_early_and_spans_ranges) {
+    fake_reader_t r;
+    std::vector<uint8_t> page(0x3000, 0x11);
+    r.write(0x3000000, page.data(), page.size());
+    r.write(0x3100000, page.data(), page.size());
+    r.write(0x3200000, page.data(), page.size());
+
+    detail::chunk_walk_t walk;
+    walk.chunk = 0x1000;
+    walk.read_ahead = true;
+    const std::vector<detail::read_range_t> ranges = {
+        {0x3000000, 0x3000}, {0x3100000, 0}, {0x3100000, 0x3000}, {0x3200000, 0x3000}};
+
+    // full walk: every range in order, empty ranges skipped
+    std::vector<size_t> order;
+    uint64_t total = 0;
+    detail::chunked_read(r, ranges, walk, cancel_token_t{},
+        [&](size_t range, uintptr_t, const uint8_t*, size_t len, uintptr_t) {
+            if (order.empty() || order.back() != range) order.push_back(range);
+            total += len;
+            return true;
+        });
+    REQUIRE((order == std::vector<size_t>{0, 2, 3}));
+    REQUIRE_EQ(total, 0x9000u);
+
+    // early stop: returning false ends the walk and joins the producer
+    size_t delivered = 0;
+    detail::chunked_read(r, ranges, walk, cancel_token_t{},
+        [&](size_t, uintptr_t, const uint8_t*, size_t, uintptr_t) {
+            return ++delivered < 2;
+        });
+    REQUIRE_EQ(delivered, 2u);
+}
+
+TEST_CASE(memory_scan_finds_value_straddling_chunk_border) {
+    fake_reader_t r;
+    const uintptr_t base = 0x5000000;
+    std::vector<uint8_t> zeros(0x2000, 0);
+    r.write(base, zeros.data(), zeros.size());
+    const uint32_t needle = 0xA1B2C3D4;
+    r.write(base + 0xFFE, &needle, 4);   // crosses the 0x1000 chunk border
+    r.write(base + 0x10, &needle, 4);
+
+    for (const bool remote : {false, true}) {
+        hinted_reader_t hr(r, remote ? remote_reader_hints() : reader_hints_t{});
+        memscan_t engine;
+        scan_config_t cfg = exact_u32(needle);
+        cfg.chunk_bytes = 0x1000;
+        cfg.threads = 1;
+        REQUIRE(engine.first_scan(hr, {rw_region(base, zeros.size())}, cfg, cancel_token_t{}));
+        REQUIRE_EQ(engine.results().size(), 2u);   // found once, no overlap duplicate
+        REQUIRE_EQ(engine.results()[0].address, base + 0x10);
+        REQUIRE_EQ(engine.results()[1].address, base + 0xFFE);
+        REQUIRE_EQ(engine.stats().bytes_scanned, zeros.size());
+    }
+}
+
+TEST_CASE(memory_aob_finds_pattern_straddling_chunk_border) {
+    fake_reader_t r;
+    const uintptr_t base = 0x5100000;
+    std::vector<uint8_t> zeros(0x2000, 0);
+    r.write(base, zeros.data(), zeros.size());
+    const uint8_t pat[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    r.write(base + 0xFFE, pat, sizeof(pat));
+
+    auto p = aob_compile("DE AD BE EF", err_placeholder());
+    REQUIRE(p.has_value());
+    aob_scan_options_t opt;
+    opt.chunk_bytes = 0x1000;
+    hinted_reader_t hr(r, remote_reader_hints());
+    aob_stats_t st{};
+    auto hits = aob_scan(hr, {rw_region(base, zeros.size())}, *p, opt, cancel_token_t{}, &st);
+    REQUIRE_EQ(hits.size(), 1u);
+    REQUIRE_EQ(hits[0], base + 0xFFE);
+    REQUIRE_EQ(st.bytes_scanned, zeros.size());
+    REQUIRE_EQ(hr.max_in_flight.load(), 1);
+}
+
+TEST_CASE(memory_remote_rescan_coalesces_reads) {
+    fake_reader_t r;
+    const uintptr_t base = 0x6000000;
+    std::vector<uint8_t> zeros(0x2000, 0);
+    r.write(base, zeros.data(), zeros.size());
+    const uint32_t v = 77;
+    for (uintptr_t i = 0; i < 100; ++i) r.write(base + i * 16, &v, 4);
+    r.write(base + 0xFFC, &v, 4);    // last slot of page 0
+    r.write(base + 0x1000, &v, 4);   // first slot of page 1
+
+    hinted_reader_t hr(r, remote_reader_hints());
+    memscan_t engine;
+    scan_config_t cfg = exact_u32(v);
+    REQUIRE(engine.first_scan(hr, {rw_region(base, zeros.size())}, cfg, cancel_token_t{}));
+    REQUIRE_EQ(engine.results().size(), 102u);
+
+    // address-list rescan: neighbouring rows ride one wire read
+    hr.reset_calls();
+    scan_config_t again = exact_u32(v);
+    REQUIRE(engine.next_scan(hr, again, cancel_token_t{}));
+    REQUIRE_EQ(engine.results().size(), 102u);
+    REQUIRE_EQ(hr.call_count(), 1u);
+
+    // page 1 disappears: the group read fails, rows settle one by one
+    r.pages.erase(base + 0x1000);
+    hr.reset_calls();
+    REQUIRE(engine.next_scan(hr, again, cancel_token_t{}));
+    REQUIRE_EQ(engine.results().size(), 101u);
+    REQUIRE_EQ(engine.results().back().address, base + 0xFFC);
+
+    // a local reader keeps one read per row
+    hinted_reader_t local(r, reader_hints_t{});
+    REQUIRE(engine.next_scan(local, again, cancel_token_t{}));
+    REQUIRE_EQ(local.call_count(), 101u);
+}
+
+// ===========================================================================
+// Pointer chains: module-backed roots + verify pass (audit item 43)
+// ===========================================================================
+
+TEST_CASE(memory_pointer_scan_module_root_checks_chain_root) {
+    fake_reader_t r;
+    const uintptr_t kTarget = 0x90000;
+    const uintptr_t kMid    = 0xA0000;   // heap object pointing at target
+    const uintptr_t kRoot   = 0xB0000;   // module global pointing at mid
+    const uint64_t mid_val  = kTarget - 16;
+    const uint64_t root_val = kMid - 8;
+    r.write(kMid, &mid_val, 8);
+    r.write(kRoot, &root_val, 8);
+
+    pointer_scan_options_t opt;
+    opt.target = kTarget;
+    opt.depth = 2;
+    opt.alignment = 8;
+    opt.only_module_backed = true;
+    std::vector<scan_region_t> regions = {
+        {kMid, 0x1000, kRW, kPrivate},
+        {kRoot, 0x1000, kRO, kImage},
+    };
+    auto chains = pointer_scan(r, regions, opt, cancel_token_t{}, nullptr);
+    REQUIRE_GE(chains.size(), 1u);
+    bool two_level = false;
+    for (const auto& c : chains) {
+        REQUIRE_EQ(c.addresses[0], kRoot);   // the root, not the last holder
+        if (c.depth() == 2 && c.addresses[1] == kMid) two_level = true;
+    }
+    REQUIRE(two_level);
+}
+
+TEST_CASE(memory_pointer_verify_drops_stale_chains) {
+    fake_reader_t r;
+    const uintptr_t kTarget = 0x90000;
+    const uintptr_t kMid    = 0xA0000;
+    const uintptr_t kRoot   = 0xB0000;
+    const uint64_t mid_val  = kTarget - 16;
+    const uint64_t root_val = kMid - 8;
+    r.write(kMid, &mid_val, 8);
+    r.write(kRoot, &root_val, 8);
+
+    pointer_chain_result_t good;     // root -> mid -> target
+    good.addresses = {kRoot, kMid};
+    good.offsets   = {8, 16};
+    pointer_chain_result_t wrong;    // lands 8 bytes off
+    wrong.addresses = {kRoot, kMid};
+    wrong.offsets   = {8, 24};
+    pointer_chain_result_t dead;     // root page unmapped
+    dead.addresses = {0xC0000};
+    dead.offsets   = {0};
+
+    auto landed = pointer_chain_resolve(r, good);
+    REQUIRE(landed.has_value());
+    REQUIRE_EQ(*landed, kTarget);
+
+    pointer_verify_options_t vo;
+    vo.target = kTarget;
+    vo.samples = 3;
+    pointer_verify_stats_t st{};
+    auto kept = pointer_verify(r, {good, wrong, dead}, vo, cancel_token_t{}, &st);
+    REQUIRE_EQ(kept.size(), 1u);
+    REQUIRE_EQ(kept[0].offsets[1], 16);
+    REQUIRE_EQ(st.checked, 3u);
+    REQUIRE_EQ(st.dropped_mismatch, 1u);
+    REQUIRE_EQ(st.dropped_unreadable, 1u);
+    REQUIRE_EQ(st.samples_done, 3u);
+    // memoized per pass: kRoot and kMid read once per sample on pass 1 for
+    // two chains (+1 for the dead root), then once each on passes 2 and 3
+    REQUIRE_EQ(st.reads, 3u + 2u + 2u);
+
+    // the object moves: the chain follows live pointers (root re-pointed)
+    const uintptr_t kMid2 = 0xA0800;
+    r.write(kMid2, &mid_val, 8);
+    const uint64_t root_val2 = kMid2 - 8;
+    r.write(kRoot, &root_val2, 8);
+    auto still = pointer_verify(r, kept, vo, cancel_token_t{}, &st);
+    REQUIRE_EQ(still.size(), 1u);
+
+    // the target itself moves: verifying against the old address drops it
+    const uint64_t mid_val2 = 0x91000 - 16;
+    r.write(kMid2, &mid_val2, 8);
+    auto gone = pointer_verify(r, kept, vo, cancel_token_t{}, &st);
+    REQUIRE_EQ(gone.size(), 0u);
+    REQUIRE_EQ(st.dropped_mismatch, 1u);
+    vo.target = 0x91000;
+    REQUIRE_EQ(pointer_verify(r, kept, vo, cancel_token_t{}, nullptr).size(), 1u);
+}
+
+// ===========================================================================
+// Console AOB multi-match walk (audit item 44)
+// ===========================================================================
+
+namespace {
+
+// emulates CMD_PROC_SCAN_AOB: first full match inside [addr, addr+len)
+struct fake_console_t {
+    uintptr_t base = 0x400000;
+    std::vector<uint8_t> mem;
+    std::vector<uint8_t> pat;
+    size_t calls = 0;
+    size_t fail_after = SIZE_MAX;
+    bool   lie = false;
+
+    console_find_fn fn() {
+        return [this](uint64_t addr, uint32_t len, uint64_t& hit) {
+            if (++calls > fail_after) return false;
+            hit = 0;
+            if (lie) { hit = addr + len + 64; return true; }
+            const uint64_t end = addr + len;
+            for (uint64_t a = addr; a + pat.size() <= end; ++a) {
+                if (a < base || a + pat.size() > base + mem.size()) continue;
+                if (std::memcmp(mem.data() + (a - base), pat.data(), pat.size()) == 0) {
+                    hit = a;
+                    return true;
+                }
+            }
+            return true;
+        };
+    }
+    void plant(size_t off) { std::memcpy(mem.data() + off, pat.data(), pat.size()); }
+};
+
+} // namespace
+
+TEST_CASE(memory_console_aob_returns_every_match) {
+    fake_console_t fc;
+    fc.mem.assign(1024, 0);
+    fc.pat = {0x48, 0x8B, 0x05, 0x90};
+    // 61 straddles the first window end, 129 the border of a no-hit slide
+    for (size_t off : {size_t{0}, size_t{61}, size_t{66}, size_t{129}, size_t{200},
+                       size_t{1020}})
+        fc.plant(off);
+
+    console_aob_options_t opt;
+    opt.pattern_len = fc.pat.size();
+    opt.window = 64;   // tiny windows: matches straddle window borders
+    console_aob_stats_t st{};
+    auto hits = console_aob_all(fc.fn(), {rw_region(fc.base, fc.mem.size())}, opt,
+                                cancel_token_t{}, &st);
+    const std::vector<uint64_t> want = {fc.base + 0,   fc.base + 61,  fc.base + 66,
+                                        fc.base + 129, fc.base + 200, fc.base + 1020};
+    REQUIRE(hits == want);
+    REQUIRE_EQ(st.matches, 6u);
+    REQUIRE(!st.truncated);
+    REQUIRE(!st.failed);
+    REQUIRE_GE(st.calls, 5u);
+
+    // alignment keeps only aligned hits; the walk still steps past the rest
+    opt.alignment = 4;
+    hits = console_aob_all(fc.fn(), {rw_region(fc.base, fc.mem.size())}, opt,
+                           cancel_token_t{}, &st);
+    REQUIRE((hits == std::vector<uint64_t>{fc.base, fc.base + 200, fc.base + 1020}));
+
+    // cap -> truncated with the first max_results hits
+    opt.alignment = 1;
+    opt.max_results = 2;
+    hits = console_aob_all(fc.fn(), {rw_region(fc.base, fc.mem.size())}, opt,
+                           cancel_token_t{}, &st);
+    REQUIRE_EQ(hits.size(), 2u);
+    REQUIRE(st.truncated);
+
+    // transport failure mid-walk -> partial results + failed flag
+    opt.max_results = 0;
+    opt.window = 1u << 20;
+    fc.calls = 0;
+    fc.fail_after = 2;
+    hits = console_aob_all(fc.fn(), {rw_region(fc.base, fc.mem.size())}, opt,
+                           cancel_token_t{}, &st);
+    REQUIRE_EQ(hits.size(), 2u);
+    REQUIRE(st.failed);
+    REQUIRE_EQ(st.failed_at, fc.base + 62);
+
+    // a reply outside the asked window is a protocol error, not a hit
+    fc.fail_after = SIZE_MAX;
+    fc.lie = true;
+    hits = console_aob_all(fc.fn(), {rw_region(fc.base, fc.mem.size())}, opt,
+                           cancel_token_t{}, &st);
+    REQUIRE(hits.empty());
+    REQUIRE(st.failed);
+    REQUIRE(st.bad_reply);
+}
+
+// ===========================================================================
+// Watchlist freeze: dirty check, write cap, failure surfacing (items 41/42)
+// ===========================================================================
+
+namespace {
+
+struct fake_io_t final : public watch::detail::pass_io_t {
+    std::map<uint64_t, uint64_t> mem;
+    std::set<uint64_t> read_only;
+    size_t reads = 0;
+    size_t writes = 0;
+
+    bool read(uint64_t addr, void* dst, size_t n) override {
+        ++reads;
+        auto it = mem.find(addr);
+        if (it == mem.end()) return false;
+        std::memcpy(dst, &it->second, n);
+        return true;
+    }
+    bool write(uint64_t addr, const void* src, size_t n) override {
+        ++writes;
+        if (read_only.count(addr) || !mem.count(addr)) return false;
+        std::memcpy(&mem[addr], src, n);
+        return true;
+    }
+};
+
+watch::entry_t frozen_u32(uint64_t id, uint64_t addr, uint64_t hold) {
+    watch::entry_t e;
+    e.id = id;
+    e.addr = addr;
+    e.width = value_width_t::u32;
+    e.freeze = true;
+    e.frozen_bits = hold;
+    return e;
+}
+
+} // namespace
+
+TEST_CASE(memory_watch_freeze_dirty_check_and_failures) {
+    fake_io_t io;
+    io.mem[0x1000] = 5;
+    io.mem[0x2000] = 9;
+    io.mem[0x3000] = 1;
+    io.read_only.insert(0x3000);
+    std::vector<watch::entry_t> entries = {
+        frozen_u32(1, 0x1000, 5),   // already holds the value
+        frozen_u32(2, 0x2000, 5),   // drifted
+        frozen_u32(3, 0x3000, 5),   // write rejected
+    };
+    size_t cursor = 0;
+    watch::detail::pass_stats_t st{};
+    auto vals = watch::detail::sample_pass(entries, {}, io, {64, 16}, cursor, &st);
+    REQUIRE_EQ(vals.size(), 3u);
+    REQUIRE_EQ(st.clean_holds, 1u);
+    REQUIRE_EQ(st.writes, 2u);
+    REQUIRE_EQ(st.write_failures, 1u);
+    REQUIRE_EQ(io.mem[0x2000], 5u);
+
+    REQUIRE(vals[0].ok);
+    REQUIRE(vals[0].held);
+    REQUIRE(!vals[0].hold_failed);
+    REQUIRE_EQ(vals[0].bits, 5u);
+    REQUIRE(vals[1].ok);
+    REQUIRE_EQ(vals[1].bits, 5u);
+    REQUIRE(!vals[2].ok);
+    REQUIRE(vals[2].hold_failed);
+    REQUIRE_STR_EQ(vals[2].text, "-");
+
+    // next pass: everything that can hold is clean, so no writes except the
+    // rejected one, which keeps reporting the failure
+    io.writes = 0;
+    vals = watch::detail::sample_pass(entries, vals, io, {64, 16}, cursor, &st);
+    REQUIRE_EQ(io.writes, 1u);
+    REQUIRE_EQ(st.clean_holds, 2u);
+    REQUIRE(vals[2].hold_failed);
+
+    // the page becomes writable: the hold recovers
+    io.read_only.clear();
+    vals = watch::detail::sample_pass(entries, vals, io, {64, 16}, cursor, &st);
+    REQUIRE(vals[2].ok);
+    REQUIRE(!vals[2].hold_failed);
+    REQUIRE_EQ(io.mem[0x3000], 5u);
+
+    // narrow widths compare only their bytes (frozen_bits carries junk above)
+    io.mem[0x4000] = 0xFFFFFF00000000AAull;
+    watch::entry_t b = frozen_u32(4, 0x4000, 0x12345600000000AAull);
+    b.width = value_width_t::u8;
+    io.writes = 0;
+    vals = watch::detail::sample_pass({b}, {}, io, {64, 16}, cursor, &st);
+    REQUIRE_EQ(io.writes, 0u);
+    REQUIRE_EQ(vals[0].bits, 0xAAu);
+}
+
+TEST_CASE(memory_watch_pass_caps_writes_and_rotates) {
+    fake_io_t io;
+    std::vector<watch::entry_t> entries;
+    for (uint64_t i = 0; i < 20; ++i) {
+        io.mem[0x10000 + i * 8] = 1;   // all drifted from the hold
+        entries.push_back(frozen_u32(i + 1, 0x10000 + i * 8, 7));
+    }
+    size_t cursor = 0;
+    watch::detail::pass_stats_t st{};
+    auto vals = watch::detail::sample_pass(entries, {}, io, {64, 16}, cursor, &st);
+    REQUIRE_EQ(st.writes, 16u);
+    REQUIRE_EQ(st.deferred, 4u);
+    REQUIRE_EQ(cursor, 16u);   // next pass starts at the first deferred entry
+    REQUIRE_EQ(vals[16].bits, 1u);   // deferred rows show the live (drifted) value
+    REQUIRE(vals[16].held);
+
+    vals = watch::detail::sample_pass(entries, vals, io, {64, 16}, cursor, &st);
+    REQUIRE_EQ(st.writes, 4u);
+    REQUIRE_EQ(st.clean_holds, 16u);
+    REQUIRE_EQ(st.deferred, 0u);
+    for (uint64_t i = 0; i < 20; ++i) REQUIRE_EQ(io.mem[0x10000 + i * 8], 7u);
+
+    // read budget: unreached rows keep their previous sample and go first next
+    std::vector<watch::entry_t> plain;
+    for (uint64_t i = 0; i < 100; ++i) {
+        io.mem[0x20000 + i * 8] = i;
+        watch::entry_t e;
+        e.id = 100 + i;
+        e.addr = 0x20000 + i * 8;
+        e.width = value_width_t::u64;
+        plain.push_back(e);
+    }
+    cursor = 0;
+    io.reads = 0;
+    vals = watch::detail::sample_pass(plain, {}, io, {64, 16}, cursor, &st);
+    REQUIRE_EQ(io.reads, 64u);
+    REQUIRE_EQ(cursor, 64u);
+    REQUIRE(vals[63].ok);
+    REQUIRE(!vals[64].ok);   // never sampled yet
+    vals = watch::detail::sample_pass(plain, vals, io, {64, 16}, cursor, &st);
+    REQUIRE(vals[99].ok);
+    REQUIRE_EQ(vals[99].bits, 99u);
+    REQUIRE(vals[0].ok);     // carried / re-read, never blanked
+    REQUIRE_EQ(cursor, 28u);
+}
+
+TEST_CASE(memory_remote_snapshot_page_granular_holes) {
+    fake_reader_t r;
+    const uintptr_t base = 0x7000000;
+    std::vector<uint8_t> bytes(0x3000);
+    for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = static_cast<uint8_t>(i ^ 0x5A);
+    r.write(base, bytes.data(), bytes.size());
+    r.pages.erase(base + 0x1000);   // middle page unreadable
+
+    hinted_reader_t hr(r, remote_reader_hints());
+    auto snap = snapshot_capture(hr, base, bytes.size(), cancel_token_t{},
+                                 slop::core::infra::limits::max_snapshot_region_bytes);
+    REQUIRE(!snap.complete);
+    REQUIRE_EQ(snap.bytes.size(), bytes.size());
+    REQUIRE(std::equal(bytes.begin(), bytes.begin() + 0x1000, snap.bytes.begin()));
+    REQUIRE(std::equal(bytes.begin() + 0x2000, bytes.end(), snap.bytes.begin() + 0x2000));
+    for (size_t i = 0x1000; i < 0x2000; ++i) REQUIRE_EQ(snap.bytes[i], 0u);
+    // page-granular probing: a handful of wire reads, not a byte bisect
+    REQUIRE_LE(hr.call_count(), 8u);
+}
+
+// ===========================================================================
+// MCP: hex-string addresses everywhere (item 46), pointerscan_verify (43)
+// ===========================================================================
+
+namespace {
+
+nlohmann::json mem_call(const nlohmann::json& args, bool& is_err) {
+    return slop::core::mcp::call_tool("memory", args, is_err);
+}
+
+std::string hex_str(uint64_t v) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%llX", static_cast<unsigned long long>(v));
+    return buf;
+}
+
+} // namespace
+
+TEST_CASE(memory_mcp_watch_accepts_hex_string_addresses) {
+    using nlohmann::json;
+    bool e = false;
+    mem_call({{"action", "watch_clear"}}, e);
+    REQUIRE(!e);
+
+    json r = mem_call({{"action", "watch_add"}, {"addr", "0x1234"}, {"width", "u32"}}, e);
+    REQUIRE(!e);
+    const uint64_t id = r.value("id", uint64_t{0});
+    REQUIRE_NE(id, 0u);
+    REQUIRE_EQ(r["entries"][0].value("addr", uint64_t{0}), 0x1234u);
+
+    // byte-count width and padded hex
+    r = mem_call({{"action", "watch_add"}, {"addr", " 0x20 "}, {"width", 4}}, e);
+    REQUIRE(!e);
+    REQUIRE_STR_EQ(r["entries"][1].value("width", std::string{}), "u32");
+
+    // garbage gets a readable message, never a raw json type_error
+    r = mem_call({{"action", "watch_add"}, {"addr", "player_hp"}}, e);
+    REQUIRE(e);
+    const std::string msg = r.value("error", std::string{});
+    REQUIRE(msg.find("addr") != std::string::npos);
+    REQUIRE(msg.find("not a number") != std::string::npos);
+    REQUIRE(msg.find("json.exception") == std::string::npos);
+
+    r = mem_call({{"action", "watch_add"}, {"addr", 16}, {"width", 3}}, e);
+    REQUIRE(e);
+    REQUIRE(r.value("error", std::string{}).find("1, 2, 4 or 8") != std::string::npos);
+
+    // ids accept strings too
+    r = mem_call({{"action", "watch_set"}, {"id", hex_str(id)}, {"label", "hp"}}, e);
+    REQUIRE(!e);
+    r = mem_call({{"action", "watch_remove"}, {"id", std::to_string(id)}}, e);
+    REQUIRE(!e);
+    REQUIRE_EQ(r["entries"].size(), 1u);
+
+    r = mem_call({{"action", "watch_list"}}, e);
+    REQUIRE(!e);
+    REQUIRE(r.contains("hold_failures"));
+    mem_call({{"action", "watch_clear"}}, e);
+}
+
+TEST_CASE(memory_mcp_pointerscan_verify_live_process) {
+    using nlohmann::json;
+    // two private pages: A holds the static-like root, B the object + target
+    auto* base = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    REQUIRE(base != nullptr);
+    const uintptr_t A = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t B = A + 0x1000;
+    const uintptr_t mid = B + 0x100;
+    const uintptr_t target = B + 0x800;
+    *reinterpret_cast<uint64_t*>(mid) = target - 0x10;   // mid + 0x10 -> target
+    *reinterpret_cast<uint64_t*>(A)   = mid - 8;         // root + 8   -> mid
+
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+    bool e = false;
+
+    json r = mem_call({{"action", "pointerscan"}, {"target", hex_str(target)},
+                       {"begin", hex_str(A)}, {"end", hex_str(A + 0x2000)},
+                       {"depth", 2}, {"alignment", 8}, {"min_offset", "-0x1000"},
+                       {"limit", 1000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  pointerscan: %s\n", r.dump().c_str());
+    bool has_root_chain = false;
+    for (const auto& c : r["chains"]) {
+        if (c["addresses"].size() == 2 && c["addresses"][0].get<uint64_t>() == A &&
+            c["offsets"][0].get<int64_t>() == 8 && c["offsets"][1].get<int64_t>() == 16)
+            has_root_chain = true;
+    }
+    CHECK(has_root_chain);
+    const size_t total = r.value("total", size_t{0});
+
+    // verify the stored list: everything still lands on target
+    r = mem_call({{"action", "pointerscan_verify"}, {"samples", 2}, {"interval_ms", 0}}, e);
+    CHECK(!e);
+    if (e) std::printf("  verify: %s\n", r.dump().c_str());
+    CHECK(r.value("kept", size_t{0}) == total);
+    CHECK(r.value("samples", 0u) == 2u);
+    CHECK(r.value("source", std::string{}) == "last_pointerscan");
+
+    // the root goes stale: every chain that starts at A is dropped
+    *reinterpret_cast<uint64_t*>(A) = 0;
+    r = mem_call({{"action", "pointerscan_verify"}, {"samples", 1}}, e);
+    CHECK(!e);
+    CHECK(r.value("kept", size_t{0}) < total);
+    for (const auto& c : r["chains"]) CHECK(c["addresses"][0].get<uint64_t>() != A);
+
+    // explicit chains with hex strings, verified against a given target
+    *reinterpret_cast<uint64_t*>(A) = mid - 8;
+    r = mem_call({{"action", "pointerscan_verify"},
+                  {"chains", json::array({json{{"base", hex_str(A)},
+                                               {"offsets", json::array({8, "0x10"})}}})},
+                  {"target", hex_str(target)}, {"samples", 1}}, e);
+    CHECK(!e);
+    CHECK(r.value("kept", size_t{0}) == 1u);
+    CHECK(r.value("source", std::string{}) == "args");
+
+    r = mem_call({{"action", "pointerscan_verify"},
+                  {"chains", json::array({json{{"offsets", json::array({8})}}})},
+                  {"target", 1}}, e);
+    CHECK(e);
+    CHECK(r.value("error", std::string{}).find("addresses[] or base") != std::string::npos);
+
+    slop::core::process::target_detach();
+    VirtualFree(base, 0, MEM_RELEASE);
 }

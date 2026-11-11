@@ -33,6 +33,11 @@ struct operand_t {
     int64_t       disp      = 0;
     // Immediate form
     uint64_t      imm       = 0;
+    // ARM/ARM64 decodes (Capstone): register ids live here, the Zydis fields
+    // above stay NONE so x86 consumers never misread them. 0 = none
+    uint16_t      arm_reg   = 0;
+    uint16_t      arm_base  = 0;
+    uint16_t      arm_index = 0;
 };
 
 struct insn_t {
@@ -88,5 +93,10 @@ private:
     bool                   initialized_ = false;
     bool                   x64_ = true;
 };
+
+// Canonical display name for a function without a symbol: "sub_" + the VA in
+// uppercase hex without padding (sub_4DDA48). Every surface (MCP, Lua, UI,
+// hyperion pseudocode) names unnamed functions with this one helper
+std::string default_function_name(uint64_t va);
 
 } // namespace slop::core::disasm

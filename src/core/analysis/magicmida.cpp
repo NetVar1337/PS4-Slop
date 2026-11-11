@@ -27,7 +27,7 @@ namespace {
 constexpr uint16_t kMachineI386 = 0x014c;
 constexpr uint16_t kMachineAmd64 = 0x8664;
 constexpr uint64_t kMaxPeBytes = 512ull * 1024ull * 1024ull;
-constexpr const char* kVersion = "2026-05-14";
+constexpr const char* kVersion = SLOP_MAGICMIDA_VERSION;   // tools/magicmida-version.txt
 
 struct handle_closer_t {
     void operator()(void* handle) const noexcept {

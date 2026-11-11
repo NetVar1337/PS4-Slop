@@ -3,23 +3,32 @@
 
 import { create } from "zustand";
 
-export type ThemeName = "obsidian" | "nord-slop" | "blood-orange";
+export type ThemeName = "obsidian" | "nord-slop" | "blood-orange" | "daylight" | "high-contrast";
 
-export const kThemes: readonly { id: ThemeName; label: string }[] = [
-  { id: "obsidian", label: "Obsidian" },
-  { id: "nord-slop", label: "Nord-slop" },
-  { id: "blood-orange", label: "Blood-orange" },
+export const kThemes: readonly { id: ThemeName; label: string; scheme: "dark" | "light" }[] = [
+  { id: "obsidian", label: "Obsidian", scheme: "dark" },
+  { id: "nord-slop", label: "Nord-slop", scheme: "dark" },
+  { id: "blood-orange", label: "Blood-orange", scheme: "dark" },
+  { id: "daylight", label: "Daylight", scheme: "light" },
+  { id: "high-contrast", label: "High contrast", scheme: "dark" },
 ];
 
 const kStorageKey = "reverse-slop.theme";
 
 function initial(): ThemeName {
   const saved = localStorage.getItem(kStorageKey);
-  return kThemes.some((t) => t.id === saved) ? (saved as ThemeName) : "obsidian";
+  if (kThemes.some((t) => t.id === saved)) return saved as ThemeName;
+  // First run: follow an explicit OS contrast / light preference
+  if (window.matchMedia?.("(prefers-contrast: more)").matches) return "high-contrast";
+  if (window.matchMedia?.("(prefers-color-scheme: light)").matches) return "daylight";
+  return "obsidian";
 }
 
 function apply(name: ThemeName): void {
-  document.documentElement.setAttribute("data-theme", name);
+  const root = document.documentElement;
+  root.setAttribute("data-theme", name);
+  // Native form controls and scrollbars follow color-scheme
+  root.style.colorScheme = kThemes.find((t) => t.id === name)?.scheme ?? "dark";
 }
 
 type ThemeStore = {

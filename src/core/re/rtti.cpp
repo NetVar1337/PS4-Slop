@@ -1,7 +1,10 @@
 // src/core/re/rtti.cpp
-// msvc x64 rtti layouts kept here as a reference while parsing
+// msvc x64 rtti layouts kept here as a reference while parsing; the Itanium
+// pass is shared with the hyperion analyzer (core/analysis/itanium_rtti.h)
 
 #include "core/re/rtti.hpp"
+
+#include "core/analysis/itanium_rtti.h"
 
 #include <algorithm>
 #include <cstring>
@@ -15,21 +18,24 @@ struct section_span_t {
     size_t   file_off = 0;
     size_t   raw_size = 0;
     bool     writable = false;
+    bool     exec = false;
 };
 
+// File-backed bytes of each section; MSVC RTTI lives in .rdata/.data, so
+// code sections are skipped unless the caller wants them (Itanium images
+// may merge .rodata into the executable segment)
 std::vector<section_span_t> data_spans(const disasm::pe_image_t& pe,
-                                       const std::vector<uint8_t>& file) {
+                                       const std::vector<uint8_t>& file,
+                                       bool include_exec) {
     std::vector<section_span_t> out;
     for (const auto& s : pe.sections) {
         if (s.raw_size == 0 || s.virtual_size == 0) continue;
         if (static_cast<size_t>(s.raw_offset) + s.raw_size > file.size())
             continue;
-        // Skip obviously code-only sections for speed; RTTI lives in data
-        if (!s.is_executable() || true) {
-            out.push_back({pe.image_base + s.rva,
-                           s.raw_offset, std::min<uint32_t>(s.raw_size, s.virtual_size),
-                           (s.characteristics & 0x80000000) != 0});
-        }
+        if (s.is_executable() && !include_exec) continue;
+        out.push_back({pe.image_base + s.rva,
+                       s.raw_offset, std::min<uint32_t>(s.raw_size, s.virtual_size),
+                       (s.characteristics & 0x80000000) != 0, s.is_executable()});
     }
     return out;
 }
@@ -52,7 +58,7 @@ rtti_result_t rtti_scan(const disasm::pe_image_t& pe,
     rtti_result_t res;
     if (!pe.ok || pe.image_base == 0) return res;
 
-    const auto spans = data_spans(pe, file);
+    const auto spans = data_spans(pe, file, false);
     for (const auto& sp : spans)
         res.scanned_bytes += sp.raw_size;
 
@@ -147,6 +153,30 @@ rtti_result_t rtti_scan(const disasm::pe_image_t& pe,
               [](const rtti_class_t& a, const rtti_class_t& b) {
                   return a.name < b.name;
               });
+    return res;
+}
+
+rtti_result_t rtti_scan_itanium(const disasm::pe_image_t& pe,
+                                const std::vector<uint8_t>& file,
+                                unsigned ptr_size) {
+    rtti_result_t res;
+    if (!pe.ok) return res;
+    std::vector<hype::RttiSpan> spans;
+    for (const auto& sp : data_spans(pe, file, true)) {
+        res.scanned_bytes += sp.raw_size;
+        spans.push_back({sp.va, std::span<const uint8_t>(file.data() + sp.file_off, sp.raw_size),
+                         sp.exec});
+    }
+    for (auto& c : hype::scan_itanium_rtti(spans, ptr_size)) {
+        rtti_class_t r;
+        r.name     = std::move(c.name);
+        r.mangled  = std::move(c.mangled);
+        r.td_va    = c.type_info;
+        r.vftables = std::move(c.vtables);
+        r.methods  = std::move(c.methods);
+        r.bases    = std::move(c.bases);
+        res.classes.push_back(std::move(r));
+    }
     return res;
 }
 

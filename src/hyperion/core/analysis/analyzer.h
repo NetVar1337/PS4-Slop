@@ -16,6 +16,11 @@
 
 namespace hype {
 
+// This thread's Capstone handle for `arch` (opened on first use). Capstone
+// handles carry decode state, so sharing one across workers meant a mutex
+// around every ARM decode; one handle per thread decodes in parallel
+CapstoneDisasm& thread_capstone(Arch arch);
+
 class Analyzer {
 public:
     Analyzer(PEImage& img, WorkerPool& pool);
@@ -73,6 +78,10 @@ private:
     void find_strings();
     void find_string_refs();
     void detect_vtables();
+    bool imm_is_address(const Insn& insn, va_t v) const;
+    u32 find_arm64_page_refs(const std::unordered_set<va_t>& str_addrs);
+    int param_reg_index(u16 reg) const;            // -1 unless an ABI arg register
+    int count_register_params(const Function& func) const;
     void detect_globals();
     void apply_names();
     void detect_noreturn();
@@ -118,7 +127,6 @@ private:
 
     PEImage&           img_;
     Disassembler       disasm_;
-    CapstoneDisasm     cap_disasm_;
     AnalysisDB         db_;
     WorkerPool&        pool_;
     TaskScheduler      sched_;
@@ -133,8 +141,8 @@ private:
     // Shared with sweep workers so decode_range can probe cancellation.
     std::shared_ptr<std::atomic<bool>> cancel_shared_{std::make_shared<std::atomic<bool>>(false)};
     // Guards the shared descent state (visited sets + db_.insns inserts +
-    // budget accounting). Decode itself runs outside the lock; the
-    // Capstone handle below is the only decoder with shared mutable state.
+    // budget accounting). Decode itself runs outside the lock (Zydis is
+    // stateless, Capstone handles are per thread).
     std::mutex descend_mu_;
     // Guards recovered_edges_, cfg_dirty_ and resolved_indirect during the
     // parallel per-function passes (switches, dataflow).
@@ -143,9 +151,6 @@ private:
     // hot loop is otherwise read-only (thunk scan). Value writes stay
     // disjoint per function.
     std::mutex funcs_mu_;
-    // Capstone's handle is not safe for concurrent disassembly; the x86/x64
-    // Zydis path needs no lock (const decoder, formatter skipped).
-    std::mutex cap_mu_;
     std::unordered_map<va_t, std::vector<va_t>> recovered_edges_;
     // functions that gained an edge or a resolved target in the last round
     std::unordered_set<va_t> cfg_dirty_;

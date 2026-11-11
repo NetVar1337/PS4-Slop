@@ -4,7 +4,11 @@
 
 #include "harness.hpp"
 
+#include <algorithm>
+
 #include "core/disasm/binary_state.hpp"
+#include "core/mcp/mcp_tools.hpp"
+#include "elf_fixture.hpp"
 #include "core/disasm/hyperion_session.hpp"
 #include "hyperion/core/decompiler/emitter.h"
 #include "hyperion/core/decompiler/decompiler.h"
@@ -451,4 +455,98 @@ TEST_CASE(assembler_decodes_roundtrip) {
     REQUIRE(ZYAN_SUCCESS(
         ZydisDecoderDecodeFull(&dec, buf, len, &insn, ops)));
     REQUIRE_EQ(insn.mnemonic, ZYDIS_MNEMONIC_ADD);
+}
+
+// === ELF (PS4) decompilation ===
+
+TEST_CASE(decomp_elf_function_sysv_and_canonical_names) {
+    using L = elf_fixture::ps4_layout;
+    namespace bs = disasm::binary_state;
+    constexpr uint64_t base = 0x400000;
+    elf_fixture::temp_file_t tf(elf_fixture::build_ps4_elf(), "decomp_elf");
+    REQUIRE(bs::load_file(tf.path.string(), base));
+    REQUIRE(wait_hype_ready());
+
+    // engine path: (a, b, c) -> a*b+c lifts with three SysV parameters
+    {
+        std::lock_guard lk(bs::state_mutex());
+        auto& bin = bs::get();
+        std::vector<hype::PseudoLine> lines;
+        std::string err;
+        REQUIRE(bin.hype->decompile(base + L::kFunc2, lines, err));
+        REQUIRE(!lines.empty());
+        std::string head;
+        for (const auto& l : lines)
+            if (l.text.find("sub_400140(") != std::string::npos) { head = l.text; break; }
+        REQUIRE(!head.empty());
+        const auto open = head.find('('), close = head.find(')');
+        REQUIRE(open != std::string::npos && close != std::string::npos);
+        const std::string params = head.substr(open + 1, close - open - 1);
+        for (const auto& l : lines) std::printf("DIAG func2: %s\n", l.text.c_str());
+        REQUIRE_EQ(std::count(params.begin(), params.end(), ','), 2);
+
+        // calls render the callee's canonical / exported name
+        REQUIRE(bin.hype->decompile(base + L::kEntry, lines, err));
+        std::string all;
+        for (const auto& l : lines) all += l.text + "\n";
+        REQUIRE(all.find("sub_400140") != std::string::npos);
+        REQUIRE(all.find("module_start") != std::string::npos);
+    }
+
+    // MCP surface: calling convention + recovered signature
+    bool is_error = false;
+    const auto out = slop::core::mcp::call_tool(
+        "decomp", {{"action", "function"}, {"addr", base + L::kFunc2}}, is_error);
+    std::printf("DIAG mcp: %s\n", out.dump().c_str());
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("callconv", std::string{}), "sysv_amd64");
+    REQUIRE_EQ(out.value("function_va", uint64_t{0}), base + L::kFunc2);
+    const std::string sig = out.value("signature", std::string{});
+    REQUIRE(sig.find("sub_400140(") != std::string::npos);
+    REQUIRE_EQ(std::count(sig.begin(), sig.end(), ','), 2);
+    bs::unload();
+}
+
+TEST_CASE(decomp_disasm_functions_filters_and_pages_server_side) {
+    using L = elf_fixture::ps4_layout;
+    namespace bs = disasm::binary_state;
+    constexpr uint64_t base = 0x400000;
+    elf_fixture::temp_file_t tf(elf_fixture::build_ps4_elf(), "decomp_fns");
+    REQUIRE(bs::load_file(tf.path.string(), base));
+    REQUIRE(wait_hype_ready());
+
+    bool is_error = false;
+    auto call = [&](nlohmann::json args) {
+        args["action"] = "functions";
+        auto r = slop::core::mcp::call_tool("disasm", args, is_error);
+        REQUIRE_FALSE(is_error);
+        return r;
+    };
+    const auto all = call({{"limit", 1000}});
+    const size_t total = all.value("total", size_t{0});
+    REQUIRE_GE(total, size_t{3});
+    REQUIRE_EQ(all.value("matched", size_t{0}), total);
+    REQUIRE_EQ(all.value("returned", size_t{0}), all["functions"].size());
+
+    // by name (case-insensitive) and by hex address
+    const auto by_name = call({{"filter", "MODULE_start"}});
+    REQUIRE_EQ(by_name.value("matched", size_t{0}), size_t{1});
+    REQUIRE_EQ(by_name["functions"][0].value("va", uint64_t{0}), base + L::kFunc3);
+    const auto by_va = call({{"filter", "0x400140"}});
+    REQUIRE_EQ(by_va.value("matched", size_t{0}), size_t{1});
+    REQUIRE_STR_EQ(by_va["functions"][0].value("name", std::string{}), "sub_400140");
+    REQUIRE_EQ(by_va.value("total", size_t{0}), total);
+
+    // paging walks every match exactly once
+    std::vector<uint64_t> seen;
+    size_t offset = 0;
+    for (int guard = 0; guard < 64; ++guard) {
+        const auto page = call({{"limit", 1}, {"offset", offset}});
+        for (const auto& f : page["functions"]) seen.push_back(f.value("va", uint64_t{0}));
+        if (!page.value("truncated", false)) break;
+        offset = page.value("next_offset", size_t{0});
+    }
+    REQUIRE_EQ(seen.size(), total);
+    REQUIRE(std::is_sorted(seen.begin(), seen.end()));
+    bs::unload();
 }

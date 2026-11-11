@@ -176,6 +176,15 @@ std::string Emitter::expr_str(const CExpr& e) {
     if (e.op == PcodeOp::INT_SEXT && !e.args.empty()) {
         return fmt::format("(int{}_t){}", e.vn.size * 8, expr_str(e.args[0]));
     }
+    if (e.op == PcodeOp::SUBPIECE && e.args.size() == 2) {
+        // the piece index counts bytes: piece 0 is the value itself truncated
+        // to the result width, piece k starts at byte offset k
+        const std::string inner = expr_str(e.args[0]);
+        if (e.args[1].vn.is_const() && e.args[1].vn.offset == 0) return inner;
+        if (e.args[1].vn.is_const() && e.args[1].vn.offset > 0)
+            return fmt::format("({} >> {})", inner, e.args[1].vn.offset * 8);
+        return inner;
+    }
 
     if (e.args.size() == 2) {
         std::string l = expr_str(e.args[0]);
@@ -573,15 +582,13 @@ std::vector<PseudoLine> Emitter::emit(const CFunc& func, const TypeInfer* ti,
     } else if (func.name == "WinMain") {
         params_s = "HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nShowCmd";
     } else {
-        int pc = 0;
+        // every ABI argument register (6 on SysV, 8 on AAPCS64), not just 4
         for (auto& p : func.params) {
-            if (pc >= 4) break;
-            if (!func_uses_param(func, p.id)) { ++pc; continue; }
+            if (!func_uses_param(func, p.id)) continue;
             if (!params_s.empty()) params_s += ", ";
             std::string pt = type_str(p.id);
             std::string pn = varnode_str(p);
             params_s += fmt::format("{} {}", pt, pn);
-            ++pc;
         }
     }
 

@@ -4,25 +4,64 @@
 // wire via the debugger ps4_* MCP actions
 
 import { useEffect, useState } from "react";
-import { Ban, Play, Plus, ScanSearch, StepForward, Timer } from "lucide-react";
-import { hex, useDisasm } from "@/store/disasm";
-import { useDebugger } from "@/store/debugger";
+import { Ban, FolderOpen, Gamepad2, Play, Plus, StepForward, Timer } from "lucide-react";
+import { save } from "@tauri-apps/plugin-dialog";
+import IconButton from "@/components/IconButton";
+import { isTauri } from "@/lib/endpoint";
+import { hex, parseAddress } from "@/lib/format";
+import { showInDisassembly } from "@/lib/navigate";
+import { kRegOrder, useDebugger } from "@/store/debugger";
 import { useEngine } from "@/store/engine";
+import { useUi } from "@/store/ui";
 
-const kRegOrder = [
-  "rip", "rsp", "rbp", "rax", "rbx", "rcx", "rdx",
-  "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "flags",
+const kScanTypes = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"];
+const kCompares = [
+  "exact",
+  "bigger",
+  "smaller",
+  "between",
+  "increased",
+  "decreased",
+  "changed",
+  "unchanged",
+  "unknown",
 ];
+const kWaitMs = 5000;
 
 export default function DebuggerView() {
   const target = useEngine((s) => s.target);
   const backend = useEngine((s) => s.backend);
+  const setRail = useUi((s) => s.setRail);
   const {
-    status, regs, regsLwpid, frames, events, breakpoints, watchpoints, scan, app, error, busy,
-    refresh, attach, detach, cont, step, waitHalt, bpSet, bpClear, wpSet, wpClear,
-    scanFirst, scanRescan, scanAob, scanReset, notify, dumpModule,
+    status,
+    regs,
+    regsLwpid,
+    frames,
+    events,
+    breakpoints,
+    watchpoints,
+    scan,
+    app,
+    error,
+    waitNote,
+    busy,
+    refresh,
+    attach,
+    detach,
+    cont,
+    step,
+    waitHalt,
+    bpSet,
+    bpClear,
+    wpSet,
+    wpClear,
+    scanFirst,
+    scanRescan,
+    scanAob,
+    scanReset,
+    notify,
+    dumpModule,
   } = useDebugger();
-  const { gotoAddress } = useDisasm();
   const [bpAddr, setBpAddr] = useState("");
   const [wpAddr, setWpAddr] = useState("");
   const [wpType, setWpType] = useState(1);
@@ -36,87 +75,146 @@ export default function DebuggerView() {
   const [scAob, setScAob] = useState("");
   const [notifyMsg, setNotifyMsg] = useState("");
   const [dumpName, setDumpName] = useState("eboot.bin");
-  const [dumpPath, setDumpPath] = useState("C:/dumps/eboot.bin");
+  const [dumpPath, setDumpPath] = useState("");
+  const [inputError, setInputError] = useState<string | null>(null);
 
   useEffect(() => {
     void refresh();
   }, [refresh, target.pid, backend.ps4]);
 
-  const parseHex = (s: string) => Number.parseInt(s.replace(/^0x/i, ""), 16);
   const pid = target.pid ?? status.debug_pid;
 
   if (!backend.ps4) {
     return (
       <div className="empty">
         <div className="empty-glyph">
-          <ScanSearch size={28} strokeWidth={1.5} />
+          <Gamepad2 size={28} strokeWidth={1.5} />
         </div>
         <div className="empty-title">No PS4 console connected.</div>
         <div className="empty-hint">
-          Connect one from the Targets panel (ps4 connect / ps4 auto), or over MCP with
-          target.ps4_auto. This view then drives the live ps4debug-NG session on the console.
+          Connect one from the Targets panel, or over MCP with target.ps4_auto. This view then
+          drives the live ps4debug-NG session on the console.
         </div>
+        <button type="button" className="row-action" onClick={() => setRail("targets")}>
+          Open Targets
+        </button>
       </div>
     );
   }
 
+  /** Parse an address field; reports instead of silently ignoring bad input. */
+  const addrOf = (text: string, what: string): number | null => {
+    const a = parseAddress(text);
+    if (a === null || a === 0) {
+      setInputError(`${what}: "${text}" is not a hex address`);
+      return null;
+    }
+    setInputError(null);
+    return a;
+  };
+
   const addBp = () => {
-    const a = parseHex(bpAddr);
-    if (Number.isFinite(a) && a !== 0) {
+    const a = addrOf(bpAddr, "breakpoint");
+    if (a !== null) {
       void bpSet(a);
       setBpAddr("");
     }
   };
   const addWp = () => {
-    const a = parseHex(wpAddr);
-    if (Number.isFinite(a) && a !== 0) {
+    const a = addrOf(wpAddr, "watchpoint");
+    if (a !== null) {
       void wpSet(a, wpType, wpLen);
       setWpAddr("");
     }
   };
-  const lwpNum = parseHex(lwp) || 0;
+  const lwpNum = parseAddress(lwp) ?? 0;
+
+  const pickDumpPath = async () => {
+    if (!isTauri()) return;
+    const picked = await save({
+      title: `Dump ${dumpName}`,
+      defaultPath: `${dumpName}.elf`,
+      filters: [{ name: "ELF", extensions: ["elf", "bin", "prx"] }],
+    });
+    if (typeof picked === "string") setDumpPath(picked);
+  };
 
   return (
-    <div className="stack">
+    <div className="stack dbg-stack">
       <div className="view-bar">
-        <span className="pill" style={{ color: status.debug_attached ? "var(--ok)" : undefined }}>
+        <span
+          className="pill"
+          style={{ color: status.debug_attached ? "var(--success)" : undefined }}
+        >
           {status.debug_attached ? `debug attached pid ${status.debug_pid}` : "debug not attached"}
         </span>
-        {status.ps4_connected && <span className="faint mono" style={{ fontSize: 11 }}>ps4 · pending {status.pending_events}</span>}
+        {status.ps4_connected && (
+          <span className="faint mono" style={{ fontSize: 11 }}>
+            ps4{status.fw !== undefined && status.fw !== "" ? ` · fw ${status.fw}` : ""} · pending{" "}
+            {status.pending_events}
+          </span>
+        )}
+        {(status.events_dropped ?? 0) > 0 && (
+          <span
+            className="pill warn-pill"
+            data-tip="The engine's stop-event queue overflowed; older events were discarded"
+          >
+            {status.events_dropped} events dropped
+          </span>
+        )}
 
         <div className="spacer" />
 
         {!status.debug_attached ? (
           <button
+            type="button"
             className="row-action"
             disabled={pid === 0 || busy}
             onClick={() => pid !== 0 && void attach(pid)}
           >
-            Attach debugger (ps4debug)
+            {pid === 0 ? "Attach a process first" : "Attach debugger (ps4debug)"}
           </button>
         ) : (
           <>
-            <button className="row-action" disabled={busy} onClick={() => void cont()} data-tip="continue">
+            <IconButton tip="Continue" variant="row" disabled={busy} onClick={() => void cont()}>
               <Play size={11} />
-            </button>
-            <button className="row-action" disabled={busy} onClick={() => void step(lwpNum)} data-tip="step one lwp (0 = all threads)">
+            </IconButton>
+            <IconButton
+              tip="Step one lwp (0 = all threads)"
+              variant="row"
+              disabled={busy}
+              onClick={() => void step(lwpNum)}
+            >
               <StepForward size={11} />
-            </button>
-            <button className="row-action" disabled={busy} onClick={() => void waitHalt(5000)} data-tip="wait for a stop event (5s)">
+            </IconButton>
+            <IconButton
+              tip={`Wait for a stop event (${kWaitMs / 1000}s)`}
+              variant="row"
+              disabled={busy}
+              onClick={() => void waitHalt(kWaitMs)}
+            >
               <Timer size={11} />
-            </button>
-            <button className="row-action" onClick={() => void detach()}>
-              <Ban size={11} /> Detach
+            </IconButton>
+            <button type="button" className="row-action" onClick={() => void detach()}>
+              <Ban size={11} aria-hidden /> Detach
             </button>
           </>
         )}
       </div>
 
-      {error !== null && (
-        <div className="empty-hint" style={{ padding: "var(--pad-sm) var(--pad-md)", color: "var(--danger)" }}>
-          {error}
-        </div>
-      )}
+      {/* Always present: the view is a three-row grid (bar / notes / columns) */}
+      <div className="dbg-notes">
+        {waitNote !== null && (
+          <div className="empty-hint" role="status">
+            {waitNote}
+          </div>
+        )}
+        {(error ?? inputError) !== null && (
+          <div className="empty-hint error-text" role="alert">
+            {error ?? inputError}
+          </div>
+        )}
+      </div>
 
       <div className="dbg">
         <div className="dbg-col">
@@ -126,6 +224,7 @@ export default function DebuggerView() {
             <input
               className="addr-input mono"
               style={{ width: 64 }}
+              aria-label="Thread (lwpid) for step"
               value={lwp}
               placeholder="lwpid"
               onChange={(e) => setLwp(e.target.value)}
@@ -134,46 +233,71 @@ export default function DebuggerView() {
           <div className="panel-body">
             {regs === null ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                {status.debug_attached ? "stop the target (bp / wait) to read registers." : "not attached."}
+                {status.debug_attached
+                  ? "stop the target (bp / wait) to read registers."
+                  : "not attached."}
               </div>
             ) : (
-              <>
-                <div className="faint" style={{ padding: "2px var(--pad-md)", fontSize: 11 }}>lwp {regsLwpid}</div>
-                <table className="table">
-                  <tbody>
-                    {kRegOrder.map((name) => (
-                      <tr key={name}>
-                        <td className="mono faint" style={{ width: 52 }}>{name}</td>
-                        <td>
-                          <button className="mono link" onClick={() => void gotoAddress(regs[name] ?? 0)}>
-                            {hex(regs[name] ?? 0)}
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </>
+              <table className="table">
+                <caption className="faint table-caption">lwp {regsLwpid}</caption>
+                <thead className="sr-only">
+                  <tr>
+                    <th scope="col">Register</th>
+                    <th scope="col">Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {kRegOrder.map((name) => (
+                    <tr key={name}>
+                      <th scope="row" className="mono faint reg-name">
+                        {name}
+                      </th>
+                      <td>
+                        <button
+                          type="button"
+                          className="mono link"
+                          data-tip="show in disassembly"
+                          onClick={() => showInDisassembly(regs[name] ?? 0)}
+                        >
+                          {hex(regs[name] ?? 0)}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             )}
           </div>
           <div className="dbg-head">Call stack</div>
           <div className="panel-body">
             {frames.length === 0 ? (
-              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>no frames.</div>
+              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
+                no frames.
+              </div>
             ) : (
-              frames.map((f, i) => (
-                <button
-                  key={i}
-                  className="fn-row"
-                  style={{ position: "static", height: 20 }}
-                  onClick={() => void gotoAddress(f.ret_addr ?? 0)}
-                  data-tip={f.snippet !== undefined && f.snippet !== "" ? f.snippet : undefined}
-                >
-                  <span className="faint" style={{ width: 20 }}>{i}</span>
-                  <span className="fn-name mono">{hex(f.ret_addr ?? 0)}</span>
-                  {f.scanned === true && <span className="faint" style={{ fontSize: 10 }}>scan</span>}
-                </button>
-              ))
+              <ol className="plain-list" aria-label="Call stack">
+                {frames.map((f, i) => (
+                  <li key={i}>
+                    <button
+                      type="button"
+                      className="fn-row"
+                      style={{ position: "static", height: 20 }}
+                      onClick={() => showInDisassembly(f.ret_addr ?? 0)}
+                      data-tip={f.snippet !== undefined && f.snippet !== "" ? f.snippet : undefined}
+                    >
+                      <span className="faint" style={{ width: 20 }}>
+                        {i}
+                      </span>
+                      <span className="fn-name mono">{hex(f.ret_addr ?? 0)}</span>
+                      {f.scanned === true && (
+                        <span className="faint" style={{ fontSize: 10 }}>
+                          scan
+                        </span>
+                      )}
+                    </button>
+                  </li>
+                ))}
+              </ol>
             )}
           </div>
         </div>
@@ -185,26 +309,34 @@ export default function DebuggerView() {
             <input
               className="addr-input mono"
               style={{ width: 110 }}
+              aria-label="Breakpoint address"
               value={bpAddr}
               placeholder="address"
               onChange={(e) => setBpAddr(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addBp()}
             />
-            <button className="icon-button" onClick={addBp} disabled={!status.debug_attached}>
+            <IconButton tip="Set breakpoint" onClick={addBp} disabled={!status.debug_attached}>
               <Plus size={13} />
-            </button>
+            </IconButton>
           </div>
           <div className="panel-body">
             {breakpoints.length === 0 ? (
-              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>none set.</div>
+              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
+                none set.
+              </div>
             ) : (
               breakpoints.map((b) => (
                 <div className="fn-row" style={{ position: "static", height: 20 }} key={b.addr}>
-                  <span className="faint" style={{ width: 44 }}>slot {b.index}</span>
+                  <span className="faint" style={{ width: 44 }}>
+                    slot {b.index}
+                  </span>
                   <span className="fn-name mono">{hex(b.addr)}</span>
-                  <button className="icon-button" onClick={() => void bpClear(b.addr)}>
+                  <IconButton
+                    tip={`Clear breakpoint ${hex(b.addr, 1)}`}
+                    onClick={() => void bpClear(b.addr)}
+                  >
                     <Ban size={11} />
-                  </button>
+                  </IconButton>
                 </div>
               ))
             )}
@@ -214,6 +346,7 @@ export default function DebuggerView() {
               <input
                 className="addr-input mono"
                 style={{ width: 110 }}
+                aria-label="Watchpoint address"
                 value={wpAddr}
                 placeholder="address"
                 onChange={(e) => setWpAddr(e.target.value)}
@@ -222,6 +355,7 @@ export default function DebuggerView() {
               <select
                 className="addr-input"
                 style={{ width: 64 }}
+                aria-label="Watchpoint type"
                 value={wpType}
                 onChange={(e) => setWpType(Number(e.target.value))}
               >
@@ -232,27 +366,37 @@ export default function DebuggerView() {
               <select
                 className="addr-input"
                 style={{ width: 44 }}
+                aria-label="Watchpoint length"
                 value={wpLen}
                 onChange={(e) => setWpLen(Number(e.target.value))}
               >
                 {[1, 2, 4, 8].map((n) => (
-                  <option key={n} value={n}>{n}</option>
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
                 ))}
               </select>
-              <button className="icon-button" onClick={addWp} disabled={!status.debug_attached}>
+              <IconButton tip="Set watchpoint" onClick={addWp} disabled={!status.debug_attached}>
                 <Plus size={13} />
-              </button>
+              </IconButton>
             </div>
             {watchpoints.length === 0 ? (
-              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>none set.</div>
+              <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
+                none set.
+              </div>
             ) : (
               watchpoints.map((w) => (
                 <div className="fn-row" style={{ position: "static", height: 20 }} key={w.addr}>
-                  <span className="faint" style={{ width: 44 }}>DR{w.index}</span>
+                  <span className="faint" style={{ width: 44 }}>
+                    DR{w.index}
+                  </span>
                   <span className="fn-name mono">{hex(w.addr)}</span>
-                  <button className="icon-button" onClick={() => void wpClear(w.addr)}>
+                  <IconButton
+                    tip={`Clear watchpoint ${hex(w.addr, 1)}`}
+                    onClick={() => void wpClear(w.addr)}
+                  >
                     <Ban size={11} />
-                  </button>
+                  </IconButton>
                 </div>
               ))
             )}
@@ -263,55 +407,119 @@ export default function DebuggerView() {
           <div className="dbg-head">
             Console scan (on-device)
             <div className="spacer" />
-            <button className="row-action" disabled={busy} onClick={() => void scanReset()}>
+            <button
+              type="button"
+              className="row-action"
+              disabled={busy}
+              onClick={() => void scanReset()}
+            >
               reset
             </button>
           </div>
           <div className="panel-body">
-            <div style={{ display: "flex", gap: 4, flexWrap: "wrap", padding: "2px var(--pad-md)" }}>
-              <input className="addr-input mono" style={{ width: 100 }} value={scAddr} placeholder="addr"
-                onChange={(e) => setScAddr(e.target.value)} />
-              <input className="addr-input mono" style={{ width: 64 }} value={scLen} placeholder="len"
-                onChange={(e) => setScLen(e.target.value)} />
-              <select className="addr-input" value={scType} onChange={(e) => setScType(e.target.value)}>
-                {["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64", "f32", "f64"].map((w) => (
-                  <option key={w} value={w}>{w}</option>
+            <div className="dbg-form">
+              <input
+                className="addr-input mono"
+                style={{ width: 100 }}
+                aria-label="Scan start address"
+                value={scAddr}
+                placeholder="addr"
+                onChange={(e) => setScAddr(e.target.value)}
+              />
+              <input
+                className="addr-input mono"
+                style={{ width: 64 }}
+                aria-label="Scan length"
+                value={scLen}
+                placeholder="len"
+                onChange={(e) => setScLen(e.target.value)}
+              />
+              <select
+                className="addr-input"
+                aria-label="Scan value type"
+                value={scType}
+                onChange={(e) => setScType(e.target.value)}
+              >
+                {kScanTypes.map((w) => (
+                  <option key={w} value={w}>
+                    {w}
+                  </option>
                 ))}
               </select>
-              <select className="addr-input" value={scCmp} onChange={(e) => setScCmp(e.target.value)}>
-                {["exact", "bigger", "smaller", "between", "increased", "decreased", "changed", "unchanged", "unknown"].map((c) => (
-                  <option key={c} value={c}>{c}</option>
+              <select
+                className="addr-input"
+                aria-label="Scan comparison"
+                value={scCmp}
+                onChange={(e) => setScCmp(e.target.value)}
+              >
+                {kCompares.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
                 ))}
               </select>
-              <input className="addr-input mono" style={{ width: 80 }} value={scVal} placeholder="value"
-                onChange={(e) => setScVal(e.target.value)} />
-              <button className="row-action" disabled={busy || !scAddr || !scVal}
+              <input
+                className="addr-input mono"
+                style={{ width: 80 }}
+                aria-label="Scan value"
+                value={scVal}
+                placeholder="value"
+                onChange={(e) => setScVal(e.target.value)}
+              />
+              <button
+                type="button"
+                className="row-action"
+                disabled={busy || !scAddr || !scVal}
                 onClick={() => {
-                  const a = parseHex(scAddr);
-                  const l = parseHex(scLen);
+                  const a = addrOf(scAddr, "scan start");
+                  const l = parseAddress(scLen);
+                  if (a === null || l === null) return;
                   const v = scVal.trim();
                   const num = Number(v);
                   void scanFirst({
-                    addr: a, len: l, value_type: scType, compare: scCmp,
+                    addr: a,
+                    len: l,
+                    value_type: scType,
+                    compare: scCmp,
                     value: Number.isFinite(num) && v !== "" ? num : v,
                   });
-                }}>
+                }}
+              >
                 scan
               </button>
-              <button className="row-action" disabled={busy || !scan?.used}
-                onClick={() => void scanRescan(scCmp === "exact" ? "changed" : scCmp,
-                  scCmp === "exact" && scVal !== "" ? Number(scVal) : undefined)}>
+              <button
+                type="button"
+                className="row-action"
+                disabled={busy || !scan?.used}
+                onClick={() =>
+                  void scanRescan(
+                    scCmp === "exact" ? "changed" : scCmp,
+                    scCmp === "exact" && scVal !== "" ? Number(scVal) : undefined,
+                  )
+                }
+              >
                 rescan
               </button>
             </div>
-            <div style={{ display: "flex", gap: 4, padding: "2px var(--pad-md)" }}>
-              <input className="addr-input mono" style={{ flex: 1 }} value={scAob}
+            <div className="dbg-form">
+              <input
+                className="addr-input mono"
+                style={{ flex: 1 }}
+                aria-label="AOB pattern"
+                value={scAob}
                 placeholder="aob pattern: 48 8B ?? ?? 90 (scan range above)"
-                onChange={(e) => setScAob(e.target.value)} />
-              <button className="row-action" disabled={busy || !scAddr || !scAob}
+                onChange={(e) => setScAob(e.target.value)}
+              />
+              <button
+                type="button"
+                className="row-action"
+                disabled={busy || !scAddr || !scAob}
                 onClick={() => {
-                  void scanAob(parseHex(scAddr), parseHex(scLen), scAob);
-                }}>
+                  const a = addrOf(scAddr, "scan start");
+                  const l = parseAddress(scLen);
+                  if (a !== null && l !== null) void scanAob(a, l, scAob);
+                }}
+              >
                 aob
               </button>
             </div>
@@ -322,14 +530,21 @@ export default function DebuggerView() {
             ) : (
               <>
                 <div className="faint mono" style={{ padding: "2px var(--pad-md)", fontSize: 11 }}>
-                  base {scan.base_hex ?? hex(scan.base ?? 0)} · {scan.count ?? 0} hits{scan.truncated === true ? " (capped)" : ""}
+                  base {scan.base_hex ?? hex(scan.base ?? 0)} · {scan.count ?? 0} hits
+                  {scan.truncated === true ? " (capped)" : ""}
                 </div>
                 {(scan.hits ?? []).slice(0, 100).map((h, i) => (
                   <div className="fn-row" style={{ position: "static", height: 20 }} key={i}>
-                    <button className="fn-name mono" onClick={() => void gotoAddress(h.addr)}>
+                    <button
+                      type="button"
+                      className="fn-name mono link"
+                      onClick={() => showInDisassembly(h.addr)}
+                    >
                       {h.addr_hex ?? hex(h.addr)}
                     </button>
-                    <span className="faint mono" style={{ fontSize: 11 }}>{h.value_hex ?? ""}</span>
+                    <span className="faint mono" style={{ fontSize: 11 }}>
+                      {h.value_hex ?? ""}
+                    </span>
                   </div>
                 ))}
               </>
@@ -344,23 +559,55 @@ export default function DebuggerView() {
                   ? "no game in foreground"
                   : `foreground: ${app.name ?? "?"} ${app.titleid ?? ""} v${app.app_ver ?? "?"} (pid ${app.pid})`}
             </div>
-            <div style={{ display: "flex", gap: 4, padding: "2px var(--pad-md)" }}>
-              <input className="addr-input" style={{ flex: 1 }} value={notifyMsg}
+            <div className="dbg-form">
+              <input
+                className="addr-input"
+                style={{ flex: 1 }}
+                aria-label="Notification text"
+                value={notifyMsg}
                 placeholder="notification text for the PS4 UI"
-                onChange={(e) => setNotifyMsg(e.target.value)} />
-              <button className="row-action" disabled={!notifyMsg}
-                onClick={() => { void notify(notifyMsg); setNotifyMsg(""); }}>
+                onChange={(e) => setNotifyMsg(e.target.value)}
+              />
+              <button
+                type="button"
+                className="row-action"
+                disabled={!notifyMsg}
+                onClick={() => {
+                  void notify(notifyMsg);
+                  setNotifyMsg("");
+                }}
+              >
                 notify
               </button>
             </div>
-            <div style={{ display: "flex", gap: 4, padding: "2px var(--pad-md)" }}>
-              <input className="addr-input mono" style={{ width: 90 }} value={dumpName}
-                onChange={(e) => setDumpName(e.target.value)} />
-              <input className="addr-input mono" style={{ flex: 1 }} value={dumpPath}
-                onChange={(e) => setDumpPath(e.target.value)} />
-              <button className="row-action" disabled={busy || !dumpName || !dumpPath}
+            <div className="dbg-form">
+              <input
+                className="addr-input mono"
+                style={{ width: 90 }}
+                aria-label="Module to dump"
+                value={dumpName}
+                onChange={(e) => setDumpName(e.target.value)}
+              />
+              <input
+                className="addr-input mono"
+                style={{ flex: 1 }}
+                aria-label="Dump output path"
+                value={dumpPath}
+                placeholder="output file (Browse…)"
+                onChange={(e) => setDumpPath(e.target.value)}
+              />
+              {isTauri() && (
+                <IconButton tip="Browse for the output file" onClick={() => void pickDumpPath()}>
+                  <FolderOpen size={12} />
+                </IconButton>
+              )}
+              <button
+                type="button"
+                className="row-action"
+                disabled={busy || !dumpName || !dumpPath}
                 onClick={() => void dumpModule(dumpName, dumpPath, true)}
-                data-tip="dump the module's memory over the wire and load the ELF into disasm">
+                data-tip="dump the module's memory over the wire and load the ELF into disasm"
+              >
                 dump+load
               </button>
             </div>
@@ -375,19 +622,36 @@ export default function DebuggerView() {
                 no stop events yet - arm a bp, continue, wait.
               </div>
             ) : (
-              events.slice(-40).map((e, i) => (
-                <div className="log-row mono" key={i} style={{ padding: "1px var(--pad-md)", fontSize: 11 }}>
-                  <span className="faint">lwp {e.lwpid}{e.thread !== undefined && e.thread !== "" ? ` (${e.thread})` : ""}</span>
-                  <span style={{ color: e.signal !== 0 && e.signal !== 5 ? "var(--danger)" : undefined }}>
-                    sig {e.signal}
-                  </span>
-                  {e.rip !== undefined && (
-                    <button className="mono link" onClick={() => void gotoAddress(e.rip ?? 0)}>
-                      {hex(e.rip, 12)}
-                    </button>
-                  )}
-                </div>
-              ))
+              <ol className="plain-list" aria-label="Stop events, newest first">
+                {events.slice(0, 40).map((e, i) => (
+                  <li
+                    className="log-row mono"
+                    key={i}
+                    style={{ padding: "1px var(--pad-md)", fontSize: 11 }}
+                  >
+                    <span className="faint">
+                      lwp {e.lwpid}
+                      {e.thread !== undefined && e.thread !== "" ? ` (${e.thread})` : ""}
+                    </span>
+                    <span
+                      style={{
+                        color: e.signal !== 0 && e.signal !== 5 ? "var(--danger)" : undefined,
+                      }}
+                    >
+                      sig {e.signal}
+                    </span>
+                    {e.rip !== undefined && (
+                      <button
+                        type="button"
+                        className="mono link"
+                        onClick={() => showInDisassembly(e.rip ?? 0)}
+                      >
+                        {hex(e.rip, 12)}
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ol>
             )}
           </div>
         </div>

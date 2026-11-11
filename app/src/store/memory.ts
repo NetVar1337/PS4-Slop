@@ -1,9 +1,11 @@
 // app/src/store/memory.ts
-// Live memory browsing for the hex editor, regions plus paged reads and writes
-// through the active backend (ps4 wire when a console is connected)
+// Live memory browsing for the hex editor: regions, a scrollable window over
+// one region filled page by page as it scrolls, and writes through the active
+// backend (ps4 wire when a console is connected). Everything the view shows
+// lives here so switching tabs does not lose the position
 
 import { create } from "zustand";
-import { call } from "@/lib/rpc";
+import { call, errorText } from "@/lib/rpc";
 
 export type Region = {
   base: number;
@@ -15,24 +17,52 @@ export type Region = {
 
 /** Page size for one read. 4 KiB keeps a scroll responsive over loopback. */
 export const kPageBytes = 0x1000;
+/**
+ * Bytes one scroll window spans. Bounded because a browser caps element height
+ * (~33M px); 1 MiB is 65536 rows. Prev/next move the window along the region.
+ */
+export const kWindowBytes = 0x100000;
+/** Pages read concurrently ahead of the viewport. */
+const kReadAhead = 2;
+/** Hex grid geometry, shared with MemoryView so scroll offsets agree. */
+export const kHexCols = 16;
+export const kHexRowPx = 19;
 
 type MemoryStore = {
   regions: Region[];
+  /** Address the user navigated to (goto, region click). */
   cursor: number;
-  bytes: Uint8Array;
+  /** First byte of the scroll window. */
+  windowBase: number;
+  /** Bytes in the scroll window. */
+  windowSize: number;
+  /** Page base -> bytes, or null when the page could not be read. */
+  pages: Record<number, Uint8Array | null>;
+  /** Text in the goto box, kept across remounts. */
+  gotoText: string;
+  /** Scroll offset of the hex grid, restored on remount. */
+  scrollTop: number;
+  /** Bumped by every goto so the grid scrolls the target into view. */
+  gotoSeq: number;
   loading: boolean;
   error: string | null;
 
   loadRegions: () => Promise<void>;
-  readAt: (addr: number) => Promise<void>;
-  writeBytes: (addr: number, data: Uint8Array) => Promise<void>;
+  goto: (addr: number) => void;
+  /** Read every not-yet-loaded page overlapping [start, end). */
+  ensurePages: (start: number, end: number) => void;
+  /** Drop the page cache and re-read what is visible. */
+  reload: () => void;
+  writeBytes: (addr: number, data: Uint8Array) => Promise<boolean>;
+  setGotoText: (text: string) => void;
+  setScrollTop: (px: number) => void;
   reset: () => void;
 };
 
 function hexToBytes(hex: string): Uint8Array {
   const clean = hex.replace(/[^0-9a-fA-F]/g, "");
   const out = new Uint8Array(clean.length >> 1);
-  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.substr(i * 2, 2), 16);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(clean.slice(i * 2, i * 2 + 2), 16);
   return out;
 }
 
@@ -61,44 +91,139 @@ export function protectName(protect: number): string {
   return out;
 }
 
-export const useMemory = create<MemoryStore>((set) => ({
-  regions: [],
-  cursor: 0,
-  bytes: new Uint8Array(0),
-  loading: false,
-  error: null,
+const alignDown = (v: number, a: number): number => v - (v % a);
 
-  loadRegions: async () => {
-    try {
-      const res = await call<{ regions: Region[] }>("target", "regions");
-      // MEM_COMMIT only: reserved and free ranges are not readable, and listing
-      // them just gives the user rows that always fail
-      const regions = (res.regions ?? []).filter((r) => r.state === 0x1000);
-      set({ regions, error: null });
-    } catch (e) {
-      set({ regions: [], error: e instanceof Error ? e.message : String(e) });
-    }
-  },
+/** Window placement for `addr`: inside its region, centred where room allows. */
+export function windowFor(
+  regions: readonly Region[],
+  addr: number,
+): { base: number; size: number } {
+  const region = regions.find((r) => addr >= r.base && addr < r.base + r.size);
+  const page = alignDown(addr, kPageBytes);
+  if (region === undefined) return { base: page, size: kWindowBytes };
+  const end = region.base + region.size;
+  let base = Math.max(region.base, page - kWindowBytes / 2);
+  base = Math.max(region.base, Math.min(base, end - kWindowBytes));
+  return { base, size: Math.min(kWindowBytes, end - base) };
+}
 
-  readAt: async (addr) => {
-    set({ loading: true, cursor: addr });
+/** Byte at `addr`, or undefined when its page is not loaded / unreadable. */
+export function byteAt(pages: Record<number, Uint8Array | null>, addr: number): number | undefined {
+  const page = pages[alignDown(addr, kPageBytes)];
+  return page?.[addr % kPageBytes];
+}
+
+const inflight = new Set<number>();
+
+export const useMemory = create<MemoryStore>((set, get) => {
+  const readPage = async (page: number, windowBase: number): Promise<void> => {
+    if (inflight.has(page)) return;
+    inflight.add(page);
+    set({ loading: true });
     try {
       const res = await call<{ hex?: string }>("memory", "read", {
-        addr,
+        addr: page,
         len: kPageBytes,
         format: "hex",
       });
-      set({ bytes: hexToBytes(res.hex ?? ""), error: null });
+      if (get().windowBase !== windowBase) return;
+      set((s) => ({ pages: { ...s.pages, [page]: hexToBytes(res.hex ?? "") }, error: null }));
     } catch (e) {
-      set({ bytes: new Uint8Array(0), error: e instanceof Error ? e.message : String(e) });
+      if (get().windowBase !== windowBase) return;
+      set((s) => ({ pages: { ...s.pages, [page]: null }, error: errorText(e) }));
     } finally {
-      set({ loading: false });
+      inflight.delete(page);
+      if (inflight.size === 0) set({ loading: false });
     }
-  },
+  };
 
-  writeBytes: async (addr, data) => {
-    await call("memory", "write", { addr, hex: bytesToHex(data) });
-  },
+  return {
+    regions: [],
+    cursor: 0,
+    windowBase: 0,
+    windowSize: 0,
+    pages: {},
+    gotoText: "",
+    scrollTop: 0,
+    gotoSeq: 0,
+    loading: false,
+    error: null,
 
-  reset: () => set({ regions: [], bytes: new Uint8Array(0), cursor: 0, error: null }),
-}));
+    loadRegions: async () => {
+      try {
+        const res = await call<{ regions: Region[] }>("target", "regions");
+        // MEM_COMMIT only: reserved and free ranges are not readable, and listing
+        // them just gives the user rows that always fail
+        const regions = (res.regions ?? []).filter((r) => r.state === 0x1000);
+        set({ regions, error: null });
+      } catch (e) {
+        set({ regions: [], error: errorText(e) });
+      }
+    },
+
+    goto: (addr) => {
+      const { base, size } = windowFor(get().regions, addr);
+      const same = base === get().windowBase && size === get().windowSize;
+      set({
+        cursor: addr,
+        windowBase: base,
+        windowSize: size,
+        gotoSeq: get().gotoSeq + 1,
+        // Where the grid should land; a view mounting after the goto (palette
+        // jump into the Memory tab) starts there
+        scrollTop: Math.floor((addr - base) / kHexCols) * kHexRowPx,
+        ...(same ? {} : { pages: {} }),
+        error: null,
+      });
+      get().ensurePages(addr, addr + kPageBytes);
+    },
+
+    ensurePages: (start, end) => {
+      const { windowBase, windowSize, pages } = get();
+      if (windowSize === 0) return;
+      const lo = Math.max(windowBase, alignDown(start, kPageBytes));
+      const hi = Math.min(windowBase + windowSize, end + kReadAhead * kPageBytes);
+      for (let p = lo; p < hi; p += kPageBytes) {
+        if (!(p in pages)) void readPage(p, windowBase);
+      }
+    },
+
+    reload: () => {
+      const { cursor } = get();
+      set({ pages: {} });
+      get().ensurePages(cursor, cursor + kPageBytes);
+    },
+
+    writeBytes: async (addr, data) => {
+      try {
+        await call("memory", "write", { addr, hex: bytesToHex(data) });
+      } catch (e) {
+        set({ error: `write at 0x${addr.toString(16).toUpperCase()} failed: ${errorText(e)}` });
+        return false;
+      }
+      // Re-read the page so the grid shows what the target actually holds
+      const page = alignDown(addr, kPageBytes);
+      set((s) => {
+        const pages = { ...s.pages };
+        delete pages[page];
+        return { pages, error: null };
+      });
+      await readPage(page, get().windowBase);
+      return true;
+    },
+
+    setGotoText: (gotoText) => set({ gotoText }),
+    setScrollTop: (scrollTop) => set({ scrollTop }),
+
+    reset: () =>
+      set({
+        regions: [],
+        pages: {},
+        cursor: 0,
+        windowBase: 0,
+        windowSize: 0,
+        scrollTop: 0,
+        error: null,
+      }),
+  };
+});

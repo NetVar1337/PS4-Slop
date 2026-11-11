@@ -15,19 +15,19 @@ infra::published_t<thread_table_t> g_threads;
 } // namespace
 
 uint64_t refresh_threads() {
-    // grab the pid now; the session may be replaced while the job runs, the
-    // backend is looked up inside the job for the same reason
-    const auto s = active_session();
+    // the job holds the session so the pid is queried on the backend the
+    // session was opened on (never a swapped-in one); stale results are
+    // dropped instead of published
+    auto s = active_session();
     if (!s || !s->valid()) return 0;
-    const uint32_t pid = s->pid();
     return infra::jobs::submit({
         "Enumerate threads", "thread_table", false,
-        [pid](infra::job_context_t& ctx) {
-            auto r = runtime::active().enum_threads(pid);
+        [s](infra::job_context_t& ctx) {
+            auto r = s->backend()->enum_threads(s->pid());
             auto snap = std::make_shared<thread_table_t>();
             snap->sampled_ms = infra::wall_ms();
             if (r.ok) snap->items = std::move(r.items);
-            if (ctx.cancelled()) return;
+            if (ctx.cancelled() || active_session() != s) return;
             g_threads.publish(std::move(snap));
         }});
 }

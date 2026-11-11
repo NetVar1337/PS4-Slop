@@ -5,6 +5,10 @@
 namespace hype {
 
 int SSABuilder::var_key(const Varnode& vn) const {
+    // Register views share one variable per id (eax and rax are versions of
+    // the same register); width mismatches between a version's definition and
+    // a narrow read are resolved by the lifter, which projects narrow reads
+    // of a wide def with SUBPIECE (see operand_read).
     if (vn.is_reg()) return vn.id;
     if (vn.is_temp()) return 1000 + vn.id;
     if (vn.is_stack()) {

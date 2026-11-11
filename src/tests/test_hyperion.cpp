@@ -8,6 +8,10 @@
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/hyperion_session.hpp"
 #include "threading/parallel.h"
+#include "core/loader/elf_loader.h"
+#include "core/loader/ps4_nid.h"
+
+#include "elf_fixture.hpp"
 
 #include <Zydis/Zydis.h>
 
@@ -475,4 +479,140 @@ TEST_CASE(hyperion_reanalysis_preserves_runtime_base) {
     REQUIRE(session.ready());
     REQUIRE_EQ(session.image().base, runtime_base);
     REQUIRE(session.function_entry(session.image().entry) != nullptr);
+}
+
+// === ELF / PS4 ===
+
+namespace {
+
+bool has_xref(const hype::AnalysisDB& db, uint64_t to, uint64_t from, hype::XrefType type) {
+    const auto it = db.xrefs_to.find(to);
+    if (it == db.xrefs_to.end()) return false;
+    return std::any_of(it->second.begin(), it->second.end(), [&](const hype::Xref& x) {
+        return x.from == from && x.type == type;
+    });
+}
+
+} // namespace
+
+TEST_CASE(hyperion_param_count_defaults_to_zero) {
+    hype::FuncSignature sig;
+    REQUIRE_EQ(sig.param_count, 0);
+    REQUIRE(hype::default_callconv(hype::Arch::X64, hype::ImageFormat::PE) == hype::CallConv::X64);
+    REQUIRE(hype::default_callconv(hype::Arch::X64, hype::ImageFormat::ELF) == hype::CallConv::SysV);
+    REQUIRE(hype::default_callconv(hype::Arch::X64, hype::ImageFormat::MachO) == hype::CallConv::SysV);
+    REQUIRE(hype::default_callconv(hype::Arch::ARM64, hype::ImageFormat::ELF) == hype::CallConv::AAPCS64);
+    REQUIRE_STR_EQ(std::string(hype::callconv_name(hype::CallConv::SysV)), "sysv_amd64");
+}
+
+TEST_CASE(hyperion_elf_session_analyzes_ps4_elf) {
+    using L = elf_fixture::ps4_layout;
+    hype::nid::clear_overrides();
+    auto elf = elf_fixture::build_ps4_elf();
+    hype::ELFLoader::apply_relocations(elf);
+    hs::session_t s;
+    REQUIRE(s.start_sync(elf.data(), elf.size(), 0));
+    REQUIRE(s.ready());
+    REQUIRE(s.image().format == hype::ImageFormat::ELF);
+    const auto& db = s.db();
+    REQUIRE(db.abi == hype::CallConv::SysV);
+
+    // all three functions recovered, SysV everywhere
+    for (uint64_t f : {L::kEntry, L::kFunc2, L::kFunc3}) {
+        REQUIRE(db.funcs.count(f) == 1);
+        REQUIRE(db.funcs.at(f).callconv == hype::CallConv::SysV);
+    }
+    // (a, b, c) -> a*b+c reads edi, esi, edx: three SysV arguments
+    REQUIRE(db.signatures.count(L::kFunc2) == 1);
+    REQUIRE_EQ(db.signatures.at(L::kFunc2).param_count, 3);
+    REQUIRE_EQ(db.signatures.at(L::kFunc3).param_count, 1);
+    REQUIRE_EQ(db.signatures.at(L::kEntry).param_count, 0);
+
+    // canonical and resolved names
+    REQUIRE_STR_EQ(db.funcs.at(L::kFunc2).name, "sub_140");
+    REQUIRE_STR_EQ(db.names.at(L::kFunc3), "module_start");
+    REQUIRE_STR_EQ(db.names.at(L::kSlotUsleep), "libkernel!sceKernelUsleep");
+    REQUIRE_STR_EQ(db.names.at(L::kSlotMemset), "libSceLibcInternal!memset");
+}
+
+TEST_CASE(hyperion_data_xrefs_validated_against_segments) {
+    using L = elf_fixture::ps4_layout;
+    auto elf = elf_fixture::build_ps4_elf();
+    hs::session_t s;
+    REQUIRE(s.start_sync(elf.data(), elf.size(), 0));
+    const auto& db = s.db();
+    // find the instruction VAs in the entry function
+    uint64_t lea_va = 0, mov_va = 0, and_va = 0;
+    for (const auto& [ba, bb] : db.funcs.at(L::kEntry).blocks) {
+        for (const auto& in : bb.insns) {
+            if (in.type == hype::InsnType::Lea && in.op_count == 2 && in.ops[1].val == L::kString) lea_va = in.addr;
+            if (in.type == hype::InsnType::Mov && in.op_count == 2 &&
+                in.ops[1].type == hype::OpType::Imm && in.ops[1].val == L::kString) mov_va = in.addr;
+            if (in.type == hype::InsnType::And) and_va = in.addr;
+        }
+    }
+    REQUIRE_NE(lea_va, 0u);
+    REQUIRE_NE(mov_va, 0u);
+    REQUIRE_NE(and_va, 0u);
+    REQUIRE(has_xref(db, L::kString, lea_va, hype::XrefType::DataOffset));   // string ref via LEA
+    REQUIRE(has_xref(db, L::kString, mov_va, hype::XrefType::DataOffset));   // mov reg, address
+    // base-0 image: small constants (mov edi, 5) and arithmetic immediates
+    // that happen to fall inside a segment (and eax, 0x1F00) are not xrefs
+    REQUIRE(db.xrefs_to.find(0x1F00) == db.xrefs_to.end());
+    REQUIRE(db.xrefs_to.find(5) == db.xrefs_to.end());
+    // a call's immediate is a code xref only
+    REQUIRE(has_xref(db, L::kFunc2, L::kEntry + 0x13, hype::XrefType::CodeCall));
+    REQUIRE_FALSE(has_xref(db, L::kFunc2, L::kEntry + 0x13, hype::XrefType::DataOffset));
+}
+
+TEST_CASE(hyperion_arm64_adrp_pairs_make_string_xrefs) {
+    const auto elf = elf_fixture::build_arm64_adrp_elf();
+    hs::session_t s;
+    REQUIRE(s.start_sync(elf.data(), elf.size(), 0));
+    REQUIRE(s.ready());
+    const auto& db = s.db();
+    REQUIRE(db.abi == hype::CallConv::AAPCS64);
+    REQUIRE(std::any_of(db.strings.begin(), db.strings.end(),
+                        [](const auto& p) { return p.first == 0x20010 && p.second == "arm64 string here"; }));
+    REQUIRE(has_xref(db, 0x20010, 0x10004, hype::XrefType::DataOffset));
+    // the adrp page itself is not a reference
+    REQUIRE(db.xrefs_to.find(0x20000) == db.xrefs_to.end());
+}
+
+TEST_CASE(hyperion_self_session_unwraps_elf) {
+    const auto self = elf_fixture::wrap_self(elf_fixture::build_ps4_elf(),
+                                             elf_fixture::self_mode::compressed);
+    hs::session_t s;
+    REQUIRE(s.start_sync(self.data(), self.size(), 0));
+    REQUIRE(s.ready());
+    REQUIRE(s.image().format == hype::ImageFormat::ELF);
+    REQUIRE(s.function_entry(elf_fixture::ps4_layout::kFunc2) != nullptr);
+
+    const auto enc = elf_fixture::wrap_self(elf_fixture::build_ps4_elf(),
+                                            elf_fixture::self_mode::encrypted);
+    hs::session_t bad;
+    REQUIRE_FALSE(bad.start_sync(enc.data(), enc.size(), 0));
+    REQUIRE(bad.error().find("encrypted SELF") != std::string::npos);
+}
+
+TEST_CASE(hyperion_decomp_cache_is_lru) {
+    using L = elf_fixture::ps4_layout;
+    auto elf = elf_fixture::build_ps4_elf();
+    hs::session_t s;
+    REQUIRE(s.start_sync(elf.data(), elf.size(), 0));
+    s.set_decomp_cache_capacity(2);
+    std::vector<hype::PseudoLine> out;
+    std::string err;
+    REQUIRE(s.decompile(L::kEntry, out, err));
+    REQUIRE(s.decompile(L::kFunc2, out, err));
+    REQUIRE(s.decompile(L::kEntry, out, err));   // hit: entry becomes most recent
+    REQUIRE(s.decompile(L::kFunc3, out, err));   // evicts func2, not everything
+    REQUIRE_EQ(s.decomp_cache_size(), size_t{2});
+    REQUIRE(s.decomp_cached(L::kEntry));
+    REQUIRE(s.decomp_cached(L::kFunc3));
+    REQUIRE_FALSE(s.decomp_cached(L::kFunc2));
+    // a cached result is returned unchanged
+    std::vector<hype::PseudoLine> again;
+    REQUIRE(s.decompile(L::kFunc3, again, err));
+    REQUIRE_EQ(again.size(), out.size());
 }

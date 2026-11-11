@@ -5,7 +5,9 @@
 // console running the ps4debug-NG payload, so memory/enumeration actions work
 // on the console exactly like on a local process
 
+#include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +26,50 @@ struct ps4_event_t {
     uint64_t         dr[16]{};
 };
 
+// decode one raw 0x4A0 packet (false when n is short)
+bool ps4_decode_event(const uint8_t* pkt, size_t n, ps4_event_t& out);
+
+// TCP can split or coalesce the fixed-size port-755 packets; this rebuilds
+// whole packets from an arbitrary byte stream. Consumed bytes are compacted
+// once per feed (not once per packet).
+class ps4_event_reassembler_t {
+public:
+    explicit ps4_event_reassembler_t(size_t packet_size);
+    // returns the number of complete packets delivered to on_packet
+    size_t feed(const uint8_t* data, size_t n,
+                const std::function<void(const uint8_t* pkt)>& on_packet);
+    size_t buffered() const noexcept { return buf_.size(); }
+    void   reset() noexcept { buf_.clear(); }
+
+private:
+    size_t packet_size_;
+    std::vector<uint8_t> buf_;
+};
+
+// one vm_map entry, as received from CMD_PROC_MAPS
+struct ps4_segment_t {
+    uint64_t    start  = 0;
+    uint64_t    end    = 0;
+    uint64_t    offset = 0;
+    uint16_t    prot   = 0;    // FreeBSD VM_PROT_* bits (1 r, 2 w, 4 x)
+    std::string name;
+};
+
+// one module: adjacent same-named map entries (text, relro, data, ...)
+// coalesced into one record spanning [base, end)
+struct ps4_module_t {
+    std::string name;          // base name ("eboot.bin")
+    std::string path;          // map name as the console reports it
+    uint64_t    base = 0;
+    uint64_t    end  = 0;
+    std::vector<ps4_segment_t> segments;
+};
+
+// group maps into modules: entries are sorted by start; consecutive entries
+// with the same non-empty name form one module (unnamed anonymous mappings in
+// between do not break the run, a different name does)
+std::vector<ps4_module_t> ps4_coalesce_modules(std::vector<ps4_segment_t> maps);
+
 class backend_ps4_t final : public backend_t {
 public:
     backend_ps4_t();
@@ -32,44 +78,80 @@ public:
     backend_ps4_t(const backend_ps4_t&) = delete;
     backend_ps4_t& operator=(const backend_ps4_t&) = delete;
 
-    // connection management (outside the backend_t interface)
+    // ---- connection management (outside the backend_t interface) ----------
+    // connect() is a fresh logical connection: handles from an earlier
+    // connection become stale, client-side slot/stub state is cleared
     bool        connect(const std::string& host, uint16_t port, std::string& err);
     void        disconnect();
     bool        connected() const noexcept;
     bool        ping();   // CMD_PROC_NOP roundtrip, liveness probe
     std::string endpoint() const;   // "host:port" or "" when not connected
     std::string branding() const;   // server branding string or ""
+    std::string server_caps() const;    // capability tail of the branding blob
+    std::string server_version() const; // CMD_VERSION string or ""
     uint16_t    fw_version() const noexcept;  // BCD (e.g. 0x1100 = 11.00), 0 if unknown
+    std::string fw_string() const;            // "11.00" or "" if unknown
 
-    // Identity
+    // any send/recv failure (error, peer close, timeout, desync) closes the
+    // socket so connected() goes false and callers fail fast. lost() then
+    // reports the dropped connection until reconnect()/connect()/disconnect()
+    bool        lost() const noexcept;
+    std::string lost_reason() const;
+    uint64_t    drop_count() const noexcept;     // connections lost so far
+    std::string last_endpoint() const;           // remembered for reconnect
+
+    // re-open the remembered endpoint, re-run the handshake and auth, then
+    // restore what the dropped connection had: the debug session (the payload
+    // keeps debug state per connection) and every breakpoint/watchpoint slot
+    // this client armed. Existing target handles stay valid.
+    struct reconnect_report_t {
+        bool        authed = false;
+        uint32_t    debug_pid = 0;          // pid re-attached (0 = none wanted)
+        bool        debug_restored = false;
+        std::string debug_error;
+        uint32_t    bp_rearmed = 0, bp_failed = 0;
+        uint32_t    wp_rearmed = 0, wp_failed = 0;
+    };
+    bool reconnect(std::string& err, reconnect_report_t* report = nullptr);
+
+    // ---- identity
     backend_kind_t kind() const noexcept override;
     const char*    badge() const noexcept override;
 
-    // Attach / Detach
+    // ---- attach / detach
     target_handle_t attach(uint32_t pid) override;
     void            detach(target_handle_t& h) override;
 
-    // Memory
+    // ---- memory
     io_result_t read_memory(const target_handle_t& h, uintptr_t addr, void* buf, size_t len) override;
     io_result_t write_memory(const target_handle_t& h, uintptr_t addr, const void* buf, size_t len) override;
     io_result_t protect_memory(const target_handle_t& h, uintptr_t addr, size_t len, uint32_t new_prot, uint32_t* old_prot) override;
     io_result_t allocate_memory(const target_handle_t& h, uintptr_t addr, size_t len, uint32_t prot, uintptr_t* out_addr) override;
     io_result_t free_memory(const target_handle_t& h, uintptr_t addr) override;
 
-    // Enumeration
+    // ---- enumeration
     enum_result_t<process_info_t> enum_processes() override;
+    // one record per module (segments coalesced, see ps4_coalesce_modules)
     enum_result_t<module_info_t>  enum_modules(const target_handle_t& h) override;
+    // threads with priority/name; the per-thread info requests are pipelined
+    // in small batches (one roundtrip per batch, not per thread)
     enum_result_t<thread_info_t>  enum_threads(uint32_t pid) override;
     enum_result_t<region_info_t>  enum_regions(const target_handle_t& h) override;
     enum_result_t<handle_info_t>  enum_handles(uint32_t pid) override;
 
-    // Thread context
+    // modules with their individual segments (for whole-module dumps)
+    enum_result_t<ps4_module_t>   ps4_modules(const target_handle_t& h);
+    // raw maps of the handle's process
+    enum_result_t<ps4_segment_t>  ps4_maps(const target_handle_t& h);
+
+    // ---- thread context
     io_result_t get_thread_context(uint32_t tid, thread_context_t& ctx) override;
     io_result_t set_thread_context(uint32_t tid, const thread_context_t& ctx) override;
 
-    // Query
+    // ---- query
     arch_t      query_arch(const target_handle_t& h) override;
     elevation_t query_elevation() override;
+    bool        handle_info(const target_handle_t& h, process_info_t& out) override;
 
     // ---- live debug session (ps4debug-NG remote debugger) -----------------
     // These drive CMD_DEBUG_* on the same connection; ps4_debug_attach also
@@ -77,6 +159,7 @@ public:
     bool        ps4_debug_attach(uint32_t pid, std::string& err);
     bool        ps4_debug_detach();
     bool        ps4_debug_attached() const noexcept;
+    bool        ps4_debug_held() const noexcept;   // a stop event is holding the debuggee
     uint32_t    ps4_debug_pid() const noexcept;
 
     io_result_t ps4_set_breakpoint(uint32_t index, bool enabled, uintptr_t addr);
@@ -89,8 +172,37 @@ public:
     io_result_t ps4_process_stop(uint32_t pid, uint32_t state);
     io_result_t ps4_get_dbregs(uint32_t lwpid, uint64_t dr[16]);
 
+    // ---- client-side breakpoint/watchpoint slot bookkeeping ---------------
+    // The payload cannot list its slots, so this client records what it
+    // armed. Records are cleared when the debug session ends (detach, SIGKILL,
+    // event channel closed by the payload, attach to another pid, connect,
+    // disconnect); a dropped connection keeps them (armed=false) so
+    // reconnect() can re-arm them. Slots are reserved under a small lock and
+    // the wire call runs without it.
+    static constexpr uint32_t kAutoSlot = 0xFFFFFFFFu;
+    struct ps4_slot_t {
+        uint32_t index = 0;
+        uint64_t addr  = 0;
+        uint32_t len   = 0;     // watchpoints only
+        uint32_t type  = 0;     // watchpoints only (ps4::kWp*)
+        bool     armed = false; // false while the connection is down
+    };
+    std::vector<ps4_slot_t> ps4_breakpoints() const;
+    std::vector<ps4_slot_t> ps4_watchpoints() const;
+    // index == kAutoSlot: reuse the slot already armed at addr, else the first
+    // free one. reused says whether addr was already armed by us
+    io_result_t ps4_bp_arm(uint64_t addr, uint32_t index, uint32_t& out_index,
+                           bool* reused = nullptr);
+    io_result_t ps4_bp_disarm(uint32_t index, uint64_t* out_addr = nullptr);
+    io_result_t ps4_bp_disarm_addr(uint64_t addr, uint32_t* out_index = nullptr);
+    io_result_t ps4_wp_arm(uint64_t addr, uint32_t len, uint32_t type, uint32_t index,
+                           uint32_t& out_index, bool* reused = nullptr);
+    io_result_t ps4_wp_disarm(uint32_t index, uint64_t* out_addr = nullptr);
+    io_result_t ps4_wp_disarm_addr(uint64_t addr, uint32_t* out_index = nullptr);
+
     // remote function call through the payload's rpc stub (CMD_PROC_INTALL /
-    // CMD_PROC_CALL); args are rdi, rsi, rdx, rcx, r8, r9
+    // CMD_PROC_CALL); args are rdi, rsi, rdx, rcx, r8, r9. ps4_install caches
+    // the stub per pid (cleared on connect/disconnect)
     io_result_t ps4_install(uint32_t pid, uint64_t& rpcstub);
     io_result_t ps4_call(uint32_t pid, uint64_t rpcstub, uint64_t rip,
                          const uint64_t args[6], uint64_t& out_rax);
@@ -99,6 +211,9 @@ public:
     size_t                   ps4_pending_events();
     bool                     ps4_wait_event(ps4_event_t& out, int timeout_ms);
     std::vector<ps4_event_t> ps4_drain_events(size_t max, bool clear);
+    uint64_t                 ps4_events_received() const noexcept;  // packets decoded
+    uint64_t                 ps4_events_dropped() const noexcept;   // lost to the queue cap
+    static constexpr size_t  kMaxQueuedEvents = 4096;
 
     // ---- console-side capabilities (ps4debug-NG) ---------------------------
 
@@ -107,6 +222,19 @@ public:
     // Run automatically on connect; bit 1 (0x2) unlocks the scan family.
     bool ps4_auth(uint32_t flags, std::string& err);
     bool ps4_authed() const noexcept;
+
+    // CMD_CONSOLE_INFO roundtrip (the payload answers a bare CMD_SUCCESS)
+    // plus everything the handshake learned about the console
+    struct ps4_console_info_t {
+        bool        alive = false;      // CMD_CONSOLE_INFO answered
+        std::string endpoint, branding, caps, version, fw;
+        uint16_t    fw_bcd = 0;
+        uint16_t    platform = 0;       // CMD_PLATFORM_ID tag (4 = PS4)
+        bool        authed = false;
+        uint32_t    debug_pid = 0;
+        uint64_t    drops = 0;
+    };
+    io_result_t ps4_console_info(ps4_console_info_t& out);
 
     // one scan hit: absolute address plus the raw value bytes found there
     struct ps4_scan_hit_t {
@@ -122,16 +250,23 @@ public:
                                std::vector<ps4_scan_hit_t>& hits);
     // SCAN_COUNT: narrow previous hits (offsets relative to base) with a new
     // comparison. prev entries carry the value bytes when the compare type
-    // needs the previous value
+    // needs the previous value; every such value must be exactly the value
+    // width (fixed width, or data.size() for arrbytes/string) and every hit
+    // must lie in [base, base + 4 GiB) or the call fails before sending
     io_result_t ps4_scan_next(uint32_t pid, uint64_t base,
                               uint8_t valtype, uint8_t cmptype,
                               const std::vector<ps4_scan_hit_t>& prev,
                               const std::vector<uint8_t>& data,
                               std::vector<ps4_scan_hit_t>& hits);
-    // legacy whole-memory single-pass scan (CMD_PROC_SCAN)
+    // max previous-hit bytes per SCAN_COUNT chunk (protocol chunk cap)
+    static constexpr uint32_t kScanChunkCap = 0x20000;
+    // legacy whole-memory single-pass scan (CMD_PROC_SCAN). Past kMaxScanAll
+    // addresses the rest of the stream is drained (connection stays in sync)
+    // and *truncated is set
+    static constexpr size_t kMaxScanAll = 0x1000000;
     io_result_t ps4_scan_all(uint32_t pid, uint8_t valtype, uint8_t cmptype,
                              const std::vector<uint8_t>& data,
-                             std::vector<uint64_t>& addrs);
+                             std::vector<uint64_t>& addrs, bool* truncated = nullptr);
     // array-of-bytes scan over [addr, addr+len); mask byte 1 = exact, 0 = wildcard.
     // Returns the max_matches-th match (0 if none / invalidated)
     io_result_t ps4_scan_aob(uint32_t pid, uint64_t addr, uint32_t len,
@@ -152,15 +287,20 @@ public:
         uint8_t  mem_scale = 0;
         uint8_t  mnemonic_lo = 0;
     };
+    // entries past max_entries are drained to the sentinel and dropped
+    // (*truncated = true), the command stream never desyncs
     io_result_t ps4_disasm_region(uint32_t pid, uint64_t addr, uint32_t len,
                                   uint32_t max_entries,
-                                  std::vector<ps4_disasm_entry_t>& out);
+                                  std::vector<ps4_disasm_entry_t>& out,
+                                  bool* truncated = nullptr);
     // RIP-relative branch/call targets inside [addr, addr+len)
     io_result_t ps4_extract_xrefs(uint32_t pid, uint64_t addr, uint32_t len,
-                                  uint32_t max_instrs, std::vector<uint64_t>& targets);
+                                  uint32_t max_instrs, std::vector<uint64_t>& targets,
+                                  bool* truncated = nullptr);
     // addresses inside [addr, addr+len) that branch/call target
     io_result_t ps4_find_xrefs_to(uint32_t pid, uint64_t addr, uint32_t len,
-                                  uint64_t target, std::vector<uint64_t>& addrs);
+                                  uint64_t target, std::vector<uint64_t>& addrs,
+                                  bool* truncated = nullptr);
 
     // one server-side stack frame from CMD_PROC_READ_STACK
     struct ps4_stack_frame_t {
@@ -169,6 +309,8 @@ public:
         std::vector<uint8_t> locals;        // rsp..rbp bytes when present
         std::vector<uint8_t> code;          // window around ret_addr
     };
+    // ok=false (kErrProtocol) when the bundle holds fewer frames than it
+    // claims; the frames that did parse are still returned
     io_result_t ps4_read_stack(uint32_t pid, uint64_t rbp, uint64_t rsp,
                                uint32_t depth, std::vector<ps4_stack_frame_t>& frames);
 
@@ -199,6 +341,14 @@ public:
     io_result_t ps4_set_dbregs(uint32_t lwpid, const uint8_t dr[128]);
     io_result_t ps4_get_fsgsbase(uint32_t lwpid, uint64_t& fs_base, uint64_t& gs_base);
     io_result_t ps4_set_fsgsbase(uint32_t lwpid, uint64_t fs_base, uint64_t gs_base);
+
+    // ---- tuning (tests use these to exercise deadlines quickly) -----------
+    // per-chunk idle timeout and whole-command budget, milliseconds
+    void set_timeouts(int io_timeout_ms, int64_t command_budget_ms,
+                      int64_t long_command_budget_ms);
+    // port the debug-event listener binds (the payload always connects back
+    // to 755; only tests override this)
+    void set_event_port(uint16_t port);
 
 private:
     struct impl_t;

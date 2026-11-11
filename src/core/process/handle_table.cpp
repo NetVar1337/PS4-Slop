@@ -15,17 +15,17 @@ infra::published_t<handle_table_t> g_handles;
 } // namespace
 
 uint64_t refresh_handles() {
-    const auto s = active_session();
+    // the job holds the session (see refresh_threads)
+    auto s = active_session();
     if (!s || !s->valid()) return 0;
-    const uint32_t pid = s->pid();
     return infra::jobs::submit({
         "Enumerate handles", "handle_table", false,
-        [pid](infra::job_context_t& ctx) {
-            auto r = runtime::active().enum_handles(pid);
+        [s](infra::job_context_t& ctx) {
+            auto r = s->backend()->enum_handles(s->pid());
             auto snap = std::make_shared<handle_table_t>();
             snap->sampled_ms = infra::wall_ms();
             if (r.ok) snap->items = std::move(r.items);
-            if (ctx.cancelled()) return;
+            if (ctx.cancelled() || active_session() != s) return;
             g_handles.publish(std::move(snap));
         }});
 }

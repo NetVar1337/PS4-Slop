@@ -53,6 +53,7 @@ struct thread_info_t {
     uint32_t owner_pid       = 0;
     uintptr_t start_address  = 0;
     int32_t  priority        = 0;
+    std::string name;               // thread name when the backend knows it
 };
 
 struct region_info_t {
@@ -146,6 +147,13 @@ public:
     // query
     virtual arch_t      query_arch(const target_handle_t& h) = 0;
     virtual elevation_t query_elevation() = 0;
+
+    // identity of an attached handle (name/path/arch/elevation) without a
+    // full process enumeration; false = backend cannot tell cheaply
+    virtual bool handle_info(const target_handle_t& h, process_info_t& out) {
+        (void)h; (void)out;
+        return false;
+    }
 };
 
 } // namespace slop::core::runtime

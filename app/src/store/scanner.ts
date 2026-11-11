@@ -3,7 +3,7 @@
 // lives in the engine
 
 import { create } from "zustand";
-import { call } from "@/lib/rpc";
+import { call, errorText } from "@/lib/rpc";
 
 export type Hit = {
   addr: number;
@@ -21,14 +21,30 @@ export type ScanState = {
 };
 
 export const kWidths = [
-  "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "all",
+  "i8",
+  "u8",
+  "i16",
+  "u16",
+  "i32",
+  "u32",
+  "i64",
+  "u64",
+  "f32",
+  "f64",
+  "all",
 ] as const;
 
 /** First pass can only seed; the comparison kinds need a previous result set. */
 export const kFirstKinds = ["exact", "unknown"] as const;
 export const kNextKinds = [
-  "exact", "between", "bigger", "smaller",
-  "increased", "decreased", "changed", "unchanged",
+  "exact",
+  "between",
+  "bigger",
+  "smaller",
+  "increased",
+  "decreased",
+  "changed",
+  "unchanged",
 ] as const;
 
 type ScannerStore = {
@@ -92,10 +108,12 @@ export const useScanner = create<ScannerStore>((set, get) => ({
         "memory",
         rescan ? "rescan" : "scan",
         params,
+        // a full first pass over a large process takes a while; it still ends
+        { timeoutMs: 300_000 },
       );
       set({ hits: res.hits ?? [], total: res.total ?? 0, hasState: true });
     } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
+      set({ error: errorText(e) });
     } finally {
       set({ busy: false });
     }

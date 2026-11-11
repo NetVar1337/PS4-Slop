@@ -1,0 +1,66 @@
+name: bench
+
+# Weekly (and on demand) benchmark run against the baselines committed in
+# docs/benchmarks (see docs/benchmarks/README.md).
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+    inputs:
+      max_slowdown:
+        description: 'Fail when a median exceeds baseline x this factor'
+        default: '3.0'
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_DISABLE_FIND_PACKAGE_PkgConfig: TRUE
+  CMAKE_DISABLE_FIND_PACKAGE_Doxygen: TRUE
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  bench:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: cache _ext (cmake deps sources)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: _ext/*-src
+          key: ext-sources-v3-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            ext-sources-v3-${{ runner.os }}-
+
+      - name: setup node with npm cache
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: install frontend deps
+        working-directory: app
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: build + run + compare
+        shell: pwsh
+        run: powershell -NoProfile -File tools\run_benchmarks.ps1 -MaxSlowdown ${{ github.event.inputs.max_slowdown || '3.0' }}
+
+      - name: upload results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bench-results
+          path: build/bench/*.json
+          if-no-files-found: warn

@@ -1,6 +1,5 @@
 // src/core/network/capture_service.cpp
-// host-side raw-socket capture (SIO_RCVALL promiscuous mode) feeding the
-// traffic store; replaces the old kernel/WFP front end. RCVALL needs admin.
+// host-side raw-socket capture (SIO_RCVALL) feeding the traffic store
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -8,6 +7,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
+#include <iphlpapi.h>
+#include <mswsock.h>
 
 #include "core/network/capture_service.hpp"
 
@@ -16,69 +17,57 @@
 #include <chrono>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 namespace slop::core::network {
 namespace capture {
 namespace {
 
-#pragma pack(push, 1)
-struct eth_hdr_t { uint8_t dst[6]; uint8_t src[6]; uint16_t type; };
-struct ipv4_hdr_t {
-    uint8_t  ver_ihl;
-    uint8_t  tos;
-    uint16_t total_len;
-    uint16_t id;
-    uint16_t frag_off;
-    uint8_t  ttl;
-    uint8_t  proto;
-    uint16_t checksum;
-    uint32_t src;
-    uint32_t dst;
+constexpr int64_t kIfaceRefreshMs = 15000;
+constexpr size_t  kPendingCap = 16384;
+constexpr size_t  kDnsCap = 4096;
+
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+struct sock_t {
+    SOCKET          s = INVALID_SOCKET;
+    capture_iface_t info;
+    std::string     key;      // adapter name + family
 };
-struct tcp_hdr_t {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint32_t seq;
-    uint32_t ack;
-    uint8_t  data_off;   // high nibble
-    uint8_t  flags;
-    uint16_t window;
-    uint16_t checksum;
-    uint16_t urg;
-};
-struct udp_hdr_t {
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint16_t len;
-    uint16_t checksum;
-};
-#pragma pack(pop)
 
 struct state_t {
-    std::mutex mu;
-    SOCKET sock = INVALID_SOCKET;
+    std::mutex mu;                         // everything below except atomics
     std::thread th;
     std::atomic<bool> stop_flag{false};
     std::atomic<bool> active{false};
+    bool wsa = false;
 
-    // filters
-    uint32_t filter_pid = 0, filter_port = 0, filter_protocol = 0;
+    std::vector<sock_t> socks;             // owned by the capture thread while active
+    std::vector<capture_iface_t> ifaces;   // last enumeration result (incl. failures)
+    std::vector<parse::ip_addr_t> locals;  // every unicast address of this host
+    int64_t locals_at = 0;
 
-    // raw captured packets waiting to be pulled into the store
+    capture_filter_t filter;
+    std::optional<parse::ip_addr_t> filter_host;
+
+    parse::reassembler_t frags;
     std::deque<packet_record_t> pending;
-    size_t pending_cap = 65536;
-
-    // parsed dns
     std::deque<dns_record_t> dns;
-    size_t dns_cap = 4096;
 
-    // counters
-    std::atomic<uint64_t> total_captured{0};
-    std::atomic<uint64_t> total_dropped{0};
-    std::atomic<uint64_t> bytes_in{0};
-    std::atomic<uint64_t> bytes_out{0};
+    uint64_t packets_seen = 0, packets_in = 0, packets_out = 0;
+    uint64_t bytes_in = 0, bytes_out = 0, filtered_out = 0, parse_errors = 0;
+    uint64_t non_tcp_udp = 0, fragments = 0, queue_dropped = 0, payload_truncated = 0;
+    uint64_t dns_total = 0;
 };
 
 state_t& st() {
@@ -86,218 +75,391 @@ state_t& st() {
     return s;
 }
 
-std::string ip_str(uint32_t addr) {
-    in_addr a{};
-    a.s_addr = addr;
-    char buf[INET_ADDRSTRLEN]{};
-    return inet_ntop(AF_INET, &a, buf, sizeof(buf)) ? buf : std::string{};
+std::string wsa_error_text(int e) {
+    switch (e) {
+        case WSAEACCES: return "access denied - run the engine elevated for SIO_RCVALL";
+        case WSAEINVAL: return "invalid argument (interface does not support SIO_RCVALL)";
+        case WSAEADDRNOTAVAIL: return "address not available";
+        case WSAEAFNOSUPPORT: return "address family not supported";
+        default: return "winsock error " + std::to_string(e);
+    }
 }
 
-// local addresses of this host, for direction classification
-std::vector<uint32_t> local_addrs() {
-    std::vector<uint32_t> out;
-    char host[256]{};
-    if (::gethostname(host, sizeof(host)) != 0) return out;
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    addrinfo* res = nullptr;
-    if (::getaddrinfo(host, nullptr, &hints, &res) == 0) {
-        for (addrinfo* p = res; p; p = p->ai_next) {
-            if (p->ai_addr && p->ai_addrlen >= sizeof(sockaddr_in)) {
-                const auto* sin = reinterpret_cast<const sockaddr_in*>(p->ai_addr);
-                if (sin->sin_addr.s_addr != 0)
-                    out.push_back(sin->sin_addr.s_addr);
+std::string narrow(const wchar_t* w) {
+    if (!w) return {};
+    const int n = ::WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string out(static_cast<size_t>(n - 1), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+
+struct adapter_addr_t {
+    std::string key, name;
+    sockaddr_storage sa{};
+    int sa_len = 0;
+    uint8_t family = 4;
+    parse::ip_addr_t ip;
+};
+
+// up, non-loopback adapters: one bind address per family; every unicast
+// address (loopback included) goes into `locals`
+std::vector<adapter_addr_t> enumerate(std::vector<parse::ip_addr_t>& locals) {
+    std::vector<adapter_addr_t> out;
+    locals.clear();
+    ULONG size = 16 * 1024;
+    std::vector<uint8_t> buf;
+    ULONG rc = ERROR_BUFFER_OVERFLOW;
+    for (int tries = 0; tries < 4 && rc == ERROR_BUFFER_OVERFLOW; ++tries) {
+        buf.resize(size);
+        rc = ::GetAdaptersAddresses(AF_UNSPEC,
+                                    GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                                        GAA_FLAG_SKIP_DNS_SERVER,
+                                    nullptr,
+                                    reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &size);
+    }
+    if (rc != NO_ERROR) return out;
+    for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()); a; a = a->Next) {
+        const bool usable = a->OperStatus == IfOperStatusUp &&
+                            a->IfType != IF_TYPE_SOFTWARE_LOOPBACK;
+        bool have4 = false, have6 = false;
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            const sockaddr* sa = u->Address.lpSockaddr;
+            if (!sa) continue;
+            adapter_addr_t aa;
+            if (sa->sa_family == AF_INET) {
+                const auto* sin = reinterpret_cast<const sockaddr_in*>(sa);
+                aa.ip = parse::make_v4(reinterpret_cast<const uint8_t*>(&sin->sin_addr));
+                aa.family = 4;
+                aa.sa_len = sizeof(sockaddr_in);
+            } else if (sa->sa_family == AF_INET6) {
+                const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(sa);
+                aa.ip = parse::make_v6(reinterpret_cast<const uint8_t*>(&sin6->sin6_addr));
+                aa.family = 6;
+                aa.sa_len = sizeof(sockaddr_in6);
+            } else {
+                continue;
             }
+            locals.push_back(aa.ip);
+            if (!usable) continue;
+            bool& have = aa.family == 4 ? have4 : have6;
+            if (have) continue;
+            have = true;
+            std::memcpy(&aa.sa, sa, static_cast<size_t>(aa.sa_len));
+            aa.name = narrow(a->FriendlyName);
+            aa.key = std::string(a->AdapterName ? a->AdapterName : "") + (aa.family == 4 ? "/4" : "/6");
+            out.push_back(std::move(aa));
         }
-        ::freeaddrinfo(res);
     }
     return out;
 }
 
-// minimal dns message parser: collect QNAMEs of queries and A answers.
-// caller holds st().mu
-void parse_dns(const uint8_t* payload, size_t len, bool is_response,
-               std::deque<dns_record_t>& out, size_t dns_cap) {
-    if (len < 12) return;
-    const uint16_t flags = (payload[2] << 8) | payload[3];
-    const uint16_t qd = (payload[4] << 8) | payload[5];
-    const uint16_t an = (payload[6] << 8) | payload[7];
-    const bool qr = (flags >> 15) & 1;
-    if (qr != is_response) return;
-    size_t off = 12;
-    auto read_name = [&](size_t& o, std::string& name) -> bool {
-        name.clear();
-        int jumps = 0;
-        size_t pos = o;
-        size_t end = 0;
-        while (true) {
-            if (pos >= len) return false;
-            const uint8_t l = payload[pos];
-            if (l == 0) {
-                if (end == 0) end = pos + 1;
-                break;
-            }
-            if ((l & 0xC0) == 0xC0) {
-                if (pos + 1 >= len) return false;
-                const size_t ptr = ((l & 0x3F) << 8) | payload[pos + 1];
-                if (end == 0) end = pos + 2;
-                pos = ptr;
-                if (++jumps > 16) return false;
-                continue;
-            }
-            if (pos + 1 + l > len) return false;
-            if (!name.empty()) name += '.';
-            name.append(reinterpret_cast<const char*>(payload + pos + 1), l);
-            pos += 1 + l;
-        }
-        o = end;
-        return true;
-    };
-    auto now_ms = [] {
-        return static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count());
-    };
-    std::string qname;
-    uint16_t qtype = 0;
-    for (uint16_t i = 0; i < qd && off < len; ++i) {
-        if (!read_name(off, qname)) return;
-        if (off + 4 > len) return;
-        qtype = (payload[off] << 8) | payload[off + 1];
-        off += 4;
+// opens a raw socket on one adapter address with RCVALL enabled
+sock_t open_socket(const adapter_addr_t& a) {
+    sock_t s;
+    s.key = a.key;
+    s.info.name = a.name;
+    s.info.address = parse::to_string(a.ip);
+    s.info.family = a.family;
+    const int af = a.family == 4 ? AF_INET : AF_INET6;
+    SOCKET sk = ::socket(af, SOCK_RAW, IPPROTO_IP);
+    if (sk == INVALID_SOCKET && af == AF_INET6) sk = ::socket(af, SOCK_RAW, IPPROTO_IPV6);
+    if (sk == INVALID_SOCKET) {
+        s.info.error = "raw socket: " + wsa_error_text(::WSAGetLastError());
+        return s;
     }
-    if (qname.empty()) return;
-    if (!is_response) {
-        dns_record_t r{};
-        r.timestamp = now_ms();
-        r.query_type = qtype;
-        r.domain = qname;
-        out.push_back(r);
-        if (out.size() > dns_cap) out.pop_front();
-        return;
+    if (::bind(sk, reinterpret_cast<const sockaddr*>(&a.sa), a.sa_len) != 0) {
+        s.info.error = "bind: " + wsa_error_text(::WSAGetLastError());
+        ::closesocket(sk);
+        return s;
     }
-    // response: walk answers for A records
-    const uint16_t rcode = flags & 0xF;
-    uint32_t ttl = 0;
-    std::string resolved;
-    for (uint16_t i = 0; i < an && off + 10 <= len; ++i) {
-        std::string aname;
-        if (!read_name(off, aname)) break;
-        const uint16_t type = (payload[off] << 8) | payload[off + 1];
-        ttl = (payload[off + 4] << 24) | (payload[off + 5] << 16) |
-              (payload[off + 6] << 8) | payload[off + 7];
-        const uint16_t rdlen = (payload[off + 8] << 8) | payload[off + 9];
-        off += 10;
-        if (off + rdlen > len) break;
-        if (type == 1 && rdlen == 4) {
-            resolved = ip_str((payload[off] << 24) | (payload[off + 1] << 16) |
-                              (payload[off + 2] << 8) | payload[off + 3]);
-            break;
-        }
-        off += rdlen;
+    DWORD on = RCVALL_ON, bytes = 0;
+    if (::WSAIoctl(sk, SIO_RCVALL, &on, sizeof(on), nullptr, 0, &bytes, nullptr, nullptr) ==
+        SOCKET_ERROR) {
+        s.info.error = "SIO_RCVALL: " + wsa_error_text(::WSAGetLastError());
+        ::closesocket(sk);
+        return s;
     }
-    dns_record_t r{};
-    r.timestamp = now_ms();
-    r.query_type = qtype;
-    r.domain = qname;
-    r.resolved_addr = resolved;
-    r.response_code = rcode;
-    r.ttl = ttl;
-    out.push_back(r);
-    if (out.size() > dns_cap) out.pop_front();
+    u_long nonblock = 1;
+    ::ioctlsocket(sk, FIONBIO, &nonblock);
+    int rcvbuf = 4 << 20;
+    ::setsockopt(sk, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+    if (af == AF_INET6) {
+        DWORD on6 = 1;   // destination address of each datagram via WSARecvMsg
+        ::setsockopt(sk, IPPROTO_IPV6, IPV6_PKTINFO, reinterpret_cast<const char*>(&on6), sizeof(on6));
+    }
+    s.s = sk;
+    s.info.active = true;
+    return s;
 }
 
-void handle_frame(const uint8_t* frame, size_t len) {
-    state_t& s = st();
-    if (len < sizeof(eth_hdr_t) + sizeof(ipv4_hdr_t)) return;
-    const auto* eth = reinterpret_cast<const eth_hdr_t*>(frame);
-    if (ntohs(eth->type) != 0x0800) return;   // ipv4 only
-    const auto* ip = reinterpret_cast<const ipv4_hdr_t*>(frame + sizeof(eth_hdr_t));
-    const size_t ihl = (ip->ver_ihl & 0x0F) * 4;
-    if (ihl < 20 || len < sizeof(eth_hdr_t) + ihl) return;
-    const uint8_t proto = ip->proto;
-    if (proto != 6 && proto != 17) return;
-    const uint8_t* l4 = frame + sizeof(eth_hdr_t) + ihl;
-    const size_t l4_len = len - sizeof(eth_hdr_t) - ihl;
-    uint16_t src_port = 0, dst_port = 0;
-    const uint8_t* payload = nullptr;
-    size_t payload_len = 0;
-    if (proto == 6) {
-        if (l4_len < sizeof(tcp_hdr_t)) return;
-        const auto* tcp = reinterpret_cast<const tcp_hdr_t*>(l4);
-        src_port = ntohs(tcp->src_port);
-        dst_port = ntohs(tcp->dst_port);
-        const size_t doff = (tcp->data_off >> 4) * 4;
-        if (doff < sizeof(tcp_hdr_t) || doff > l4_len) return;
-        payload = l4 + doff;
-        payload_len = l4_len - doff;
-        if (payload_len == 0) return;   // pure ack, no payload to store
-    } else {
-        if (l4_len < sizeof(udp_hdr_t)) return;
-        const auto* udp = reinterpret_cast<const udp_hdr_t*>(l4);
-        src_port = ntohs(udp->src_port);
-        dst_port = ntohs(udp->dst_port);
-        payload = l4 + sizeof(udp_hdr_t);
-        payload_len = l4_len - sizeof(udp_hdr_t);
+void close_socket(sock_t& s) {
+    if (s.s == INVALID_SOCKET) return;
+    DWORD off = RCVALL_OFF, bytes = 0;
+    ::WSAIoctl(s.s, SIO_RCVALL, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
+    ::closesocket(s.s);
+    s.s = INVALID_SOCKET;
+    s.info.active = false;
+}
+
+bool is_local(const state_t& s, const parse::ip_addr_t& a) {
+    return std::find(s.locals.begin(), s.locals.end(), a) != s.locals.end();
+}
+
+// caller holds s.mu
+void handle_l4(state_t& s, const parse::ip_addr_t& src, const parse::ip_addr_t& dst,
+               uint8_t proto, const uint8_t* l4, size_t l4_len, uint32_t l4_wire_len,
+               size_t ip_bytes, int64_t at) {
+    if (proto != 6 && proto != 17) {
+        ++s.non_tcp_udp;
+        return;
+    }
+    parse::l4_info_t l;
+    if (parse::parse_l4(proto, l4, l4_len, l4_wire_len, l) != parse::status_t::ok) {
+        ++s.parse_errors;
+        return;
+    }
+    if (s.filter_host && !(src == *s.filter_host || dst == *s.filter_host)) {
+        ++s.filtered_out;
+        return;
     }
 
-    static const auto locals = local_addrs();
-    const bool inbound = std::find(locals.begin(), locals.end(), ip->dst) != locals.end();
+    // direction: this host first, then the filtered peer (a console behind
+    // ICS / a mirror port), then the ephemeral-port side as the client
+    bool outbound;
+    if (is_local(s, src)) outbound = true;
+    else if (is_local(s, dst)) outbound = false;
+    else if (s.filter_host) outbound = src == *s.filter_host;
+    else outbound = l.src_port >= l.dst_port;
 
-    packet_record_t rec{};
-    rec.at_ms = static_cast<int64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    rec.protocol = proto;
-    rec.direction = inbound ? 1 : 0;
-    rec.local_addr = inbound ? ip_str(ip->dst) : ip_str(ip->src);
-    rec.local_port = inbound ? dst_port : src_port;
-    rec.remote_addr = inbound ? ip_str(ip->src) : ip_str(ip->dst);
-    rec.remote_port = inbound ? src_port : dst_port;
-    rec.payload.assign(payload, payload + std::min<size_t>(payload_len, 1536));
-
-    s.total_captured.fetch_add(1);
-    if (inbound) s.bytes_in.fetch_add(len); else s.bytes_out.fetch_add(len);
-    {
-        std::lock_guard lk(s.mu);
-        if (proto == 17 && payload_len > 0 && (src_port == 53 || dst_port == 53))
-            parse_dns(payload, payload_len, src_port == 53, s.dns, s.dns_cap);
-        if (s.pending.size() >= s.pending_cap) {
-            s.pending.pop_front();
-            s.total_dropped.fetch_add(1);
+    if (proto == 17 && (l.src_port == 53 || l.dst_port == 53) && l.payload_len) {
+        if (auto r = parse::parse_dns(l.payload, l.payload_len)) {
+            r->timestamp = static_cast<uint64_t>(at);
+            const bool from_server = l.src_port == 53;
+            r->client_addr = parse::to_string(from_server ? dst : src);
+            r->server_addr = parse::to_string(from_server ? src : dst);
+            s.dns.push_back(std::move(*r));
+            if (s.dns.size() > kDnsCap) s.dns.pop_front();
+            ++s.dns_total;
         }
-        s.pending.push_back(std::move(rec));
     }
+
+    if (s.filter.protocol && s.filter.protocol != proto) { ++s.filtered_out; return; }
+    if (s.filter.port && l.src_port != s.filter.port && l.dst_port != s.filter.port) {
+        ++s.filtered_out;
+        return;
+    }
+    if (proto == 6 && l.payload_wire_len == 0) return;   // bare ACK / handshake
+
+    packet_record_t rec;
+    rec.at_ms = at;
+    rec.protocol = proto;
+    rec.ip_version = src.family;
+    rec.direction = outbound ? 0 : 1;
+    rec.local_addr = parse::to_string(outbound ? src : dst);
+    rec.local_port = outbound ? l.src_port : l.dst_port;
+    rec.remote_addr = parse::to_string(outbound ? dst : src);
+    rec.remote_port = outbound ? l.dst_port : l.src_port;
+    rec.wire_len = l.payload_wire_len;
+    rec.tcp_seq = l.tcp_seq;
+    rec.tcp_ack = l.tcp_ack;
+    rec.tcp_flags = l.tcp_flags;
+    const size_t keep = std::min(l.payload_len, kMaxPayload);
+    if (l.payload_wire_len > keep) ++s.payload_truncated;
+    rec.payload.assign(l.payload, l.payload + keep);
+
+    if (outbound) { ++s.packets_out; s.bytes_out += ip_bytes; }
+    else          { ++s.packets_in;  s.bytes_in += ip_bytes; }
+    if (s.pending.size() >= kPendingCap) {
+        s.pending.pop_front();
+        ++s.queue_dropped;
+    }
+    s.pending.push_back(std::move(rec));
+}
+
+// caller holds s.mu
+void handle_fragment(state_t& s, const parse::ip_info_t& ip, int64_t at) {
+    ++s.fragments;
+    auto dg = s.frags.add(ip, at);
+    if (!dg) return;
+    uint8_t proto = dg->proto;
+    const uint8_t* p = dg->l4.data();
+    size_t len = dg->l4.size();
+    if (ip.src.family == 6 && parse::skip_v6_ext(proto, p, len) != parse::status_t::ok) {
+        ++s.parse_errors;
+        return;
+    }
+    handle_l4(s, ip.src, ip.dst, proto, p, len, static_cast<uint32_t>(len),
+              dg->l4.size() + (ip.src.family == 4 ? 20 : 40), at);
+}
+
+void handle_datagram(state_t& s, const uint8_t* d, size_t n, int64_t at) {
+    ++s.packets_seen;
+    parse::ip_info_t ip;
+    if (parse::parse_ip(d, n, ip) != parse::status_t::ok) {
+        ++s.parse_errors;
+        return;
+    }
+    if (ip.fragment) return handle_fragment(s, ip, at);
+    handle_l4(s, ip.src, ip.dst, ip.proto, ip.l4, ip.l4_len, ip.l4_wire_len, n, at);
+}
+
+// IPv6 raw sockets hand over the bytes after the last IPv6 header only; the
+// addresses come from WSARecvMsg and the transport is inferred
+void handle_v6_transport(state_t& s, const parse::ip_addr_t& src, const parse::ip_addr_t& dst,
+                         const uint8_t* d, size_t n, int64_t at) {
+    ++s.packets_seen;
+    const uint8_t proto = parse::infer_v6_transport(src, dst, d, n);
+    if (proto == 6 || proto == 17)
+        return handle_l4(s, src, dst, proto, d, n, static_cast<uint32_t>(n), n + 40, at);
+    if (proto == 58) {
+        ++s.non_tcp_udp;
+        return;
+    }
+    if (proto != 44) {
+        ++s.parse_errors;
+        return;
+    }
+    parse::ip_info_t ip;
+    ip.src = src;
+    ip.dst = dst;
+    ip.proto = d[0];
+    ip.l4 = d + 8;
+    ip.l4_len = n - 8;
+    ip.l4_wire_len = static_cast<uint32_t>(n - 8);
+    const uint16_t fo = static_cast<uint16_t>((static_cast<uint16_t>(d[2]) << 8) | d[3]);
+    ip.frag_offset = fo & 0xFFF8u;
+    ip.more_fragments = (fo & 1) != 0;
+    ip.frag_id = (static_cast<uint32_t>(d[4]) << 24) | (static_cast<uint32_t>(d[5]) << 16) |
+                 (static_cast<uint32_t>(d[6]) << 8) | d[7];
+    ip.fragment = ip.frag_offset != 0 || ip.more_fragments;
+    if (ip.fragment) return handle_fragment(s, ip, at);
+    handle_l4(s, src, dst, ip.proto, ip.l4, ip.l4_len, ip.l4_wire_len, n + 40, at);
+}
+
+LPFN_WSARECVMSG wsa_recvmsg(SOCKET sk) {
+    static LPFN_WSARECVMSG fn = nullptr;
+    if (!fn) {
+        GUID guid = WSAID_WSARECVMSG;
+        DWORD bytes = 0;
+        ::WSAIoctl(sk, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, sizeof(guid), &fn,
+                   sizeof(fn), &bytes, nullptr, nullptr);
+    }
+    return fn;
+}
+
+// one IPv6 datagram: payload, source from the sender address, destination
+// from IPV6_PKTINFO. Returns the byte count or <= 0
+int recv_v6(SOCKET sk, std::vector<uint8_t>& buf, parse::ip_addr_t& src, parse::ip_addr_t& dst) {
+    LPFN_WSARECVMSG fn = wsa_recvmsg(sk);
+    if (!fn) return -1;
+    sockaddr_in6 from{};
+    char control[WSA_CMSG_SPACE(sizeof(IN6_PKTINFO))]{};
+    WSABUF data{static_cast<ULONG>(buf.size()), reinterpret_cast<CHAR*>(buf.data())};
+    WSAMSG msg{};
+    msg.name = reinterpret_cast<LPSOCKADDR>(&from);
+    msg.namelen = sizeof(from);
+    msg.lpBuffers = &data;
+    msg.dwBufferCount = 1;
+    msg.Control = {sizeof(control), control};
+    DWORD got = 0;
+    if (fn(sk, &msg, &got, nullptr, nullptr) != 0) return -1;
+    src = parse::make_v6(reinterpret_cast<const uint8_t*>(&from.sin6_addr));
+    dst = parse::ip_addr_t{};
+    for (WSACMSGHDR* c = WSA_CMSG_FIRSTHDR(&msg); c; c = WSA_CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == IPPROTO_IPV6 && c->cmsg_type == IPV6_PKTINFO) {
+            const auto* pi = reinterpret_cast<const IN6_PKTINFO*>(WSA_CMSG_DATA(c));
+            dst = parse::make_v6(reinterpret_cast<const uint8_t*>(&pi->ipi6_addr));
+        }
+    }
+    return dst.valid() ? static_cast<int>(got) : -1;
+}
+
+// re-enumerates adapters: refreshes the local address set, opens sockets for
+// new interfaces and closes those whose adapter went away. Socket thread only
+void refresh_interfaces(state_t& s) {
+    std::vector<parse::ip_addr_t> locals;
+    auto addrs = enumerate(locals);
+    std::vector<sock_t> keep;
+    for (auto& sk : s.socks) {
+        const bool present = std::any_of(addrs.begin(), addrs.end(), [&](const adapter_addr_t& a) {
+            return a.key == sk.key && parse::to_string(a.ip) == sk.info.address;
+        });
+        if (present) keep.push_back(sk);
+        else close_socket(sk);
+    }
+    std::vector<capture_iface_t> ifaces;
+    for (const auto& a : addrs) {
+        auto it = std::find_if(keep.begin(), keep.end(), [&](const sock_t& k) { return k.key == a.key; });
+        if (it != keep.end()) {
+            ifaces.push_back(it->info);
+            continue;
+        }
+        sock_t ns = open_socket(a);
+        ifaces.push_back(ns.info);
+        if (ns.s != INVALID_SOCKET) keep.push_back(std::move(ns));
+    }
+    s.socks = std::move(keep);
+    std::lock_guard lk(s.mu);
+    s.locals = std::move(locals);
+    s.locals_at = now_ms();
+    s.ifaces = std::move(ifaces);
 }
 
 void capture_thread() {
     state_t& s = st();
-    // RCVALL promiscuous mode: needs admin
-    DWORD rcvall = 1;
-    DWORD bytes = 0;
-    if (::WSAIoctl(s.sock, SIO_RCVALL, &rcvall, sizeof(rcvall), nullptr, 0,
-                   &bytes, nullptr, nullptr) == SOCKET_ERROR) {
-        s.active.store(false);
-        return;
-    }
-    uint8_t buf[65536];
+    std::vector<uint8_t> buf(65536);
+    std::vector<WSAPOLLFD> fds;
     while (!s.stop_flag.load()) {
-        const int n = ::recv(s.sock, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-        if (n <= 0) {
-            if (s.stop_flag.load()) break;
-            const int err = ::WSAGetLastError();
-            if (err == WSAETIMEDOUT || err == WSAEWOULDBLOCK) continue;
-            break;
+        if (now_ms() - s.locals_at > kIfaceRefreshMs) refresh_interfaces(s);
+        fds.clear();
+        for (const auto& sk : s.socks) fds.push_back({sk.s, POLLRDNORM, 0});
+        if (fds.empty()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            continue;
         }
-        handle_frame(buf, static_cast<size_t>(n));
+        const int r = ::WSAPoll(fds.data(), static_cast<ULONG>(fds.size()), 250);
+        if (r <= 0) continue;
+        for (size_t i = 0; i < fds.size(); ++i) {
+            const auto& fd = fds[i];
+            if (!(fd.revents & (POLLRDNORM | POLLERR | POLLHUP))) continue;
+            const bool v6 = s.socks[i].info.family == 6;
+            // drain what is queued on this socket, bounded per wakeup
+            for (int burst = 0; burst < 256; ++burst) {
+                if (v6) {
+                    parse::ip_addr_t src, dst;
+                    const int n = recv_v6(fd.fd, buf, src, dst);
+                    if (n <= 0) break;
+                    std::lock_guard lk(s.mu);
+                    handle_v6_transport(s, src, dst, buf.data(), static_cast<size_t>(n), now_ms());
+                    continue;
+                }
+                const int n = ::recv(fd.fd, reinterpret_cast<char*>(buf.data()),
+                                     static_cast<int>(buf.size()), 0);
+                if (n <= 0) break;
+                std::lock_guard lk(s.mu);
+                handle_datagram(s, buf.data(), static_cast<size_t>(n), now_ms());
+            }
+        }
     }
-    rcvall = 0;
-    ::WSAIoctl(s.sock, SIO_RCVALL, &rcvall, sizeof(rcvall), nullptr, 0, &bytes,
-               nullptr, nullptr);
+    for (auto& sk : s.socks) close_socket(sk);
+    s.socks.clear();
     s.active.store(false);
+}
+
+std::string apply_filter(state_t& s, const capture_filter_t& f) {
+    std::optional<parse::ip_addr_t> host;
+    if (!f.host.empty()) {
+        host = parse::parse_ip(f.host);
+        if (!host) return "capture filter host must be an IPv4/IPv6 address, got '" + f.host + "'";
+    }
+    if (f.protocol != 0 && f.protocol != 6 && f.protocol != 17)
+        return "capture filter protocol must be 6 (tcp), 17 (udp) or 0";
+    std::lock_guard lk(s.mu);
+    s.filter = f;
+    if (host) s.filter.host = parse::to_string(*host);
+    s.filter_host = host;
+    return {};
 }
 
 } // namespace
@@ -306,40 +468,48 @@ bool running() {
     return st().active.load();
 }
 
-std::string start(uint32_t filter_pid, uint32_t filter_port,
-                  uint32_t filter_protocol) {
+std::string start(const capture_filter_t& filter, bool* updated) {
     state_t& s = st();
-    if (s.active.load()) return {};
-    {
+    if (updated) *updated = false;
+    if (s.active.load()) {
+        auto err = apply_filter(s, filter);
+        if (err.empty() && updated) *updated = true;
+        return err;
+    }
+    // the previous run's thread has exited on its own; reclaim it
+    if (s.th.joinable()) s.th.join();
+    if (auto err = apply_filter(s, filter); !err.empty()) return err;
+
+    if (!s.wsa) {
         WSADATA wsa{};
-        if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
-            return "WSAStartup failed";
+        if (::WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return "WSAStartup failed";
+        s.wsa = true;
     }
-    SOCKET sock = ::socket(AF_INET, SOCK_RAW, IPPROTO_IP);
-    if (sock == INVALID_SOCKET)
-        return "raw socket failed (error " + std::to_string(::WSAGetLastError()) +
-               ") - run elevated for SIO_RCVALL capture";
-    // bind to any so we receive on all interfaces
-    sockaddr_in bind_addr{};
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_addr.s_addr = INADDR_ANY;
-    bind_addr.sin_port = 0;
-    if (::bind(sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
-        const int e = ::WSAGetLastError();
-        ::closesocket(sock);
-        return "raw socket bind failed (error " + std::to_string(e) + ")";
+    std::vector<parse::ip_addr_t> locals;
+    const auto addrs = enumerate(locals);
+    std::vector<sock_t> socks;
+    std::vector<capture_iface_t> ifaces;
+    for (const auto& a : addrs) {
+        sock_t sk = open_socket(a);
+        ifaces.push_back(sk.info);
+        if (sk.s != INVALID_SOCKET) socks.push_back(std::move(sk));
     }
-    // receive timeout so the thread notices stop_flag
-    DWORD tv = 500;
-    ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv),
-                 sizeof(tv));
+    if (socks.empty()) {
+        std::string why = addrs.empty() ? "no active network interfaces" : ifaces.front().error;
+        for (size_t i = 1; i < ifaces.size(); ++i)
+            if (ifaces[i].error != ifaces.front().error) why += "; " + ifaces[i].error;
+        std::lock_guard lk(s.mu);
+        s.ifaces = std::move(ifaces);
+        return "capture failed on every interface: " + why;
+    }
     {
         std::lock_guard lk(s.mu);
-        s.sock = sock;
-        s.filter_pid = filter_pid;
-        s.filter_port = filter_port;
-        s.filter_protocol = filter_protocol;
+        s.locals = std::move(locals);
+        s.locals_at = now_ms();
+        s.ifaces = std::move(ifaces);
+        s.frags.clear();
     }
+    s.socks = std::move(socks);
     s.stop_flag.store(false);
     s.active.store(true);
     s.th = std::thread(capture_thread);
@@ -350,65 +520,125 @@ std::string stop() {
     state_t& s = st();
     s.stop_flag.store(true);
     if (s.th.joinable()) s.th.join();
-    {
-        std::lock_guard lk(s.mu);
-        if (s.sock != INVALID_SOCKET) {
-            ::closesocket(s.sock);
-            s.sock = INVALID_SOCKET;
-        }
-    }
     s.active.store(false);
-    ::WSACleanup();
+    if (s.wsa) {
+        ::WSACleanup();
+        s.wsa = false;
+    }
     return {};
 }
 
 size_t poll(traffic_store_t& sink, size_t max_packets) {
     state_t& s = st();
-    size_t pulled = 0;
-    std::lock_guard lk(s.mu);
-    while (!s.pending.empty() && pulled < max_packets) {
-        packet_record_t rec = std::move(s.pending.front());
-        s.pending.pop_front();
-        // apply filters
-        if (s.filter_protocol != 0 && rec.protocol != s.filter_protocol) continue;
-        if (s.filter_port != 0 &&
-            rec.local_port != s.filter_port && rec.remote_port != s.filter_port)
-            continue;
-        sink.add(std::move(rec));
-        ++pulled;
+    std::deque<packet_record_t> batch;
+    {
+        std::lock_guard lk(s.mu);
+        const size_t n = std::min(max_packets, s.pending.size());
+        for (size_t i = 0; i < n; ++i) {
+            batch.push_back(std::move(s.pending.front()));
+            s.pending.pop_front();
+        }
     }
-    return pulled;
+    for (auto& rec : batch) sink.add(std::move(rec));
+    return batch.size();
 }
 
-std::vector<dns_record_t> dns_queries(uint32_t filter_pid) {
-    (void)filter_pid;   // raw capture has no pid attribution; return all
+std::vector<dns_record_t> dns_queries(const std::string& host) {
     state_t& s = st();
     std::lock_guard lk(s.mu);
-    return {s.dns.begin(), s.dns.end()};
+    if (host.empty()) return {s.dns.begin(), s.dns.end()};
+    const auto want = parse::parse_ip(host);
+    const std::string canon = want ? parse::to_string(*want) : host;
+    std::vector<dns_record_t> out;
+    for (const auto& r : s.dns)
+        if (r.client_addr == canon || r.server_addr == canon) out.push_back(r);
+    return out;
 }
 
 net_stats_t stats() {
     state_t& s = st();
-    net_stats_t out{};
+    net_stats_t out;
     out.capture_active = s.active.load();
-    out.total_captured = static_cast<uint32_t>(s.total_captured.load());
-    out.total_dropped = static_cast<uint32_t>(s.total_dropped.load());
-    out.bytes_received = s.bytes_in.load();
-    out.bytes_sent = s.bytes_out.load();
-    out.packets_received = out.total_captured;
     std::lock_guard lk(s.mu);
-    out.total_dns_logged = static_cast<uint32_t>(s.dns.size());
+    out.packets_seen = s.packets_seen;
+    out.packets_in = s.packets_in;
+    out.packets_out = s.packets_out;
+    out.bytes_in = s.bytes_in;
+    out.bytes_out = s.bytes_out;
+    out.filtered_out = s.filtered_out;
+    out.parse_errors = s.parse_errors;
+    out.non_tcp_udp = s.non_tcp_udp;
+    out.fragments = s.fragments;
+    out.fragments_reassembled = s.frags.completed();
+    out.fragments_dropped = s.frags.dropped();
+    out.queue_dropped = s.queue_dropped;
+    out.payload_truncated = s.payload_truncated;
+    out.dns_logged_total = s.dns_total;
+    out.dns_buffered = static_cast<uint32_t>(s.dns.size());
+    out.pending = static_cast<uint32_t>(s.pending.size());
+    out.filter = s.filter;
+    out.interfaces = s.ifaces;
     return out;
 }
 
-std::string export_pcap(const traffic_store_t& store, const std::string& path,
-                        uint32_t max_packets) {
-    const auto page = store.packets(0, max_packets);
+std::string export_pcap(traffic_store_t& store, const std::string& path,
+                        uint32_t max_packets, size_t* exported, bool* truncated) {
+    while (poll(store, 4096) > 0) {}
+    const auto page = store.packets_tail(max_packets);
     std::string err;
     if (!store.write_pcap(path, page.items, &err))
         return err.empty() ? "pcap write failed" : err;
+    if (exported) *exported = page.items.size();
+    if (truncated) *truncated = page.truncated;
     return {};
 }
+
+namespace testing {
+
+void reset() {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    s.pending.clear();
+    s.dns.clear();
+    s.frags.clear();
+    s.locals.clear();
+    s.filter = {};
+    s.filter_host.reset();
+    s.packets_seen = s.packets_in = s.packets_out = s.bytes_in = s.bytes_out = 0;
+    s.filtered_out = s.parse_errors = s.non_tcp_udp = s.fragments = 0;
+    s.queue_dropped = s.payload_truncated = s.dns_total = 0;
+}
+
+void set_local_addresses(const std::vector<std::string>& addrs) {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    s.locals.clear();
+    for (const auto& a : addrs)
+        if (auto ip = parse::parse_ip(a)) s.locals.push_back(*ip);
+    s.locals_at = now_ms();
+}
+
+std::string set_filter(const capture_filter_t& filter) {
+    return apply_filter(st(), filter);
+}
+
+void inject(const uint8_t* d, size_t n, int64_t at) {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    handle_datagram(s, d, n, at);
+}
+
+void inject_v6_transport(const std::string& src, const std::string& dst, const uint8_t* d,
+                         size_t n, int64_t at) {
+    const auto s6 = parse::parse_ip(src);
+    const auto d6 = parse::parse_ip(dst);
+    if (!s6 || !d6) return;
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    handle_v6_transport(s, *s6, *d6, d, n, at);
+}
+
+} // namespace testing
 
 } // namespace capture
 } // namespace slop::core::network

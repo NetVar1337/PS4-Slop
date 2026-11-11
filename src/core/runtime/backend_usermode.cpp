@@ -367,4 +367,23 @@ elevation_t backend_usermode_t::query_elevation() {
     return detect_elevation(GetCurrentProcessId());
 }
 
+bool backend_usermode_t::handle_info(const target_handle_t& h, process_info_t& out) {
+    if (!h.valid()) return false;
+    const HANDLE ph = static_cast<HANDLE>(h.native);
+    wchar_t path[MAX_PATH * 2]{};
+    DWORD n = static_cast<DWORD>(sizeof(path) / sizeof(path[0]));
+    if (!QueryFullProcessImageNameW(ph, 0, path, &n)) return false;
+    char narrow[MAX_PATH * 6]{};
+    WideCharToMultiByte(CP_UTF8, 0, path, -1, narrow, static_cast<int>(sizeof(narrow)),
+                        nullptr, nullptr);
+    out = process_info_t{};
+    out.pid  = h.pid;
+    out.path = narrow;
+    const size_t slash = out.path.find_last_of("\\/");
+    out.name = slash == std::string::npos ? out.path : out.path.substr(slash + 1);
+    out.arch = detect_arch(ph);
+    out.elevation = detect_elevation(h.pid);
+    return true;
+}
+
 } // namespace slop::core::runtime

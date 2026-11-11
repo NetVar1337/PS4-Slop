@@ -66,7 +66,7 @@ std::vector<heap_block_t> walk_heap_blocks(uint32_t pid, uint64_t heap_base,
                     if (out.size() >= max_blocks) break;
                     heap_block_t b;
                     b.address = he.dwAddress;
-                    b.size    = he.dwBlockSize;
+                    b.size    = static_cast<uint32_t>(he.dwBlockSize);
                     b.flags   = he.dwFlags;
                     out.push_back(std::move(b));
                 } while (Heap32Next(&he));

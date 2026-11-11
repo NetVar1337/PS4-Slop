@@ -4,8 +4,12 @@
 
 #include "harness.hpp"
 
+#include "core/disasm/binary_state.hpp"
 #include "core/emu/session.hpp"
 #include "core/emu/taint.hpp"
+#include "core/mcp/mcp_tools.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <Zydis/Zydis.h>
 
@@ -421,4 +425,248 @@ TEST_CASE(emu_dump_and_write_values) {
     REQUIRE(r.memory[2].bytes.empty());
     REQUIRE_EQ(r.memory[3].bytes.size(), 2u);   // cut at the unmapped page
     REQUIRE_EQ(r.paged_in, 0u);                 // dumps never map pages
+}
+
+// === SysV / PS4 environment (item 55) ========================================
+
+TEST_CASE(emu_sysv_import_args_use_sysv_registers) {
+    // mov edi,0x11 / call [rip+0x1FF5] (IAT slot 0x402000) / add rax,1 / ret
+    auto req = base_req({0xBF, 0x11, 0x00, 0x00, 0x00,
+                         0xFF, 0x15, 0xF5, 0x1F, 0x00, 0x00,
+                         0x48, 0x83, 0xC0, 0x01,
+                         0xC3});
+    req.abi = abi_t::sysv;
+    req.imports.push_back({0x402000, "libkernel!sceKernelUsleep"});
+    req.api_ret = 41;
+    req.regs["rsi"] = 0x22;
+    req.regs["r9"]  = 0x66;
+    emu_mem_region_t iat;
+    iat.addr = 0x402000;
+    iat.bytes.assign(8, 0);
+    req.maps.push_back(iat);
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs.at("rax"), 42u);
+    REQUIRE_EQ(r.api_calls.size(), 1u);
+    REQUIRE_EQ(r.api_calls[0].arg_count, 6u);
+    REQUIRE_EQ(r.api_calls[0].args[0], 0x11ull);   // rdi
+    REQUIRE_EQ(r.api_calls[0].args[1], 0x22ull);   // rsi
+    REQUIRE_EQ(r.api_calls[0].args[5], 0x66ull);   // r9
+    REQUIRE_STR_EQ(abi_name(req.abi), "sysv");
+}
+
+TEST_CASE(emu_win64_import_args_stay_win64) {
+    auto req = import_call_req();
+    emu_mem_region_t iat;
+    iat.addr = 0x402000;
+    iat.bytes.assign(8, 0);
+    req.maps.push_back(iat);
+    auto r = emulate_run(req);
+    REQUIRE_EQ(r.api_calls.size(), 1u);
+    REQUIRE_EQ(r.api_calls[0].arg_count, 4u);
+    REQUIRE_EQ(r.api_calls[0].args[0], 0x11ull);   // rcx
+    REQUIRE_STR_EQ(abi_name(req.abi), "win64");
+}
+
+TEST_CASE(emu_sysv_tcb_behind_fs) {
+    // mov rax,fs:[0] / mov rcx,fs:[8] / mov rdx,[rcx+0x10] / mov r8,fs:[-8] / ret
+    auto req = base_req({0x64, 0x48, 0x8B, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00,
+                         0x64, 0x48, 0x8B, 0x0C, 0x25, 0x08, 0x00, 0x00, 0x00,
+                         0x48, 0x8B, 0x51, 0x10,
+                         0x64, 0x4C, 0x8B, 0x04, 0x25, 0xF8, 0xFF, 0xFF, 0xFF,
+                         0xC3});
+    req.abi = abi_t::sysv;
+    req.regs["r8"] = 0xFF;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE(r.tls_mapped);
+    REQUIRE_FALSE(r.teb_mapped);
+    const uint64_t tp = r.regs.at("fs_base");
+    REQUIRE(tp != 0);
+    REQUIRE_EQ(r.regs.at("rax"), tp);              // tcb_self
+    REQUIRE_EQ(r.regs.at("rdx"), tp - 0x2000);     // dtv[2]: static TLS block
+    REQUIRE_EQ(r.regs.at("r8"), 0u);               // static TLS reads zero
+
+    // a caller fs_base replaces the fake TCB
+    req.regs["fs_base"] = 0x500000;
+    emu_mem_region_t tcb;
+    tcb.addr = 0x500000;
+    tcb.bytes.assign(0x100, 0);
+    tcb.bytes[0] = 0x77;
+    req.maps.push_back(tcb);
+    req.code.resize(9);
+    req.code.push_back(0xC3);
+    r = emulate_run(req);
+    REQUIRE_FALSE(r.tls_mapped);
+    REQUIRE_EQ(r.regs.at("rax"), 0x77u);
+}
+
+namespace {
+
+const char* test_syscall_name(uint64_t num) {
+    switch (num) {
+    case 4:  return "write";
+    case 20: return "getpid";
+    default: return nullptr;
+    }
+}
+
+} // namespace
+
+TEST_CASE(emu_syscall_hook_logs_names_args_and_returns) {
+    // mov eax,20 / mov edi,7 / mov r10d,9 / syscall / mov rbx,rax /
+    // mov eax,4 / stc / syscall / mov eax,99 / syscall / ret
+    auto req = base_req({0xB8, 0x14, 0x00, 0x00, 0x00,
+                         0xBF, 0x07, 0x00, 0x00, 0x00,
+                         0x41, 0xBA, 0x09, 0x00, 0x00, 0x00,
+                         0x0F, 0x05,
+                         0x48, 0x89, 0xC3,
+                         0xB8, 0x04, 0x00, 0x00, 0x00,
+                         0xF9,
+                         0x0F, 0x05,
+                         0x48, 0x89, 0xC6,                 // mov rsi,rax
+                         0xB8, 0x63, 0x00, 0x00, 0x00,
+                         0x0F, 0x05,
+                         0xC3});
+    req.abi = abi_t::sysv;
+    req.syscall_ret = 0x55;
+    req.syscall_returns[20] = 1234;
+    req.syscall_name = test_syscall_name;
+    req.trace = true;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.total_syscalls, 3u);
+    REQUIRE_EQ(r.syscalls.size(), 3u);
+
+    REQUIRE_EQ(r.syscalls[0].ip, 0x400010ull);
+    REQUIRE_EQ(r.syscalls[0].num, 20u);
+    REQUIRE_STR_EQ(r.syscalls[0].name.c_str(), "getpid");
+    REQUIRE_EQ(r.syscalls[0].args[0], 7u);    // rdi
+    REQUIRE_EQ(r.syscalls[0].args[3], 9u);    // r10, the 4th syscall arg
+    REQUIRE_EQ(r.syscalls[0].ret, 1234u);
+    REQUIRE_EQ(r.regs.at("rbx"), 1234u);
+
+    REQUIRE_STR_EQ(r.syscalls[1].name.c_str(), "write");
+    REQUIRE_EQ(r.regs.at("rsi"), 0x55u);
+    REQUIRE(r.syscalls[2].name.empty());      // unknown number
+    REQUIRE_EQ(r.syscalls[2].num, 99u);
+
+    // rcx = next rip, CF cleared even after stc
+    REQUIRE_EQ(r.regs.at("rcx"), 0x400027ull);
+    REQUIRE_EQ(r.regs.at("rflags") & 1u, 0u);
+
+    bool named = false;
+    for (const auto& t : r.trace)
+        if (t.ip == 0x400010 && t.text.find("; getpid") != std::string::npos) named = true;
+    REQUIRE(named);
+}
+
+// === write log keeps wide stores (item 75) ===================================
+
+TEST_CASE(emu_write_log_keeps_wide_store_values) {
+    // movups xmm0,[0x500000] / movups [0x500010],xmm0 / mov qword [0x500020],rcx / ret
+    auto req = base_req({0x0F, 0x10, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00,
+                         0x0F, 0x11, 0x04, 0x25, 0x10, 0x00, 0x50, 0x00,
+                         0x48, 0x89, 0x0C, 0x25, 0x20, 0x00, 0x50, 0x00,
+                         0xC3});
+    req.regs["rcx"] = 0x1122334455667788ull;
+    emu_mem_region_t data;
+    data.addr = 0x500000;
+    data.bytes.assign(0x40, 0);
+    for (uint8_t i = 0; i < 16; ++i) data.bytes[i] = static_cast<uint8_t>(0xA0 + i);
+    req.maps.push_back(data);
+    req.dumps = {{0x500000, 0x40}};
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.memory.size(), 1u);
+    const auto& mem = r.memory[0].bytes;
+
+    size_t vec_bytes = 0;
+    bool saw_qword = false;
+    for (const auto& w : r.writes) {
+        REQUIRE(w.addr >= 0x500000 && w.addr + w.len <= 0x500040);
+        // the logged value is the low (up to 8) bytes actually stored
+        const size_t n = std::min<size_t>(w.len, 8);
+        uint64_t want = 0;
+        std::memcpy(&want, mem.data() + (w.addr - 0x500000), n);
+        REQUIRE_EQ(w.value, want);
+        REQUIRE_EQ(w.truncated, w.len > 8);
+        if (w.addr >= 0x500010 && w.addr < 0x500020) vec_bytes += w.len;
+        if (w.addr == 0x500020 && w.len == 8) {
+            saw_qword = true;
+            REQUIRE_EQ(w.value, 0x1122334455667788ull);
+        }
+    }
+    REQUIRE_EQ(vec_bytes, 16u);
+    REQUIRE(saw_qword);
+    REQUIRE(r.writes.front().value != 0);   // the vector store is not logged as 0
+}
+
+// === emulate tool: arch gate on every source (56) and abi selection (55) =====
+
+namespace {
+
+nlohmann::json emulate_call(const nlohmann::json& args, bool& is_error) {
+    return slop::core::mcp::call_tool("emulate", args, is_error);
+}
+
+} // namespace
+
+TEST_CASE(emu_tool_hex_rejects_non_x64_arch) {
+    bool is_error = false;
+    auto out = emulate_call({{"action", "run"}, {"hex", "90c3"}, {"arch", "arm64"}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(out.value("error", "").find("x86-64") != std::string::npos);
+
+    out = emulate_call({{"action", "run"}, {"hex", "90c3"}, {"arch", "x64"}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("stopped_reason", "").c_str(), "return");
+}
+
+TEST_CASE(emu_tool_abi_selection_and_syscall_log) {
+    namespace ds = slop::core::disasm::binary_state;
+    ds::unload();
+    bool is_error = false;
+
+    // no console, no image: hex defaults to the win64 environment
+    auto out = emulate_call({{"action", "run"}, {"hex", "90c3"}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("abi", "").c_str(), "win64");
+    REQUIRE(out.value("teb_mapped", false));
+    REQUIRE_FALSE(out.contains("tls_mapped"));
+
+    // mov eax,20 (getpid) / mov edi,5 / syscall / ret on the PS4 abi
+    const std::string code = "b814000000" "bf05000000" "0f05" "c3";
+    out = emulate_call({{"action", "run"}, {"hex", code}, {"abi", "sysv"},
+                        {"syscall_returns", {{"getpid", 77}}}, {"trace", true}},
+                       is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("abi", "").c_str(), "sysv");
+    REQUIRE(out.value("tls_mapped", false));
+    REQUIRE_EQ(out.at("regs").value("rax", 0ull), 77ull);
+    REQUIRE_EQ(out.value("total_syscalls", 0ull), 1ull);
+    const auto& sc = out.at("syscalls").at(0);
+    REQUIRE_EQ(sc.value("num", 0ull), 20ull);
+    REQUIRE_STR_EQ(sc.value("name", "").c_str(), "getpid");
+    REQUIRE_EQ(sc.at("args").size(), 6u);
+    REQUIRE_EQ(sc.at("args").at(0).get<uint64_t>(), 5ull);
+
+    // numeric keys and the default return
+    out = emulate_call({{"action", "run"}, {"hex", code}, {"abi", "sysv"},
+                        {"syscall_returns", {{"0x14", 9}}}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_EQ(out.at("regs").value("rax", 0ull), 9ull);
+    out = emulate_call({{"action", "run"}, {"hex", code}, {"abi", "sysv"},
+                        {"syscall_ret", 3}}, is_error);
+    REQUIRE_EQ(out.at("regs").value("rax", 0ull), 3ull);
+
+    out = emulate_call({{"action", "run"}, {"hex", code}, {"abi", "sysv"},
+                        {"syscall_returns", {{"not_a_syscall", 1}}}}, is_error);
+    REQUIRE(is_error);
+    out = emulate_call({{"action", "run"}, {"hex", code}, {"abi", "vax"}}, is_error);
+    REQUIRE(is_error);
 }

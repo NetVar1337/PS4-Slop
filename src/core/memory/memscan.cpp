@@ -500,10 +500,13 @@ struct worker_out_t {
 };
 
 // Run the value-scan kernel over one contiguous run of memory. `old` holds
-// the previous contents (firstnext scans) or is null (first scan)
+// the previous contents (firstnext scans) or is null (first scan). Values
+// may extend into the run's tail, but only slots starting before
+// `start_limit` are candidates (the rest belong to the next chunk)
 void scan_run(const scan_config_t& cfg, const fastscan_t& fs,
               uintptr_t base, const uint8_t* data, size_t len,
-              const uint8_t* old, worker_out_t& out, scan_progress_t& prog) {
+              const uint8_t* old, worker_out_t& out, scan_progress_t& prog,
+              uintptr_t start_limit = std::numeric_limits<uintptr_t>::max()) {
     const size_t slot = value_size(cfg.width);
     if (slot == 0) return;
     const size_t cap = cfg.max_results ? cfg.max_results : infra::limits::max_scan_hits;
@@ -517,6 +520,7 @@ void scan_run(const scan_config_t& cfg, const fastscan_t& fs,
 
     for (; off <= last_off; off += fs.step) {
         const uintptr_t addr = base + off;
+        if (addr >= start_limit) break;
 
         if (all) {
             for (const value_width_t w : kAllWidths) {
@@ -576,26 +580,68 @@ void merge_workers(std::vector<worker_out_t>& outs,
     st.found = results_out.size();
 }
 
-unsigned worker_count(const scan_config_t& cfg) noexcept {
+unsigned worker_count(const scan_config_t& cfg, const reader_hints_t& h) noexcept {
     unsigned n = cfg.threads ? cfg.threads : std::thread::hardware_concurrency();
+    // a serialized reader (one remote connection) gains nothing from more
+    // workers than it can serve; they would only queue on its socket lock
+    if (h.max_workers) n = std::min(n, h.max_workers);
     return std::max(1u, std::min(n, 64u));
+}
+
+// Effective chunk size: explicit config wins, then the reader's preference
+size_t effective_chunk(const scan_config_t& cfg, const reader_hints_t& h) noexcept {
+    if (cfg.chunk_bytes) return cfg.chunk_bytes;
+    if (h.chunk_bytes)   return h.chunk_bytes;
+    return infra::limits::scan_chunk_bytes;
+}
+
+// Bytes past a chunk border a value slot can reach (all-scans read up to 8)
+size_t value_overlap(const scan_config_t& cfg) noexcept {
+    const size_t widest = cfg.scan_all_types ? 8 : value_size(cfg.width);
+    return widest ? widest - 1 : 0;
 }
 
 // First scan (TScanController.firstScan thread fan-out)
 
-// Region-scan walks stash readable runs into the worker copy. The value
-// kernel only runs for address-list scans; unknown scans keep just bytes
-void walk_region(reader_t& r, const scan_region_t& reg,
-                 const scan_config_t& cfg, const fastscan_t& fs,
-                 const infra::cancel_token_t& tok, bool stash_mode,
-                 std::atomic<uint64_t>& stash_used, uint64_t stash_budget,
-                 worker_out_t& out, scan_progress_t& prog) {
-    const size_t chunk = cfg.chunk_bytes ? cfg.chunk_bytes
-                                         : infra::limits::scan_chunk_bytes;
+// Walk one worker's share of the regions in a single chunked pass (so the
+// read-ahead thread keeps streaming across region borders). Region scans
+// stash readable runs into the worker copy; the value kernel only runs for
+// address-list scans. `aborted` lets sibling workers stop this one
+void walk_regions(reader_t& r, const std::vector<scan_region_t>& regs,
+                  const scan_config_t& cfg, const fastscan_t& fs,
+                  const infra::cancel_token_t& tok, bool stash_mode, bool read_ahead,
+                  std::atomic<uint64_t>& stash_used, uint64_t stash_budget,
+                  const std::atomic<bool>& aborted,
+                  worker_out_t& out, scan_progress_t& prog) {
+    if (regs.empty()) return;
+    detail::chunk_walk_t walk;
+    walk.chunk      = cfg.chunk_bytes ? cfg.chunk_bytes : infra::limits::scan_chunk_bytes;
+    // stash copies must not overlap (the rescan would compare slots twice)
+    walk.overlap    = stash_mode ? 0 : value_overlap(cfg);
+    walk.min_leaf   = 4096;
+    walk.read_ahead = read_ahead;
 
-    auto sink = [&](uintptr_t run_addr, const uint8_t* data, size_t len) {
-        out.bytes_scanned += len;
-        prog.bytes += len;
+    std::vector<detail::read_range_t> ranges;
+    ranges.reserve(regs.size());
+    for (const auto& reg : regs) ranges.push_back({reg.base, reg.size});
+
+    // regions count as done once the walk moves past them
+    size_t done_upto = 0;
+    auto finish_upto = [&](size_t n) {
+        for (; done_upto < n; ++done_upto) {
+            ++out.regions_scanned;
+            prog.regions_done++;
+        }
+    };
+
+    auto sink = [&](size_t range, uintptr_t run_addr, const uint8_t* data, size_t len,
+                    uintptr_t limit) -> bool {
+        finish_upto(range);
+        if (aborted.load(std::memory_order_relaxed)) return false;
+        const size_t owned = static_cast<size_t>(
+            std::min<uint64_t>(len, limit > run_addr ? limit - run_addr : 0));
+        out.bytes_scanned += owned;
+        prog.bytes += owned;
 
         if (stash_mode) {
             // Atomic add-then-check: tiny over-admission is acceptable
@@ -603,7 +649,7 @@ void walk_region(reader_t& r, const scan_region_t& reg,
                                                        std::memory_order_relaxed) + len;
             if (used > stash_budget) {
                 out.truncated = true;
-                return;
+                return false;
             }
             region_copy_t rc;
             rc.base  = run_addr;
@@ -611,23 +657,19 @@ void walk_region(reader_t& r, const scan_region_t& reg,
             out.stash.push_back(std::move(rc));
             out.slots_tracked += len;
             out.slots_scanned += len / value_size(cfg.width);
-            return; // no address rows for region scans
+            return true; // no address rows for region scans
         }
 
-        scan_run(cfg, fs, run_addr, data, len, nullptr, out, prog);
+        scan_run(cfg, fs, run_addr, data, len, nullptr, out, prog, limit);
+        return !out.truncated;
     };
 
-    uintptr_t cursor = reg.base;
-    const uintptr_t end = reg.base + reg.size;
-    while (cursor < end) {
-        if (tok.cancelled()) break;
-        const size_t want = static_cast<size_t>(std::min<uint64_t>(chunk, end - cursor));
-        detail::resilient_read(r, cursor, want, 4096, tok, sink);
-        if (out.truncated) break;
-        cursor += want;
-    }
-    ++out.regions_scanned;
-    prog.regions_done++;
+    detail::chunked_read(r, ranges, walk, tok, sink);
+    // a walk that ran to completion visited every region (holes included)
+    if (!out.truncated && !tok.cancelled() && !aborted.load(std::memory_order_relaxed))
+        finish_upto(ranges.size());
+    else
+        finish_upto(std::min(done_upto + 1, ranges.size()));
 }
 
 } // namespace
@@ -667,37 +709,29 @@ bool memscan_t::first_scan(reader_t& r,
     scan_config_t run_cfg = cfg;
     if (is_relational(run_cfg.type)) run_cfg.type = scan_type_t::unknown_initial;
     const bool region_scan = run_cfg.type == scan_type_t::unknown_initial;
-    if (!run_cfg.chunk_bytes) run_cfg.chunk_bytes = infra::limits::scan_chunk_bytes;
+    const reader_hints_t hints = r.hints();
+    run_cfg.chunk_bytes = effective_chunk(run_cfg, hints);
 
     const uint64_t stash_budget = region_scan ? infra::limits::max_stash_bytes : 0;
 
-    const unsigned nw = std::max(1u, std::min(worker_count(run_cfg),
+    const unsigned nw = std::max(1u, std::min(worker_count(run_cfg, hints),
                                               static_cast<unsigned>(regions.size())));
     std::vector<worker_out_t> outs(nw);
     std::vector<std::thread>  pool;
     std::atomic<uint64_t>     stash_used{0};
     std::atomic<bool>         aborted{false};
 
-    // Address-list scans cap rows per worker so one thread cannot hog the
-    // whole budget (the merge still enforces the global cap)
-    const size_t worker_cap = region_scan
-        ? std::numeric_limits<size_t>::max()
-        : max_results;
-
+    // Round-robin the regions; each worker walks its share in one chunked
+    // pass. Address-list scans cap rows per worker (scan_run) so one thread
+    // cannot hog the whole budget; the merge still enforces the global cap
     for (unsigned i = 0; i < nw; ++i) {
         pool.emplace_back([&, i] {
             worker_out_t& out = outs[i];
-            for (size_t k = i; k < regions.size(); k += nw) {
-                if (aborted.load(std::memory_order_relaxed) || tok.cancelled()) break;
-                walk_region(r, regions[k], run_cfg, fs, tok, region_scan,
-                            stash_used, stash_budget, out, progress_);
-                if (out.truncated) aborted.store(true, std::memory_order_relaxed);
-                if (!region_scan && out.results.size() >= worker_cap) {
-                    out.truncated = true;
-                    aborted.store(true, std::memory_order_relaxed);
-                    break;
-                }
-            }
+            std::vector<scan_region_t> mine;
+            for (size_t k = i; k < regions.size(); k += nw) mine.push_back(regions[k]);
+            walk_regions(r, mine, run_cfg, fs, tok, region_scan, hints.read_ahead,
+                         stash_used, stash_budget, aborted, out, progress_);
+            if (out.truncated) aborted.store(true, std::memory_order_relaxed);
         });
     }
     for (auto& t : pool) t.join();
@@ -746,7 +780,8 @@ bool memscan_t::next_scan(reader_t& r,
     const fastscan_t fs = make_fastscan(cfg);
 
     scan_config_t run_cfg = cfg;
-    if (!run_cfg.chunk_bytes) run_cfg.chunk_bytes = infra::limits::scan_chunk_bytes;
+    const reader_hints_t hints = r.hints();
+    run_cfg.chunk_bytes = effective_chunk(run_cfg, hints);
 
     scan_stats_t st{};
     st.regions = stats_.regions;
@@ -756,7 +791,7 @@ bool memscan_t::next_scan(reader_t& r,
     if (region_scan_active_) {
         // FirstNextScan: re-read the stashed memory, compare old vs new per
         // slot, emit the first address list, then drop the stash
-        const unsigned nw = std::max(1u, std::min(worker_count(run_cfg),
+        const unsigned nw = std::max(1u, std::min(worker_count(run_cfg, hints),
             static_cast<unsigned>(stash_.size() ? stash_.size() : 1)));
         std::vector<worker_out_t> outs(nw);
         std::vector<std::thread>  pool;
@@ -765,32 +800,37 @@ bool memscan_t::next_scan(reader_t& r,
         for (unsigned i = 0; i < nw; ++i) {
             pool.emplace_back([&, i] {
                 worker_out_t& out = outs[i];
+                std::vector<detail::read_range_t> ranges;
+                std::vector<size_t>               owner;   // range -> stash index
                 for (size_t k = i; k < stash_.size(); k += nw) {
-                    if (aborted.load(std::memory_order_relaxed) || tok.cancelled()) break;
-                    const region_copy_t& rc = stash_[k];
-
-                    auto sink = [&](uintptr_t run_addr, const uint8_t* fresh, size_t len) {
-                        const size_t old_off = static_cast<size_t>(run_addr - rc.base);
-                        if (old_off > rc.bytes.size()) return;
-                        const size_t comparable =
-                            std::min(len, rc.bytes.size() - old_off);
-                        if (comparable == 0) return;
-                        out.bytes_scanned += comparable;
-                        progress_.bytes += comparable;
-                        scan_run(run_cfg, fs, run_addr, fresh, comparable,
-                                 rc.bytes.data() + old_off, out, progress_);
-                        if (out.results.size() >= max_results) {
-                            out.truncated = true;
-                        }
-                    };
-
-                    detail::resilient_read(r, rc.base, rc.bytes.size(), 4096,
-                                           tok, sink);
-                    if (out.truncated) {
-                        aborted.store(true, std::memory_order_relaxed);
-                        break;
-                    }
+                    ranges.push_back({stash_[k].base, stash_[k].bytes.size()});
+                    owner.push_back(k);
                 }
+                detail::chunk_walk_t walk;
+                walk.chunk      = run_cfg.chunk_bytes;
+                walk.overlap    = value_overlap(run_cfg);
+                walk.min_leaf   = 4096;
+                walk.read_ahead = hints.read_ahead;
+
+                auto sink = [&](size_t range, uintptr_t run_addr, const uint8_t* fresh,
+                                size_t len, uintptr_t limit) -> bool {
+                    if (aborted.load(std::memory_order_relaxed)) return false;
+                    const region_copy_t& rc = stash_[owner[range]];
+                    const size_t old_off = static_cast<size_t>(run_addr - rc.base);
+                    if (old_off >= rc.bytes.size()) return true;
+                    const size_t comparable = std::min(len, rc.bytes.size() - old_off);
+                    const size_t owned = static_cast<size_t>(std::min<uint64_t>(
+                        comparable, limit > run_addr ? limit - run_addr : 0));
+                    out.bytes_scanned += owned;
+                    progress_.bytes += owned;
+                    scan_run(run_cfg, fs, run_addr, fresh, comparable,
+                             rc.bytes.data() + old_off, out, progress_, limit);
+                    if (out.results.size() >= max_results) out.truncated = true;
+                    return !out.truncated;
+                };
+
+                detail::chunked_read(r, ranges, walk, tok, sink);
+                if (out.truncated) aborted.store(true, std::memory_order_relaxed);
             });
         }
         for (auto& t : pool) t.join();
@@ -800,33 +840,84 @@ bool memscan_t::next_scan(reader_t& r,
         stash_.shrink_to_fit();
         region_scan_active_ = false;
     } else {
-        // NextNextScan: re-read each stored address, compare stored bits
+        // NextNextScan: re-read each stored address, compare stored bits.
+        // Rows are address sorted; readers that ask for it get neighbouring
+        // rows fetched with one read (a remote roundtrip per row is the cost
+        // that dominates console rescans)
         const std::vector<scan_result_t> prev = std::move(results_);
-        const unsigned nw = worker_count(run_cfg);
+        const unsigned nw = worker_count(run_cfg, hints);
         std::vector<worker_out_t> outs(nw);
         std::vector<std::thread>  pool;
         std::atomic<size_t>       next_item{0};
+        const size_t gap   = hints.coalesce_gap;
+        const size_t span  = std::max<size_t>(run_cfg.chunk_bytes, 4096);
+        // coalescing wants long sorted runs per grab; per-row readers keep
+        // small grabs so the workers stay balanced
+        const size_t kBatch = gap ? 4096 : 64;
 
         for (unsigned i = 0; i < nw; ++i) {
             pool.emplace_back([&, i] {
                 worker_out_t& out = outs[i];
+                std::vector<uint8_t> buf;
+
+                // compare one row against fresh bits; false = result cap hit
+                auto judge = [&](const scan_result_t& row, uint64_t bits) -> bool {
+                    ++out.slots_scanned;
+                    if (!check_value(run_cfg, row.matched, bits, row.bits)) return true;
+                    out.results.push_back({row.address, bits, row.matched});
+                    if (out.results.size() >= max_results) {
+                        out.truncated = true;
+                        return false;
+                    }
+                    return true;
+                };
+                auto single = [&](const scan_result_t& row) -> bool {
+                    uint64_t bits = 0;
+                    if (!r.read(row.address, &bits, value_size(row.matched)))
+                        return true; // freed
+                    return judge(row, bits);
+                };
+
                 while (!tok.cancelled()) {
-                    const size_t idx = next_item.fetch_add(64, std::memory_order_relaxed);
+                    const size_t idx = next_item.fetch_add(kBatch, std::memory_order_relaxed);
                     if (idx >= prev.size()) break;
-                    const size_t n = std::min<size_t>(64, prev.size() - idx);
-                    for (size_t k = 0; k < n; ++k) {
-                        const scan_result_t& row = prev[idx + k];
-                        const size_t vs = value_size(row.matched);
-                        uint64_t bits = 0;
-                        if (!r.read(row.address, &bits, vs)) continue; // freed
-                        ++out.slots_scanned;
-                        if (check_value(run_cfg, row.matched, bits, row.bits)) {
-                            out.results.push_back({row.address, bits, row.matched});
-                            if (out.results.size() >= max_results) {
-                                out.truncated = true;
-                                return;
+                    const size_t n = std::min<size_t>(kBatch, prev.size() - idx);
+                    size_t k = 0;
+                    while (k < n) {
+                        if (tok.cancelled()) return;
+                        const scan_result_t& first = prev[idx + k];
+                        const uintptr_t g_begin = first.address;
+                        uintptr_t g_end = first.address + value_size(first.matched);
+                        size_t j = k + 1;
+                        if (gap) {
+                            for (; j < n; ++j) {
+                                const scan_result_t& nx = prev[idx + j];
+                                const uintptr_t nx_end = nx.address + value_size(nx.matched);
+                                if (nx.address > g_end + gap) break;
+                                if (nx_end - g_begin > span) break;
+                                g_end = std::max(g_end, nx_end);
                             }
                         }
+                        if (j == k + 1) {
+                            if (!single(first)) return;
+                            k = j;
+                            continue;
+                        }
+                        buf.resize(static_cast<size_t>(g_end - g_begin));
+                        const bool ok = r.read(g_begin, buf.data(), buf.size());
+                        for (size_t m = k; m < j; ++m) {
+                            const scan_result_t& row = prev[idx + m];
+                            if (!ok) {
+                                // part of the span is gone: settle row by row
+                                if (!single(row)) return;
+                                continue;
+                            }
+                            uint64_t bits = 0;
+                            std::memcpy(&bits, buf.data() + (row.address - g_begin),
+                                        value_size(row.matched));
+                            if (!judge(row, bits)) return;
+                        }
+                        k = j;
                     }
                 }
             });

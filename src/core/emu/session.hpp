@@ -1,8 +1,11 @@
 #pragma once
 
-// one shot x64 emulation over unicorn, map regions, seed registers, run
+// one shot x86-64 emulation over unicorn, map regions, seed registers, run
 // with budget timeout and stop address, collect trace and taint,
-// callers materialize the bytes so this stays source agnostic
+// callers materialize the bytes so this stays source agnostic.
+// the abi picks the environment: win64 (rcx,rdx,r8,r9 args, TEB/PEB behind
+// gs) or sysv (rdi,rsi,rdx,rcx,r8,r9 args, FreeBSD/PS4 TCB behind fs).
+// syscall instructions are hooked and logged in both modes
 
 #include <cstdint>
 #include <functional>
@@ -38,6 +41,16 @@ struct import_slot_t {
 // stub page holds one RET per import
 inline constexpr size_t kMaxImports = 16384;
 
+enum class abi_t : uint8_t {
+    win64,   // Windows x64: TEB/PEB at gs, api args rcx,rdx,r8,r9
+    sysv,    // SysV AMD64 (FreeBSD/PS4 ELF): TCB at fs, args rdi,rsi,rdx,rcx,r8,r9
+};
+
+const char* abi_name(abi_t a) noexcept;
+
+// syscall number -> name, null for unknown numbers
+using syscall_namer_t = const char* (*)(uint64_t num);
+
 struct run_request_t {
     std::vector<uint8_t> code;                 // required, non-empty
     uint64_t code_base       = 0x400000;
@@ -63,10 +76,20 @@ struct run_request_t {
     std::vector<import_slot_t> imports;        // <= kMaxImports
     uint64_t api_ret = 0;
 
-    // A zeroed TEB/PEB is mapped at gs base (self, PEB, stack bounds, ids)
-    // unless regs sets gs_base or the pages are taken; this fills
+    // win64: a zeroed TEB/PEB is mapped at gs base (self, PEB, stack bounds,
+    // ids) unless regs sets gs_base or the pages are taken; this fills
     // PEB.ImageBaseAddress
     uint64_t image_base = 0;
+
+    abi_t abi = abi_t::win64;
+
+    // syscall hook: the instruction does not enter a kernel, it is logged in
+    // syscalls (rax = number, args rdi,rsi,rdx,r10,r8,r9) and returns
+    // syscall_returns[number] or syscall_ret in rax with CF clear (FreeBSD
+    // success); rcx/r11 get the return rip / rflags like the real instruction
+    uint64_t syscall_ret = 0;
+    std::map<uint64_t, uint64_t> syscall_returns;
+    syscall_namer_t syscall_name = nullptr;    // names the log entries when set
 
     // Memory read back after the run. Pages the run never touched come
     // from page_in, so a dump of an untouched global still has its bytes
@@ -100,8 +123,12 @@ struct run_result_t {
     struct trace_entry_t { uint64_t ip = 0; std::string text; };
     std::vector<trace_entry_t> trace;
 
-    // value holds the stored bytes for len <= 8, 0 for wider stores
-    struct write_entry_t { uint64_t ip = 0; uint64_t addr = 0; size_t len = 0; uint64_t value = 0; };
+    // value holds the low 8 bytes of the store; truncated marks stores wider
+    // than 8 bytes (vector/string stores) whose upper bytes are not logged
+    struct write_entry_t {
+        uint64_t ip = 0; uint64_t addr = 0; size_t len = 0; uint64_t value = 0;
+        bool truncated = false;
+    };
     std::vector<write_entry_t> writes;     // capped at 2048 entries
     size_t total_writes = 0;
 
@@ -110,14 +137,26 @@ struct run_result_t {
         uint64_t    ip = 0;
         uint64_t    ret = 0;
         std::string name;
-        uint64_t    args[4] = {};          // rcx, rdx, r8, r9 at entry
+        uint64_t    args[6] = {};          // abi argument registers at entry
+        uint8_t     arg_count = 0;         // 4 win64 (rcx..r9), 6 sysv (rdi..r9)
     };
     std::vector<api_call_t> api_calls;     // capped at 1024 entries
     size_t total_api_calls = 0;
 
+    struct syscall_t {
+        uint64_t    ip = 0;                // the syscall instruction
+        uint64_t    num = 0;               // rax at entry
+        std::string name;                  // from syscall_name, empty when unknown
+        uint64_t    args[6] = {};          // rdi, rsi, rdx, r10, r8, r9
+        uint64_t    ret = 0;               // rax handed back
+    };
+    std::vector<syscall_t> syscalls;       // capped at 1024 entries
+    size_t total_syscalls = 0;
+
     size_t paged_in          = 0;          // demand pages mapped from page_in
     bool   page_in_exhausted = false;      // a fault was left standing at page_in_max
-    bool   teb_mapped        = false;
+    bool   teb_mapped        = false;      // win64 TEB/PEB at gs
+    bool   tls_mapped        = false;      // sysv TCB at fs
 
     std::vector<emu_mem_region_t> memory;  // one per dump, cut at the first unreadable page
 

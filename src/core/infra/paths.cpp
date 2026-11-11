@@ -4,6 +4,7 @@
 #include <shlobj.h>
 
 #include <filesystem>
+#include <fstream>
 
 namespace slop::core::infra::paths {
 
@@ -39,5 +40,31 @@ const std::string& app_data()      { return g_app_data; }
 const std::string& settings_file() { return g_settings_file; }
 const std::string& sessions_dir()  { return g_sessions_dir; }
 const std::string& crashes_dir()   { return g_crashes_dir; }
+
+bool write_file_atomic(const std::string& path, std::string_view data) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dst(path);
+    if (dst.has_parent_path()) fs::create_directories(dst.parent_path(), ec);
+
+    const fs::path tmp(path + ".tmp");
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f.is_open()) return false;
+        f.write(data.data(), static_cast<std::streamsize>(data.size()));
+        f.flush();
+        if (!f) {
+            f.close();
+            fs::remove(tmp, ec);
+            return false;
+        }
+    }
+    if (!::MoveFileExW(tmp.c_str(), dst.c_str(),
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        fs::remove(tmp, ec);
+        return false;
+    }
+    return true;
+}
 
 } // namespace slop::core::infra::paths

@@ -3,6 +3,7 @@
 #include "core/infra/lifecycle.hpp"
 
 #include <windows.h>
+#include <dpapi.h>
 
 #include <atomic>
 #include <chrono>
@@ -21,11 +22,14 @@
 #include "core/infra/mcp_onboard.hpp"
 #include "core/infra/paths.hpp"
 #include "core/infra/settings.hpp"
+#include "core/infra/text_format.hpp"
 #include "core/infra/work_queue.hpp"
 #include "core/mcp/mcp_server.hpp"
 #include "core/memory/watch_service.hpp"
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
+
+#pragma comment(lib, "crypt32.lib")
 
 namespace slop::core::infra::lifecycle {
 
@@ -55,14 +59,69 @@ std::string endpoint_file() {
     return dir + "\\engine.json";
 }
 
+// the token never lands on disk in the clear: DPAPI (current user) blob as hex
+std::string protect(const std::string& plain) {
+    if (plain.empty()) return {};
+    DATA_BLOB in{static_cast<DWORD>(plain.size()),
+                 reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()))};
+    DATA_BLOB out{};
+    if (!::CryptProtectData(&in, L"reverse-slop engine token", nullptr, nullptr, nullptr,
+                            CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return {};
+    std::string hex = fmt::format_hex_packed({out.pbData, out.cbData});
+    ::LocalFree(out.pbData);
+    return hex;
+}
+
+std::string unprotect(const std::string& hex) {
+    std::vector<uint8_t> blob;
+    std::string err;
+    if (hex.empty() || !fmt::parse_hex(hex, blob, err)) return {};
+    DATA_BLOB in{static_cast<DWORD>(blob.size()), blob.data()};
+    DATA_BLOB out{};
+    if (!::CryptUnprotectData(&in, nullptr, nullptr, nullptr, nullptr,
+                              CRYPTPROTECT_UI_FORBIDDEN, &out))
+        return {};
+    std::string plain(reinterpret_cast<const char*>(out.pbData), out.cbData);
+    ::SecureZeroMemory(out.pbData, out.cbData);
+    ::LocalFree(out.pbData);
+    return plain;
+}
+
+std::wstring image_path_of(HANDLE process) {
+    wchar_t buf[MAX_PATH * 2]{};
+    DWORD n = static_cast<DWORD>(std::size(buf));
+    if (!::QueryFullProcessImageNameW(process, 0, buf, &n)) return {};
+    return std::wstring(buf, n);
+}
+
+std::string utf8(const std::wstring& w) {
+    if (w.empty()) return {};
+    const int n = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
+                                        nullptr, 0, nullptr, nullptr);
+    std::string out(static_cast<size_t>(n), '\0');
+    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), n,
+                          nullptr, nullptr);
+    return out;
+}
+
+std::wstring wide(const std::string& s) {
+    if (s.empty()) return {};
+    const int n = ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()),
+                                        nullptr, 0);
+    std::wstring out(static_cast<size_t>(n), L'\0');
+    ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
+    return out;
+}
+
 void write_endpoint(uint16_t p, const std::string& token) {
     const std::string path = endpoint_file();
     if (path.empty()) return;
     const json doc{{"pid", static_cast<uint32_t>(::GetCurrentProcessId())},
                    {"port", p},
-                   {"token", token}};
-    std::ofstream f(path, std::ios::binary | std::ios::trunc);
-    if (f) f << doc.dump(2);
+                   {"exe", utf8(image_path_of(::GetCurrentProcess()))},
+                   {"token_dpapi", protect(token)}};
+    paths::write_file_atomic(path, doc.dump(2));
 }
 
 void remove_endpoint() {
@@ -96,6 +155,13 @@ void start_mcp() {
         const int p = std::atoi(env_port);
         if (p > 0 && p < 65536) cfg.port = static_cast<uint16_t>(p);
     }
+    // a spawner (tauri supervisor, test harness) brings its own per-launch token
+    // so the persisted one never has to travel over stdout
+    if (const char* env_tok = std::getenv("SLOP_MCP_TOKEN"); env_tok && *env_tok)
+        cfg.extra_tokens.emplace_back(env_tok);
+    if (cfg.token.empty())
+        bus::output("WARNING: mcp_token is empty, the mcp server accepts unauthenticated "
+                    "requests from any local process");
 
     // port taken means fall back to an ephemeral one and skip onboarding so clients stay pointed at the owner
     bool ephemeral = false;
@@ -124,15 +190,25 @@ void start_mcp() {
         std::lock_guard lk(s.mu);
         onboard = s.cfg.mcp_onboarding;
     }
-    if (!onboard || ephemeral || settings::mcp_onboarded()) return;
+    if (!onboard || ephemeral) return;
 
-    for (const auto& r : mcp_onboard::install_all(mcp::port(), cfg.token)) {
+    // first run registers everywhere; later runs only refresh entries we already
+    // wrote so a changed port or rotated token never leaves a client stale
+    const bool first = !settings::mcp_onboarded();
+    const auto results = first ? mcp_onboard::install_all(mcp::port(), cfg.token)
+                               : mcp_onboard::refresh_existing(mcp::port(), cfg.token);
+    for (const auto& r : results) {
         if (r.installed)
-            bus::output("mcp registered: " + r.client + " -> " + r.path);
+            bus::output(std::string(first ? "mcp registered: " : "mcp entry refreshed: ") +
+                        r.client + " -> " + r.path);
         else if (!r.error.empty())
             bus::output("mcp onboard skip (" + r.client + "): " + r.error);
     }
-    settings::set_mcp_onboarded(true);
+    if (first) {
+        settings::set_mcp_onboarded(true);
+        bus::output("note: client configs now hold the mcp bearer token; do not sync them "
+                    "to public dotfile repos");
+    }
 }
 
 } // namespace
@@ -278,6 +354,12 @@ const std::string& endpoint_path() {
     return path;
 }
 
+void refresh_endpoint() {
+    // only the booted engine owns engine.json; a bare mcp::start (tests) never writes it
+    if (!st().started.load() || st().torn_down.load() || !mcp::running()) return;
+    write_endpoint(mcp::port(), settings::mcp_token());
+}
+
 bool read_endpoint(endpoint_t& out) {
     const std::string path = endpoint_file();
     if (path.empty()) return false;
@@ -290,7 +372,8 @@ bool read_endpoint(endpoint_t& out) {
     endpoint_t ep;
     ep.pid   = doc.value("pid", uint32_t{0});
     ep.port  = doc.value("port", uint16_t{0});
-    ep.token = doc.value("token", std::string{});
+    ep.token = unprotect(doc.value("token_dpapi", std::string{}));
+    const std::string exe = doc.value("exe", std::string{});
     if (ep.pid == 0 || ep.port == 0) return false;
 
     // a crash leaves the file behind, treat a dead pid as no endpoint
@@ -298,8 +381,13 @@ bool read_endpoint(endpoint_t& out) {
     if (h == nullptr) return false;
     DWORD exit_code = 0;
     const bool alive = ::GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE;
+    // pid reuse: the live process must still be the image that wrote the file
+    const std::wstring image = alive ? image_path_of(h) : std::wstring{};
     ::CloseHandle(h);
     if (!alive) return false;
+    if (exe.empty() || image.empty() ||
+        ::CompareStringOrdinal(image.c_str(), -1, wide(exe).c_str(), -1, TRUE) != CSTR_EQUAL)
+        return false;
 
     out = std::move(ep);
     return true;

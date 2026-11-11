@@ -1,41 +1,59 @@
 #pragma once
 
 // src/core/infra/settings.hpp
-// settings live in localappdata
+// persistent engine settings (%LOCALAPPDATA%\reverse-slop\settings.json)
+//
+// every setter persists immediately through an atomic replace so a crash never
+// loses a change and never leaves a half written file behind
 
 #include <cstdint>
 #include <string>
+#include <string_view>
+
+#include <nlohmann/json.hpp>
 
 namespace slop::core::infra::settings {
 
+// loads settings_file(); a parseable non-object or unparseable file is backed up
+// to settings.json.corrupt-<ms> and replaced by an empty object. generates the
+// mcp_token on first run when it is empty
 void load();
-void save();
+// atomic write of the current state; returns false when the write failed
+bool save();
 
-// dock resets when this changes
-uint32_t layout_version();
-void     set_layout_version(uint32_t v);
+// tests point the store at a scratch file; load() reads from it afterwards
+void set_file_for_testing(std::string path);
+const std::string& file();
 
-// last target, for session restore
-std::string last_target_name();
-uint32_t    last_target_pid();
-void        set_last_target(const std::string& name, uint32_t pid);
+// raw value or null when absent
+nlohmann::json get_json(std::string_view key);
+
+// typed read with a fallback for missing keys and type mismatches
+template <class T>
+T get(std::string_view key, T def) {
+    const nlohmann::json j = get_json(key);
+    if (j.is_null()) return def;
+    try {
+        return j.get<T>();
+    } catch (...) {
+        return def;
+    }
+}
+
+// sets (null erases) and persists immediately; false when the write failed
+bool set(std::string_view key, nlohmann::json value);
+
+// copy of the whole settings object
+nlohmann::json snapshot();
 
 // MCP server
-bool     mcp_enabled();
-uint16_t mcp_port();
+bool        mcp_enabled();
+uint16_t    mcp_port();                 // out of range values fall back to 8765
 std::string mcp_token();
-void     set_mcp(bool enabled, uint16_t port, const std::string& token);
+std::string generate_token();           // 32 random bytes as 64 hex chars
 
 // first run registration into ai clients
 bool mcp_onboarded();
 void set_mcp_onboarded(bool v);
-
-// zero the debug flags in the targets peb right after a kernel attach
-bool stealth_peb_spoof();
-void set_stealth_peb_spoof(bool v);
-
-// prefer the kernel event channel when the driver is around
-bool stealth_kernel_debug();
-void set_stealth_kernel_debug(bool v);
 
 } // namespace slop::core::infra::settings

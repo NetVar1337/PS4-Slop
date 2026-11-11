@@ -61,22 +61,7 @@ read_t read_json_file(const std::string& path, json& out) {
 }
 
 bool write_json_file(const std::string& path, const json& j) {
-    // make sure the folder is there first
-    std::error_code ec;
-    fs::create_directories(fs::path(path).parent_path(), ec);
-
-    const std::string tmp = path + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if (!f.is_open()) return false;
-        f << j.dump(2);
-    }
-    fs::rename(tmp, path, ec);
-    if (ec) {
-        fs::remove(path, ec);
-        fs::rename(tmp, path, ec);
-    }
-    return !ec;
+    return paths::write_file_atomic(path, j.dump(2));
 }
 
 // entry builder
@@ -98,30 +83,69 @@ json make_mcp_entry(uint16_t port, const std::string& token) {
 // Each returns {client_name, installed, path, error}
 
 // shared installer, keeps every other key and bails on a config it cant parse
+// true when an existing entry already points at this port with this token
+bool entry_current(const json& existing, const json& wanted) {
+    if (!existing.is_object()) return false;
+    for (const char* k : {"url", "headers", "type"}) {
+        const bool has_w = wanted.contains(k);
+        const bool has_e = existing.contains(k);
+        if (has_w != has_e) return false;
+        if (has_w && existing.at(k) != wanted.at(k)) return false;
+    }
+    return true;
+}
+
+// writes or refreshes our entry inside container[servers_key]; keeps every
+// other key. a stale entry (old port/token) is rewritten in place, and in
+// update_only mode a missing entry is left missing
+install_result_t upsert_entry(const char* client, const std::string& path, json& cfg,
+                              json& container, const char* servers_key, json entry,
+                              bool update_only) {
+    if (!container.contains(servers_key) || !container.at(servers_key).is_object()) {
+        if (update_only) return {client, false, path, ""};
+        container[servers_key] = json::object();
+    }
+    json& servers = container[servers_key];
+    if (servers.contains(kServerName)) {
+        json& existing = servers[kServerName];
+        if (entry_current(existing, entry)) return {client, false, path, ""};
+        // keep user additions (env, disabled flags...) and refresh only what we own
+        if (existing.is_object()) {
+            existing.erase("headers");
+            for (auto& [k, v] : entry.items()) existing[k] = v;
+        } else {
+            existing = std::move(entry);
+        }
+    } else {
+        if (update_only) return {client, false, path, ""};
+        servers[kServerName] = std::move(entry);
+    }
+    if (!write_json_file(path, cfg))
+        return {client, false, path, "write failed"};
+    return {client, true, path, ""};
+}
+
+// shared installer, keeps every other key and bails on a config it cant parse
 install_result_t install_url_entry(const char* client, const std::string& path,
                                    uint16_t port, const std::string& token,
-                                   bool with_type) {
+                                   bool with_type, bool update_only) {
     json cfg;
     switch (read_json_file(path, cfg)) {
     case read_t::corrupt:
         return {client, false, path, "config unparseable, left untouched"};
     case read_t::missing:
+        if (update_only) return {client, false, path, ""};
         cfg = json::object();
         break;
     default:
         break;
     }
-    if (!cfg.contains("mcpServers") || !cfg.at("mcpServers").is_object())
-        cfg["mcpServers"] = json::object();
-    if (cfg.at("mcpServers").contains(kServerName))
-        return {client, false, path, ""};
+    if (!cfg.is_object())
+        return {client, false, path, "config root is not an object, left untouched"};
 
     json entry = make_mcp_entry(port, token);
     if (with_type) entry["type"] = "http";
-    cfg["mcpServers"][kServerName] = std::move(entry);
-    if (!write_json_file(path, cfg))
-        return {client, false, path, "write failed"};
-    return {client, true, path, ""};
+    return upsert_entry(client, path, cfg, cfg, "mcpServers", std::move(entry), update_only);
 }
 
 // old builds wrote a dead entry into ~/.claude/settings.json, wipe just ours
@@ -138,11 +162,11 @@ void remove_legacy_claude_code_settings_entry() {
     write_json_file(path, settings);
 }
 
-install_result_t do_claude_code_global(uint16_t port, const std::string& token) {
+install_result_t do_claude_code_global(uint16_t port, const std::string& token, bool update_only) {
     // ~/.claude.json is claude codes state file so only add our key and touch nothing else
     remove_legacy_claude_code_settings_entry();   // old builds wrote there
     return install_url_entry("Claude Code (global)", userprofile() + "\\.claude.json",
-                             port, token, /*with_type=*/true);
+                             port, token, /*with_type=*/true, update_only);
 }
 
 install_result_t do_claude_desktop(uint16_t port, const std::string& token) {
@@ -165,18 +189,18 @@ install_result_t do_claude_desktop(uint16_t port, const std::string& token) {
             "desktop config is stdio-only; add remote MCP via the Connectors UI"};
 }
 
-install_result_t do_cursor(uint16_t port, const std::string& token) {
+install_result_t do_cursor(uint16_t port, const std::string& token, bool update_only) {
     return install_url_entry("Cursor", userprofile() + "\\.cursor\\mcp.json",
-                             port, token, /*with_type=*/false);
+                             port, token, /*with_type=*/false, update_only);
 }
 
-install_result_t do_windsurf(uint16_t port, const std::string& token) {
+install_result_t do_windsurf(uint16_t port, const std::string& token, bool update_only) {
     return install_url_entry("Windsurf",
                              userprofile() + "\\.codeium\\windsurf\\mcp_config.json",
-                             port, token, /*with_type=*/false);
+                             port, token, /*with_type=*/false, update_only);
 }
 
-install_result_t do_vscode(uint16_t port, const std::string& token) {
+install_result_t do_vscode(uint16_t port, const std::string& token, bool update_only) {
     // vs code tucks servers under mcp.servers
     const std::string path = appdata() + "\\Code\\User\\settings.json";
 
@@ -185,56 +209,77 @@ install_result_t do_vscode(uint16_t port, const std::string& token) {
     case read_t::corrupt:
         return {"VS Code", false, path, "config unparseable, left untouched"};
     case read_t::missing:
+        if (update_only) return {"VS Code", false, path, ""};
         settings = json::object();
         break;
     default:
         break;
     }
+    if (!settings.is_object())
+        return {"VS Code", false, path, "config root is not an object, left untouched"};
 
-    // VS Code uses "mcp" -> "servers" -> { name: { ... } }
-    if (!settings.contains("mcp"))
+    // VS Code uses "mcp" -> "servers" -> { name: { ... } }; a non-object "mcp"
+    // is the user's business, never overwrite it
+    if (!settings.contains("mcp")) {
+        if (update_only) return {"VS Code", false, path, ""};
         settings["mcp"] = json::object();
-    if (!settings["mcp"].contains("servers"))
-        settings["mcp"]["servers"] = json::object();
+    }
+    if (!settings.at("mcp").is_object())
+        return {"VS Code", false, path, "\"mcp\" is not an object, left untouched"};
 
-    if (settings["mcp"]["servers"].contains(kServerName))
-        return {"VS Code", false, path, ""};
-
-    json entry;
+    json entry = make_mcp_entry(port, token);
     entry["type"] = "http";
-    entry["url"] = "http://127.0.0.1:" + std::to_string(port) + "/mcp";
-    if (!token.empty())
-        entry["headers"] = json::object({{"Authorization", "Bearer " + token}});
-    settings["mcp"]["servers"][kServerName] = entry;
-
-    if (!write_json_file(path, settings))
-        return {"VS Code", false, path, "write failed"};
-    return {"VS Code", true, path, ""};
+    return upsert_entry("VS Code", path, settings, settings["mcp"], "servers",
+                        std::move(entry), update_only);
 }
 
-install_result_t do_opencode(uint16_t port, const std::string& token) {
+install_result_t do_opencode(uint16_t port, const std::string& token, bool update_only) {
     // ~/.config/opencode/config.json  (XDG on Linux; %USERPROFILE%\.config on Win)
     return install_url_entry("OpenCode",
                              userprofile() + "\\.config\\opencode\\config.json",
-                             port, token, /*with_type=*/false);
+                             port, token, /*with_type=*/false, update_only);
 }
 
 } // namespace
 
 // public api
 
-std::vector<install_result_t> install_all(uint16_t port, const std::string& token) {
+namespace {
+
+// one bad config must never abort the sweep (or the boot that runs it)
+template <class Fn>
+install_result_t guarded(const char* client, Fn&& fn) {
+    try {
+        return fn();
+    } catch (const std::exception& e) {
+        return {client, false, "", std::string("installer failed: ") + e.what()};
+    } catch (...) {
+        return {client, false, "", "installer failed"};
+    }
+}
+
+std::vector<install_result_t> sweep(uint16_t port, const std::string& token, bool update_only) {
     std::vector<install_result_t> results;
     results.reserve(6);
-
-    results.push_back(do_claude_code_global(port, token));
-    results.push_back(do_claude_desktop(port, token));
-    results.push_back(do_cursor(port, token));
-    results.push_back(do_windsurf(port, token));
-    results.push_back(do_vscode(port, token));
-    results.push_back(do_opencode(port, token));
-
+    results.push_back(guarded("Claude Code (global)",
+                              [&] { return do_claude_code_global(port, token, update_only); }));
+    if (!update_only)
+        results.push_back(guarded("Claude Desktop", [&] { return do_claude_desktop(port, token); }));
+    results.push_back(guarded("Cursor", [&] { return do_cursor(port, token, update_only); }));
+    results.push_back(guarded("Windsurf", [&] { return do_windsurf(port, token, update_only); }));
+    results.push_back(guarded("VS Code", [&] { return do_vscode(port, token, update_only); }));
+    results.push_back(guarded("OpenCode", [&] { return do_opencode(port, token, update_only); }));
     return results;
+}
+
+} // namespace
+
+std::vector<install_result_t> install_all(uint16_t port, const std::string& token) {
+    return sweep(port, token, /*update_only=*/false);
+}
+
+std::vector<install_result_t> refresh_existing(uint16_t port, const std::string& token) {
+    return sweep(port, token, /*update_only=*/true);
 }
 
 std::vector<install_result_t> uninstall_all() {

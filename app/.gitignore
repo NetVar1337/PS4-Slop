@@ -1,0 +1,5 @@
+# Browser-dev engine port/token (see README.md), never committed
+.env.local
+.env.*.local
+# vitest --coverage output
+coverage/

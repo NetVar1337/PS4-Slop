@@ -18,15 +18,16 @@ infra::published_t<module_table_t> g_modules;
 } // namespace
 
 uint64_t refresh_modules() {
-    const auto s = active_session();
+    auto s = active_session();
     if (!s || !s->valid()) return 0;
-    // copy the handle out: the session may be detached while the job runs and
-    // the backend is looked up inside the job for the same reason
-    const runtime::target_handle_t h = s->handle();
+    // the job owns a reference to the session: its handle (and the backend
+    // it was opened on) stay valid until the job finishes even if the user
+    // detaches meanwhile; a result for a session that is no longer current
+    // is dropped instead of published
     return infra::jobs::submit({
         "Enumerate modules", "module_table", false,
-        [h](infra::job_context_t& ctx) {
-            auto r = runtime::active().enum_modules(h);
+        [s](infra::job_context_t& ctx) {
+            auto r = s->backend()->enum_modules(s->handle());
             auto snap = std::make_shared<module_table_t>();
             snap->sampled_ms = infra::wall_ms();
             if (r.ok) {
@@ -37,7 +38,7 @@ uint64_t refresh_modules() {
                               return a.base < b.base;
                           });
             }
-            if (ctx.cancelled()) return;
+            if (ctx.cancelled() || active_session() != s) return;
             g_modules.publish(std::move(snap));
         }});
 }

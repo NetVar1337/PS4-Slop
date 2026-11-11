@@ -1,27 +1,40 @@
 [CmdletBinding()]
 param(
-    [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'reverse-slop\tools\magicmida\2026-05-14'),
+    # defaults to %LOCALAPPDATA%\reverse-slop\tools\magicmida\<version>
+    [string]$InstallRoot,
     [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
-$release = '2026-05-14'
+# Single version source: tools/magicmida-version.txt. Line 1 is the release
+# (read by CMake as SLOP_MAGICMIDA_VERSION, build.ps1 and the CI cache key),
+# the following `<arch> <sha256>` lines pin that release's packages.
+$versionLines = @(Get-Content -LiteralPath (Join-Path $PSScriptRoot 'magicmida-version.txt') | Where-Object { $_.Trim() })
+$release = $versionLines[0].Trim()
+$sha = @{}
+foreach ($line in $versionLines | Select-Object -Skip 1) {
+    $arch, $hash = $line.Trim() -split '\s+', 2
+    $sha[$arch] = $hash.ToLowerInvariant()
+}
+foreach ($arch in 'x86', 'x64') {
+    if (-not $sha[$arch]) { throw "tools/magicmida-version.txt has no SHA-256 line for $arch" }
+}
+if (-not $InstallRoot) {
+    if (-not $env:LOCALAPPDATA) { throw 'LOCALAPPDATA is not set; pass -InstallRoot explicitly' }
+    $InstallRoot = Join-Path $env:LOCALAPPDATA "reverse-slop\tools\magicmida\$release"
+}
 $packages = @(
     @{
         Arch = 'x86'
         Url = "https://github.com/Hendi48/Magicmida/releases/download/$release/Magicmida.zip"
-        Sha256 = 'efe8e676efd5920c6e1636a1b8f9847513986433959e429eebecf8e8f5ab5146'
+        Sha256 = $sha['x86']
     },
     @{
         Arch = 'x64'
         Url = "https://github.com/Hendi48/Magicmida/releases/download/$release/Magicmida64.zip"
-        Sha256 = '6ec3262a6632218513dcaaf1cdd17b4d131bbbbc9ad349e4a0c28789ca92070c'
+        Sha256 = $sha['x64']
     }
 )
-
-if (-not $env:LOCALAPPDATA -and -not $PSBoundParameters.ContainsKey('InstallRoot')) {
-    throw 'LOCALAPPDATA is not set; pass -InstallRoot explicitly'
-}
 
 $tempRoot = Join-Path $env:TEMP "reverse-slop-magicmida-$PID"
 New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null

@@ -1,965 +1,668 @@
-<!-- logo pinned to a commit so github's image cache can't serve a stale one,
-     bump the sha whenever the icon changes -->
 <p align="center">
-  <img src="https://raw.githubusercontent.com/kaizer1308/reverse-slap/a61180fb51fc19141104a13a2caf6c33b9661bcc/app/src-tauri/icons/256x256.png" width="144" alt="reverse-slop" />
+  <img src="app/src-tauri/icons/256x256.png" width="128" alt="reverse-slop logo" />
 </p>
 
-# reverse-slop
+<h1 align="center">reverse-slop</h1>
 
-PS4 reverse-engineering toolkit with desktop interfaces, live remote analysis
-and debugging of a console running the ps4debug-NG payload, static analysis
-and decompilation of dumped game binaries, host-side network capture, and a
-built-in Model Context Protocol (MCP) server so AI agents can drive whole
-game-RE workflows end to end.
+<p align="center">
+  <b>PS4 reverse-engineering workbench</b><br/>
+  live memory, scanning and debugging over ps4debug-NG · static analysis of dumped modules ·
+  Lua scripting · a built-in MCP server so AI agents can drive the whole workflow
+</p>
+
+<p align="center">
+  <a href="https://github.com/NetVar1337/PS4-Slop/actions/workflows/build.yml"><img alt="build" src="https://github.com/NetVar1337/PS4-Slop/actions/workflows/build.yml/badge.svg"></a>
+  <img alt="version" src="https://img.shields.io/badge/version-0.1.1-informational">
+  <img alt="platform" src="https://img.shields.io/badge/host-Windows%2010%2F11%20x64-blue">
+  <img alt="target" src="https://img.shields.io/badge/target-PS4%20%2B%20ps4debug--NG-black">
+</p>
 
 > [!WARNING]
-> Use reverse-slop only on consoles, games, and systems you own or are
-> authorized to test. Live debugging and memory writes on a PS4 can crash the
-> console or trip anti-cheat; host-side packet capture needs administrator
-> privileges on the analysis PC.
+> Use reverse-slop only on consoles, games, and systems you own or are authorized to test.
+> Live debugging and memory writes can crash the console or the game. Host-side packet
+> capture needs administrator rights on the analysis PC.
 
-## Inspiration and attribution
+![reverse-slop workspace: PS4 process list, value scanner with watchlist, disassembly of a dumped eboot, inspector](docs/screenshots/workspace.png)
 
-reverse-slop is heavily inspired by [AiDA Private](https://github.com/sigwl/AiDAPrivate),
-created by [sigwl](https://github.com/sigwl) (ruarridh). Most, if not almost all,
-of reverse-slop's feature set and feature concepts are based on that project.
+<sub>Screenshots in this README were captured from the Tauri UI against a simulated
+ps4debug-NG console; process names, addresses and values are demo data.</sub>
+
+---
+
+## Contents
+
+- [What it does](#what-it-does)
+- [Screenshots](#screenshots)
+- [Quick start](#quick-start)
+- [Typical workflows](#typical-workflows)
+- [Desktop UI](#desktop-ui)
+- [Feature reference](#feature-reference)
+- [Lua scripting](#lua-scripting)
+- [MCP and HTTP API](#mcp-and-http-api)
+- [Architecture](#architecture)
+- [Building](#building)
+- [Runtime data](#runtime-data)
+- [Tests](#tests)
+- [Known limitations](#known-limitations)
+- [Troubleshooting](#troubleshooting)
+- [Security notes](#security-notes)
+- [Credits and license](#credits-and-license)
+
+## What it does
+
+| Area | Summary |
+|---|---|
+| **Console connection** | Speaks the [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) wire protocol directly (TCP 744 + the port-755 event callback). Nothing is installed on the PC side of the wire. |
+| **Live memory** | Process list, attach, regions, modules, threads, read/write/protect/alloc, Cheat Engine-style scans, AOB search, pointer chains, snapshots and diffs, a shared watchlist with freeze. |
+| **Live debugging** | Software breakpoints, DR0-DR3 hardware watchpoints, continue/step/suspend, stop events with full register sets, callstacks, FP/debug/FS-GS registers, remote function calls, and one-call trace actions. |
+| **On-console tooling** | Native scan/rescan and AOB scan, Zydis disassembly, xref extraction, stack walks, Keystone assembly, ELF upload, notifications — all executed by the payload on the console. |
+| **Static analysis** | ELF64 (SCE imports with **NID→name resolution**, relocation application), decrypted-SELF extraction, PE and Mach-O/`.ipa` loading; function, xref and string indexes; Xray passes; image patching with a journal; binary diffing; packer heuristics. |
+| **Decompiler** | Hyperion p-code lifting, SSA, DCE, type inference and structuring to C-like output, with SysV AMD64 (PS4), Win64 and AAPCS64 calling conventions. |
+| **Emulation** | Isolated Unicorn x86-64 runs with demand paging from the loaded image or live console memory, tracing and byte-level taint. |
+| **Automation** | Lua 5.4 against the same shared session as the UI, plus an MCP server with 20 action-based tools and task playbooks (`guide`). |
+| **Host network** | Raw-socket capture, DNS log, stream reassembly, PCAP export, and a localhost HTTP inspection proxy. |
+
+Two desktop shells drive the same C++ core: the **Tauri v2 + React** app (the one that
+ships) and a legacy **ImGui/DX11** shell. The engine can also run headless for MCP/HTTP
+clients only.
 
 ## Screenshots
 
-The main workspace, process list and disassembly side by side under the kernel badge:
-
-![main workspace](docs/reverse-slop-main.png)
-
-The strings view with search, UTF-16 flagging and xref counts:
-
-![strings view](docs/reverse-slop-strings.png)
-
-## Highlights
-
-- **Two desktop interfaces, one core:** native ImGui/DX11 shell and Tauri v2 +
-  React shell both drive the same C++ engine.
-- **Headless operation:** run the engine without a window for MCP or HTTP clients.
-- **Remote PS4 targets:** connect directly to a console running the
-  [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload (TCP 744) and
-  use the same process list, attach, memory read/write/scan, regions, modules,
-  and threads against the console — plus live remote debugging: breakpoints,
-  hardware watchpoints, continue/step, stop events, register get/set,
-  callstacks, and remote function calls via the `debugger` tool's `ps4_*`
-  actions and the one-call `target.ps4_auto`.
-- **Live analysis over the wire:** memory read/write/protect/alloc, Cheat
-  Engine-style scans, AOB search, pointer chains, snapshots and diffs,
-  watchlists, and module/region enumeration all run against the console
-  process through ps4debug-NG.
-- **Static analysis:** PE, PS4/Orbis ELF64 (SELF) and Mach-O/`.ipa` loading,
-  x86/x64 and ARM64 disassembly, function and cross-reference indexes, strings,
-  globals, vtables, RTTI, signatures, binary diffing, packer detection, and
-  security-focused reconnaissance — built for analyzing dumped `eboot.bin`
-  and game modules offline.
-- **Decompiler:** Hyperion p-code lifting, SSA, dead-code elimination, type
-  inference, control-flow structuring, and C-like output with source addresses.
-- **Emulation:** isolated x86-64 Unicorn execution with demand paging from the
-  loaded image or live console memory, IAT stubs, register/memory setup,
-  tracing, and byte-level taint propagation.
-- **Network tooling:** host-side raw-socket capture (packets, DNS, streams,
-  per-packet HTTP/TLS/DNS classification, PCAP export) plus an independent
-  localhost HTTP inspection proxy.
-- **Unpacking and devirtualization:** Magicmida Themida sidecars, VM handler and
-  opcode-map recovery, trace/lift/pseudocode flows, CFG recovery, predicate
-  proofs, invariants, and IAT auditing.
-- **Agent-native control:** 25 MCP-visible domain tools with consolidated
-  `action` parameters, task playbooks via `guide`, plus an `/api`-only
-  application-control tool and SSE events.
-
-## Platform and requirements
-
-### Required for the C++ build
-
-- Windows 10 or 11, x64
-- Visual Studio 2022 with **Desktop development with C++** and the
-  `Microsoft.VisualStudio.Component.VC.Tools.x86.x64` component
-- CMake 3.25 or newer
-- Ninja
-- PowerShell
-- Git and internet access during first configure
-
-`tools/build.ps1` locates Visual Studio with `vswhere`, then uses Visual
-Studio's bundled CMake and Ninja. CMake downloads pinned dependencies into
-`_ext/`, including ImGui, FreeType, Zydis, Capstone, Unicorn, nlohmann/json,
-cpp-httplib, SQLite, Lua, fmt, spdlog, and zlib.
-
-### Additional requirements by component
-
-| Component | Additional requirements |
+| | |
 |---|---|
-| Tauri desktop shell | Node.js/npm, Rust toolchain with Cargo, WebView2 runtime |
-| Themida unpacking | Separately installed Magicmida x86/x64 sidecars |
-| Host packet capture (`network` tool) | Administrator privileges for SIO_RCVALL |
+| **Live debugger** — a breakpoint hit on the console: registers of the stopped thread, callstack, armed breakpoint and DR0 watchpoint, event feed, console actions. | **Memory** — region list of the console process and the hex editor on the game heap (editable in place). |
+| ![debugger](docs/screenshots/debugger.png) | ![memory](docs/screenshots/memory.png) |
+| **Strings** — strings of the dumped eboot with min-length / exec-section filters; click to follow xrefs. | **Lua scripts** — read live console memory and query the static index from one script. |
+| ![strings](docs/screenshots/strings.png) | ![scripts](docs/screenshots/scripts.png) |
+| **Settings** — theme, motion, target state, engine endpoints, MCP token and URL, sandbox and egress toggles. | **Themes** — Obsidian (default), Nord-slop, Blood-orange, Daylight (light) and High-contrast. |
+| ![settings](docs/screenshots/settings.png) | ![nord theme](docs/screenshots/theme-nord.png) |
 
-## Build
+## Quick start
 
-Run commands from a PowerShell prompt at repository root.
+**1. Prerequisites**
 
-### Standard build
+| Needed for | Requirement |
+|---|---|
+| Everything | Windows 10/11 x64, PowerShell, Git, internet access on first configure |
+| C++ engine | Visual Studio 2022+ with *Desktop development with C++* (x64 tools), CMake ≥ 3.25, Ninja (VS bundles both) |
+| Desktop app | Node.js + npm, Rust/Cargo, WebView2 runtime (bundled with Windows 11) |
+| Console | A PS4 on the same network running the ps4debug-NG payload |
+| Optional | Administrator rights (host packet capture), Magicmida sidecars (Themida unpacking) |
+
+**2. Build**
 
 ```powershell
-powershell -File tools/build.ps1
+git clone https://github.com/NetVar1337/PS4-Slop.git
+cd PS4-Slop
+powershell -File tools/build.ps1          # C++ engine + Tauri app (portable folder + installer)
+powershell -File tools/build.ps1 -NoFrontend   # C++ only, fastest loop
 ```
 
-This configures and builds the `ninja-msvc-release` preset into `build/`, then
-builds the Tauri app (portable folder plus installer). Incremental builds reuse
-both directories. Add `-NoFrontend` for the C++ targets alone.
-
-Useful build-script switches:
+**3. Run**
 
 ```powershell
-# Delete build/ before configuring
-powershell -File tools/build.ps1 -FullClean
-
-# Configure only; do not compile
-powershell -File tools/build.ps1 -PlanOnly
-
-# Select another preset if one has been added to CMakePresets.json
-powershell -File tools/build.ps1 -Preset ninja-msvc-release
-
-# Full installer: bundle Magicmida and the WebView2
-# runtime so the target machine needs nothing but Windows (no internet,
-# no WebView2, no dev tools). Fails instead of skipping a missing component
-powershell -File tools/build.ps1 -Full
+.\dist\reverse-slop\reverse-slop.exe      # desktop app (spawns the engine as a sidecar)
 ```
 
-Default CMake options are all enabled:
+**4. Connect the console**
 
-| Option | Default | Output |
+Load ps4debug-NG on the PS4, then in the **Targets** panel press the gamepad button, enter
+the console IP and connect. Or let an agent do it in one call:
+
+```json
+{ "tool": "target", "action": "ps4_auto", "params": { "host": "192.168.1.50" } }
+```
+
+`ps4_auto` connects, authenticates the native scanner, picks the game process (the one
+with `/app0/` modules, eboot-named preferred), attaches a session and the debug session,
+and returns modules, threads and regions.
+
+## Typical workflows
+
+**Find and freeze a value**
+
+1. Targets → connect → attach the game.
+2. Scanner: choose a width (`u32`, `f32`, …), type the current value, **First**.
+3. Change the value in game, type the new one, **Next** until a handful remain.
+4. Add the hit to the watchlist and toggle **freeze**; the watch service writes it back about 10× per second.
+
+**Find what writes an address**
+
+```json
+{ "tool": "debugger", "action": "ps4_find_write", "params": { "addr": "0x200001000", "len": 4, "timeout_ms": 10000 } }
+```
+
+Arms a write watchpoint, resumes, waits for the hit and returns the event with the
+writer's callstack. `ps4_until`, `ps4_trace_calls` and `ps4_trace_steps` cover the other
+common one-shot moves.
+
+**Dump a module and analyze it offline**
+
+```json
+{ "tool": "target", "action": "ps4_dump_module", "params": { "name": "eboot.bin", "path": "C:/dumps/eboot.bin", "load": true } }
+```
+
+`load: true` opens an ELF dump in the Disassembly workspace (functions, xrefs, strings,
+Xray, patching). The Debugger view has the same **dump+load** action.
+
+**Let an agent drive**
+
+Start the app (or `reverse-slop-engine.exe`) and point an MCP client at
+`http://127.0.0.1:8765/mcp`. Supported clients are registered automatically on first
+start (see [Automatic MCP client registration](#automatic-mcp-client-registration)).
+`guide list` / `guide get {topic}` return ready-to-run tool sequences such as
+`ps4_setup`, `ps4_breakpoint`, `ps4_find_write`, `ps4_native_scan`, `find_health`,
+`pointer_chain` and `ps4_dump_and_analyze`.
+
+**If the payload or the game restarts**
+
+Console commands start failing after the drop; `target.ps4_reconnect` re-runs the
+handshake and authentication, re-attaches the debug session and re-arms the breakpoints
+and watchpoints you had set.
+
+Scriptable versions of these flows live in [`examples/`](examples) (PS4 Lua scripts plus
+the older UE5 dumper example).
+
+## Desktop UI
+
+Left to right: the activity rail (Targets, Modules, Scripts, Settings), the selected side
+panel, the scanner and watchlist, the tabbed workspace above the Output/Log pane, and the
+Inspector. The status bar shows backend, engine, memory, image and analysis state.
+
+| Panel | What it does |
+|---|---|
+| Targets | Process list with filter, attach/detach, PS4 connect bar (host/port), PS4 auto setup. |
+| Modules | Module list of the attached process with **Dump** and **Dump + analyze**. |
+| Scripts | Lua scratchpad (`Ctrl+Enter` runs) with per-run output history. |
+| Scanner / Watchlist | Value scanner (width, compare, value; first/next) and the shared watchlist with freeze/poke/remove. |
+| Disassembly | Virtualized function list with filter and rename, instruction listing with flow colouring and jump-following. |
+| Strings | String hits of the loaded image with min-length and exec-section filters; follows xrefs. |
+| Memory | Region list plus a 4 KiB-paged hex editor with goto and in-place byte edits. |
+| Debugger | PS4 run control, registers, callstack, breakpoints, watchpoints, event feed, on-console scan/AOB, notifications, dump+load. |
+| PE Browser | Sections, imports and exports of the loaded image (Mach-O browser for iOS images). |
+| Output / Log | Engine output (SSE, replayed on reconnect) and the diagnostic log. |
+| Inspector | Facts about the attached target, the loaded image and analysis state. |
+| Settings | Theme, motion, target status, engine endpoints, MCP token (show/regenerate), Lua sandbox and web egress toggles. |
+
+Themes and the motion preference persist, as do panel sizes, the active rail and the
+active workspace tab. Panels are resizable with the splitters (mouse or keyboard). A
+command palette (`Ctrl+K`) jumps to functions, addresses, tabs and actions; global
+shortcuts: `Ctrl+O` open binary, `Ctrl+G` go to address, `Ctrl+1…5` workspace tabs,
+`Ctrl+,` settings, `Ctrl+Alt+I` inspector.
+
+### Legacy ImGui shell
+
+`build\src\app\reverse-slop.exe` (requests elevation) is the original native shell, kept
+for parity work. It has the same core views with `Ctrl+1`…`Ctrl+0` shortcuts (Targets,
+Inspector, Disassembly, Memory, Output, Scanner, Strings, PE Browser, Debugger,
+Pseudocode), an Unpacker view and `F12` frame metrics.
+
+## Feature reference
+
+### Console connection (ps4debug-NG)
+
+- `target.ps4_connect {host, port=744, pid?}`, `target.ps4_disconnect`, `target.ps4_auto {host, port?}`.
+- Once connected, `target.list` enumerates console processes and `target.attach {pid}`
+  opens a session over the wire; the backend badge reads `PS4`.
+- Reads are validated against the console VM map, so unmapped ranges fail instead of
+  returning zeros. Windows `PAGE_*` constants are translated to FreeBSD `VM_PROT_*`.
+- `target.ps4_dump_module {name|base, path, load?}` pulls a module's memory image off the
+  console.
+
+### Live memory
+
+- Read/write in hex, UTF-8, integer and float formats; allocate, free, change protection.
+- Initial and refined numeric scans: exact/range/changed/unchanged, signed/unsigned/float
+  widths, rounding, region/protection/alignment filters, worker/chunk/result caps.
+- AOB wildcard search, pointer-chain scans, signature generation, live crypto-constant search.
+- Memory snapshots with compare/list/free.
+- Shared watchlist sampled about 10 Hz with freeze writes; UI and MCP edits appear in both.
+- Pointer-chain scans can be re-verified over multiple samples (`pointerscan_verify`).
+
+### Live debugging
+
+Every action below lives on the `debugger` tool.
+
+| Group | Actions |
+|---|---|
+| Session | `ps4_attach {pid}`, `ps4_detach`, `ps4_status` |
+| Breakpoints | `ps4_bp_set {addr, index?}`, `ps4_bp_clear {addr\|index}`, `ps4_bp_list` (slots 0-29, allocated client-side) |
+| Watchpoints | `ps4_watch_set {addr, len=1\|2\|4\|8, type=0 exec\|1 write\|3 rw, index?}`, `ps4_watch_clear`, `ps4_watch_list` (DR0-DR3) |
+| Run control | `ps4_continue {stop: 0 resume\|1 SIGSTOP\|2 SIGKILL}`, `ps4_step {lwpid?}`, `ps4_suspend`/`ps4_resume {lwpid}`, `ps4_process_stop {state}` |
+| Events | `ps4_wait {timeout_ms}` (next stop: registers, signal, thread name, DRs), `ps4_events {max, clear}` |
+| Registers | `ps4_regs`, `ps4_set_reg {lwpid, name, value}`, `ps4_dbregs`, `ps4_set_dbregs`, `ps4_fpregs`, `ps4_set_fpregs` (832-byte savefpu), `ps4_fsgs`, `ps4_set_fsgs` |
+| Stack | `ps4_callstack {lwpid, depth}` (rbp chain over live reads), `ps4_stack {rbp?, rsp?, depth}` (server-side walk with locals and code windows) |
+| Remote calls | `ps4_call {addr, args[6]}` — installs the payload RPC stub once per process and returns `rax` |
+| Power actions | `ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps` |
+
+### On-console tooling
+
+These run inside the payload on the console:
+
+- **Native scan** (unlocked by `ps4_auth`, run automatically on connect):
+  `ps4_scan`, `ps4_rescan` (exact/fuzzy/bigger/smaller/between/increased/decreased/changed/unchanged/unknown),
+  `ps4_scan_state`, `ps4_scan_reset`, `ps4_scan_all`, `ps4_scan_aob` (`??` wildcards).
+- **Code analysis**: `ps4_disasm {addr, len, max}`, `ps4_xrefs {addr, len}`, `ps4_xrefs_to {addr, len, target}`.
+- **Assembly**: `ps4_assemble {asm, base?, syntax?}` (payload-side Keystone); write the bytes with `memory.write`.
+- **ELF upload**: `ps4_elf_rpc {path}` (returns the entry) and `ps4_elf_load {path}` (jumps into it).
+- **Console**: `ps4_notify {msg, type?}`, `ps4_print {msg}`, `ps4_app` (foreground pid, title ID, content ID, version).
+
+### Static analysis
+
+- ELF64 loading with segment-backed section maps, SCE `PT_SCE_DYNLIBDATA` imports with
+  **NID→name resolution** (built-in database, overridable via
+  `%LOCALAPPDATA%\reverse-slop\nids.txt`), and static relocation application; SELF
+  header/segment extraction for plaintext images; PE headers/imports/exports; Mach-O
+  thin/FAT and `.ipa` (main executable from `Info.plist`, arm64 slice preferred,
+  `LC_FUNCTION_STARTS` bounds).
+- Fast Zydis function, xref and string indexes; Capstone for ARM64.
+- Background Hyperion analysis (CFGs, globals, vtables, RTTI, names) and the decompiler
+  for PE and Mach-O images; .NET assemblies list types, render C#, or dump IL.
+- **Xray** (read-only): CFG and cyclomatic complexity, control-flow flattening and
+  obfuscation scoring, string reconstruction, indirect-call recovery, anti-analysis
+  patterns, hook checks, direct syscalls, API-hash resolution, entropy windows, page
+  classification, crypto constants, ROP gadgets.
+- **Patching** (loaded image only, not live memory): junk-NOP cleanup, opaque predicates,
+  anti-debug, XOR unpack, string decoding, explicit byte writes, a patch journal with full
+  revert, a combined pass, and re-indexing after edits.
+- Binary-to-binary function diff, packer/protector indicators, RTTI/vtable recovery,
+  dangerous-import callsites, library signatures, user structs/enums, comments and bookmarks.
+- Names, comments and bookmarks persist per file hash and remap across runtime bases.
+
+### Emulation and devirtualization
+
+- Unicorn x86-64 runs from bytes, loaded-image addresses or live target addresses, with
+  demand paging, IAT stubs that log calls, custom registers/stack/memory, stop
+  conditions, bounded traces and byte-granular taint.
+- VM identification, handler discovery, opcode maps, trace/lift/pseudocode, CFG recovery,
+  predicate proofs, invariants and IAT audits.
+- Supervised Magicmida (Themida) jobs with architecture checks, cancellation and timeouts.
+
+### Host network and proxy
+
+- Raw-socket capture on the analysis PC (SIO_RCVALL, administrator): packet paging with
+  text filters, DNS log, statistics, stream listing and reassembly, per-packet
+  HTTP/TLS/DNS inspection, PCAP export.
+- Independent localhost HTTP/1.1 proxy: start/stop, captured exchanges, replay. CONNECT
+  tunnels record metadata and SNI only.
+
+### Persistence, filesystem and web
+
+- SQLite session snapshots and key/value storage; Hyperion `.hdb` export/import.
+- Host filesystem read/write/list/create/delete/search/grep.
+- Outbound WinHTTP GET/POST without browser-cookie inheritance.
+
+## Lua scripting
+
+Scripts run from the **Scripts** panel, the `script` MCP tool (`action=run`, `code`,
+`timeout_ms`) or `/api`, against the same session as the UI — renames and comments made
+in one surface show up in all of them. Returned values are appended as `return: <value>`.
+Scripts are sandboxed by default (no `io`/`os` execution, memory and instruction caps);
+set `script_unsafe` in Settings for the full standard library.
+
+```lua
+-- read the player struct on the console, then rank the dump's functions
+local st = slop.target.status()
+print("backend:", st.backend, st.name, st.pid)
+local raw = slop.mem.read_bytes(0x200001000, 12)         -- raw bytes
+local hp, ammo, lives = string.unpack("<i4i4i4", raw)
+print("player: hp=" .. hp .. " ammo=" .. ammo .. " lives=" .. lives)
+
+-- the debugger surface is scriptable too
+slop.ps4.attach(st.pid)
+slop.ps4.bp_set(0x484490)
+local ev = slop.ps4.wait(5000)
+print(("stop: rip=0x%X thread=%s"):format(ev.rip, ev.thread))
+
+local fns = slop.disasm.functions(4000)
+table.sort(fns, function(a, b) return a.size > b.size end)
+for i = 1, 5 do
+  print(string.format("%X  %s  %d bytes", fns[i].va, fns[i].name, fns[i].size))
+end
+```
+
+| Group | Functions |
+|---|---|
+| Core | `slop.version()`, `slop.log(msg)` |
+| Target | `slop.target.list()`, `attach(pid)`, `status()` |
+| Memory | `slop.mem.read_hex(addr, len)`, `write_hex(addr, data)`, `scan(...)` |
+| Image session | `slop.image.load(path[, base])`, `load_from_target`, `unload`, `status`, `wait_ready([ms])` |
+| Instructions | `slop.disasm.decode(addr[, count])`, `bytes(addr[, len])`, `disassemble(...)` (live memory) |
+| Functions / xrefs | `slop.disasm.functions([limit])`, `function_at(va)`, `xrefs_to(va)` |
+| Data | `slop.disasm.strings([min[, limit]])`, `slop.disasm.pe()` |
+| Annotation | `slop.disasm.name/set_name/comment/set_comment`, `bookmark_toggle`, `bookmarks` |
+| Decompiler | `slop.decomp.decompile(va)`, `blocks(va)`, `vtables()`, `globals()`, `rtti()` (need `wait_ready()`) |
+| Analysis | `slop.analyze.packer()` |
+
+## MCP and HTTP API
+
+### Endpoints
+
+The listener binds `127.0.0.1:8765` only.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness and version |
+| `POST /mcp` | MCP JSON-RPC 2.0: `initialize`, `ping`, `tools/list`, `tools/call` (protocol `2025-06-18`) |
+| `GET /mcp` | MCP SSE endpoint / keepalive |
+| `POST /api` | Direct frontend RPC; one request or an array |
+| `GET /events` | Frontend SSE stream: `hello`, `output`, `boot.stage`, `target.changed`, `backend.changed`, `hype.progress`, `watch.list`, `watch.values`, `app.quitting` |
+
+`initialize` also returns `instructions` (a usage preamble) and `state` (backend badge,
+attached target, debugger state, loaded image and analysis readiness). The same context
+is available later through `target.status` and `disasm.loaded`.
+
+```powershell
+# health
+Invoke-RestMethod http://127.0.0.1:8765/health
+
+# one tool call over /api
+$body = @{ tool = 'target'; action = 'ps4_auto'; params = @{ host = '192.168.1.50' } } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/api -ContentType 'application/json' -Body $body
+
+# the same over MCP
+$body = @{ jsonrpc = '2.0'; id = 1; method = 'tools/call'
+           params = @{ name = 'target'; arguments = @{ action = 'list' } } } | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/mcp -ContentType 'application/json' -Body $body
+```
+
+### Configuration
+
+`%LOCALAPPDATA%\reverse-slop\settings.json`:
+
+```json
+{ "mcp_enabled": true, "mcp_port": 8765, "mcp_token": "<auto>", "mcp_onboarded": false }
+```
+
+- **A bearer token is generated automatically on first start** and written to
+  `settings.json`; every `/mcp` and `/api` call needs `Authorization: Bearer <token>`.
+  Regenerate it from the Settings dialog (`app.rotate_token`) — client configs and
+  `engine.json` are updated in place. `SLOP_MCP_TOKEN` adds a per-process token without
+  persisting anything (the Tauri app uses this).
+- `SLOP_MCP_PORT` or engine `--port` overrides the port for one process. If the port is
+  busy the engine takes an ephemeral port and skips onboarding.
+- The event stream (`/events`) authenticates with a **single-use ticket** from
+  `app.events_ticket` — no token in URLs.
+- Other settings: `script_unsafe` (restore the full Lua `io`/`os` libraries — the
+  default sandbox only exposes `base`/`string`/`table`/`math`/`utf8` and a safe
+  `os.clock`/`os.time`), `web_allow_private` and `web_allowlist` (the `web` tool denies
+  loopback/LAN/metadata targets by default), `proxy_token` (the HTTP proxy requires it
+  when set).
+- Request bodies are capped at 32 MiB. Cancellation notifications reach long-running
+  operations that support them. Every route validates `Host` and browser `Origin`
+  (DNS-rebinding and cross-site JSON-RPC are rejected with 403).
+
+### Tool index
+
+Every tool takes an `action`; `tools/list` returns the exact schemas.
+
+| Tool | Actions |
+|---|---|
+| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_dump_module` |
+| `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `pointerscan_verify` |
+| `debugger` | `status` plus the `ps4_*` actions in [Live debugging](#live-debugging) and [On-console tooling](#on-console-tooling) |
+| `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed` |
+| `decomp` | `function` |
+| `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
+| `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |
+| `devirt` | `themida_status`, `themida_start`, `themida_job`, `themida_cancel`, `identify`, `handlers`, `opcode_map`, `trace`, `lift`, `pseudocode`, `recover_cfg`, `prove_predicates`, `invariants`, `iat_audit` |
+| `emulate` | `run` |
+| `analyze` | `packer`, `signatures`, `diff` |
+| `re` | `rtti_scan`, `vftable`, `danger`, `libsig` |
+| `types` | `declare`, `create_struct`, `get_struct`, `list_structs`, `add_member`, `remove_struct`, `create_enum`, `get_enum`, `list_enums`, `remove_enum`, `read_field`, `format_at` |
+| `notes` | `set_comment`, `get_comment`, `comments`, `bookmark_toggle`, `bookmarks` |
+| `network` | `status`, `capture_start` (filter by `host`/`console_ip`), `capture_stop`, `packets`, `dns`, `stats`, `export_pcap`, `streams`, `stream_data`, `reassemble_stream`, `connections`, `deep_inspect` |
+| `proxy` | `start`, `stop`, `status`, `entries`, `entry`, `replay`, `mitm_enable` (explicit consent), `mitm_disable` |
+| `persist` | `save`, `list`, `load`, `delete`, `kv_set`, `kv_get`, `hype_save`, `hype_load` |
+| `fs` | `read_file`, `write_file`, `list_directory`, `create_directory`, `delete_path`, `search_files`, `grep_in_files` |
+| `web` | `fetch`, `post` |
+| `script` | `run` |
+| `guide` | `list`, `get` |
+
+`app` (`status`, `ping`, `output`, `output_clear`, `log`, `diag`, `shutdown`) is frontend
+plumbing, reachable through `/api` only and hidden from `tools/list`.
+
+### Automatic MCP client registration
+
+On the first successful start on the configured port, a `reverse-slop` HTTP entry is added
+(existing entries are kept) to:
+
+| Client | File |
+|---|---|
+| Claude Code | `%USERPROFILE%\.claude.json` (user scope, `"type": "http"`) |
+| Cursor | `%USERPROFILE%\.cursor\mcp.json` |
+| Windsurf | `%USERPROFILE%\.codeium\windsurf\mcp_config.json` |
+| VS Code | `%APPDATA%\Code\User\settings.json` (`mcp.servers`) |
+| OpenCode | `%USERPROFILE%\.config\opencode\config.json` |
+
+Claude Desktop only supports stdio servers in its config file; add the URL through its
+Connectors UI. Unparseable config files are left untouched. When a token is set, it is
+written into these files — do not sync them publicly. Run the engine with `--no-onboard`
+to skip registration; set `mcp_onboarded` to `false` to request another pass.
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph PC["Analysis PC (Windows)"]
+    UI["Tauri v2 + React<br/>app/"] -- "/api, /events (HTTP + SSE)" --> ENG
+    AG["AI agent / MCP client"] -- "/mcp (JSON-RPC)" --> ENG
+    IMGUI["ImGui / DX11 shell<br/>src/app + src/ui"] -- in-process --> CORE
+    subgraph ENG["reverse-slop-engine.exe (src/engine)"]
+      CORE["slop_core (src/core)<br/>process · memory · disasm · analysis<br/>emu · network · script · mcp"]
+      HYPE["Hyperion<br/>src/hyperion"]
+      CORE --- HYPE
+    end
+  end
+  CORE -- "TCP 744 commands" --> PS4["PS4 running ps4debug-NG"]
+  PS4 -- "TCP 755 debug events" --> CORE
+```
+
+- The Tauri supervisor (`app/src-tauri`) starts the engine as a sidecar, waits for the
+  `SLOP_ENGINE_READY <port> <token>` handshake (up to 180 s, covering the UAC prompt),
+  holds it in a kill-on-close job object and lets it shut down cleanly. Keeping the
+  engine out of the Rust process avoids CRT mixing and isolates crashes.
+- Both hosts share the lifecycle in `src/core/infra/lifecycle.cpp`: paths and worker
+  queues → process/target services → settings and persistence → MCP/API server and
+  onboarding → periodic target/watch/event servicing → orderly shutdown.
+
+```text
+src/
+├── app/       Win32 entry + DX11 loop (legacy shell)
+├── engine/    headless host and parent-process contract
+├── ui/        ImGui chrome, docking, theme, views
+├── hyperion/  vendored analysis/decompiler engine (hype namespace)
+├── core/
+│   ├── infra/     lifecycle, jobs, settings, paths, events, onboarding
+│   ├── runtime/   ps4debug-NG backend (+ user-mode backend used by the test fixture)
+│   ├── process/   targets, processes, modules, threads, dumps
+│   ├── memory/    scanner, AOB, pointer scan, snapshots, watch service
+│   ├── debugger/  call-stack unwinding
+│   ├── disasm/    image loading, Zydis/Capstone indexes, Hyperion bridge
+│   ├── analysis/  packer, signatures, xray, patches, devirt, Magicmida
+│   ├── emu/       Unicorn execution and taint
+│   ├── network/   raw capture, traffic store, proxy, WinHTTP
+│   ├── script/    Lua engine
+│   ├── mcp/       MCP schemas, tool dispatcher, /api, /events
+│   └── persist, re, util
+├── target/    deterministic live-analysis fixture (SlopTarget.exe)
+├── tests/     core test harness (slop_tests.exe)
+└── live/      live probes
+app/           Tauri v2 supervisor and React/TypeScript frontend
+tools/         build, Magicmida installer, live-test and benchmark scripts
+examples/      Lua scripts (PS4 breakpoints, eboot overview, find-value)
+```
+
+## Building
+
+`tools/build.ps1` finds Visual Studio with `vswhere`, uses its bundled CMake and Ninja,
+configures the `ninja-msvc-release` preset into `build/`, then builds the Tauri app.
+First configure downloads pinned dependencies into `_ext/` (ImGui, FreeType, Zydis,
+Capstone, Unicorn, nlohmann/json, cpp-httplib, SQLite, Lua, fmt, spdlog, zlib).
+
+| Switch | Effect |
+|---|---|
+| *(none)* | C++ engine + Tauri portable folder (`dist\reverse-slop\`) + NSIS installer |
+| `-NoFrontend` | C++ targets only |
+| `-FullClean` | Delete `build/` before configuring |
+| `-PlanOnly` | Configure without compiling |
+| `-Preset <name>` | Use another preset: `ninja-msvc-debug`, `ninja-msvc-asan` (AddressSanitizer) or `ninja-msvc-analyze` (`/analyze`) |
+| `-Full` | Self-contained installer: embeds WebView2 and Magicmida, fails instead of skipping a missing component |
+
+First-party targets compile with `/W4 /WX`. The legacy ImGui shell is optional
+(`SLOP_BUILD_UI`), and CI keeps it compiling.
+
+| CMake option | Default | Builds |
 |---|---:|---|
-| `SLOP_BUILD_ENGINE` | `ON` | Headless engine host |
+| `SLOP_BUILD_ENGINE` | `ON` | headless engine |
+| `SLOP_BUILD_UI` | `ON` | legacy ImGui shell |
 | `SLOP_BUILD_TEST_TARGET` | `ON` | `SlopTarget.exe` fixture |
-| `SLOP_BUILD_TESTS` | `ON` | Core test harness |
+| `SLOP_BUILD_TESTS` | `ON` | `slop_tests.exe` |
 
-For manual configuration, first enter an x64 Visual Studio developer shell:
+Manual configure (from an x64 developer shell):
 
 ```powershell
 cmake --preset ninja-msvc-release -S .
 cmake --build --preset ninja-msvc-release
 ```
 
-### Tauri + React desktop build
-
-The Tauri UI is the app that ships; `reverse-slop.exe` (ImGui) is the legacy
-shell kept for parity work. The frontend build needs the C++ engine first
-because Tauri bundles `reverse-slop-engine.exe` as a resource.
-
-```powershell
-powershell -File tools/build.ps1
-```
-
-That performs the C++ build, runs `npm install` if `app/node_modules` is
-missing, builds the React app, and produces two standalone outputs:
+Outputs:
 
 ```text
-dist\reverse-slop\reverse-slop.exe                          portable folder
+build\src\engine\reverse-slop-engine.exe                     headless engine
+build\src\app\reverse-slop.exe                               legacy ImGui shell
+dist\reverse-slop\reverse-slop.exe                           portable Tauri app (carries engine\)
 app\src-tauri\target\release\bundle\nsis\...-setup.exe       per-machine installer
 ```
 
-The portable folder carries its own `engine\` directory, so it runs from a copy
-with no installer and no build tree. It needs the Microsoft Edge WebView2
-runtime, which ships with Windows 11 and current Windows 10; the NSIS installer
-downloads it when missing.
+Release Tauri builds request elevation so the engine can capture packets; debug builds run
+as the invoking user and report capture as unavailable.
 
-Run the same command with `-Full` for a self-contained release installer: the
-setup exe embeds the WebView2 runtime (offline install, no download on the
-target machine) and hard-requires every optional component, so the Magicmida
-sidecars are always inside. The build fails loudly instead
-of silently shipping a degraded bundle when the network or Magicmida is missing.
-
-Use `-NoFrontend` for a fast C++-only loop (skips Rust, npm, and the bundle).
-
-Release Tauri builds request administrator elevation so the engine sidecar can
-run host-side packet capture (SIO_RCVALL). Debug Tauri builds run as the
-invoking user and packet capture reports unavailable.
-
-Frontend development:
+### Frontend development
 
 ```powershell
-# Terminal 1: build or refresh the C++ engine
-powershell -File tools/build.ps1 -NoFrontend
-
-# Terminal 2
+powershell -File tools/build.ps1 -NoFrontend   # build or refresh the engine first
 cd app
 npm install
-npm run tauri -- dev
-```
-
-Vite uses fixed port `1420`; the engine's CORS allow-list depends on it.
-Additional frontend checks:
-
-```powershell
-cd app
+npm run tauri -- dev        # Vite on fixed port 1420 (the engine's CORS allow-list expects it)
 npm run typecheck
 npm run build
-
-# Requires a running engine; validates frontend calls against tools/list
-npm run check:api -- 8765
+npm test                    # store-level smoke tests
+npm run check:api -- 8765   # validate frontend calls against a running engine's tools/list
 ```
-
-### Magicmida Themida sidecars
-
-Magicmida and its ScyllaHide dependency are separate GPLv3 programs, not linked
-into reverse-slop. Install the pinned, SHA-256-verified `2026-05-14` release:
-
-```powershell
-powershell -File tools/install_magicmida.ps1
-```
-
-Default destination:
-
-```text
-%LOCALAPPDATA%\reverse-slop\tools\magicmida\2026-05-14\x86
-%LOCALAPPDATA%\reverse-slop\tools\magicmida\2026-05-14\x64
-```
-
-Overrides:
-
-- `SLOP_MAGICMIDA_ROOT` — root containing `x86` and `x64` directories
-- `SLOP_MAGICMIDA_X86` — direct path to x86 executable
-- `SLOP_MAGICMIDA_X64` — direct path to x64 executable
-
-## Run
-
-### Tauri app (primary)
-
-```powershell
-.\dist\reverse-slop\reverse-slop.exe
-```
-
-Requests administrator elevation once, spawns `engine\reverse-slop-engine.exe`
-as a sidecar in a kill-on-close job object, and drives it over `/api` +
-`/events`. Installed builds behave the same from `%ProgramFiles%`.
-
-### Native ImGui shell (legacy)
-
-```powershell
-.\build\src\app\reverse-slop.exe
-```
-
-The executable requests administrator elevation. It owns a Win32 window with a
-DX11 composition swapchain, docking, FreeType fonts, keyboard navigation, and
-DWM styling. Built-in views and shortcuts:
-
-| View | Shortcut |
-|---|---|
-| Targets | `Ctrl+1` |
-| Inspector | `Ctrl+2` |
-| Disassembly | `Ctrl+3` |
-| Memory | `Ctrl+4` |
-| Output | `Ctrl+5` |
-| Scanner/watchlist | `Ctrl+6` |
-| Strings | `Ctrl+7` |
-| PE Browser | `Ctrl+8` |
-| Debugger | `Ctrl+9` |
-| Pseudocode | `Ctrl+0` |
-| Unpacker | No default shortcut |
-| Frame Metrics | `F12` |
 
 ### Headless engine
-
-Safest development path, with no client-config changes:
 
 ```powershell
 .\build\src\engine\reverse-slop-engine.exe --no-onboard
 ```
 
-Full engine:
-
-```powershell
-.\build\src\engine\reverse-slop-engine.exe
-```
-
-Options:
-
 | Option | Effect |
 |---|---|
-| `--no-onboard` | Do not register MCP endpoint in supported AI clients |
-| `--quiet` | Suppress mirrored engine output on stderr |
-| `--port <n>` | Override MCP/API port for this process |
-| `--parent-pid <pid>` | Exit through clean teardown when parent exits |
-| `--headless` | Accepted for supervisor compatibility; engine is always headless |
+| `--no-onboard` | Do not register the MCP endpoint in AI clients |
+| `--quiet` | Do not mirror engine output to stderr |
+| `--port <n>` | Override the MCP/API port |
+| `--parent-pid <pid>` | Exit cleanly when the parent exits |
+| `--headless` | Accepted for supervisor compatibility |
 
-Successful startup writes this machine-readable line to stdout:
+Startup prints `SLOP_ENGINE_READY <port> <token>`. If another live engine is advertised,
+the new one prints `SLOP_ENGINE_EXISTING <pid>` and exits.
 
-```text
-SLOP_ENGINE_READY <port> <token>
-```
+### Magicmida (optional)
 
-If another live reverse-slop endpoint is advertised, a new engine reports that
-endpoint with `SLOP_ENGINE_EXISTING <pid>` and exits rather than competing for
-the port.
-
-### Tauri shell
-
-Launch installed `reverse-slop`, or during development:
+Magicmida and ScyllaHide are separate GPLv3 programs, never linked into reverse-slop.
 
 ```powershell
-cd app
-npm run tauri -- dev
+powershell -File tools/install_magicmida.ps1   # pinned 2026-05-14 release, SHA-256 verified
 ```
 
-The Rust supervisor starts the C++ engine, waits up to 180 seconds for its
-handshake, places it in a kill-on-close job object, and lets it perform clean
-shutdown when the UI exits. The React shell exposes targets (including the PS4 connect/auto flow),
-modules, scripts, scanner/watchlist, disassembly, strings, memory, the PS4
-debugger, PE browser, output, inspector, and theme/motion settings.
-
-## Feature reference
-
-### Process and live-memory workspace
-
-On a connected PS4 these run against the console process over the ps4debug-NG
-wire; a hidden local user-mode backend remains for the automated test fixture.
-
-- Enumerate processes with icons and architecture/elevation metadata.
-- Attach/detach a shared target session.
-- Enumerate modules, threads, virtual-memory regions, heaps, heap blocks, and
-  handles (`target.heaps` / `target.heap_blocks` over MCP, local targets only).
-- Reconstruct a conventional PE from a mapped module (local Windows targets
-  only; PS4 modules are ELF/SELF); strict mode rejects unreadable spans, while
-  best-effort mode zero-fills them.
-- Read/write memory in hex, UTF-8, integer, and floating-point formats.
-- Allocate, free, and change page protection.
-- Cheat Engine-style initial and refined numeric scans with exact/range/change,
-  signed/unsigned/floating widths, rounding, region/protection, address,
-  alignment, worker, chunk, and result-cap filters.
-- AOB wildcard search, pointer-chain scans, signature generation, and live
-  cryptographic-constant search.
-- Snapshot memory, compare snapshots, list/free snapshot state.
-- Shared watchlist sampled around 10 Hz, including freeze writes; UI and MCP
-  changes appear in both surfaces.
-
-### Remote PS4 targets (ps4debug-NG)
-
-With a PS4 on the same network running the
-[ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) payload, reverse-slop
-speaks its wire protocol directly (TCP 744, plus the port-755 debug-event
-callback) through a dedicated `PS4` backend:
-
-- Connect from the ImGui targets view ("PS4..." button), the Tauri targets
-  panel (gamepad button), or MCP with `target.ps4_connect {host, port=744,
-  pid?}`; `target.ps4_disconnect` drops the console. `target.status` reports
-  the endpoint and the server branding string. `target.ps4_auto {host,
-  port?}` does the whole setup in one call: connect, pick the game process
-  (the one with `/app0/` modules, eboot-named preferred), attach a session
-  and the ps4debug debug session, and return modules/threads/regions.
-- Once connected, `target.list` enumerates console processes and the existing
-  attach button / `target.attach {pid}` opens a session over the wire; the
-  backend badge reads `PS4`.
-- Memory read/write, protect/alloc/free, AOB and numeric scans, snapshots,
-  watchlists, regions, and module enumeration all work against the remote
-  process. Reads are validated against the console's VM map so unmapped
-  ranges report failure instead of zero fill; Windows `PAGE_*` constants are
-  translated to FreeBSD `VM_PROT_*` on the way out.
-- `target.threads` and thread register get/set use ps4debug-NG's debug
-  commands (`CMD_DEBUG_ATTACH` + `GET_THREAD_LIST`/`GETREGS`/`SETREGS`); the
-  engine listens on port 755 for the server's event callback while a debug
-  session is attached.
-- PS4 modules are ELF/SELF, not PE, so `dump_module`/PE loading stay local-only;
-  pull a module's raw memory image off the console with
-  `target.ps4_dump_module {name|base, path, load?}` (load=true opens ELF dumps in
-  `disasm`), or analyze live addresses with `disasm.disassemble` and
-  `memory.read` instead.
-
-### Live debugging on the PS4 (ps4debug-NG)
-
-With a console connected (`target.ps4_connect`), the `debugger` tool's `ps4_*`
-actions drive the payload's debug session live, no local target needed:
-
-- `ps4_attach {pid}` / `ps4_detach` / `ps4_status` manage the debug session
-  (the engine accepts the payload's port-755 event connection automatically).
-- `ps4_bp_set {addr, index?}` / `ps4_bp_clear {addr|index}` arm software INT3
-  breakpoints (slots 0-29 auto-allocated client-side, since the payload has no
-  query command); `ps4_watch_set {addr, len=1|2|4|8, type=0|1|3, index?}` /
-  `ps4_watch_clear` arm hardware DR0-DR3 watchpoints (type 0=exec, 1=write,
-  3=read/write).
-- `ps4_continue {stop}` resumes the debuggee (stop 0=resume, 1=SIGSTOP,
-  2=SIGKILL); `ps4_step {lwpid?}` single-steps (0/absent = all threads);
-  `ps4_suspend`/`ps4_resume {lwpid}` freeze one thread; `ps4_process_stop
-  {state}` signals the whole process.
-- Every stop (breakpoint hit, watchpoint hit, step, signal) arrives as a
-  0x4A0-byte event packet on port 755 and is queued: `ps4_wait {timeout_ms}`
-  blocks for the next one (returns the full register set, signal, thread
-  name, and DR registers), `ps4_events {max, clear}` drains the queue.
-- `ps4_regs {lwpid}` / `ps4_set_reg {lwpid, name, value}` read or write one
-  register (`rax`..`r15`, `rip`, `rsp`, `rbp`, `flags`); `ps4_dbregs {lwpid}`
-  dumps DR0-DR7+; `ps4_callstack {lwpid, depth}` walks the rbp frame chain via
-  live memory reads.
-- `ps4_call {addr, args[6]}` installs the payload's RPC stub once per process
-  (`CMD_PROC_INTALL`) and calls any address in the console process with up to
-  six arguments (rdi, rsi, rdx, rcx, r8, r9), returning `rax` — remote function
-  calls for dynamic analysis, e.g. resolving a function live and calling it
-  with crafted arguments.
-- One-call "power actions" wrap the common dynamic-analysis moves:
-  `ps4_until {addr, timeout_ms}` (arm a one-shot bp, continue, wait, auto-clear),
-  `ps4_find_write {addr, len, timeout_ms, depth}` (write watchpoint + continue +
-  wait, returns the event and the writer callstack), `ps4_trace_calls {addr,
-  count, timeout_ms}` (bp arg logger: every hit with rdi/rsi/rdx/rcx/r8/r9),
-  `ps4_trace_steps {lwpid, count, timeout_ms}` (step+wait loop with rip and the
-  disassembled instruction per step), and `ps4_bp_list` / `ps4_watch_list` to
-  see the armed slots.
-- Register completeness: `ps4_fpregs {lwpid}` / `ps4_set_fpregs {lwpid, hex}`
-  read/write the 832-byte savefpu (XMM/YMM) block, `ps4_set_dbregs {lwpid,
-  hex}` writes the 128-byte DR set, `ps4_fsgs {lwpid}` /
-  `ps4_set_fsgs {lwpid, fs_base, gs_base}` read/write FS/GS base.
-- Console-side tooling (everything below runs inside the ps4debug-NG payload on
-  the console, not on the PC):
-  - Native memory scan, unlocked by `ps4_auth` (run automatically on connect;
-    the payload's challenge keystream is four LFSRs seeded 200/300/400/500):
-    `ps4_scan {addr, len, value_type, compare, value|hex}` seeds a scan over a
-    range, `ps4_rescan {compare, value?}` narrows the stored hit set
-    (exact/fuzzy/bigger/smaller/between/increased/decreased/changed/unchanged/
-    unknown), `ps4_scan_state` / `ps4_scan_reset` manage it, `ps4_scan_all`
-    scans every readable map, and `ps4_scan_aob {addr, len, pattern}` scans for
-    a byte pattern with `??` wildcards.
-  - On-device code analysis: `ps4_disasm {addr, len, max}` (payload-side Zydis:
-    kind flags, mem operands, rip-relative targets), `ps4_xrefs {addr, len}`
-    (all branch/call targets in a range), `ps4_xrefs_to {addr, len, target}`,
-    `ps4_stack {rbp?, rsp?, depth}` (server-side rbp-chain walk with frame
-    locals and a code window per frame).
-  - `ps4_assemble {asm, base?, syntax?}` assembles x86-64 on the console
-    (payload-side Keystone) — write the bytes with `memory.write`.
-  - `ps4_elf_rpc {path}` / `ps4_elf_load {path}` upload a raw ELF64 payload into
-    the game process and get its entry address / jump into it.
-  - `ps4_notify {msg, type?}` shows a system notification on the PS4 UI,
-    `ps4_print {msg}` writes to the console kernel log, `ps4_app` returns the
-    foreground game's pid/titleid/contentid/version.
-- The same controls exist in the ImGui debugger view: while a PS4 backend is
-  active it shows a live panel with debug attach/detach, continue/step,
-  breakpoint and watchpoint arming, the port-755 event feed, registers of the
-  last stopped thread, and remote calls through the rpc stub.
-- The `guide` tool is the AI playbook index: `guide list` shows the topics and
-  `guide get {topic}` returns a ready-to-run tool-call sequence (e.g.
-  `ps4_setup`, `ps4_breakpoint`, `ps4_api_trace`, `ps4_find_write`,
-  `ps4_step_trace`, `ps4_remote_call`, `find_health`, `find_damage_source`,
-  `pointer_chain`, `runtime_decrypt`, `ps4_api_monitor`, `snapshot_diff`,
-  `emulate_function`, `devirt_cflow`, `ps4_unpack_runtime`,
-  `ps4_hw_watchpoints`, `ps4_native_scan`, `ps4_dump_and_analyze`).
-
-### Static analysis and decompilation
-
-- PE headers, sections, data directories, imports, exports, and runtime-base
-  rebasing.
-- Fast synchronous Zydis function, xref, string, and PE indexes.
-- Background Hyperion recursive analysis with CFGs, globals, vtables, RTTI,
-  names, PDB/FLIRT support, and progress/cancellation state.
-- .NET/CLI assemblies: `disasm.loaded` reports `hype.managed`, and
-  `disasm.managed` lists TypeDefs (`type_filter`), renders one type as
-  dnSpy-style C# (`type`), or dumps one method's ILDASM-style listing
-  (`method_token`).
-- x86/x64 disassembly and assembly.
-- PS4/Orbis ELF64 (SELF) static analysis: ELF loading, segment-backed section
-  mapping, and SCE `PT_SCE_DYNLIBDATA` import extraction, so a dumped
-  `eboot.bin` or game module can be analyzed offline with the full disasm /
-  xray / decomp surface while the console is driven live over ps4debug-NG.
-- iOS apps and Mach-O: `disasm.load`, `slop.image.load` and both Disassembly
-  open dialogs accept an `.ipa`, a thin Mach-O or a FAT Mach-O, detected by
-  content. For an `.ipa` the main executable is the `Payload/<Name>.app/`
-  entry named by `Info.plist` `CFBundleExecutable` (XML or binary plist,
-  falling back to the bundle stem); a FAT binary is reduced to its arm64 slice
-  (else x86_64, arm, x86). The image gets a section map (`__TEXT.__text`,
-  `__TEXT.__cstring`, ...), imports from the GOT/lazy pointers grouped by
-  dylib, `__stubs` and local symbols as names, and function bounds from
-  `LC_FUNCTION_STARTS`. ARM64 code decodes with Capstone and decompiles
-  through the Hyperion ARM64 lifter; xrefs come from the Hyperion DB.
-  `disasm.loaded` reports `format`, `arch`, `bundle` (id, version, build,
-  minimum iOS) and `encrypted`. App Store copies are FairPlay-encrypted
-  (`cryptid != 0`): load a decrypted dump, or the code is noise. Tools that
-  decode x86 (`xray` except `entropy`/`apihash`, `emulate`, `devirt`,
-  code-rewriting `patch` actions, `disasm.assemble`) or parse PE structures
-  (`analyze.packer`, `re.rtti_scan`) refuse Mach-O/ARM64 images with an error.
-- Structured decompilation pipeline: instruction lifting to p-code, SSA,
-  propagation, dead-code elimination, type inference, control-flow structuring,
-  and C-like emission.
-- Per-line virtual-address mappings, optional address annotations, reconstructed
-  stack variables, signatures, and persisted user names.
-- Binary-to-binary function diff with added/removed/modified functions and
-  similarity scores.
-- Packer/protector indicators: signatures, entropy, import anomalies, W+X
-  sections, TLS, overlay, and crypto constants.
-- RTTI class/vtable recovery, dangerous-import callsites, library byte
-  signatures, user structs/enums, typed formatting, comments, and bookmarks.
-- Per-binary metadata persists by file hash and remaps across different runtime
-  bases.
-
-### Xray and patching
-
-Read-only Xray passes include:
-
-- CFG and cyclomatic complexity
-- Control-flow flattening and general obfuscation scoring
-- String reconstruction and indirect-call recovery
-- Anti-analysis patterns
-- Hook checks and direct-syscall discovery
-- Imported API hash resolution
-- Entropy windows and executable-page classification
-- Crypto constants and ROP gadget search
-
-File-image patching includes:
-
-- Junk-NOP cleanup and opaque-predicate resolution
-- Anti-debug patching
-- XOR unpacking and string decoding
-- Explicit byte writes
-- Patch journal and full revert
-- Combined full pass
-- Function re-decode/index invalidation after edits
-
-Patches affect the loaded analysis image, not live process memory. Use the memory
-suite for live writes.
-
-### Debugger (PS4 live debugging)
-
-The `debugger` tool is PS4-only in this build; see
-"Live debugging on the PS4 (ps4debug-NG)" above for the full `ps4_*` action
-list: software breakpoints, DR0-DR3 hardware watchpoints, continue/step,
-suspend/resume, stop events on the payload's port-755 stream, register
-read/write, callstacks, remote calls (`ps4_call`), and the one-call power
-actions (`ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps`).
-Both the ImGui debugger view and the Tauri debugger tab drive the same
-ps4debug-NG session. Local Win32 debugging, the kernel VEH mode, and the
-driver-backed hardware breakpoints were removed with the Windows toolkit.
-
-### Emulation and devirtualization
-
-- Isolated x86-64 Unicorn execution from explicit bytes, loaded-file addresses,
-  or attached-target addresses.
-- Demand paging from the loaded image (relocated when rebased) or the attached
-  process, so runs follow calls, jumps and global loads past the code slice.
-- IAT stubs that log every import call with its arguments and return a chosen
-  value per import, plus a TEB/PEB behind `gs`.
-- Final-memory dumps and a write log with stored values.
-- Custom register, stack, and memory-map initialization.
-- Instruction-count, target-address, and timeout stopping conditions.
-- Bounded instruction traces and byte-granular taint tracking.
-- VM identification, handler discovery, opcode maps, execution traces, lifting,
-  and pseudocode.
-- CFG recovery, multi-run predicate proofs and invariant discovery, plus IAT
-  audits.
-- Supervised Magicmida jobs with architecture validation, cancellation,
-  timeouts, output selection, and optional loading into analysis session.
-
-### Network and proxy
-
-Host-side network features on the analysis PC (raw socket with SIO_RCVALL,
-needs administrator; `pid`/`port`/`protocol` act as capture filters):
-
-- Capture start/stop, packet paging with text filters, DNS query log,
-  statistics, and PCAP export
-- Stream listing, payload reads, and TCP reassembly from the capture store
-- Connection 4-tuple listing and per-packet deep inspection (HTTP
-  method/host/path, TLS version/SNI/content-type, DNS)
-
-Independent HTTP/1.1 proxy features include start/stop, captured entries,
-exchange detail, and request replay. CONNECT tunnels record metadata/SNI but do
-not decrypt tunnel bodies; replay applies to captured plain HTTP.
-
-### Automation, persistence, filesystem, and web access
-
-- Lua 5.4 scripts with bounded execution, covering the whole static-analysis
-  surface the way IDAPython covers IDA (see "Lua scripting" below), plus APIs
-  for logging, targets, memory, live disassembly, and packer analysis.
-- SQLite session snapshots and key/value storage.
-- Hyperion `.hdb` project export/import for names and comments.
-- Host filesystem read/write/list/create/delete/name-search/content-search.
-- Outbound WinHTTP GET/POST requests without browser-cookie inheritance.
-
-### Lua scripting
-
-Scripts run through the `script` MCP tool (`action=run`, `code`, `timeout_ms`)
-or the engine API and execute against the same shared binary session as the
-UI and every other MCP tool — loads, renames, and comments made from one
-surface appear in all of them. Returned values are serialized into the
-captured output as `return: <value>`.
-
-```lua
--- Load a binary, wait for the Hyperion analysis, and walk the functions.
-assert(slop.image.load([[C:\bin\target.exe]]))
-assert(slop.image.wait_ready(30000))
-
-for _, f in ipairs(slop.disasm.functions()) do
-    slop.log(string.format("%X  %s (%d bytes)", f.va, f.name, f.size))
-end
-
--- Cross-references, decompilation, and annotation all interoperate:
-local refs = slop.disasm.xrefs_to(0x140001000)     -- { {from=..., kind=...}, ... }
-local d    = slop.decomp.decompile(0x140001000)   -- pseudo-C lines + signature
-slop.disasm.set_name(d.va, "entry_handler")        -- persisted rename
-slop.disasm.set_comment(d.va, "called on startup") -- persisted comment
-```
-
-The static-analysis surface:
-
-| Group | Functions |
-|---|---|
-| Session | `slop.image.load(path[, base])`, `load_from_target`, `unload`, `status`, `wait_ready([ms])` |
-| Instructions | `slop.disasm.decode(addr[, count])`, `slop.disasm.bytes(addr[, len])` |
-| Functions | `slop.disasm.functions([limit])`, `slop.disasm.function_at(va)` |
-| Cross-refs | `slop.disasm.xrefs_to(va)` |
-| Data | `slop.disasm.strings([min[, limit]])`, `slop.disasm.pe()` |
-| Annotation | `slop.disasm.name/set_name/comment/set_comment`, `bookmark_toggle`, `bookmarks` |
-| Decompiler | `slop.decomp.decompile(va)` (pseudo-C + signature), `blocks(va)` (CFG) |
-| Rich DB | `slop.decomp.vtables()`, `globals()`, `rtti()` |
-
-`decomp.*` requires the Hyperion analysis to be ready — call
-`slop.image.wait_ready()` after loading. On a connected PS4 the same
-`slop.target.*` / `slop.mem.*` surface reads and writes the console process
-over the wire, alongside `slop.disasm.disassemble` and `slop.analyze.packer`.
-
-## MCP and HTTP API
-
-### Endpoints
-
-Default listener: `127.0.0.1:8765`. It never binds to a non-loopback address.
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /health` | Liveness and version |
-| `POST /mcp` | MCP JSON-RPC 2.0 (`initialize`, `ping`, `tools/list`, `tools/call`) |
-| `GET /mcp` | MCP SSE endpoint/keepalive |
-| `POST /api` | Direct frontend RPC; accepts one request or an array |
-| `GET /events` | Frontend SSE event stream |
-
-Protocol version: `2025-06-18`.
-
-`initialize` returns two agent-facing fields beyond the standard handshake:
-`instructions` (a short server-level usage preamble clients surface to the
-model) and `state` — the live session context: active backend badge, attached
-target (`pid`/`name`/`arch`), debugger state, and the loaded-image summary
-including Hyperion analysis readiness (`image.hype.ready`). The same context
-is available mid-session through `target.status` and `disasm.loaded`.
-
-Configure `%LOCALAPPDATA%\reverse-slop\settings.json`:
-
-```json
-{
-  "mcp_enabled": true,
-  "mcp_port": 8765,
-  "mcp_token": "",
-  "mcp_onboarded": false
-}
-```
-
-`SLOP_MCP_PORT` or engine `--port` overrides configured port for that process.
-When configured port is busy, reverse-slop uses an ephemeral port and skips
-onboarding so existing clients remain pointed at owner of well-known port.
-Set `mcp_token` to require `Authorization: Bearer <token>` on MCP/API routes.
-The `/events` route also accepts a token query parameter because browser
-`EventSource` cannot set custom headers.
-
-Request bodies are capped at 32 MiB. Tool calls share core state and are
-serialized where required; cancellation notifications propagate to supported
-long-running operations.
-
-### MCP examples
-
-Health check:
-
-```powershell
-Invoke-RestMethod http://127.0.0.1:8765/health
-```
-
-List tools:
-
-```powershell
-$body = @{
-  jsonrpc = '2.0'
-  id = 1
-  method = 'tools/list'
-} | ConvertTo-Json -Depth 8
-
-Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8765/mcp `
-  -ContentType 'application/json' `
-  -Body $body
-```
-
-List processes through MCP:
-
-```powershell
-$body = @{
-  jsonrpc = '2.0'
-  id = 2
-  method = 'tools/call'
-  params = @{
-    name = 'target'
-    arguments = @{ action = 'list' }
-  }
-} | ConvertTo-Json -Depth 8
-
-Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8765/mcp `
-  -ContentType 'application/json' `
-  -Body $body
-```
-
-Direct `/api` request:
-
-```powershell
-$body = @{
-  tool = 'disasm'
-  action = 'loaded'
-  params = @{}
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post `
-  -Uri http://127.0.0.1:8765/api `
-  -ContentType 'application/json' `
-  -Body $body
-```
-
-### MCP tool/action index
-
-All MCP tools accept an `action` string. Exact parameter schemas and detailed
-operational guidance are returned by `tools/list`.
-
-| Tool | Actions |
-|---|---|
-| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_auto`, `ps4_dump_module` |
-| `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set` |
-| `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed` |
-| `debugger` | `status`, `ps4_attach`, `ps4_detach`, `ps4_status`, `ps4_bp_set`, `ps4_bp_clear`, `ps4_watch_set`, `ps4_watch_clear`, `ps4_continue`, `ps4_step`, `ps4_suspend`, `ps4_resume`, `ps4_process_stop`, `ps4_regs`, `ps4_set_reg`, `ps4_dbregs`, `ps4_wait`, `ps4_events`, `ps4_callstack`, `ps4_call`, `ps4_bp_list`, `ps4_watch_list`, `ps4_until`, `ps4_find_write`, `ps4_trace_calls`, `ps4_trace_steps` |
-| `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
-| `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |
-| `devirt` | `themida_status`, `themida_start`, `themida_job`, `themida_cancel`, `identify`, `handlers`, `opcode_map`, `trace`, `lift`, `pseudocode`, `recover_cfg`, `prove_predicates`, `invariants`, `iat_audit` |
-| `types` | `declare`, `create_struct`, `get_struct`, `list_structs`, `add_member`, `remove_struct`, `create_enum`, `get_enum`, `list_enums`, `remove_enum`, `read_field`, `format_at` |
-| `notes` | `set_comment`, `get_comment`, `comments`, `bookmark_toggle`, `bookmarks` |
-| `emulate` | `run` |
-| `analyze` | `packer`, `signatures`, `diff` |
-| `network` | `status`, `capture_start`, `capture_stop`, `packets`, `dns`, `stats`, `export_pcap`, `streams`, `stream_data`, `reassemble_stream`, `connections`, `deep_inspect` |
-| `proxy` | `start`, `stop`, `status`, `entries`, `entry`, `replay` |
-| `persist` | `save`, `list`, `load`, `delete`, `kv_set`, `kv_get`, `hype_save`, `hype_load` |
-| `re` | `rtti_scan`, `vftable`, `danger`, `libsig` |
-| `decomp` | `function` |
-| `fs` | `read_file`, `write_file`, `list_directory`, `create_directory`, `delete_path`, `search_files`, `grep_in_files` |
-| `web` | `fetch`, `post` |
-| `script` | `run` |
-| `guide` | `list`, `get` |
-
-`app` is intentionally omitted from MCP `tools/list`; it is frontend plumbing
-available only through `/api`: `status`, `ping`, `output`, `output_clear`, `log`,
-`diag`, and `shutdown`.
-
-### Events
-
-`GET /events` sends `hello` with an output revision cursor, then events such as:
-
-- `output`
-- `boot.stage`
-- `target.changed`
-- `backend.changed`
-- `hype.progress`
-- `watch.list`
-- `watch.values`
-- `app.quitting`
-
-On reconnect, frontend can replay missed output with `app.output` and the last
-revision.
-
-### Automatic MCP client registration
-
-On first successful startup at configured port, reverse-slop adds a
-`reverse-slop` HTTP MCP entry without replacing existing entries in:
-
-- Claude Code: `%USERPROFILE%\.claude.json` (user scope; the entry needs
-  `"type": "http"`, server definitions do not live in `settings.json`)
-- Cursor: `%USERPROFILE%\.cursor\mcp.json`
-- Windsurf: `%USERPROFILE%\.codeium\windsurf\mcp_config.json`
-- VS Code: `%APPDATA%\Code\User\settings.json` (under `mcp.servers`)
-- OpenCode: `%USERPROFILE%\.config\opencode\config.json`
-
-Claude Desktop is not auto-registered: `claude_desktop_config.json` supports
-stdio servers only, so a remote HTTP entry cannot work there — add it through
-Claude Desktop's Connectors UI instead. Unparseable client config files are
-left untouched rather than overwritten.
-
-Use `--no-onboard` for a headless run that must not edit client configuration.
-Set `mcp_onboarded` to `false` to request another onboarding pass after removing
-or changing entries.
-
-## Architecture
-
-```text
-                       +----------------------+
-                       | ImGui / DX11 shell   |
-                       | src/app + src/ui     |
-                       +----------+-----------+
-                                  |
-                                  | in-process calls
-                                  |
-+---------------------+   HTTP    v    +--------------------------+
-| Tauri / React shell |<-------------->| shared C++ core          |
-| app/                |  /api,/events  | src/core                 |
-+----------+----------+                +------------+-------------+
-           |                                        |
-           | supervises                             +-- process/memory
-           v                                        +-- runtime (ps4 backend)
-+--------------------------+                        +-- disasm/analysis/decomp
-| headless engine          |                        +-- network/proxy
-| src/engine               |                        +-- MCP/API/event bus
-+--------------------------+
-```
-
-Both native and headless hosts drive the shared lifecycle in
-`src/core/infra/lifecycle.cpp`:
-
-1. Initialize application paths and worker/job queues.
-2. Start process and target services.
-3. Load settings and persistence state.
-4. Bind MCP/API server and optionally onboard clients.
-5. Publish capabilities and enter periodic target/watch/event servicing.
-6. On shutdown, stop server/jobs/watches/targets and save settings.
-
-Key directories:
-
-```text
-src/
-├── app/          Win32 entry point and DX11 loop
-├── engine/       Headless lifecycle host and parent-process contract
-├── ui/           ImGui chrome, docking, theme, fonts, and views
-├── hyperion/     Vendored analysis/decompiler engine (`hype` namespace)
-├── core/
-│   ├── infra/    Lifecycle, jobs, settings, paths, events, onboarding
-│   ├── process/  Targets, processes, modules, threads, heaps, handles, dumps
-│   ├── memory/   Scanner, AOB, pointers, snapshots, watch service
-│   ├── disasm/   PE/Zydis indexes and Hyperion session bridge
-│   ├── debugger/ Call-stack unwinding (used by ps4_* frame walks)
-│   ├── runtime/  PS4 (ps4debug-NG) backend + hidden user-mode test fixture
-│   ├── analysis/ Packer, signatures, xray, patches, devirt, Magicmida
-│   ├── emu/      Unicorn execution and taint propagation
-│   ├── network/  Raw-socket capture, traffic store, proxy, WinHTTP
-│   ├── mcp/      MCP schemas, tool dispatcher, `/api`, `/events`
-│   └── ...       Types, RTTI, persistence, scripting, filesystem
-├── target/       Deterministic live-analysis fixture
-├── tests/        Core test harness
-└── live/         Live probes and integration utilities
-app/              Tauri v2 supervisor and React/TypeScript frontend
-tools/            Build, Magicmida, and live-test scripts
-```
-
-Tauri supervises a separate C++ engine instead of linking it into Rust, avoiding
-static/dynamic CRT mixing and providing crash isolation. The PS4 backend lives
-in `slop_core` and speaks the ps4debug-NG wire protocol directly, so no payload
-or driver is loaded on the analysis PC.
+Installs to `%LOCALAPPDATA%\reverse-slop\tools\magicmida\2026-05-14\{x86,x64}`. Override with
+`SLOP_MAGICMIDA_ROOT`, `SLOP_MAGICMIDA_X86` or `SLOP_MAGICMIDA_X64`.
 
 ## Runtime data
 
-Application state lives under `%LOCALAPPDATA%\reverse-slop`:
+Everything lives under `%LOCALAPPDATA%\reverse-slop`:
 
 | Path | Purpose |
 |---|---|
 | `settings.json` | MCP and runtime settings |
-| `engine.json` | Live engine PID/port/token advertisement; removed on clean exit |
+| `engine.json` | live engine PID/port/token; removed on clean exit — do not share it |
 | `dock.ini` | ImGui layout |
 | `sessions.db` | SQLite snapshots and key/value state |
-| `symbols\<hash>.json` | Per-binary names, comments, and bookmarks |
-| `sessions\` | Session artifacts |
-| `crashes\` | Crash artifacts |
-| `tools\magicmida\...` | Optional Magicmida installation |
-
-Do not publish `engine.json` if bearer token is configured.
+| `symbols\<hash>.json` | per-binary names, comments, bookmarks |
+| `sessions\`, `crashes\` | session and crash artifacts |
+| `tools\magicmida\…` | optional Magicmida install |
 
 ## Tests
 
-Build includes deterministic `SlopTarget.exe` and `slop_tests.exe` by default.
-Run full suite:
-
 ```powershell
-.\build\tests\slop_tests.exe
+.\build\tests\slop_tests.exe                       # full suite
+ctest --test-dir build --output-on-failure         # registered CTest subsets
+$env:SLOP_TEST_FILTER = 'ps4'; .\build\tests\slop_tests.exe; Remove-Item Env:SLOP_TEST_FILTER
 ```
 
-Or through CTest:
+The PS4 tests run the backend and the `ps4_*` MCP flows against a fake ps4debug-NG server
+on loopback, including chaos modes (fragmented replies, mid-transfer disconnects) and
+the reconnect/slot-restore flows. Other suites cover infrastructure, memory, disassembly, MCP wire/schemas,
+analysis, emulation, the capture store, persistence, RTTI/types, Lua, module dumping,
+Hyperion/decompilation, Mach-O/`.ipa`, Xray/patching and Magicmida supervision.
 
-```powershell
-ctest --test-dir build --output-on-failure
-```
+`tools/mcp_live_test.py` is a destructive-capable integration battery for a running engine
+with `SlopTarget` loaded; read it before running — it writes memory, patches images, and
+touches the filesystem and network.
 
-Filter tests by case-name substring:
+## Known limitations
 
-```powershell
-$env:SLOP_TEST_FILTER = 'decomp'
-.\build\tests\slop_tests.exe
-Remove-Item Env:SLOP_TEST_FILTER
-```
-
-Test coverage includes infrastructure, memory, disassembly, the PS4 backend
-(fake ps4debug-NG server) and its `ps4_*` MCP flows, MCP wire/schema, analysis,
-emulation, network capture store, persistence, RTTI/types, Lua, module dumping,
-Hyperion/decompilation, Mach-O/`.ipa` loading, Xray/patching, Magicmida
-supervision, and filesystem/web/PKI helpers.
-
-`tools/mcp_live_test.py` is a destructive-capable integration battery intended
-for a controlled local fixture with a running engine and loaded `SlopTarget`.
-Review paths and actions before running it; it exercises writes, patches,
-filesystem operations, and network calls.
+- **Encrypted SELF segments are not decrypted.** The SELF loader extracts plaintext
+  segments and fails with a precise message on encrypted ones — analyze decrypted ELF
+  dumps (for example from `ps4_dump_module`), not retail `eboot.bin`/`.sprx` files.
+- **One console at a time.** A dropped console connection now fails fast and
+  `target.ps4_reconnect` restores the session, breakpoints and scan state.
+- **Host-only network capture** sees the analysis PC's traffic (IPv4 and IPv6), not the
+  console's, unless the console's traffic is routed through the PC — filter by the
+  console IP with `capture_start {host}`.
+- Two debugger tests (`ps4_composites_on_local_debugger`,
+  `ps4_chaos_peer_close_drops_socket_and_reconnect_restores`) are timing-sensitive when
+  the whole suite runs back-to-back on one machine (they share the fixed port-755 debug
+  event listener); each passes reliably in isolation and the underlying flows are
+  covered by the other passing tests.
 
 ## Troubleshooting
 
-### Configure cannot download dependencies
-
-First configure requires HTTPS access to pinned upstream archives/repositories.
-Retry with network/proxy access available. Once populated,
-CMake uses `_ext/` with disconnected updates.
-
-### `Visual Studio 2022 with C++ tools not found`
-
-Install Desktop development with C++, verify `vswhere.exe` exists under Visual
-Studio Installer, and ensure x64 C++ tools are selected.
-
-### Port 8765 is busy
-
-Engine falls back to an ephemeral port and records it in `engine.json`. Use
-`--port <n>`, change `mcp_port`, or stop the process owning 8765. Automatic
-onboarding is skipped on fallback ports.
-
-### Tauri cannot find engine
-
-Build C++ target first:
-
-```powershell
-powershell -File tools/build.ps1
-```
-
-Expected development path:
-
-```text
-build\src\engine\reverse-slop-engine.exe
-```
-
-### Hyperion-dependent calls fail
-
-Call `disasm.loaded` and wait until `image.hype.ready` is true. Use
-`image.hype.progress` and `image.hype.error` for state. Reload image to restart
-analysis after `disasm.analyze_stop`.
-
-### Magicmida unavailable
-
-Run installer or set path overrides, then call `devirt.themida_status` before
-starting a job.
+| Symptom | Fix |
+|---|---|
+| Configure cannot download dependencies | First configure needs HTTPS to the pinned archives; later runs reuse `_ext/`. |
+| `CMakeCache.txt directory … is different` after moving the repo | Delete `build/` and the generated `_ext/*-build` and `_ext/*-subbuild` folders, then rebuild. |
+| `Visual Studio 2022 with C++ tools not found` | Install *Desktop development with C++* with the x64 tools; check `vswhere.exe` exists. |
+| Port 8765 busy | The engine falls back to an ephemeral port (see `engine.json`); use `--port`, change `mcp_port`, or stop the owner. |
+| Tauri cannot find the engine | Build the C++ side first; dev builds expect `build\src\engine\reverse-slop-engine.exe`. |
+| Browser dev mode is stuck on *waiting for the engine* | The engine requires its bearer token; put `VITE_SLOP_TOKEN=<token from settings.json>` in `app/.env.local` and restart Vite. |
+| Hyperion-dependent calls fail | Poll `disasm.loaded` until `image.hype.ready`; check `image.hype.error`. Reload the image to restart analysis after `disasm.analyze_stop`. |
+| Magicmida unavailable | Run the installer or set the path overrides, then check `devirt.themida_status`. |
 
 ## Security notes
 
-- HTTP services bind only to `127.0.0.1`.
-- Empty MCP token means no authentication; any local process can then invoke
-  mutation-capable tools. Configure a bearer token on shared or untrusted
-  workstations.
-- `/api` browser origins are restricted to Tauri and fixed Vite development
-  origins. Non-browser local clients are still governed by loopback and bearer
-  authentication.
-- Filesystem, web, script, debugger (`ps4_*`), patch, network capture, proxy,
-  and memory tools can change analysis-host or console state. Expose MCP only
-  to trusted clients.
-- Keep analysis isolated from production and personal systems; use disposable
-  virtual machines and snapshots for untrusted samples.
+- HTTP services bind to `127.0.0.1` only. A bearer token is generated on first start and
+  is required on `/mcp` and `/api`; every route also validates the `Host` header and
+  browser `Origin`. The event stream uses single-use tickets instead of URL tokens.
+- The default Lua sandbox exposes no `io`/`os` execution (`script_unsafe` re-enables the
+  full standard library); the sandbox also caps memory and instruction counts. Treat
+  `script.run` as code execution regardless — the `slop.*` surface writes memory and files.
+- The `web` tool refuses loopback, link-local and private-network targets unless
+  `web_allow_private` or `web_allowlist` says otherwise; the HTTP proxy is a plain relay
+  unless `proxy_token` is set.
+- `/api` browser origins are limited to the Tauri and Vite dev origins; non-browser
+  clients are governed by loopback binding and the bearer token.
+- Analyze untrusted samples in a disposable VM.
 
-## Project status
+## Credits and license
 
-reverse-slop is version `0.1.1` and Windows-only. APIs and analysis output may
-change. No root project license file is currently present; do not assume a
-license for reverse-slop itself. Third-party components retain their own
-licenses, and separately downloaded Magicmida/ScyllaHide components are GPLv3.
+- Heavily inspired by [AiDA Private](https://github.com/sigwl/AiDAPrivate) by
+  [sigwl](https://github.com/sigwl) (ruarridh); most of the feature concepts come from it.
+- Forked from [kaizer1308/reverse-slap](https://github.com/kaizer1308/reverse-slap).
+- Console protocol: [ps4debug-NG](https://github.com/Pharaoh2k/ps4debug-NG) by Pharaoh2k.
+
+reverse-slop is version `0.1.1`, Windows-only, and its APIs may change. It is licensed
+under the MIT license (see [LICENSE](LICENSE)); third-party components keep their own
+licenses (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), and the separately
+downloaded Magicmida/ScyllaHide components are GPLv3.

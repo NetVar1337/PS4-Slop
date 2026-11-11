@@ -30,12 +30,7 @@ export default function TooltipLayer() {
       setTip(null);
     };
 
-    const onOver = (e: PointerEvent) => {
-      const host = (e.target as Element | null)?.closest?.("[data-tip]");
-      if (!(host instanceof HTMLElement)) {
-        cancel();
-        return;
-      }
+    const show = (host: HTMLElement, delay: number) => {
       const text = host.dataset.tip ?? "";
       if (text === "") {
         cancel();
@@ -53,7 +48,25 @@ export default function TooltipLayer() {
           top: below ? r.bottom + kGap : r.top - kGap,
           below,
         });
-      }, kDelayMs);
+      }, delay);
+    };
+
+    const onOver = (e: PointerEvent) => {
+      const host = (e.target as Element | null)?.closest?.("[data-tip]");
+      if (!(host instanceof HTMLElement)) {
+        cancel();
+        return;
+      }
+      show(host, kDelayMs);
+    };
+
+    // Keyboard users get the same hint when tabbing onto a control; mouse
+    // clicks also move focus but do not match :focus-visible
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target;
+      if (!(el instanceof HTMLElement) || !el.matches(":focus-visible")) return;
+      const host = el.closest("[data-tip]");
+      if (host instanceof HTMLElement) show(host, 120);
     };
 
     // Any interaction dismisses: a tooltip lingering over a menu that just
@@ -62,12 +75,16 @@ export default function TooltipLayer() {
     document.addEventListener("pointerdown", cancel, true);
     document.addEventListener("wheel", cancel, true);
     document.addEventListener("keydown", cancel, true);
+    document.addEventListener("focusin", onFocusIn, true);
+    document.addEventListener("focusout", cancel, true);
     window.addEventListener("blur", cancel);
     return () => {
       document.removeEventListener("pointerover", onOver, true);
       document.removeEventListener("pointerdown", cancel, true);
       document.removeEventListener("wheel", cancel, true);
       document.removeEventListener("keydown", cancel, true);
+      document.removeEventListener("focusin", onFocusIn, true);
+      document.removeEventListener("focusout", cancel, true);
       window.removeEventListener("blur", cancel);
       if (timer.current !== null) clearTimeout(timer.current);
     };

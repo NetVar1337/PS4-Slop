@@ -15,6 +15,7 @@ struct PEImage {
     Arch                       arch;
     va_t                       base;
     va_t                       entry;
+    ImageFormat                format = ImageFormat::PE;
     std::vector<Segment>       segments;
     std::vector<Import>        imports;
     std::vector<Export>        exports;

@@ -62,7 +62,7 @@ snapshot_t snapshot(uint64_t since_revision, size_t limit) {
 }
 
 uint64_t revision() noexcept {
-    std::lock_guard lk(const_cast<std::mutex&>(g_mu));
+    std::lock_guard lk(g_mu);
     return g_revision;
 }
 

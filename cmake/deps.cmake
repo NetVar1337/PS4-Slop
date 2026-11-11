@@ -1,17 +1,30 @@
 include_guard(GLOBAL)
 include(FetchContent)
 
-set(FETCHCONTENT_BASE_DIR "${CMAKE_SOURCE_DIR}/_ext" CACHE PATH "" FORCE)
+# Downloaded dependency sources plus their sub-builds/binary dirs. The primary
+# build/ tree uses _ext/ (cached by CI); the other presets (debug, asan,
+# analyze) point this into their own binary dir because a dependency's binary
+# dir under here belongs to exactly one build tree.
+set(SLOP_DEPS_DIR "${CMAKE_SOURCE_DIR}/_ext" CACHE PATH "FetchContent base dir for dependency sources and builds")
+set(FETCHCONTENT_BASE_DIR "${SLOP_DEPS_DIR}" CACHE PATH "" FORCE)
 set(FETCHCONTENT_QUIET OFF)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
-set(SLOP_IMGUI_VERSION "v1.92.1-docking")
+# Every archive is pinned by SHA-256 and every git dependency by a full commit
+# SHA, so a moved tag or a tampered download fails the configure instead of
+# being compiled into the shipped engine. Bumping a dep means updating both
+# the URL and its hash (tools/dep_hash.ps1 prints the hash of a URL).
+# Dear ImGui v1.92.1-docking (tag object e0b5968) -> commit 44aa9a4
 set(SLOP_IMGUI_COMMIT "44aa9a4b3a6f27d09a4eb5770d095cbd376dfc4b")
 
 set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_SHARED_LIB OFF CACHE BOOL "" FORCE)
 set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
+set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# zlib's examples register CTest entries (example/example64); CTest lists only
+# reverse-slop's own tests
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(ZYDIS_FEATURE_ENCODER ON CACHE BOOL "" FORCE)
 
 set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
@@ -49,57 +62,78 @@ set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(fmt
     URL https://github.com/fmtlib/fmt/archive/refs/tags/11.1.4.zip
+    URL_HASH SHA256=7e85cbf6125a76daa0f83cd9240eff863d988aca68cd5f66c01ff7b59fa886b6
+    SYSTEM
 )
 
 FetchContent_Declare(spdlog
     URL https://github.com/gabime/spdlog/archive/refs/tags/v1.15.3.zip
+    URL_HASH SHA256=b74274c32c8be5dba70b7006c1d41b7d3e5ff0dff8390c8b6390c1189424e094
+    SYSTEM
 )
 
 FetchContent_Declare(capstone
     URL https://github.com/capstone-engine/capstone/archive/refs/tags/5.0.6.zip
+    URL_HASH SHA256=3b3bdad8a75c4a9cbec28efd47778e412904db1588ec606d516b7196e8e6668e
+    SYSTEM
 )
 
 FetchContent_Declare(zlib_kr
     URL https://github.com/madler/zlib/archive/refs/tags/v1.3.1.zip
+    URL_HASH SHA256=50b24b47bf19e1f35d2a21ff36d2a366638cdf958219a66f30ce0861201760e6
+    SYSTEM
 )
 
 FetchContent_Declare(freetype
     URL https://github.com/freetype/freetype/archive/refs/tags/VER-2-13-3.zip
+    URL_HASH SHA256=a7165cb405dfce349ae64d6f59efb2567565ca8edbacbeff2a8d0e4cfa779cf5
+    SYSTEM
 )
 
+# v3.12.0 release tarball (the layout upstream recommends for FetchContent)
 FetchContent_Declare(nlohmann_json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.12.0
-    GIT_SHALLOW TRUE
+    URL https://github.com/nlohmann/json/releases/download/v3.12.0/json.tar.xz
+    URL_HASH SHA256=42f6e95cad6ec532fd372391373363b62a14af6d771056dbfc86160e6dfff7aa
+    SYSTEM
 )
 
+# v4.1.1; git (not an archive) because zycore comes in as a submodule.
+# GIT_SHALLOW cannot fetch an arbitrary commit, so this one is a full clone
 FetchContent_Declare(zydis
     GIT_REPOSITORY https://github.com/zyantific/zydis.git
-    GIT_TAG v4.1.1
-    GIT_SHALLOW TRUE
+    GIT_TAG a2278f1d254e492f6a6b39f6cb5d1f5d515659dc
     GIT_SUBMODULES_RECURSE TRUE
+    SYSTEM
 )
 
 FetchContent_Declare(imgui
-    GIT_REPOSITORY https://github.com/ocornut/imgui.git
-    GIT_TAG ${SLOP_IMGUI_VERSION}
-    GIT_SHALLOW TRUE
+    URL https://github.com/ocornut/imgui/archive/${SLOP_IMGUI_COMMIT}.zip
+    URL_HASH SHA256=56c0ada056a6a9676759d533afc6f0b0c7cfbf6fe72b51a8a2b3d77dad75dfb4
+    SYSTEM
 )
 
 FetchContent_Declare(httplib
     URL https://github.com/yhirose/cpp-httplib/archive/refs/tags/v0.18.7.zip
+    URL_HASH SHA256=a5e878f58b035b6b2258c982af5696b7e510ee7e6033799e083bcdc6efc0cdfe
+    SYSTEM
 )
 
 FetchContent_Declare(unicorn
     URL https://github.com/unicorn-engine/unicorn/archive/refs/tags/2.1.4.zip
+    URL_HASH SHA256=787a4b46ad5df58f1eec11343c55b163779df32dbe9e7d9d0f99967f34a1ff79
+    SYSTEM
 )
 
 FetchContent_Declare(sqlite
     URL https://www.sqlite.org/2025/sqlite-amalgamation-3500400.zip
+    URL_HASH SHA256=1d3049dd0f830a025a53105fc79fd2ab9431aea99e137809d064d8ee8356b032
+    SYSTEM
 )
 
 FetchContent_Declare(lua
     URL https://www.lua.org/ftp/lua-5.4.7.tar.gz
+    URL_HASH SHA256=9fbf5e28ef86c69858f6d3d34eccc32e911c1a28b4120ff3e84aaa70cfbf1e30
+    SYSTEM
 )
 
 # httplib grabs openssl or zlib off the host when they happen to be installed,
@@ -111,58 +145,6 @@ set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(freetype nlohmann_json zydis imgui httplib unicorn sqlite lua fmt spdlog capstone zlib_kr)
 
-# frida-core devkit
-# frida core ships a prebuilt static lib plus one self contained header, the
-# upstream tree needs their forked vala toolchain so we link the release
-# devkit instead, same 17.17.0 as the cloned tree
-set(SLOP_FRIDA_VERSION "17.17.0")
-set(SLOP_FRIDA_DIR "${CMAKE_SOURCE_DIR}/_ext/frida-devkit")
-set(SLOP_FRIDA_MARKER "${SLOP_FRIDA_DIR}/.version")
-set(SLOP_FRIDA_READY FALSE)
-if(EXISTS "${SLOP_FRIDA_DIR}/frida-core.lib" AND EXISTS "${SLOP_FRIDA_MARKER}")
-    file(READ "${SLOP_FRIDA_MARKER}" SLOP_FRIDA_INSTALLED_VERSION)
-    string(STRIP "${SLOP_FRIDA_INSTALLED_VERSION}" SLOP_FRIDA_INSTALLED_VERSION)
-    if(SLOP_FRIDA_INSTALLED_VERSION STREQUAL SLOP_FRIDA_VERSION)
-        set(SLOP_FRIDA_READY TRUE)
-    endif()
-elseif(EXISTS "${SLOP_FRIDA_DIR}/frida-core.lib")
-    # adopt an existing matching checkout once, version changes force a verified
-    # refresh
-    file(WRITE "${SLOP_FRIDA_MARKER}" "${SLOP_FRIDA_VERSION}\n")
-    set(SLOP_FRIDA_READY TRUE)
-endif()
-if(NOT SLOP_FRIDA_READY)
-    set(SLOP_FRIDA_SFX "${SLOP_FRIDA_DIR}/frida-core-devkit-${SLOP_FRIDA_VERSION}.exe")
-    file(MAKE_DIRECTORY "${SLOP_FRIDA_DIR}")
-    message(STATUS "frida: downloading core devkit ${SLOP_FRIDA_VERSION} (~53 MB, one-time)")
-    file(DOWNLOAD
-        "https://github.com/frida/frida/releases/download/${SLOP_FRIDA_VERSION}/frida-core-devkit-${SLOP_FRIDA_VERSION}-windows-x86_64.exe"
-        "${SLOP_FRIDA_SFX}"
-        EXPECTED_HASH SHA256=92479d971d722ff21e933af856952027e6935a79f7d2eaa3484efa92c85790e3
-        SHOW_PROGRESS
-        STATUS SLOP_FRIDA_DL)
-    list(GET SLOP_FRIDA_DL 0 SLOP_FRIDA_DL_RC)
-    if(NOT SLOP_FRIDA_DL_RC EQUAL 0)
-        message(FATAL_ERROR "frida: devkit download failed (${SLOP_FRIDA_DL})")
-    endif()
-    execute_process(COMMAND "${SLOP_FRIDA_SFX}" "-o${SLOP_FRIDA_DIR}" "-y"
-                    RESULT_VARIABLE SLOP_FRIDA_X)
-    if(NOT SLOP_FRIDA_X EQUAL 0)
-        message(FATAL_ERROR "frida: devkit self-extractor failed (${SLOP_FRIDA_X})")
-    endif()
-    file(REMOVE "${SLOP_FRIDA_SFX}")
-    if(NOT EXISTS "${SLOP_FRIDA_DIR}/frida-core.lib")
-        message(FATAL_ERROR "frida: devkit extracted but frida-core.lib is missing")
-    endif()
-    file(WRITE "${SLOP_FRIDA_MARKER}" "${SLOP_FRIDA_VERSION}\n")
-endif()
-if(NOT TARGET frida::core)
-    add_library(frida::core UNKNOWN IMPORTED)
-    set_target_properties(frida::core PROPERTIES
-        IMPORTED_LOCATION "${SLOP_FRIDA_DIR}/frida-core.lib"
-        INTERFACE_INCLUDE_DIRECTORIES "${SLOP_FRIDA_DIR}")
-endif()
-
 # zlib builds both a shared and a static lib, we only want the static one so
 # the exes stay freestanding
 if(NOT TARGET ZLIB::ZLIB)
@@ -173,7 +155,7 @@ endif()
 add_library(slop_sqlite STATIC
     "${sqlite_SOURCE_DIR}/sqlite3.c"
 )
-target_include_directories(slop_sqlite PUBLIC "${sqlite_SOURCE_DIR}")
+target_include_directories(slop_sqlite SYSTEM PUBLIC "${sqlite_SOURCE_DIR}")
 target_compile_definitions(slop_sqlite PRIVATE
     SQLITE_OMIT_LOAD_EXTENSION
     SQLITE_THREADSAFE=1
@@ -216,7 +198,7 @@ add_library(slop_lua STATIC
     "${lua_SOURCE_DIR}/src/lvm.c"
     "${lua_SOURCE_DIR}/src/lzio.c"
 )
-target_include_directories(slop_lua PUBLIC "${lua_SOURCE_DIR}/src")
+target_include_directories(slop_lua SYSTEM PUBLIC "${lua_SOURCE_DIR}/src")
 target_compile_definitions(slop_lua PRIVATE
     LUA_USE_WINDOWS
 )
@@ -243,7 +225,7 @@ add_library(slop_imgui STATIC
     "${imgui_SOURCE_DIR}/misc/freetype/imgui_freetype.cpp"
 )
 
-target_include_directories(slop_imgui PUBLIC
+target_include_directories(slop_imgui SYSTEM PUBLIC
     "${imgui_SOURCE_DIR}"
     "${imgui_SOURCE_DIR}/backends"
     "${imgui_SOURCE_DIR}/misc/freetype"

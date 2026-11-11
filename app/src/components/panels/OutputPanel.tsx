@@ -4,18 +4,25 @@
 import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, Eraser, Trash2 } from "lucide-react";
+import IconButton from "@/components/IconButton";
+import Tabs, { panelId, tabId } from "@/components/Tabs";
 import { call } from "@/lib/rpc";
 import { useOutput } from "@/store/output";
+import { useUi, type OutputTab } from "@/store/ui";
 
 type DiagEntry = { ms: number; level: string; tag: string; message: string };
 
 const timeFormat = new Intl.DateTimeFormat(undefined, {
-  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false,
 });
 const clock = (ms: number) => timeFormat.format(ms);
 
 export default function OutputPanel() {
-  const [tab, setTab] = useState<"output" | "log">("output");
+  const tab = useUi((s) => s.outputTab);
+  const setTab = useUi((s) => s.setOutputTab);
   const [diag, setDiag] = useState<DiagEntry[]>([]);
   const [follow, setFollow] = useState(true);
   const lines = useOutput((s) => s.lines);
@@ -28,12 +35,15 @@ export default function OutputPanel() {
     estimateSize: () => 20,
     overscan: 12,
     initialRect: { width: 800, height: 300 },
-    getItemKey: (index) => tab === "output" ? `output-${lines[index].seq}` : `diag-${index}`,
-
+    getItemKey: (index) => (tab === "output" ? `output-${lines[index].seq}` : `diag-${index}`),
   });
-  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = follow ? () => false : undefined;
   const totalSize = virtualizer.getTotalSize();
 
+  // While following, a re-measured row must not nudge the scroll position; the
+  // pin below owns it. Configured in an effect: render must stay side-effect free
+  useEffect(() => {
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = follow ? () => false : undefined;
+  }, [virtualizer, follow]);
 
   // diag has no push channel: it is a high-volume ring that would swamp the
   // event stream, so the Log tab polls it while it is the visible tab
@@ -41,17 +51,20 @@ export default function OutputPanel() {
     if (tab !== "log") return;
     let alive = true;
     let revision = 0;
-    let timer: ReturnType<typeof setTimeout>;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const pull = async () => {
       try {
         const res = await call<{ entries: DiagEntry[]; revision: number }>("app", "diag", {
-          limit: 1000, since_revision: revision,
+          limit: 1000,
+          since_revision: revision,
         });
         if (alive) {
           const reset = res.revision < revision;
           const replace = revision === 0 || reset;
-          if (res.entries.length || reset) setDiag((previous) =>
-            (replace ? res.entries : [...previous, ...res.entries]).slice(-1000));
+          if (res.entries.length || reset)
+            setDiag((previous) =>
+              (replace ? res.entries : [...previous, ...res.entries]).slice(-1000),
+            );
           revision = reset ? 0 : res.revision;
         }
       } catch {
@@ -67,70 +80,102 @@ export default function OutputPanel() {
     };
   }, [tab]);
 
+  // Follow mode: one observer per pane watching the content's height; it fires
+  // when lines arrive (total size grows), so nothing re-subscribes per line
   useEffect(() => {
     const el = bodyRef.current;
-    if (!follow || !el || !el.firstElementChild) return;
-    const pin = () => { el.scrollTop = el.scrollHeight; };
+    const content = el?.firstElementChild;
+    if (!follow || !el || !content) return;
+    const pin = () => {
+      el.scrollTop = el.scrollHeight;
+    };
     const observer = new ResizeObserver(pin);
-    observer.observe(el.firstElementChild);
+    observer.observe(content);
     pin();
     return () => observer.disconnect();
-  }, [follow, tab, lines, diag]);
+  }, [follow, tab]);
 
   return (
-    <div className="panel" style={{ borderRight: "none", borderTop: "1px solid var(--border-soft)" }}>
+    <div className="panel output-panel">
       <div className="tabs">
-        <button className="tab" data-active={tab === "output"} onClick={() => setTab("output")}>
-          Output
-        </button>
-        <button className="tab" data-active={tab === "log"} onClick={() => setTab("log")}>
-          Log
-        </button>
+        <Tabs<OutputTab>
+          items={[
+            { id: "output", label: "Output" },
+            { id: "log", label: "Log" },
+          ]}
+          active={tab}
+          onChange={setTab}
+          label="Output panes"
+          idPrefix="output"
+        />
         <div className="spacer" />
-        <div style={{ display: "flex", alignSelf: "center", gap: 2, marginRight: 6 }}>
-          <button
-            className="icon-button"
-            data-tip="Clear"
+        <div className="tab-actions">
+          <IconButton
+            tip={tab === "output" ? "Clear output" : "Clear log view"}
             onClick={() => void (tab === "output" ? clear() : setDiag([]))}
           >
             <Trash2 size={14} />
-          </button>
-          <button className="icon-button" data-tip="Clear engine ring" onClick={() => void clear()}>
+          </IconButton>
+          <IconButton tip="Clear engine output ring" onClick={() => void clear()}>
             <Eraser size={14} />
-          </button>
-          <button
-            className="icon-button"
-            data-tip={follow ? "Following output" : "Scroll locked"}
+          </IconButton>
+          <IconButton
+            tip={follow ? "Following output" : "Scroll locked"}
+            pressed={follow}
             style={{ color: follow ? "var(--accent)" : undefined }}
             onClick={() => setFollow((v) => !v)}
           >
             <ChevronDown size={14} />
-          </button>
+          </IconButton>
         </div>
       </div>
 
       {/* Keyed so switching Output <-> Log replays the enter animation and
           resets the scroll position to the new pane's tail. */}
-      <div className="panel-body log swap-fade" key={tab} ref={bodyRef}>
+      <div
+        className="panel-body log swap-fade"
+        key={tab}
+        ref={bodyRef}
+        role="tabpanel"
+        id={panelId("output", tab)}
+        aria-labelledby={tabId("output", tab)}
+        aria-live="off"
+      >
         <div style={{ height: totalSize, position: "relative", width: "100%" }}>
-        {virtualizer.getVirtualItems().map((row) => {
-          const l = lines[row.index];
-          const e = diag[row.index];
-          return <div key={row.key} data-index={row.index} ref={virtualizer.measureElement}
-            style={{ position: "absolute", top: 0, left: 0, width: "100%", transform: `translateY(${row.start}px)` }}>
-            {tab === "output" ? <div className="log-row">
-                <span className="log-time">{clock(l.ms)}</span>
-                <span>{l.text}</span>
-              </div> : <div className="log-row">
-                <span className="log-time">{clock(e.ms)}</span>
-                <span className="log-level" data-level={e.level}>
-                  {e.level}
-                </span>
-                <span className="log-tag">{e.tag}</span>
-                <span>{e.message}</span>
-              </div>}
-          </div>;
-        })}
+          {virtualizer.getVirtualItems().map((row) => {
+            const l = lines[row.index];
+            const e = diag[row.index];
+            return (
+              <div
+                key={row.key}
+                data-index={row.index}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${row.start}px)`,
+                }}
+              >
+                {tab === "output" ? (
+                  <div className="log-row">
+                    <span className="log-time">{clock(l.ms)}</span>
+                    <span>{l.text}</span>
+                  </div>
+                ) : (
+                  <div className="log-row">
+                    <span className="log-time">{clock(e.ms)}</span>
+                    <span className="log-level" data-level={e.level}>
+                      {e.level}
+                    </span>
+                    <span className="log-tag">{e.tag}</span>
+                    <span>{e.message}</span>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

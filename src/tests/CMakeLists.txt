@@ -27,6 +27,7 @@ add_executable(slop_tests
     test_magicmida.cpp
     test_ipa.cpp
     test_ps4.cpp
+    test_harness.cpp
 )
 
 target_include_directories(slop_tests PRIVATE "${CMAKE_SOURCE_DIR}/src/tests")
@@ -44,7 +45,7 @@ if(TARGET slop_target)
 endif()
 
 if(MSVC)
-    target_compile_options(slop_tests PRIVATE /W4 /EHsc)
+    target_compile_options(slop_tests PRIVATE /W4 /WX /EHsc)
 endif()
 
 set_target_properties(slop_tests PROPERTIES
@@ -52,12 +53,35 @@ set_target_properties(slop_tests PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
 )
 
-foreach(filter IN ITEMS decomp hyperion disasm_accuracy mcp app_perf ipa ps4)
-    add_test(NAME "slop_tests_${filter}" COMMAND slop_tests)
-    set_tests_properties("slop_tests_${filter}" PROPERTIES
-        ENVIRONMENT "SLOP_TEST_FILTER=${filter}"
+# One CTest entry per test area (a test_<area>.cpp file, the harness derives
+# the same area name from __FILE__) plus one entry running the whole suite.
+# Derived from the source list so a new test file is registered automatically.
+# CI runs `ctest -L area`; `ctest -L all` is the single-process full run.
+get_target_property(_slop_test_sources slop_tests SOURCES)
+set(_slop_test_areas "")
+foreach(_src IN LISTS _slop_test_sources)
+    get_filename_component(_name "${_src}" NAME_WE)
+    if(_name MATCHES "^test_(.+)$" AND NOT _name STREQUAL "test_main")
+        list(APPEND _slop_test_areas "${CMAKE_MATCH_1}")
+    endif()
+endforeach()
+list(REMOVE_DUPLICATES _slop_test_areas)
+list(SORT _slop_test_areas)
+
+foreach(_area IN LISTS _slop_test_areas)
+    add_test(NAME "slop_tests_${_area}" COMMAND slop_tests)
+    set_tests_properties("slop_tests_${_area}" PROPERTIES
+        ENVIRONMENT "SLOP_TEST_AREA=${_area}"
+        LABELS "slop;area"
+        TIMEOUT 1800
     )
 endforeach()
+
+add_test(NAME slop_tests_all COMMAND slop_tests)
+set_tests_properties(slop_tests_all PROPERTIES
+    LABELS "slop;all"
+    TIMEOUT 5400
+)
 
 if(TARGET slop_decomp_target_o0 AND TARGET slop_decomp_target_o2)
     add_executable(slop_bench bench_hyperion.cpp)
@@ -69,7 +93,7 @@ if(TARGET slop_decomp_target_o0 AND TARGET slop_decomp_target_o2)
     )
     add_dependencies(slop_bench slop_decomp_target_o0 slop_decomp_target_o2)
     if(MSVC)
-        target_compile_options(slop_bench PRIVATE /W4 /EHsc)
+        target_compile_options(slop_bench PRIVATE /W4 /WX /EHsc)
     endif()
     set_target_properties(slop_bench PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests"
@@ -80,6 +104,6 @@ add_executable(slop_app_bench bench_app.cpp)
 target_include_directories(slop_app_bench PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(slop_app_bench PRIVATE slop_core nlohmann_json::nlohmann_json)
 if(MSVC)
-    target_compile_options(slop_app_bench PRIVATE /W4 /EHsc)
+    target_compile_options(slop_app_bench PRIVATE /W4 /WX /EHsc)
 endif()
 set_target_properties(slop_app_bench PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")

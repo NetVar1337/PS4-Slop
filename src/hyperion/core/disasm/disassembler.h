@@ -20,31 +20,62 @@ enum class InsnType : u8 {
 
 enum class OpType : u8 { None, Reg, Imm, Mem };
 
+// ARM register-operand shift (`x2, lsl #3`)
+enum class ShiftKind : u8 { Lsl = 0, Lsr = 1, Asr = 2, Ror = 3 };
+
+// ARM operand extension: a memory index (`[x0, w1, sxtw #2]`, A32 `[r1, -r2]`
+// is Neg) or an ARM64 extended-register operand (`add x0, x1, w2, uxtb`),
+// kept in mem.ext for both since a Reg operand leaves mem unused
+enum class IndexExt : u8 { None = 0, Uxtw, Sxtw, Sxtx, Neg, Uxtb, Uxth, Sxtb, Sxth };
+
 // Field order is chosen for size, not readability: the natural ordering pads
 // this out to 40 bytes, and an Insn carries five of them for every decoded
 // instruction in the image. Keeping the 8-byte members first packs it to 32
 struct Operand {
     u64    val  = 0;
-    struct { i64 disp; u16 base; u16 index; u8 scale; } mem{};
+    // scale multiplies index (x86 SIB scale; ARM `lsl #n` as 1 << n)
+    struct { i64 disp; u16 base; u16 index; u8 scale; IndexExt ext; } mem{};
     u16    reg  = 0;
     u16    size = 0;
     OpType type = OpType::None;
     bool   read = false;
     bool   write = false;
+    // Reg: ARM shift, amount in the low 6 bits (0 = none), ShiftKind in the
+    // top 2. Imm: same packing, the LSL already folded into val (ARM64
+    // `movz/movk/add #imm, lsl #n`). Mem: kWriteback / kPostIndex
+    // (ARM `[x1, #8]!` / `[x1], #8`)
+    u8     aux = 0;
+
+    static constexpr u8 kWriteback = 0x01;
+    static constexpr u8 kPostIndex = 0x02;
+
+    static u8 pack_shift(ShiftKind k, unsigned amount) {
+        return static_cast<u8>((static_cast<unsigned>(k) << 6) | (amount & 0x3F));
+    }
+    unsigned  shift_amount() const { return type == OpType::Mem ? 0u : (aux & 0x3Fu); }
+    ShiftKind shift_kind()   const { return static_cast<ShiftKind>(aux >> 6); }
+    bool writeback()  const { return type == OpType::Mem && (aux & kWriteback); }
+    bool post_index() const { return type == OpType::Mem && (aux & kPostIndex); }
 };
+static_assert(sizeof(Operand) == 32, "Operand is stored per instruction, keep it packed");
 
 // Also ordered for size — an image with tens of millions of instructions
 // keeps one of these per instruction in the DB and another per basic block
 struct Insn {
     va_t        addr;
     Operand     ops[5]; // Includes the mask and trailing immediate of AVX-512.
-    char        op_str[64];
+    char        op_str[63];
+    // operands the decoder reported; above 5 (ARM register lists, NEON
+    // table lookups) only the first 5 are in ops[], op_str has them all
+    u8          ops_total;
     char        mnemonic[12];
     u8          bytes[15];
     u8          len;
     InsnType    type;
     u8          op_count;
     u16         mnemonic_id;
+
+    bool ops_truncated() const { return ops_total > op_count; }
 
     void set_mnemonic(const char* s) {
         std::strncpy(mnemonic, s, sizeof(mnemonic) - 1);

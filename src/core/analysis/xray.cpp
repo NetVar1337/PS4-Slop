@@ -1,6 +1,7 @@
 // src/core/analysis/xray.cpp
 
 #include "core/analysis/xray.hpp"
+#include "core/analysis/ps4_syscalls.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -747,9 +748,51 @@ std::vector<hook_hit_t> detect_hooks_at(const image_ref_t& img,
 
 // direct syscalls
 
+namespace {
+
+// mov r10, rcx in both encodings (8B /r and 89 /r)
+bool is_mov_r10_rcx(const uint8_t* p) {
+    return (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0xD1) ||
+           (p[0] == 0x49 && p[1] == 0x89 && p[2] == 0xCA);
+}
+
+struct number_load_t {
+    size_t   len   = 0;
+    uint32_t value = 0;
+    bool     rax   = false;
+};
+
+// immediate load of the syscall number that ends exactly at buf[end]
+std::optional<number_load_t> number_load_before(const std::vector<uint8_t>& buf,
+                                                size_t end) {
+    // mov rax, imm32 (sign extended): 48 C7 C0 ii ii ii ii
+    if (end >= 7 && buf[end - 7] == 0x48 && buf[end - 6] == 0xC7 &&
+        buf[end - 5] == 0xC0) {
+        int32_t v = 0;
+        std::memcpy(&v, buf.data() + end - 4, 4);
+        if (v >= 0) return number_load_t{7, static_cast<uint32_t>(v), true};
+    }
+    // mov eax, imm32: B8 ii ii ii ii, not a REX.B form (that targets r8d..r15d)
+    if (end >= 5 && buf[end - 5] == 0xB8) {
+        if (end >= 6 && (buf[end - 6] & 0xF1) == 0x41) return std::nullopt;
+        uint32_t v = 0;
+        std::memcpy(&v, buf.data() + end - 4, 4);
+        return number_load_t{5, v, false};
+    }
+    return std::nullopt;
+}
+
+// Windows 10+ ntdll stubs test SharedUserData before `syscall`:
+// test byte ptr [7FFE0308h], 1 ; jne +3
+constexpr uint8_t kNtSharedUserCheck[] = {0xF6, 0x04, 0x25, 0x08, 0x03,
+                                          0xFE, 0x7F, 0x01, 0x75, 0x03};
+
+} // namespace
+
 std::vector<syscall_hit_t> detect_syscalls(const image_ref_t& img,
                                            uint64_t va, size_t size) {
     std::vector<syscall_hit_t> out;
+    const bool ps4 = img.abi == syscall_abi_t::ps4;
 
     // Default: all executable sections
     std::vector<std::pair<uint64_t, size_t>> ranges;
@@ -762,53 +805,47 @@ std::vector<syscall_hit_t> detect_syscalls(const image_ref_t& img,
                                     std::min<uint32_t>(s.raw_size, s.virtual_size));
     }
 
-    for (const auto& [rva_start, rlen] : ranges) {
+    for (const auto& [range_va, rlen] : ranges) {
         if (rlen < 6) continue;
         std::vector<uint8_t> buf(rlen);
-        if (!read_img(img, rva_start, buf.data(), buf.size())) continue;
+        if (!read_img(img, range_va, buf.data(), buf.size())) continue;
 
-        for (size_t i = 0; i + 7 <= buf.size(); ++i) {
-            // mov r10, rcx ; mov eax, N ; syscall
-            if (buf[i] == 0x4C && buf[i + 1] == 0x8B && buf[i + 2] == 0xD1 &&
-                buf[i + 3] == 0xB8 && buf[i + 8] == 0x0F && buf[i + 9] == 0x05) {
-                const uint32_t ssn = buf[i + 4] | (buf[i + 5] << 8) |
-                                     (buf[i + 6] << 16) | (buf[i + 7] << 24);
-                if (ssn <= 0x1000) {
-                    syscall_hit_t h;
-                    h.address = rva_start + i;
-                    h.ssn = ssn;
-                    h.pattern = "mov_r10_rcx";
-                    out.push_back(std::move(h));
-                }
-                i += 9;
-                continue;
+        for (size_t i = 0; i + 2 <= buf.size(); ++i) {
+            const bool sys    = buf[i] == 0x0F && buf[i + 1] == 0x05;
+            const bool int2e  = !ps4 && buf[i] == 0xCD && buf[i + 1] == 0x2E;
+            if (!sys && !int2e) continue;
+
+            size_t cur = i;
+            bool r10_after = false, r10_before = false;
+            if (sys && !ps4 && cur >= sizeof(kNtSharedUserCheck) &&
+                std::memcmp(buf.data() + cur - sizeof(kNtSharedUserCheck),
+                            kNtSharedUserCheck, sizeof(kNtSharedUserCheck)) == 0)
+                cur -= sizeof(kNtSharedUserCheck);
+            if (sys && cur >= 3 && is_mov_r10_rcx(buf.data() + cur - 3)) {
+                r10_after = true;
+                cur -= 3;
             }
-            // mov eax, N ; syscall
-            if (buf[i] == 0xB8 && buf[i + 5] == 0x0F && buf[i + 6] == 0x05) {
-                const uint32_t ssn = buf[i + 1] | (buf[i + 2] << 8) |
-                                     (buf[i + 3] << 16) | (buf[i + 4] << 24);
-                if (ssn <= 0x1000) {
-                    syscall_hit_t h;
-                    h.address = rva_start + i;
-                    h.ssn = ssn;
-                    h.pattern = "mov_eax_syscall";
-                    out.push_back(std::move(h));
-                }
-                i += 6;
-                continue;
+            const auto load = number_load_before(buf, cur);
+            if (!load || load->value > 0x1000) continue;
+            cur -= load->len;
+            if (sys && !r10_after && cur >= 3 && is_mov_r10_rcx(buf.data() + cur - 3)) {
+                r10_before = true;
+                cur -= 3;
             }
-            // mov eax, N ... ; int 2E (within 5 bytes)
-            if (buf[i] == 0xCD && buf[i + 1] == 0x2E && i >= 5 && buf[i - 5] == 0xB8) {
-                const uint32_t ssn = buf[i - 4] | (buf[i - 3] << 8) |
-                                     (buf[i - 2] << 16) | (buf[i - 1] << 24);
-                if (ssn <= 0x1000) {
-                    syscall_hit_t h;
-                    h.address = rva_start + i - 5;
-                    h.ssn = ssn;
-                    h.pattern = "int_2e";
-                    out.push_back(std::move(h));
-                }
+
+            syscall_hit_t h;
+            h.address = range_va + cur;
+            h.ssn     = load->value;
+            if (int2e)           h.pattern = "int_2e";
+            else if (r10_before) h.pattern = load->rax ? "mov_r10_rcx_rax" : "mov_r10_rcx";
+            else if (r10_after)  h.pattern = load->rax ? "mov_rax_r10_syscall"
+                                                       : "mov_eax_r10_syscall";
+            else                 h.pattern = load->rax ? "mov_rax_syscall" : "mov_eax_syscall";
+            if (ps4) {
+                if (const char* n = ps4_syscall_name(load->value)) h.name = n;
             }
+            out.push_back(std::move(h));
+            ++i;   // skip the second opcode byte
         }
     }
     return out;

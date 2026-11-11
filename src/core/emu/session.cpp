@@ -28,7 +28,17 @@ constexpr uint64_t kStubStride = 8;
 constexpr uint64_t kTebBase    = kStubBase + kMaxImports * kStubStride;
 constexpr uint64_t kTebSize    = 0x2000;       // x64 TEB is 0x1838 bytes
 constexpr uint64_t kPebBase    = kTebBase + kTebSize;
+// sysv uses the same reserved range for the FreeBSD TCB (the abis exclude
+// each other): static TLS below the thread pointer (variant II), the TCB at
+// it, then dtv and a zeroed struct pthread
+constexpr uint64_t kTlsBase    = kTebBase;
+constexpr uint64_t kTlsStatic  = 0x2000;       // static TLS block below fs
+constexpr uint64_t kTlsSize    = 0x4000;
+constexpr uint64_t kTlsTp      = kTlsBase + kTlsStatic;   // fs base
+constexpr uint64_t kTlsDtv     = kTlsTp + 0x100;
+constexpr uint64_t kTlsThread  = kTlsTp + 0x1000;
 constexpr size_t   kMaxApiCalls = 1024;
+constexpr size_t   kMaxSyscalls = 1024;
 
 struct reg_alias_t { const char* name; int uc_reg; };
 
@@ -101,6 +111,9 @@ struct run_ctx_t {
     std::vector<run_result_t::api_call_t> api_calls;
     size_t total_api_calls = 0;
 
+    std::vector<run_result_t::syscall_t> syscalls;
+    size_t total_syscalls = 0;
+
     size_t paged_in          = 0;
     bool   page_in_exhausted = false;
     std::vector<uint8_t> page_buf = std::vector<uint8_t>(kPageSize);
@@ -166,9 +179,15 @@ void on_import(uc_engine* uc, run_ctx_t* c, uint64_t address) {
         uint64_t rsp = 0;
         uc_reg_read(uc, UC_X86_REG_RSP, &rsp);
         uc_mem_read(uc, rsp, &call.ret, sizeof(call.ret));
-        static constexpr int kArgRegs[4] = {UC_X86_REG_RCX, UC_X86_REG_RDX,
-                                            UC_X86_REG_R8,  UC_X86_REG_R9};
-        for (int i = 0; i < 4; ++i) uc_reg_read(uc, kArgRegs[i], &call.args[i]);
+        static constexpr int kWin64Args[4] = {UC_X86_REG_RCX, UC_X86_REG_RDX,
+                                              UC_X86_REG_R8,  UC_X86_REG_R9};
+        static constexpr int kSysvArgs[6] = {UC_X86_REG_RDI, UC_X86_REG_RSI,
+                                             UC_X86_REG_RDX, UC_X86_REG_RCX,
+                                             UC_X86_REG_R8,  UC_X86_REG_R9};
+        const bool sysv = c->req->abi == abi_t::sysv;
+        const int* regs = sysv ? kSysvArgs : kWin64Args;
+        call.arg_count = sysv ? 6 : 4;
+        for (int i = 0; i < call.arg_count; ++i) uc_reg_read(uc, regs[i], &call.args[i]);
         c->api_calls.push_back(std::move(call));
     }
 
@@ -298,11 +317,11 @@ bool hook_mem_write(uc_engine*, uc_mem_type, uint64_t address, int size,
         c->taint_on && c->taint.note_mem_write(address, static_cast<size_t>(size));
     ++c->total_writes;
     if (c->writes.size() < 2048) {
-        uint64_t stored = 0;
-        if (size == 8)                stored = static_cast<uint64_t>(value);
-        else if (size > 0 && size < 8) stored = static_cast<uint64_t>(value) &
-                                                ((1ull << (size * 8)) - 1);
-        c->writes.push_back({c->cur_ip, address, static_cast<size_t>(size), stored});
+        // unicorn hands at most 8 bytes of the stored value; wider stores
+        // keep their low 8 bytes and are flagged
+        uint64_t stored = static_cast<uint64_t>(value);
+        if (size > 0 && size < 8) stored &= (1ull << (size * 8)) - 1;
+        c->writes.push_back({c->cur_ip, address, static_cast<size_t>(size), stored, size > 8});
     }
     if (tainted) {
         // Propagate: the stored bytes themselves become taint carriers
@@ -316,6 +335,51 @@ bool hook_mem_write(uc_engine*, uc_mem_type, uint64_t address, int size,
         }
     }
     return false;
+}
+
+// syscall: log it, hand back the configured result and fake the instruction's
+// register effects (rcx = next rip, r11 = rflags, CF clear = success)
+void hook_syscall(uc_engine* uc, void* user_data) {
+    auto* c = static_cast<run_ctx_t*>(user_data);
+    uint64_t num = 0, rip = 0, rflags = 0;
+    uc_reg_read(uc, UC_X86_REG_RAX, &num);
+    uc_reg_read(uc, UC_X86_REG_RIP, &rip);
+    uc_reg_read(uc, UC_X86_REG_EFLAGS, &rflags);
+
+    const auto it = c->req->syscall_returns.find(num);
+    uint64_t ret = it != c->req->syscall_returns.end() ? it->second : c->req->syscall_ret;
+
+    ++c->total_syscalls;
+    const char* name = c->req->syscall_name ? c->req->syscall_name(num) : nullptr;
+    if (c->syscalls.size() < kMaxSyscalls) {
+        run_result_t::syscall_t sc;
+        sc.ip  = c->cur_ip;
+        sc.num = num;
+        if (name) sc.name = name;
+        static constexpr int kArgs[6] = {UC_X86_REG_RDI, UC_X86_REG_RSI, UC_X86_REG_RDX,
+                                         UC_X86_REG_R10, UC_X86_REG_R8,  UC_X86_REG_R9};
+        for (int i = 0; i < 6; ++i) uc_reg_read(uc, kArgs[i], &sc.args[i]);
+        sc.ret = ret;
+        c->syscalls.push_back(std::move(sc));
+    }
+    // the trace already holds "syscall" for this ip, name it there too
+    if (name && !c->trace.empty() && c->trace.back().ip == c->cur_ip)
+        c->trace.back().text += std::string(" ; ") + name;
+
+    // unicorn reports rip at the syscall itself or past it depending on the
+    // path; the instruction is 2 bytes (0F 05) either way
+    const uint64_t next = rip == c->cur_ip ? rip + 2 : rip;
+    uint64_t r11 = rflags;
+    rflags &= ~1ull;   // CF clear: success in the FreeBSD convention
+    uc_reg_write(uc, UC_X86_REG_RAX, &ret);
+    uc_reg_write(uc, UC_X86_REG_RCX, &next);
+    uc_reg_write(uc, UC_X86_REG_R11, &r11);
+    uc_reg_write(uc, UC_X86_REG_EFLAGS, &rflags);
+    if (c->taint_on) {
+        c->taint.set_reg(ZYDIS_REGISTER_RAX, false);
+        c->taint.set_reg(ZYDIS_REGISTER_RCX, false);
+        c->taint.set_reg(ZYDIS_REGISTER_R11, false);
+    }
 }
 
 bool hook_mem_invalid(uc_engine* uc, uc_mem_type access, uint64_t address,
@@ -356,6 +420,28 @@ bool map_teb(unicorn_t& uc, const run_request_t& req) {
     if (!uc.write(kTebBase, blk.data(), blk.size())) return false;
     uint64_t gs = kTebBase;
     return uc_reg_write(uc.handle(), UC_X86_REG_GS_BASE, &gs) == UC_ERR_OK;
+}
+
+// FreeBSD/PS4 thread control block behind fs (TLS variant II): fs:[0] is the
+// TCB self pointer, fs:[8] the dtv, fs:[0x10] the struct pthread. Static TLS
+// sits below the thread pointer and reads as zeros; dtv[2] points the main
+// module's block at it so __tls_get_addr style lookups land in mapped memory
+bool map_tls(unicorn_t& uc) {
+    if (!uc.map(kTlsBase, kTlsSize)) return false;
+    std::vector<uint8_t> blk(kTlsSize, 0);
+    auto put = [&blk](uint64_t va, uint64_t v) {
+        std::memcpy(blk.data() + (va - kTlsBase), &v, sizeof(v));
+    };
+    put(kTlsTp + 0x00, kTlsTp);                  // tcb_self
+    put(kTlsTp + 0x08, kTlsDtv);                 // tcb_dtv
+    put(kTlsTp + 0x10, kTlsThread);              // tcb_thread
+    put(kTlsDtv + 0x00, 1);                      // dtv generation
+    put(kTlsDtv + 0x08, 1);                      // module count
+    put(kTlsDtv + 0x10, kTlsBase);               // module 1 TLS block
+    put(kTlsThread + 0x00, kTlsTp);              // pthread -> its tcb
+    if (!uc.write(kTlsBase, blk.data(), blk.size())) return false;
+    uint64_t fs = kTlsTp;
+    return uc_reg_write(uc.handle(), UC_X86_REG_FS_BASE, &fs) == UC_ERR_OK;
 }
 
 // Page by page so a dump running into unmapped memory keeps its readable
@@ -455,8 +541,13 @@ run_result_t emulate_run(const run_request_t& req) {
         patch_slots(uc.handle(), ctx, 0, UINT64_MAX);
     }
 
-    // Best effort: a caller map over the TEB pages or a caller gs_base wins
-    if (!req.regs.count("gs_base")) res.teb_mapped = map_teb(uc, req);
+    // Best effort: a caller map over the TEB/TCB pages or a caller segment
+    // base wins
+    if (req.abi == abi_t::sysv) {
+        if (!req.regs.count("fs_base")) res.tls_mapped = map_tls(uc);
+    } else if (!req.regs.count("gs_base")) {
+        res.teb_mapped = map_teb(uc, req);
+    }
 
     // Initial RSP with a return-address sentinel so clean leaf routines halt
     // deterministically with stopped_reason="return"
@@ -501,7 +592,7 @@ run_result_t emulate_run(const run_request_t& req) {
     const uint64_t entry_va = req.entry_absolute ? req.entry
                                                  : req.code_base + req.entry;
 
-    uc_hook h_code = 0, h_read = 0, h_write = 0, h_bad = 0;
+    uc_hook h_code = 0, h_read = 0, h_write = 0, h_bad = 0, h_sys = 0;
     uc_hook_add(uc.handle(), &h_code, UC_HOOK_CODE,
                 reinterpret_cast<void*>(hook_code), &ctx, 1, 0);
     if (ctx.taint_on)   // the read hook only feeds taint; skip the per-access callback otherwise
@@ -511,6 +602,8 @@ run_result_t emulate_run(const run_request_t& req) {
                 reinterpret_cast<void*>(hook_mem_write), &ctx, 1, 0);
     uc_hook_add(uc.handle(), &h_bad, UC_HOOK_MEM_INVALID,
                 reinterpret_cast<void*>(hook_mem_invalid), &ctx, 1, 0);
+    uc_hook_add(uc.handle(), &h_sys, UC_HOOK_INSN,
+                reinterpret_cast<void*>(hook_syscall), &ctx, 1, 0, UC_X86_INS_SYSCALL);
 
     uint64_t rip = entry_va, spv = rsp;
     uc_reg_write(uc.handle(), UC_X86_REG_RIP, &rip);
@@ -542,6 +635,8 @@ run_result_t emulate_run(const run_request_t& req) {
     res.total_writes = ctx.total_writes;
     res.api_calls = std::move(ctx.api_calls);
     res.total_api_calls = ctx.total_api_calls;
+    res.syscalls = std::move(ctx.syscalls);
+    res.total_syscalls = ctx.total_syscalls;
     res.paged_in = ctx.paged_in;
     res.page_in_exhausted = ctx.page_in_exhausted;
     res.fault  = ctx.fault;
@@ -579,6 +674,10 @@ run_result_t emulate_run(const run_request_t& req) {
                              ctx.taint.memory_any(req.watch_addr, req.watch_len);
     }
     return res;
+}
+
+const char* abi_name(abi_t a) noexcept {
+    return a == abi_t::sysv ? "sysv" : "win64";
 }
 
 } // namespace slop::core::emu

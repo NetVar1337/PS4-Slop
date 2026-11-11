@@ -1,40 +1,47 @@
 // app/src/components/panels/ModulesPanel.tsx
 // Module list for the attached target, with the dump / dump+analyze workflow the
-// ImGui Targets view carried (src/ui/view_targets.cpp, module table)
+// ImGui Targets view carried (src/ui/view_targets.cpp, module table). On a PS4
+// the module is pulled over the ps4debug wire and rebuilt as an ELF
 
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Download, RefreshCw, Search } from "lucide-react";
-import { call } from "@/lib/rpc";
-import { hex } from "@/store/disasm";
-import { useDisasm } from "@/store/disasm";
+import { save } from "@tauri-apps/plugin-dialog";
+import IconButton from "@/components/IconButton";
+import { isTauri } from "@/lib/endpoint";
+import { call, errorText } from "@/lib/rpc";
+import { hex, useDisasm } from "@/store/disasm";
 import { useEngine } from "@/store/engine";
 import { useTargets } from "@/store/targets";
 
 const kRow = 22;
 
-/** `target.dump_module` result, see mcp_tools.cpp, action "dump_module". */
+/** `target.dump_module` / `target.ps4_dump_module` result. */
 type DumpResult = {
-  dumped: boolean;
-  complete: boolean;
-  path: string;
-  bytes_written: number;
-  sections: number;
-  loaded: boolean;
+  dumped?: boolean;
+  complete?: boolean;
+  path?: string;
+  bytes_written?: number;
+  sections?: number;
+  loaded?: boolean;
   warnings?: string[];
 };
 
+function dumpFileName(name: string, base: number, ps4: boolean): string {
+  if (ps4) return name.toLowerCase().endsWith(".elf") ? name : `${name}.elf`;
+  return `${name}_${hex(base, 12)}.dump.${name.toLowerCase().endsWith(".dll") ? "dll" : "exe"}`;
+}
+
 export default function ModulesPanel() {
   const target = useEngine((s) => s.target);
-  const { modules, refreshModules } = useTargets();
+  const ps4 = useEngine((s) => s.backend.ps4);
+  // The engine store refreshes this list on every target.changed
+  const modules = useTargets((s) => s.modules);
+  const refreshModules = useTargets((s) => s.refreshModules);
   const refreshLoaded = useDisasm((s) => s.refreshLoaded);
   const [filter, setFilter] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (target.attached) void refreshModules();
-  }, [target.attached, refreshModules]);
 
   const rows = modules.filter((m) => m.name.toLowerCase().includes(filter.toLowerCase()));
 
@@ -45,40 +52,50 @@ export default function ModulesPanel() {
     overscan: 12,
   });
 
-  // dump_module reconstructs a conventional PE from the mapped image; load=true
+  // dump_module reconstructs a loadable image from the mapped one; load=true
   // hands it straight to the shared analysis session, which is the fast path
   // from "attached to a packed process" to "looking at real code"
-  const dump = async (base: number, name: string, load: boolean) => {
+  const dump = async (base: number, name: string) => {
+    let path: string | null;
+    if (isTauri()) {
+      path = await save({ title: `Dump ${name}`, defaultPath: dumpFileName(name, base, ps4) });
+    } else {
+      // Browser dev mode has no native dialog
+      path = window.prompt(`Output path for ${name}`, dumpFileName(name, base, ps4));
+    }
+    if (path === null || path.trim() === "") {
+      setStatus(null);
+      return;
+    }
+    setStatus(`dumping ${name}…`);
     try {
-      const dialog = await import("@tauri-apps/plugin-dialog");
-      const picked = await dialog.save({
-        title: `Dump ${name}`,
-        defaultPath: `${name}_${hex(base, 12)}.dump.${name.endsWith(".dll") ? "dll" : "exe"}`,
-      });
-      if (picked === null) {
-        setStatus(null);
-        return;
-      }
-      setStatus(`dumping ${name}…`);
       // strict=false so a packed image with unreadable spans still produces a
       // file; the engine zero-fills those and reports complete=false
-      const res = await call<DumpResult>("target", "dump_module", {
-        base,
-        path: picked,
-        load,
-        strict: false,
-      });
-      const size = `${Math.round(res.bytes_written / 1024)} KiB`;
+      const res = ps4
+        ? await call<DumpResult>(
+            "target",
+            "ps4_dump_module",
+            { name, path, load: true },
+            { timeoutMs: 600_000 },
+          )
+        : await call<DumpResult>(
+            "target",
+            "dump_module",
+            { base, path, load: true, strict: false },
+            { timeoutMs: 600_000 },
+          );
+      const size =
+        res.bytes_written !== undefined ? ` · ${Math.round(res.bytes_written / 1024)} KiB` : "";
       const partial = res.complete === false ? " (partial, unreadable spans zero-filled)" : "";
-      setStatus(`dumped ${name} · ${size} · ${res.sections} sections${partial}`);
-      if (res.warnings !== undefined && res.warnings.length > 0) {
-        setStatus(
-          `dumped ${name} · ${size}${partial} · ${res.warnings.length} warning(s): ${res.warnings[0]}`,
-        );
-      }
-      if (load) await refreshLoaded();
+      const warn =
+        res.warnings !== undefined && res.warnings.length > 0
+          ? ` · ${res.warnings.length} warning(s): ${res.warnings[0]}`
+          : "";
+      const sections = res.sections !== undefined ? ` · ${res.sections} sections` : "";
+      setStatus(`dumped ${name}${size}${sections}${partial}${warn}`);
+      await refreshLoaded();
     } catch (e) {
-      setStatus(e instanceof Error ? e.message : String(e));
+      setStatus(errorText(e));
     }
   };
 
@@ -100,16 +117,23 @@ export default function ModulesPanel() {
       <div className="panel-head">
         <span className="panel-title">Modules</span>
         <div className="spacer" />
-        <span className="faint" style={{ fontSize: 11 }}>{modules.length}</span>
-        <button className="icon-button" data-tip="Refresh" onClick={() => void refreshModules()}>
+        <span className="faint" style={{ fontSize: 11 }}>
+          {modules.length}
+        </span>
+        <IconButton tip="Refresh modules" onClick={() => void refreshModules()}>
           <RefreshCw size={14} />
-        </button>
+        </IconButton>
       </div>
 
-      <div style={{ display: "grid", gridTemplateRows: "auto 1fr auto", minHeight: 0 }}>
+      <div className="modules-body">
         <div className="search">
-          <Search size={13} />
-          <input value={filter} placeholder="Filter modules…" onChange={(e) => setFilter(e.target.value)} />
+          <Search size={13} aria-hidden />
+          <input
+            value={filter}
+            aria-label="Filter modules"
+            placeholder="Filter modules…"
+            onChange={(e) => setFilter(e.target.value)}
+          />
         </div>
 
         <div className="panel-body" ref={scrollRef}>
@@ -118,20 +142,21 @@ export default function ModulesPanel() {
               const m = rows[v.index];
               return (
                 <div
-                  key={m.base}
+                  key={`${m.base}-${m.name}`}
                   className="fn-row"
                   style={{ top: v.start, height: kRow }}
                   data-tip={m.path ?? m.name}
                 >
                   <span className="fn-name">{m.name}</span>
-                  <span className="faint" style={{ fontSize: 10 }}>{hex(m.base, 12)}</span>
-                  <button
-                    className="icon-button"
-                    data-tip="Dump + analyze"
-                    onClick={() => void dump(m.base, m.name, true)}
+                  <span className="faint" style={{ fontSize: 10 }}>
+                    {hex(m.base, 12)}
+                  </span>
+                  <IconButton
+                    tip={`Dump + analyze ${m.name}`}
+                    onClick={() => void dump(m.base, m.name)}
                   >
                     <Download size={11} />
-                  </button>
+                  </IconButton>
                 </div>
               );
             })}
@@ -139,7 +164,13 @@ export default function ModulesPanel() {
         </div>
 
         {status !== null && (
-          <div className="empty-hint" style={{ padding: "var(--pad-sm) var(--pad-md)" }}>{status}</div>
+          <div
+            className="empty-hint"
+            role="status"
+            style={{ padding: "var(--pad-sm) var(--pad-md)" }}
+          >
+            {status}
+          </div>
         )}
       </div>
     </div>

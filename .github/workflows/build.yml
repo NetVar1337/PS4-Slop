@@ -5,11 +5,15 @@ on:
     branches: [main]
     # a version tag (v0.1.1 or 0.1.1) also publishes the build as a github release
     tags: ['v*', '[0-9]*']
+  pull_request:
   workflow_dispatch:
 
 concurrency:
   group: build-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   # CI-fast Rust: local Cargo.toml keeps lto=true + codegen-units=1 for max
@@ -24,122 +28,218 @@ env:
   CMAKE_DISABLE_FIND_PACKAGE_Doxygen: TRUE
   SCCACHE_GHA_ENABLED: "true"
 
+# Third-party actions are pinned to full commit SHAs (the tag is in the
+# comment); Dependabot (.github/dependabot.yml) proposes bumps.
 jobs:
-  # C++ engine only, no tests, no frontend.
-  # Critical path: ~2-4 min warm (sccache + _ext hit) vs 5-8 min cold.
+  # Version consistency: VERSION vs package.json / tauri.conf.json / Cargo.toml
+  # (and vs the tag on a release build).
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+      - name: check versions
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
+          ./tools/sync_version.ps1 -Check -Tag $tag
+
+  # C++ engine (shipped) + the legacy ImGui shell (compile check only).
   cxx:
     runs-on: windows-2022
     timeout-minutes: 30
-    permissions:
-      contents: read
     env:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: cache _ext (cmake deps sources)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: |
-            _ext/*-src
-            _ext/frida-devkit
-          key: ext-sources-v2-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          path: _ext/*-src
+          key: ext-sources-v3-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
           restore-keys: |
-            ext-sources-v2-${{ runner.os }}-
+            ext-sources-v3-${{ runner.os }}-
 
-      - name: build cxx (no tests, no frontend)
+      - name: build engine + ImGui shell (no tests, no frontend)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF"
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "reverse-slop-engine,reverse-slop" -CmakeExtra "-DSLOP_BUILD_TESTS=OFF -DSLOP_BUILD_TEST_TARGET=OFF -DSLOP_BUILD_UI=ON"
 
       - name: sccache stats
         shell: pwsh
         run: sccache --show-stats || true
 
-      - name: upload engine artifacts
-        uses: actions/upload-artifact@v4
+      - name: upload engine artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cxx-artifacts
           compression-level: 0
-          path: |
-            build/src/engine/reverse-slop-engine.exe
-            build/src/engine/slop_frida.dll
+          path: build/src/engine/reverse-slop-engine.exe
           if-no-files-found: error
 
-  # Tests run parallel, never block the bundle.
+  # Every test area registered with CTest (one entry per src/tests/test_*.cpp).
   tests:
     runs-on: windows-2022
-    timeout-minutes: 30
-    permissions:
-      contents: read
+    timeout-minutes: 45
     env:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: cache _ext (cmake deps sources)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: |
-            _ext/*-src
-            _ext/frida-devkit
-          key: ext-sources-v2-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          path: _ext/*-src
+          key: ext-sources-v3-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
           restore-keys: |
-            ext-sources-v2-${{ runner.os }}-
+            ext-sources-v3-${{ runner.os }}-
 
-      - name: build + run tests (no frontend)
+      - name: build + run tests (ctest -L area)
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=OFF" -Test -TestLabel area
+
+      - name: live MCP battery (spawned engine + SlopTarget)
+        shell: pwsh
+        run: python tools/mcp_live_test.py --results mcp_live_results.json
+
+      - name: upload live battery results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mcp-live-results
+          path: mcp_live_results.json
+          if-no-files-found: ignore
+
+  # Same suite under MSVC AddressSanitizer (preset ninja-msvc-asan).
+  asan:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+
+      - name: cache deps sources (asan tree)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build-ninja-msvc-asan/_deps/*-src
+          key: asan-deps-v1-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            asan-deps-v1-${{ runner.os }}-
+
+      - name: build + run tests with /fsanitize=address
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel area
+
+  # MSVC /analyze over first-party code (preset ninja-msvc-analyze). Findings
+  # are listed in the run summary.
+  analyze:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: cache deps sources (analyze tree)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: build-ninja-msvc-analyze/_deps/*-src
+          key: analyze-deps-v1-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            analyze-deps-v1-${{ runner.os }}-
+
+      - name: build with /analyze
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-analyze -NoFrontend -Targets "reverse-slop-engine,slop_tests,reverse-slop" *>&1 | Tee-Object -FilePath analyze.log
+
+      - name: summarize /analyze findings
+        if: always()
         shell: pwsh
         run: |
-          # zlib registers its example with CTest; keep that dependency too.
-          powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,slop_decomp_target_o0,slop_decomp_target_o2,example" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ctest --test-dir build --output-on-failure
+          $hits = @(Select-String -LiteralPath analyze.log -Pattern 'warning C(6|26|28)\d{3}' |
+            ForEach-Object { $_.Line.Trim() } | Sort-Object -Unique)
+          "### MSVC /analyze: $($hits.Count) unique findings" | Add-Content $env:GITHUB_STEP_SUMMARY
+          if ($hits) { '```'; $hits | Select-Object -First 200; '```' } | Add-Content $env:GITHUB_STEP_SUMMARY
+
+  # clang-tidy (.clang-tidy) over first-party code via compile_commands.json.
+  clang-tidy:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: cache _ext (cmake deps sources)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: _ext/*-src
+          key: ext-sources-v3-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            ext-sources-v3-${{ runner.os }}-
+
+      - name: configure (compile_commands.json)
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -PlanOnly
+
+      - name: clang-tidy
+        shell: pwsh
+        run: ./tools/clang_tidy.ps1 -Jobs 4
 
   # Compile the real frontend immediately, independently of native sidecars.
   # Tests live in their own parallel ubuntu lane; this job only compiles.
   frontend-build:
     runs-on: windows-2022
     timeout-minutes: 30
-    permissions:
-      contents: read
     env:
       RUSTC_WRAPPER: sccache
       CARGO_PROFILE_RELEASE_DEBUG: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: sccache (rustc wrapper)
-        uses: mozilla-actions/sccache-action@v0.0.9
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: setup node with npm cache
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
 
       - name: rust cache (target/ + registry)
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: app/src-tauri -> target
           cache-on-failure: true
           shared-key: frontend-release-v2
 
       - name: cache node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: app/node_modules
           key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
@@ -154,7 +254,7 @@ jobs:
         run: sccache --show-stats
 
       - name: upload frontend binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: frontend-binary
           compression-level: 0
@@ -166,15 +266,13 @@ jobs:
   frontend-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: setup node with npm cache
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -184,54 +282,54 @@ jobs:
         working-directory: app
         run: npm ci --prefer-offline --no-audit --no-fund && npm test
 
-  # Only packaging waits: no Rust or C++ compilation on this job's critical path.
-  frontend:
+  # Packaging: no Rust or C++ compilation on this job's critical path.
+  # Signs the binaries and the installer when signing secrets are configured,
+  # and always publishes SHA256SUMS next to the artifacts.
+  bundle:
     runs-on: windows-2022
     timeout-minutes: 30
     needs: [cxx, frontend-build]
-    permissions:
-      # write so a tag build can publish its release
-      contents: write
+    env:
+      # secrets are not usable in step `if:`; expose presence as a flag
+      SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_SIGNING_ENDPOINT != '' && secrets.AZURE_SIGNING_ACCOUNT != '' && secrets.AZURE_SIGNING_PROFILE != '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 1
 
       - name: setup node with npm cache
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: app/package-lock.json
 
       - name: cache node_modules (exact lockfile only)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: app/node_modules
           key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
 
       - name: cache tauri bundler tooling (NSIS)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~\AppData\Local\tauri\NSIS
           key: tauri-nsis-v1
 
       - name: download frontend binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: frontend-binary
           path: app/src-tauri/target/release
 
       - name: cache magicmida (unpacker zips)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/AppData/Local/reverse-slop/tools/magicmida
-          key: magicmida-2026-05-14-v1
-          restore-keys: |
-            magicmida-
+          key: magicmida-${{ hashFiles('tools/magicmida-version.txt') }}
 
       - name: download cxx artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: cxx-artifacts
           path: _staging/cxx
@@ -241,57 +339,157 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path build/src/engine | Out-Null
           # upload-artifact preserves subdirs (build/...) on some versions and
-          # flattens on others — search recursively so both layouts work.
-          function Find-Staged($root, $name) {
-            $f = Get-ChildItem -Path $root -Recurse -Filter $name -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $f) { throw "staged file missing: $name under $root" }
-            return $f.FullName
-          }
-          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'reverse-slop-engine.exe') -Destination build/src/engine/reverse-slop-engine.exe -Force
-          Copy-Item -LiteralPath (Find-Staged _staging/cxx 'slop_frida.dll') -Destination build/src/engine/slop_frida.dll -Force
+          # flattens on others: search recursively so both layouts work.
+          $f = @(Get-ChildItem -Path _staging/cxx -Recurse -Filter 'reverse-slop-engine.exe' -File)
+          if ($f.Count -ne 1) { throw "expected exactly one staged reverse-slop-engine.exe, found $($f.Count)" }
+          Copy-Item -LiteralPath $f[0].FullName -Destination build/src/engine/reverse-slop-engine.exe -Force
           Get-ChildItem build/src/engine
+
+      - name: sign engine + frontend binaries
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: |
+            ${{ github.workspace }}\build\src\engine\reverse-slop-engine.exe
+            ${{ github.workspace }}\app\src-tauri\target\release\reverse-slop-ui.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
       - name: bundle precompiled frontend and native artifacts
         shell: pwsh
         run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -BundleOnly -FastBundle -Full -OnlineWebview
 
+      - name: resolve the installer
+        id: setup
+        shell: pwsh
+        run: |
+          # exactly one fresh installer: a stale second *-setup.exe is an error,
+          # never a silent pick
+          $version = (Get-Content VERSION -TotalCount 1).Trim()
+          $all = @(Get-ChildItem app/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' -File)
+          $match = @($all | Where-Object Name -Like "*_${version}_*")
+          if ($match.Count -ne 1) { throw "expected one installer for $version, found: $($all.Name -join ', ')" }
+          "path=$($match[0].FullName)" >> $env:GITHUB_OUTPUT
+
+      - name: sign the installer
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ steps.setup.outputs.path }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: verify signatures
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          foreach ($f in @('dist/reverse-slop/reverse-slop.exe', 'dist/reverse-slop/engine/reverse-slop-engine.exe', '${{ steps.setup.outputs.path }}')) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            if ($sig.Status -ne 'Valid') { throw "$f signature status: $($sig.Status)" }
+            Write-Host "signed: $f ($($sig.SignerCertificate.Subject))"
+          }
+
+      - name: release files + SHA256SUMS
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force -Path _release
+          $ref = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "$((Get-Content VERSION -TotalCount 1).Trim())-$($env:GITHUB_SHA.Substring(0, 8))" }
+          Compress-Archive -Path dist/reverse-slop -DestinationPath (Join-Path $out "reverse-slop-portable-$ref.zip")
+          Copy-Item -LiteralPath '${{ steps.setup.outputs.path }}' -Destination $out
+          Push-Location $out
+          Get-ChildItem -File | Where-Object Name -NE 'SHA256SUMS' | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content -LiteralPath SHA256SUMS -Encoding ascii
+          Get-Content SHA256SUMS
+          Pop-Location
+
       - name: upload the portable app
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: reverse-slop-portable
           compression-level: 0
           path: |
             dist/reverse-slop/reverse-slop.exe
             dist/reverse-slop/engine
+            dist/reverse-slop/LICENSE.txt
+            dist/reverse-slop/THIRD_PARTY_NOTICES.md
           if-no-files-found: error
 
       - name: upload the installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: reverse-slop-setup
           compression-level: 0
-          path: app/src-tauri/target/release/bundle/nsis/*-setup.exe
+          path: ${{ steps.setup.outputs.path }}
           if-no-files-found: error
 
-      - name: zip the portable app for the release
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
-        run: Compress-Archive -Path dist/reverse-slop -DestinationPath "reverse-slop-portable-${{ github.ref_name }}.zip"
+      - name: upload release files (zip, installer, SHA256SUMS)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reverse-slop-release
+          compression-level: 0
+          path: _release/*
+          if-no-files-found: error
+
+  # A tag build publishes only after every lane passed: builds, all test
+  # areas (plain + ASan), static analysis, frontend tests, version check.
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [version, cxx, tests, asan, analyze, clang-tidy, frontend-build, frontend-tests, bundle]
+    permissions:
+      # write so a tag build can publish its release
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 1
+
+      - name: download release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: reverse-slop-release
+          path: _release
+
+      - name: verify SHA256SUMS
+        working-directory: _release
+        run: sha256sum --check --strict SHA256SUMS
 
       - name: publish the github release
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          # release notes: this version's CHANGELOG.md section (required), then
+          # GitHub's generated commit/PR list
+          version="${TAG#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && index($0, "## [") == 1 { exit }
+            on && /^\[[^]]*\]: / { exit }
+            on { print }' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md has no entry for [$version]" >&2
+            exit 1
+          fi
           # first run on a tag creates the release, a rerun or a manual dispatch
           # on the same tag just replaces its assets
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $env:TAG --title $env:TAG --generate-notes --verify-tag
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          $setup = Get-ChildItem app/src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
-          gh release upload $env:TAG "reverse-slop-portable-$env:TAG.zip" $setup.FullName --clobber
-          exit $LASTEXITCODE
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
+          fi
+          gh release upload "$TAG" _release/* --clobber

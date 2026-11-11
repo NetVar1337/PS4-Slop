@@ -67,9 +67,6 @@ void draw_loading_screen() {
     ImFont* big = slop::ui::fonts::Get().ui_header
                       ? slop::ui::fonts::Get().ui_header
                       : ImGui::GetFont();
-    ImFont* mono = slop::ui::fonts::Get().mono
-                       ? slop::ui::fonts::Get().mono
-                       : ImGui::GetFont();
 
     ImGui::SetCursorPos(ImVec2(origin.x, origin.y));
     ImGui::BeginChild("##boot_panel", size, true,
@@ -309,7 +306,7 @@ void ApplyWindowChrome(HWND hwnd) {
 
 } // namespace
 
-int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int n_cmd_show) {
+int APIENTRY wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ PWSTR, _In_ int n_cmd_show) {
     if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))
         SetProcessDPIAware();
 

@@ -1,4 +1,5 @@
 #include "rtti.h"
+#include "itanium_rtti.h"
 #include <spdlog/spdlog.h>
 #include <fmt/format.h>
 #include <cstring>
@@ -72,6 +73,11 @@ namespace hype {
 
 void RTTIParser::parse(PEImage& img, AnalysisDB& db) {
     classes_.clear();
+    itanium_ = false;
+    if (img.format == ImageFormat::ELF) {
+        parse_itanium(img, db);
+        return;
+    }
     if (img.arch != Arch::X64) return;
 
     find_type_descriptors(img);
@@ -81,6 +87,31 @@ void RTTIParser::parse(PEImage& img, AnalysisDB& db) {
     name_methods(img, db);
 
     spdlog::info("RTTI: found {} classes", classes_.size());
+}
+
+void RTTIParser::parse_itanium(PEImage& img, AnalysisDB& db) {
+    itanium_ = true;
+    const unsigned ptr_size =
+        (img.arch == Arch::X64 || img.arch == Arch::ARM64 || img.arch == Arch::PPC) ? 8 : 4;
+    std::vector<RttiSpan> spans;
+    spans.reserve(img.segments.size());
+    for (const auto& seg : img.segments)
+        if (!seg.data.empty()) spans.push_back({seg.va, seg.data, seg.executable()});
+
+    for (auto& c : scan_itanium_rtti(spans, ptr_size)) {
+        if (c.vtables.empty()) continue;   // base named by a type_info, no vtable here
+        RTTIClass r;
+        r.mangled_name    = std::move(c.mangled);
+        r.demangled_name  = std::move(c.name);
+        r.type_descriptor = c.type_info;
+        r.vtable          = c.vtables.front();
+        r.methods         = std::move(c.methods);
+        r.bases           = std::move(c.bases);
+        classes_.push_back(std::move(r));
+    }
+    if (classes_.empty()) return;
+    name_methods(img, db);
+    spdlog::info("RTTI: found {} Itanium classes", classes_.size());
 }
 
 void RTTIParser::find_type_descriptors(PEImage& img) {
@@ -196,7 +227,7 @@ void RTTIParser::find_vtables(PEImage& img, [[maybe_unused]] AnalysisDB& db) {
 
 void RTTIParser::name_methods([[maybe_unused]] PEImage& img, AnalysisDB& db) {
     for (auto& cls : classes_) {
-        db.set_name(cls.vtable, cls.demangled_name + "::vftable");
+        db.set_name(cls.vtable, cls.demangled_name + (itanium_ ? "::vtable" : "::vftable"));
 
         for (size_t i = 0; i < cls.methods.size(); ++i) {
             va_t method = cls.methods[i];

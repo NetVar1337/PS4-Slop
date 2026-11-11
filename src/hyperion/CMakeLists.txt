@@ -25,7 +25,9 @@ target_link_libraries(slop_hyperion PUBLIC
     fmt::fmt
     spdlog::spdlog
     capstone          # ARM/ARM64/MIPS/PPC decode
-    ZLIB::ZLIB        # FLIRT signature decompression
+    # hyperion itself no longer uses zlib (the FLIRT loader is gone), but
+    # slop_core's zip_reader and the test fixtures get <zlib.h> through here
+    ZLIB::ZLIB
 )
 
 if(WIN32)

@@ -41,12 +41,15 @@ struct binary_t {
     uint64_t                 file_hash = 0;
     disasm::pe_image_t       pe;      // synthesized section map for Mach-O
     uint64_t                 base   = 0;      // VA base used everywhere
-    // what `file` holds: a PE, or the thin Mach-O slice (also when opened
-    // from a FAT binary or an .ipa)
+    // what `file` holds: a PE, the thin Mach-O slice (also when opened from a
+    // FAT binary or an .ipa), an ELF, or the ELF rebuilt from a PS4 SELF
     disasm::image_format_t   format    = disasm::image_format_t::pe;
     disasm::image_arch_t     arch      = disasm::image_arch_t::x64;
     bool                     encrypted = false;   // FairPlay-encrypted Mach-O code
     std::optional<disasm::ipa::bundle_t> bundle;  // set when loaded from an .ipa
+    // ELF/SELF static loads: relocation slots written into `file` at `base`
+    // (file_hash is taken before, so annotations survive rebasing)
+    size_t                   relocations_applied = 0;
     // x86/x64 only: Zydis engine and the decode-built legacy indexes. Other
     // arches leave eng uninitialized, build fns from the image's bounds data
     // and leave xrefs empty (the hyperion DB is their xref source)
@@ -92,9 +95,14 @@ struct binary_t {
 binary_t& get();
 
 // load a file, base_override rebases everything so static vas match live ones.
-// accepts a PE, a thin or FAT Mach-O, or an .ipa (its main executable),
-// detected by content
-bool load_file(const std::string& path, uint64_t base_override = 0);
+// accepts a PE, a thin or FAT Mach-O, an .ipa (its main executable), an ELF
+// or a PS4 SELF (unencrypted/fake-signed), detected by content.
+// apply_relocs: ELF/SELF images get their RELATIVE/64/GLOB_DAT/JUMP_SLOT
+// relocations applied at the session base (a file on disk is unrelocated);
+// pass false for memory dumps, which already carry the loader's relocations.
+// Publishes image.changed {loaded, name, format} on success
+bool load_file(const std::string& path, uint64_t base_override = 0,
+               bool apply_relocs = true);
 // why the last load_file failed ("" after a successful load), e.g. the .ipa
 // had no main executable or the bytes are no PE/Mach-O
 std::string last_load_error();

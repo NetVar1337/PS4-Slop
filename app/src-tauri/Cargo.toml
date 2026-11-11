@@ -11,21 +11,30 @@ name = "reverse_slop_ui_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+# keep tauri-build / tauri / tauri-plugin-dialog on the same minors as the npm
+# side (@tauri-apps/cli 2.11.x, @tauri-apps/api 2.11.x, plugin-dialog 2.7.x);
+# the tauri CLI refuses mismatched major.minor pairs
+tauri-build = { version = "~2.6", features = [] }
+# build.rs parses tauri.conf.json to keep index.html's CSP in lockstep
+serde_json = "1"
 
 [dependencies]
-tauri = { version = "2", features = ["devtools"] }
-tauri-plugin-dialog = "2"
+# no "devtools" feature: tauri enables devtools in debug builds on its own,
+# release builds ship without them
+tauri = { version = "~2.11.5", features = [] }
+tauri-plugin-dialog = "~2.7.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
-# Job object (kill-on-close) plus the elevation probe. The engine holds a kernel
-# driver open, so "the UI died, the engine must die too" has to be enforced by
-# the OS rather than by a watchdog we hope gets to run.
+# Job object (kill-on-close), the adopted-engine process wait, and the OS RNG
+# for the per-launch engine token. The supervisor stops the engine gracefully
+# on exit; the job object is the OS-enforced backstop so a wedged engine can
+# never outlive the UI and keep holding the MCP port and console sockets.
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
@@ -37,5 +46,8 @@ custom-protocol = ["tauri/custom-protocol"]
 [profile.release]
 codegen-units = 1
 lto = true
-panic = "abort"
+# unwind, not abort: a panic on a helper thread (log tee, engine supervisor)
+# must not take the whole window down; the supervisor catches its own panics
+# and reports them to the UI as a failed engine
+panic = "unwind"
 strip = true

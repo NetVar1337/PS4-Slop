@@ -4,7 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <!-- No remote origins: everything ships in the bundle, and the only
-         network target is the loopback engine. -->
+         network target is the loopback engine. Source of truth is
+         src-tauri/tauri.conf.json app.security.csp; this copy serves plain
+         browser dev, and src-tauri/build.rs fails the build if they drift. -->
     <meta
       http-equiv="Content-Security-Policy"
       content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost"

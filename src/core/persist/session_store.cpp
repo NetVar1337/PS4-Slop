@@ -1,6 +1,7 @@
 // src/core/persist/session_store.cpp
 
 #include "core/persist/session_store.hpp"
+#include "core/infra/paths.hpp"
 
 #include <windows.h>
 
@@ -180,11 +181,11 @@ std::optional<std::string> session_store_t::kv_get(
 }
 
 std::string default_store_path() {
-    char base[MAX_PATH]{};
-    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    CreateDirectoryA((std::string(base, n) + "\\reverse-slop").c_str(), nullptr);
-    return std::string(base, n) + "\\reverse-slop\\sessions.db";
+    // paths::init creates the app data folder; tests may reach here before boot
+    if (infra::paths::app_data().empty()) infra::paths::init();
+    const std::string& dir = infra::paths::app_data();
+    if (dir.empty()) return {};
+    return dir + "\\sessions.db";
 }
 
 } // namespace slop::core::persist

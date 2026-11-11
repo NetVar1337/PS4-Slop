@@ -29,6 +29,11 @@ private:
     Arch arch_ = Arch::X64;
     std::vector<Varnode> stack_vars_;
     std::unordered_map<va_t, int> addr_to_block_;
+    // last write width (bytes) per GPR register id on x64: 8 after any write
+    // (every sub-register write also re-defines the full register), 0 when
+    // unknown / clobbered by a call. Narrow reads of a register whose last
+    // write was wide must be projected (see operand_read).
+    int reg_last_width_[16] = {};
 };
 
 }

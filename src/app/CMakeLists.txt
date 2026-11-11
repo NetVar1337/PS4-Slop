@@ -1,15 +1,15 @@
+# Legacy ImGui shell, built when SLOP_BUILD_UI is ON (CI keeps it compiling)
 add_executable(reverse-slop WIN32
     main.cpp
-    app.rc
 )
 
-# The manifest is embedded as an RT_MANIFEST resource by app.rc, keep the
-# linker's own manifest machinery out of it entirely (CMP0090 NEW)
-target_link_options(reverse-slop PRIVATE "/MANIFEST:NO")
+slop_add_win_resources(reverse-slop
+    DESCRIPTION "reverse-slop legacy ImGui shell"
+    MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/app.manifest.in")
 
 target_include_directories(reverse-slop PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(reverse-slop PRIVATE slop_ui)
 
 if(MSVC)
-    target_compile_options(reverse-slop PRIVATE /W4)
+    target_compile_options(reverse-slop PRIVATE /W4 /WX)
 endif()

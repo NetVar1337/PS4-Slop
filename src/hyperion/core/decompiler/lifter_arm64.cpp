@@ -36,38 +36,111 @@ Varnode LifterARM64::reg_vn(int reg_id) {
     return vn_reg(reg_id, name, sz);
 }
 
+Varnode LifterARM64::extend(Varnode v, IndexExt ext, PcodeBlock& out) {
+    PcodeOp op = PcodeOp::INT_ZEXT;
+    int from = 0;
+    switch (ext) {
+    case IndexExt::Uxtb: from = 1; break;
+    case IndexExt::Uxth: from = 2; break;
+    case IndexExt::Uxtw: from = 4; break;
+    case IndexExt::Sxtb: from = 1; op = PcodeOp::INT_SEXT; break;
+    case IndexExt::Sxth: from = 2; op = PcodeOp::INT_SEXT; break;
+    case IndexExt::Sxtw: from = 4; op = PcodeOp::INT_SEXT; break;
+    default: return v;   // none / sxtx / uxtx: the full register
+    }
+    if (v.size > from) {
+        Varnode low = alloc_temp(from);
+        emit(out, PcodeOp::SUBPIECE, low, {v, vn_const(0)});
+        v = low;
+    }
+    Varnode wide = alloc_temp(8);
+    emit(out, op, wide, {v});
+    return wide;
+}
+
+Varnode LifterARM64::shifted(Varnode v, const Operand& op, PcodeBlock& out) {
+    const unsigned amount = op.shift_amount();
+    if (!amount) return v;
+    PcodeOp p = PcodeOp::SHIFT_LEFT;
+    switch (op.shift_kind()) {
+    case ShiftKind::Lsl: p = PcodeOp::SHIFT_LEFT; break;
+    case ShiftKind::Lsr: p = PcodeOp::SHIFT_RIGHT; break;
+    case ShiftKind::Asr: p = PcodeOp::SHIFT_ARIGHT; break;
+    case ShiftKind::Ror: p = PcodeOp::ROTATE_RIGHT; break;
+    }
+    Varnode r = alloc_temp(v.size);
+    emit(out, p, r, {v, vn_const(amount)});
+    return r;
+}
+
+int LifterARM64::mem_operand(const Insn& insn) const {
+    for (int i = 0; i < insn.op_count; ++i)
+        if (insn.ops[i].type == OpType::Mem) return i;
+    return -1;
+}
+
+Varnode LifterARM64::mem_address(const Insn& insn, int idx, PcodeBlock& out) {
+    const Operand& op = insn.ops[idx];
+    Varnode addr = vn_const(0);
+    bool has = false;
+    if (op.mem.base) {
+        addr = reg_vn(op.mem.base);
+        has = true;
+    }
+    // post-index accesses the bare base; the offset only moves the base after
+    if (op.post_index()) return addr;
+    if (op.mem.index) {
+        Varnode idx_vn = extend(reg_vn(op.mem.index), op.mem.ext, out);
+        if (op.mem.scale > 1) {
+            Varnode t = alloc_temp();
+            emit(out, PcodeOp::INT_MULT, t, {idx_vn, vn_const(op.mem.scale)});
+            idx_vn = t;
+        }
+        if (has) {
+            Varnode t = alloc_temp();
+            emit(out, PcodeOp::ADD, t, {addr, idx_vn});
+            addr = t;
+        } else { addr = idx_vn; }
+        has = true;
+    }
+    if (op.mem.disp != 0) {
+        Varnode d = vn_const(static_cast<u64>(op.mem.disp));
+        if (has) {
+            Varnode t = alloc_temp();
+            emit(out, PcodeOp::ADD, t, {addr, d});
+            addr = t;
+        } else { addr = d; }
+    }
+    return addr;
+}
+
+void LifterARM64::writeback(const Insn& insn, int idx, PcodeBlock& out) {
+    if (idx < 0 || idx >= insn.op_count) return;
+    const Operand& op = insn.ops[idx];
+    if (!op.writeback() || !op.mem.base) return;
+    // pre-index `[x1, #8]!` moves by disp; post-index `[x1], #8` by the
+    // trailing immediate (or disp when the decoder folded it in)
+    i64 delta = op.mem.disp;
+    if (op.post_index()) {
+        for (int i = idx + 1; i < insn.op_count; ++i)
+            if (insn.ops[i].type == OpType::Imm) { delta = static_cast<i64>(insn.ops[i].val); break; }
+    }
+    Varnode base = reg_vn(op.mem.base);
+    Varnode moved = alloc_temp(base.size);
+    emit(out, PcodeOp::ADD, moved, {base, vn_const(static_cast<u64>(delta))});
+    emit(out, PcodeOp::COPY, base, {moved});
+}
+
 Varnode LifterARM64::operand_read(const Insn& insn, int idx, PcodeBlock& out) {
     if (idx >= insn.op_count) return vn_const(0);
     auto& op = insn.ops[idx];
     switch (op.type) {
     case OpType::Reg:
-        return reg_vn(op.reg);
+        return shifted(extend(reg_vn(op.reg), op.mem.ext, out), op, out);
     case OpType::Imm:
         return vn_const(op.val);
     case OpType::Mem: {
-        Varnode addr = vn_const(0);
-        bool has = false;
-        if (op.mem.base) {
-            addr = reg_vn(op.mem.base);
-            has = true;
-        }
-        if (op.mem.index) {
-            Varnode idx_vn = reg_vn(op.mem.index);
-            if (has) {
-                Varnode t = alloc_temp();
-                emit(out, PcodeOp::ADD, t, {addr, idx_vn});
-                addr = t;
-            } else { addr = idx_vn; }
-            has = true;
-        }
-        if (op.mem.disp != 0) {
-            Varnode d = vn_const(static_cast<u64>(op.mem.disp));
-            if (has) {
-                Varnode t = alloc_temp();
-                emit(out, PcodeOp::ADD, t, {addr, d});
-                addr = t;
-            } else { addr = d; }
-        }
+        Varnode addr = mem_address(insn, idx, out);
         int sz = op.size / 8;
         if (sz < 1) sz = 8;
         Varnode res = alloc_temp(sz);
@@ -84,30 +157,7 @@ void LifterARM64::operand_write(const Insn& insn, int idx, Varnode val, PcodeBlo
     if (op.type == OpType::Reg) {
         emit(out, PcodeOp::COPY, reg_vn(op.reg), {val});
     } else if (op.type == OpType::Mem) {
-        Varnode addr = vn_const(0);
-        bool has = false;
-        if (op.mem.base) {
-            addr = reg_vn(op.mem.base);
-            has = true;
-        }
-        if (op.mem.index) {
-            Varnode idx_vn = reg_vn(op.mem.index);
-            if (has) {
-                Varnode t = alloc_temp();
-                emit(out, PcodeOp::ADD, t, {addr, idx_vn});
-                addr = t;
-            } else { addr = idx_vn; }
-            has = true;
-        }
-        if (op.mem.disp != 0) {
-            Varnode d = vn_const(static_cast<u64>(op.mem.disp));
-            if (has) {
-                Varnode t = alloc_temp();
-                emit(out, PcodeOp::ADD, t, {addr, d});
-                addr = t;
-            } else { addr = d; }
-        }
-        emit(out, PcodeOp::STORE, {}, {addr, val});
+        emit(out, PcodeOp::STORE, {}, {mem_address(insn, idx, out), val});
     }
 }
 
@@ -131,16 +181,16 @@ void LifterARM64::lift_insn(const Insn& insn, PcodeBlock& blk, const AnalysisDB&
 
     if (mn == "movk") {
         // Insert the immediate into a 16-bit lane; movk is not an overwrite.
+        // The decoder folds `lsl #n` into the value and keeps n in aux
         if (insn.op_count >= 2) {
             Varnode old = operand_read(insn, 0, blk);
-            u64 imm = insn.ops[1].type == OpType::Imm ? insn.ops[1].val : 0;
-            u64 shift = 0;
-            if (insn.op_count >= 3 && insn.ops[2].type == OpType::Imm)
-                shift = insn.ops[2].val;
+            const Operand& imm_op = insn.ops[1];
+            const u64 shift = imm_op.type == OpType::Imm ? imm_op.shift_amount() : 0;
+            const u64 lane = imm_op.type == OpType::Imm ? (imm_op.val & (u64(0xFFFF) << shift)) : 0;
             Varnode cleared = alloc_temp(old.size);
             emit(blk, PcodeOp::AND, cleared, {old, vn_const(~(u64(0xFFFF) << shift), old.size)});
             Varnode placed = alloc_temp(old.size);
-            emit(blk, PcodeOp::OR, placed, {cleared, vn_const(imm << shift, old.size)});
+            emit(blk, PcodeOp::OR, placed, {cleared, vn_const(lane, old.size)});
             operand_write(insn, 0, placed, blk);
         }
     } else if (mn == "mov" || mn == "movz" || mn == "movn") {
@@ -217,58 +267,77 @@ void LifterARM64::lift_insn(const Insn& insn, PcodeBlock& blk, const AnalysisDB&
         Varnode res = alloc_temp(lhs.size);
         PcodeOp op = PcodeOp::SHIFT_LEFT;
         if (mn == "lsr") op = PcodeOp::SHIFT_RIGHT;
-        else if (mn == "asr") op = PcodeOp::SHIFT_RIGHT; // Should be signed shift
+        else if (mn == "asr") op = PcodeOp::SHIFT_ARIGHT;
+        else if (mn == "ror") op = PcodeOp::ROTATE_RIGHT;
         emit(blk, op, res, {lhs, rhs});
         operand_write(insn, 0, res, blk);
-    } else if (mn == "ldr" || mn == "ldrb" || mn == "ldrh" || mn == "ldrsw" || mn == "ldrsh" || mn == "ldrsb") {
-        Varnode res = operand_read(insn, 1, blk);
-        if (mn == "ldrsw" || mn == "ldrsh" || mn == "ldrsb") {
-            Varnode ext = alloc_temp(insn.ops[0].size);
-            emit(blk, PcodeOp::INT_SEXT, ext, {res});
-            res = ext;
+    } else if (mn == "ldr" || mn == "ldrb" || mn == "ldrh" || mn == "ldrsw" || mn == "ldrsh" ||
+               mn == "ldrsb" || mn == "ldur" || mn == "ldurb" || mn == "ldurh" ||
+               mn == "ldursw" || mn == "ldursh" || mn == "ldursb") {
+        const int mi = mem_operand(insn);
+        Varnode dst = reg_vn(insn.ops[0].reg);
+        if (mi < 0) {
+            // literal form: the decoder resolved the pool address
+            Varnode res = alloc_temp(dst.size);
+            emit(blk, PcodeOp::LOAD, res, {operand_read(insn, 1, blk)});
+            operand_write(insn, 0, res, blk);
+            return;
+        }
+        const bool sx = mn.find("ldrs") == 0 || mn.find("ldurs") == 0;
+        int sz = dst.size;
+        if (mn.back() == 'b') sz = 1;
+        else if (mn.back() == 'h') sz = 2;
+        else if (mn.back() == 'w' && sx) sz = 4;
+        Varnode res = alloc_temp(sz);
+        emit(blk, PcodeOp::LOAD, res, {mem_address(insn, mi, blk)});
+        if (sz < dst.size) {
+            Varnode wide = alloc_temp(dst.size);
+            emit(blk, sx ? PcodeOp::INT_SEXT : PcodeOp::INT_ZEXT, wide, {res});
+            res = wide;
         }
         operand_write(insn, 0, res, blk);
-    } else if (mn == "str" || mn == "strb" || mn == "strh") {
+        writeback(insn, mi, blk);
+    } else if (mn == "str" || mn == "strb" || mn == "strh" ||
+               mn == "stur" || mn == "sturb" || mn == "sturh") {
+        const int mi = mem_operand(insn);
         Varnode val = operand_read(insn, 0, blk);
-        operand_write(insn, 1, val, blk);
-    } else if (mn == "ldp") {
-        Varnode addr = vn_const(0);
-        if (insn.ops[2].type == OpType::Mem) {
-            addr = reg_vn(insn.ops[2].mem.base);
-            if (insn.ops[2].mem.disp) {
-                Varnode t = alloc_temp();
-                emit(blk, PcodeOp::ADD, t, {addr, vn_const(static_cast<u64>(insn.ops[2].mem.disp))});
-                addr = t;
-            }
+        const int sz = mn.back() == 'b' ? 1 : mn.back() == 'h' ? 2 : 0;
+        if (sz && val.size > sz) {
+            Varnode low = alloc_temp(sz);
+            emit(blk, PcodeOp::SUBPIECE, low, {val, vn_const(0)});
+            val = low;
         }
-        int sz = insn.ops[0].size / 8; if (sz < 4) sz = 8;
-        Varnode l1 = alloc_temp(sz);
-        emit(blk, PcodeOp::LOAD, l1, {addr});
-        operand_write(insn, 0, l1, blk);
-        
-        Varnode addr2 = alloc_temp();
-        emit(blk, PcodeOp::ADD, addr2, {addr, vn_const(static_cast<u64>(sz))});
-        Varnode l2 = alloc_temp(sz);
-        emit(blk, PcodeOp::LOAD, l2, {addr2});
-        operand_write(insn, 1, l2, blk);
-    } else if (mn == "stp") {
-        Varnode addr = vn_const(0);
-        if (insn.ops[2].type == OpType::Mem) {
-            addr = reg_vn(insn.ops[2].mem.base);
-            if (insn.ops[2].mem.disp) {
-                Varnode t = alloc_temp();
-                emit(blk, PcodeOp::ADD, t, {addr, vn_const(static_cast<u64>(insn.ops[2].mem.disp))});
-                addr = t;
-            }
+        if (mi >= 0) {
+            emit(blk, PcodeOp::STORE, {}, {mem_address(insn, mi, blk), val});
+            writeback(insn, mi, blk);
         }
-        int sz = insn.ops[0].size / 8; if (sz < 4) sz = 8;
-        Varnode s1 = operand_read(insn, 0, blk);
-        emit(blk, PcodeOp::STORE, {}, {addr, s1});
-        
-        Varnode addr2 = alloc_temp();
-        emit(blk, PcodeOp::ADD, addr2, {addr, vn_const(static_cast<u64>(sz))});
-        Varnode s2 = operand_read(insn, 1, blk);
-        emit(blk, PcodeOp::STORE, {}, {addr2, s2});
+    } else if (mn == "ldp" || mn == "ldpsw" || mn == "stp") {
+        const int mi = mem_operand(insn);
+        if (mi >= 0) {
+            Varnode addr = mem_address(insn, mi, blk);
+            const bool load = mn != "stp";
+            // pair element size follows the register width (ldpsw: 4)
+            const int sz = mn == "ldpsw" ? 4 : reg_vn(insn.ops[0].reg).size;
+            Varnode addr2 = alloc_temp();
+            emit(blk, PcodeOp::ADD, addr2, {addr, vn_const(static_cast<u64>(sz))});
+            for (int r = 0; r < 2; ++r) {
+                Varnode at = r == 0 ? addr : addr2;
+                if (load) {
+                    Varnode v = alloc_temp(sz);
+                    emit(blk, PcodeOp::LOAD, v, {at});
+                    Varnode dst = reg_vn(insn.ops[r].reg);
+                    if (sz < dst.size) {
+                        Varnode wide = alloc_temp(dst.size);
+                        emit(blk, PcodeOp::INT_SEXT, wide, {v});
+                        v = wide;
+                    }
+                    operand_write(insn, r, v, blk);
+                } else {
+                    emit(blk, PcodeOp::STORE, {}, {at, operand_read(insn, r, blk)});
+                }
+            }
+            writeback(insn, mi, blk);
+        }
     } else if (mn == "cmp" || mn == "cmn" || mn == "tst" || mn == "subs" || mn == "adds") {
         // Emit NZCV-equivalent flags so b.cond conditions have real inputs.
         Varnode lhs = operand_read(insn, 0, blk);
@@ -368,12 +437,6 @@ void LifterARM64::lift_insn(const Insn& insn, PcodeBlock& blk, const AnalysisDB&
         emit(blk, PcodeOp::RETURN, {}, {reg_vn(ARM64_REG_X0)});
     } else if (mn == "adr" || mn == "adrp") {
         operand_write(insn, 0, vn_const(insn.ops[1].val), blk);
-    } else if (mn == "asr") {
-        Varnode lhs = operand_read(insn, 1, blk);
-        Varnode rhs = operand_read(insn, 2, blk);
-        Varnode res = alloc_temp(lhs.size);
-        emit(blk, PcodeOp::SHIFT_ARIGHT, res, {lhs, rhs});
-        operand_write(insn, 0, res, blk);
     } else if (mn == "nop") {
     } else {
         // Unsupported: keep visible instead of deleting semantics.
@@ -398,12 +461,7 @@ PcodeFunc LifterARM64::lift(const Function& func, const AnalysisDB& db) {
 
     PcodeFunc pf;
     pf.entry = func.entry;
-    if (!func.name.empty())
-        pf.name = func.name;
-    else if (db.image_base && func.entry >= db.image_base)
-        pf.name = fmt::format("sub_{:X}", func.entry - db.image_base);
-    else
-        pf.name = fmt::format("sub_{:X}", func.entry);
+    pf.name = func.name.empty() ? default_func_name(func.entry) : func.name;
 
     std::vector<va_t> order;
     for (auto& [addr, _] : func.blocks)

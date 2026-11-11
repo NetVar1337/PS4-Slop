@@ -194,99 +194,95 @@ std::vector<uintptr_t> aob_scan(reader_t& r,
     std::vector<uintptr_t> matches;
     if (p.size() == 0) return matches;
 
+    const reader_hints_t hints = r.hints();
     const size_t max_results = opt.max_results ? opt.max_results
                                                : infra::limits::max_aob_matches;
     const size_t chunk = opt.chunk_bytes ? opt.chunk_bytes
-                                         : infra::limits::scan_chunk_bytes;
+                       : hints.chunk_bytes ? hints.chunk_bytes
+                                           : infra::limits::scan_chunk_bytes;
     const size_t align = std::max<size_t>(opt.alignment ? opt.alignment : 1, 1);
 
     // Contiguous region pairs (begin/end), honoring alignment start
-    struct span_t { uintptr_t begin; uintptr_t end; };
-    std::vector<span_t> spans;
+    std::vector<detail::read_range_t> spans;
     for (const auto& reg : regions) {
         if (reg.size < p.size()) continue;
         const uintptr_t b = (reg.base + align - 1) / align * align;
         const uintptr_t e = reg.base + reg.size;
-        if (e <= b) continue;
-        spans.push_back({b, e});
+        if (e <= b || e - b < p.size()) continue;
+        spans.push_back({b, static_cast<size_t>(e - b)});
     }
 
-    // Round-robin spans across workers; chunk-local buffers carry a
-    // pattern-1 overlap so matches spanning chunk borders survive
     unsigned nw = opt.threads ? opt.threads
                               : std::thread::hardware_concurrency();
+    if (hints.max_workers) nw = std::min(nw, hints.max_workers);
     nw = std::max(1u, std::min(nw, 64u));
     if (!spans.empty()) nw = std::min<unsigned>(nw, static_cast<unsigned>(spans.size()));
+
+    // Chunks carry a pattern-1 overlap tail so matches spanning chunk
+    // borders are seen whole; only starts before the chunk limit count
+    detail::chunk_walk_t walk;
+    walk.chunk      = chunk;
+    walk.overlap    = p.size() - 1;
+    walk.min_leaf   = 4096;
+    walk.read_ahead = hints.read_ahead;
 
     std::mutex mu;
     std::atomic<size_t> next_span{0};
 
     auto worker = [&] {
-        std::vector<uint8_t> buf;
         std::vector<uintptr_t> local_matches;
         uint64_t local_bytes = 0;
+        bool     local_trunc = false;
 
-        while (!tok.cancelled()) {
-            const size_t si = next_span.fetch_add(1, std::memory_order_relaxed);
-            if (si >= spans.size()) break;
-            const span_t& s = spans[si];
-
-            uintptr_t cursor = s.begin;
-            while (cursor + p.size() <= s.end) {
-                if (tok.cancelled()) break;
-                const size_t want = static_cast<size_t>(
-                    std::min<uint64_t>(chunk, s.end - cursor));
-                buf.resize(want);
-                if (!r.read(cursor, buf.data(), want)) {
-                    // Fall back to page-granularity resilient reads for
-                    // partially mapped spans
-                    detail::resilient_read(r, cursor, want, 4096, tok,
-                        [&](uintptr_t run_addr, const uint8_t* data, size_t len) {
-                            local_bytes += len;
-                            if (len < p.size()) return;
-                            const uintptr_t run_end = run_addr + len - p.size();
-                            for (uintptr_t a = run_addr; a <= run_end; a += align) {
-                                if (aob_match(p, data + (a - run_addr),
-                                              len - static_cast<size_t>(a - run_addr))) {
-                                    if (local_matches.size() < max_results)
-                                        local_matches.push_back(a);
-                                    else st.truncated = true;
-                                }
-                            }
-                        });
-                    cursor += want;
-                    continue;
-                }
-
-                local_bytes += want;
-                const uintptr_t scan_end = cursor + want - p.size();
-                for (uintptr_t a = cursor; a <= scan_end; a += align) {
-                    if (aob_match(p, buf.data() + (a - cursor),
-                                  want - static_cast<size_t>(a - cursor))) {
-                        if (local_matches.size() < max_results)
-                            local_matches.push_back(a);
-                        else st.truncated = true;
+        auto sink = [&](size_t, uintptr_t run_addr, const uint8_t* data, size_t len,
+                        uintptr_t limit) -> bool {
+            local_bytes += std::min<uint64_t>(len, limit > run_addr ? limit - run_addr : 0);
+            if (len < p.size()) return true;
+            // first aligned start inside the run
+            uintptr_t a = (run_addr + align - 1) / align * align;
+            const uintptr_t run_end = run_addr + len - p.size();
+            for (; a <= run_end && a < limit; a += align) {
+                if (aob_match(p, data + (a - run_addr),
+                              len - static_cast<size_t>(a - run_addr))) {
+                    if (local_matches.size() >= max_results) {
+                        local_trunc = true;
+                        return false;
                     }
+                    local_matches.push_back(a);
                 }
+            }
+            return true;
+        };
 
-                // Step back so a pattern straddling this chunk's tail is
-                // seen whole in the next chunk (alignment-aware)
-                const size_t back = std::min<size_t>(p.size() - 1, want - 1);
-                cursor += want - back;
+        if (nw == 1) {
+            // one worker: a single walk so read-ahead streams across spans
+            detail::chunked_read(r, spans, walk, tok, sink);
+        } else {
+            std::vector<detail::read_range_t> one(1);
+            while (!tok.cancelled() && !local_trunc) {
+                const size_t si = next_span.fetch_add(1, std::memory_order_relaxed);
+                if (si >= spans.size()) break;
+                one[0] = spans[si];
+                detail::chunked_read(r, one, walk, tok, sink);
             }
         }
 
         std::lock_guard<std::mutex> lk(mu);
         st.bytes_scanned += local_bytes;
+        st.truncated = st.truncated || local_trunc;
         for (uintptr_t m : local_matches) {
             if (matches.size() >= max_results) { st.truncated = true; break; }
             matches.push_back(m);
         }
     };
 
-    std::vector<std::thread> pool;
-    for (unsigned i = 0; i < nw; ++i) pool.emplace_back(worker);
-    for (auto& t : pool) t.join();
+    if (nw == 1) {
+        worker();
+    } else {
+        std::vector<std::thread> pool;
+        for (unsigned i = 0; i < nw; ++i) pool.emplace_back(worker);
+        for (auto& t : pool) t.join();
+    }
 
     std::sort(matches.begin(), matches.end());
     matches.erase(std::unique(matches.begin(), matches.end()), matches.end());

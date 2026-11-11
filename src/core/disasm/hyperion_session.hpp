@@ -11,7 +11,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <list>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "core/disasm/engine.hpp"
@@ -74,9 +76,14 @@ struct session_t {
     const hype::Function* function_entry(uint64_t va) const;
 
     // Decompile the function containing `va` to pseudo-C lines. Results are
-    // cached per function entry and invalidated by reanalysis or renames
+    // cached per function entry (LRU, kDecompCacheCapacity functions) and
+    // invalidated by reanalysis or renames
     bool decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
                    std::string& err);
+    static constexpr size_t kDecompCacheCapacity = 256;
+    void   set_decomp_cache_capacity(size_t n);   // >= 1; trims on shrink
+    size_t decomp_cache_size() const;
+    bool   decomp_cached(uint64_t entry) const;
 
     // User renames to apply onto the AnalysisDB once analysis lands (names
     // the analyzer derives would otherwise clobber mid-analysis renames)
@@ -88,11 +95,11 @@ struct session_t {
     static insn_t convert(const hype::Insn& in);
 
     // One-shot decode of a raw buffer. X86/X64 go through hyperion's Zydis
-    // core (convert() above). ARM/ARM64 decode with Capstone: text is
-    // "<MNEMONIC> <op_str>", flow comes from the instruction type,
-    // rel_target is the last immediate of a direct branch (b.cond/cbz/tbz
-    // put the target after the tested operands), mnemonic and ops stay empty
-    // because insn_t carries Zydis enums
+    // core (convert() above). ARM/ARM64 decode with this thread's Capstone
+    // handle: text is "<MNEMONIC> <op_str>", flow comes from the instruction
+    // type, rel_target is the last immediate of a direct branch (b.cond/cbz/
+    // tbz put the target after the tested operands), operands carry Capstone
+    // register ids in operand_t::arm_* (the Zydis enum fields stay NONE)
     static bool decode(uint64_t va, const uint8_t* buf, size_t len,
                        insn_t& out, hype::Arch arch = hype::Arch::X64);
     // Decode `count` instructions starting at va with 1-byte resync on bad
@@ -117,14 +124,18 @@ private:
     struct BlockRange { uint64_t start; uint64_t end; const hype::Function* func; };
     std::vector<BlockRange> block_ranges_;
 
-    // Decompile cache, keyed by function entry. Valid until reanalyze/queue_names
-    std::unordered_map<uint64_t, std::vector<hype::PseudoLine>> decomp_cache_;
+    // Decompile cache, keyed by function entry, most recent first. Valid
+    // until reanalyze/queue_names; guarded by decomp_mu_
+    using decomp_lru_t = std::list<std::pair<uint64_t, std::vector<hype::PseudoLine>>>;
+    decomp_lru_t decomp_lru_;
+    std::unordered_map<uint64_t, decomp_lru_t::iterator> decomp_cache_;
     std::atomic<uint64_t> decomp_cache_gen_{0};
+    size_t decomp_cache_cap_ = kDecompCacheCapacity;
 
     std::thread        worker_;
     mutable std::mutex start_mu_;   // serializes start/reanalyze/stop/dtor
     mutable std::mutex err_mu_;     // err_ is read cross-thread
-    std::mutex         decomp_mu_;  // Decompiler pipeline not re-entrant
+    mutable std::mutex decomp_mu_;  // Decompiler pipeline not re-entrant; decomp cache
     std::mutex         pending_mu_; // pending_names_ (queue_names vs worker)
     std::unordered_map<uint64_t, std::string> pending_names_;
     std::atomic<bool>  ready_{false};

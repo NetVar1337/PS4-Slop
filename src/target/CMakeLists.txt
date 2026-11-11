@@ -17,7 +17,7 @@ add_executable(slop_target
 target_compile_definitions(slop_target PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 
 if(MSVC)
-    target_compile_options(slop_target PRIVATE /W4 /EHsc /O2)
+    target_compile_options(slop_target PRIVATE /W4 /WX /EHsc /O2)
     target_link_options(slop_target PRIVATE /DEBUG:FULL)
 endif()
 
@@ -33,7 +33,7 @@ foreach(opt IN ITEMS O0 O2)
     add_executable(slop_decomp_target_${opt_lower} decomp_target.cpp)
     target_compile_definitions(slop_decomp_target_${opt_lower} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
     if(MSVC)
-        target_compile_options(slop_decomp_target_${opt_lower} PRIVATE /W4 /EHsc)
+        target_compile_options(slop_decomp_target_${opt_lower} PRIVATE /W4 /WX /EHsc)
         if(opt STREQUAL "O0")
             target_compile_options(slop_decomp_target_${opt_lower} PRIVATE /Od)
         else()

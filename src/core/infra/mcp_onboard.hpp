@@ -17,8 +17,12 @@ struct install_result_t {
     std::string error;      // empty when all good
 };
 
-// runs the whole sweep, one result per client
+// runs the whole sweep, one result per client; an existing entry with a stale
+// url/token is rewritten in place (user added keys are kept)
 std::vector<install_result_t> install_all(uint16_t port, const std::string& token);
+
+// only refreshes entries we already wrote (port/token changed), never adds new ones
+std::vector<install_result_t> refresh_existing(uint16_t port, const std::string& token);
 
 // removes everything we wrote, for an uninstall button
 std::vector<install_result_t> uninstall_all();

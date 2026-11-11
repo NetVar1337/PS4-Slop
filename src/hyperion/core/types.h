@@ -18,6 +18,24 @@ using va_t = u64;
 constexpr va_t INVALID_VA = ~va_t(0);
 
 enum class Arch : u8 { X86, X64, ARM, ARM64, MIPS, PPC };
+// Container the image came from; selects ABI defaults (Win64 for PE, SysV
+// AMD64 / AAPCS64 for ELF and Mach-O)
+enum class ImageFormat : u8 { PE, ELF, MachO };
+
+// Canonical name for an unnamed function: "sub_" + the VA in uppercase hex,
+// no padding (sub_4DDA48). The engine, MCP, Lua and UI all use this form
+inline std::string default_func_name(va_t va) {
+    static constexpr char kHex[] = "0123456789ABCDEF";
+    char rev[16];
+    int n = 0;
+    do {
+        rev[n++] = kHex[va & 0xF];
+        va >>= 4;
+    } while (va);
+    std::string out("sub_");
+    while (n) out.push_back(rev[--n]);
+    return out;
+}
 
 struct Segment {
     std::string name;

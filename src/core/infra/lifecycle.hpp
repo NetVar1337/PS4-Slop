@@ -56,17 +56,21 @@ void tick();
 void shutdown();
 
 // endpoint advertisement
-// the running instance writes its pid port and token to engine.json so a front end can find it
+// the running instance writes pid, port, its image path and the DPAPI (current
+// user) protected token to engine.json so a front end / second engine can find it
 
 struct endpoint_t {
     uint32_t    pid  = 0;
     uint16_t    port = 0;
-    std::string token;
+    std::string token;   // decrypted; empty when the blob is missing or not ours
 };
 
 const std::string& endpoint_path();
 
-// false when the file is missing or the pid is dead
+// false when the file is missing, the pid is dead or now runs another image
 bool read_endpoint(endpoint_t& out);
+
+// rewrites engine.json with the current port and settings token (token rotation)
+void refresh_endpoint();
 
 } // namespace slop::core::infra::lifecycle

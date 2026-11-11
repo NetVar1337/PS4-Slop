@@ -83,7 +83,7 @@ void DrawJob(const magicmida::job_t& job) {
 void Draw() {
     const auto install = magicmida::installation();
     ImGui::TextUnformatted("Themida / WinLicense unpacker");
-    ImGui::TextDisabled("Magicmida 2026-05-14 sidecar, debugger-driven x86/x64 unpacking");
+    ImGui::TextDisabled("Magicmida " SLOP_MAGICMIDA_VERSION " sidecar, debugger-driven x86/x64 unpacking");
     ImGui::Separator();
     ImGui::TextColored(install.x86_available ? ImVec4(0.35f, 0.9f, 0.5f, 1.0f)
                                                : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),

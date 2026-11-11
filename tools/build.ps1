@@ -11,32 +11,78 @@ param(
     [switch]$OnlineWebview,
     [string]$CmakeExtra = '',
     [string]$Preset = 'ninja-msvc-release',
-    [string]$Targets = ''
+    [string]$Targets = '',
+    # CTest label selecting the test entries -Test runs ('area' = every area)
+    [string]$TestLabel = 'area',
+    # Visual Studio install root; defaults to $env:SLOP_VS_ROOT, then vswhere
+    [string]$VsRoot = $env:SLOP_VS_ROOT
 )
 
 $ErrorActionPreference = 'Stop'
 if ($BundleOnly -and -not $FrontendOnly) { throw '-BundleOnly requires -FrontendOnly' }
 if ($BundleOnly -and $NoFrontend) { throw '-BundleOnly cannot be combined with -NoFrontend' }
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$logDir = Join-Path $env:TEMP "slop-build-$stamp"
+
+# One parent dir for every run's logs; keep the newest few, drop the rest
+# (older layouts left a %TEMP%\slop-build-<stamp> dir behind per run)
+$logRoot = Join-Path $env:TEMP 'slop-build'
+New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
+Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'slop-build-*' -ErrorAction SilentlyContinue |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath $logRoot -Directory -ErrorAction SilentlyContinue |
+    Sort-Object LastWriteTime -Descending | Select-Object -Skip 4 |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+$logDir = Join-Path $logRoot (Get-Date -Format 'yyyyMMdd-HHmmss-fff')
 New-Item -ItemType Directory -Path $logDir | Out-Null
 
-$vsRoot = $null
-$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
-if (-not $FrontendOnly) {
-if (Test-Path -LiteralPath $vswhere) {
-    $vsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+# binaryDir of a configure preset (follows `inherits`, expands the macros the
+# presets use) so build/test steps work for every preset, not only build/
+function Resolve-PresetBinaryDir([string]$name) {
+    $presets = (Get-Content -LiteralPath (Join-Path $repoRoot 'CMakePresets.json') -Raw | ConvertFrom-Json).configurePresets
+    $cur = $presets | Where-Object name -EQ $name
+    if (-not $cur) { throw "unknown configure preset '$name'" }
+    $dir = $null
+    while ($cur -and -not $dir) {
+        if ($cur.binaryDir) { $dir = $cur.binaryDir; break }
+        $parent = @($cur.inherits)[0]
+        $cur = if ($parent) { $presets | Where-Object name -EQ $parent } else { $null }
+    }
+    if (-not $dir) { throw "preset '$name' has no binaryDir" }
+    $dir = $dir.Replace('${sourceDir}', $repoRoot).Replace('${presetName}', $name)
+    return [IO.Path]::GetFullPath($dir)
 }
-foreach ($candidate in @((Join-Path ([IO.Path]::GetPathRoot($repoRoot)) 'PRODUCT VS22'), 'E:\PRODUCT VS22')) {
-    if (-not $vsRoot -and (Test-Path -LiteralPath (Join-Path $candidate 'VC\Auxiliary\Build\vcvars64.bat'))) {
-        $vsRoot = $candidate
-        break
+
+# A build tree configured from another checkout location (the repo was moved
+# or copied) makes cmake refuse to configure, and FetchContent's sub-builds
+# carry the old absolute paths too. Wipe exactly those; downloaded sources
+# (_ext\*-src) stay. Only the primary build\ tree keeps its deps in _ext\, the
+# other presets keep them inside their own binary dir.
+function Clear-GeneratedTrees([string]$binaryDir, [string]$reason) {
+    $primary = [IO.Path]::GetFullPath((Join-Path $repoRoot 'build')).TrimEnd('\') -eq $binaryDir.TrimEnd('\')
+    Write-Host "==> $reason, removing $binaryDir$(if ($primary) { ' and _ext\*-build, _ext\*-subbuild' })"
+    if (Test-Path -LiteralPath $binaryDir) { Remove-Item -LiteralPath $binaryDir -Recurse -Force }
+    if ($primary) {
+        Get-ChildItem -LiteralPath (Join-Path $repoRoot '_ext') -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like '*-build' -or $_.Name -like '*-subbuild' } |
+            Remove-Item -Recurse -Force
     }
 }
-if (-not $vsRoot) { throw 'Visual Studio 2022 with C++ tools not found' }
+
+$vsCMake = 'cmake'
+$vsCTest = 'ctest'
+if (-not $FrontendOnly) {
+if (-not $VsRoot) {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path -LiteralPath $vswhere) {
+        $VsRoot = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    }
+}
+if (-not $VsRoot -or -not (Test-Path -LiteralPath (Join-Path $VsRoot 'VC\Auxiliary\Build\vcvars64.bat'))) {
+    throw 'Visual Studio with C++ tools not found (install VS 2022+ with "Desktop development with C++", or pass -VsRoot / set SLOP_VS_ROOT)'
+}
 
 $vsCMake = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
+$vsCTest = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe'
 $vsNinja = Join-Path $vsRoot 'Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe'
 $vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
 
@@ -46,7 +92,6 @@ Write-Host "==> logs:     $logDir"
 } else {
     Write-Host "==> repo:     $repoRoot (frontend-only, skipping VS detection)"
     Write-Host "==> logs:     $logDir"
-    $vsCMake = 'cmake'
 }
 if ($Full) {
     Write-Host '==> full installer mode: magicmida and the webview2 runtime are all required' -ForegroundColor Cyan
@@ -64,9 +109,21 @@ if (Test-Path -LiteralPath $vsNinja) {
 }
 }
 
-if ($FullClean -and (Test-Path -LiteralPath (Join-Path $repoRoot 'build'))) {
-    Write-Host '==> removing build directory'
-    Remove-Item -LiteralPath (Join-Path $repoRoot 'build') -Recurse -Force
+$binaryDir = $null
+if (-not $FrontendOnly) {
+    $binaryDir = Resolve-PresetBinaryDir $Preset
+    if ($FullClean) {
+        Clear-GeneratedTrees $binaryDir '-FullClean'
+    } else {
+        $cache = Join-Path $binaryDir 'CMakeCache.txt'
+        if (Test-Path -LiteralPath $cache) {
+            $cachedHome = (Select-String -LiteralPath $cache -Pattern '^CMAKE_HOME_DIRECTORY:INTERNAL=(.*)$' |
+                Select-Object -First 1).Matches.Groups[1].Value
+            if ($cachedHome -and ([IO.Path]::GetFullPath($cachedHome).TrimEnd('\') -ne [IO.Path]::GetFullPath($repoRoot).TrimEnd('\'))) {
+                Clear-GeneratedTrees $binaryDir "build tree was configured for $cachedHome (repo moved)"
+            }
+        }
+    }
 }
 
 if (-not $FrontendOnly) {
@@ -96,7 +153,7 @@ $ErrorActionPreference = 'Continue'
 # `--build --preset` resolves CMakePresets.json from the *current* directory,
 # which breaks when the script runs from anywhere but the repo root, build by
 # binary dir instead (same dir the preset expands to, works from anywhere)
-$buildArgs = @('--build', (Join-Path $repoRoot 'build'))
+$buildArgs = @('--build', $binaryDir)
 if ($Targets.Trim()) {
     $buildArgs += '--target'
     $buildArgs += $Targets.Split(',', [System.StringSplitOptions]::RemoveEmptyEntries).Trim()
@@ -107,18 +164,22 @@ $ErrorActionPreference = $prevEap
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE), log: $(Join-Path $logDir 'build.log')" }
 
 if ($Test) {
-    Write-Host '==> running tests'
-    & $vsCMake --build (Join-Path $repoRoot 'build') --target test
+    # ctest from the same VS toolset (the vcvars PATH also carries the ASan
+    # runtime DLLs an asan preset build needs)
+    Write-Host "==> running tests (label '$TestLabel')"
+    & $vsCTest --test-dir $binaryDir --output-on-failure --no-tests=error -L $TestLabel
     if ($LASTEXITCODE -ne 0) { throw "tests failed (exit $LASTEXITCODE)" }
 }
 
+$cacheType = (Select-String -LiteralPath (Join-Path $binaryDir 'CMakeCache.txt') -Pattern '^CMAKE_BUILD_TYPE:STRING=(.*)$' |
+    Select-Object -First 1).Matches.Groups[1].Value
 $summary = [ordered]@{
     preset   = $Preset
-    config   = 'Release'
+    config   = $cacheType
     result   = 'success'
     logDir   = $logDir
-    binary   = Join-Path $repoRoot 'build\src\app\reverse-slop.exe'
-    engine   = Join-Path $repoRoot 'build\src\engine\reverse-slop-engine.exe'
+    binary   = Join-Path $binaryDir 'src\app\reverse-slop.exe'
+    engine   = Join-Path $binaryDir 'src\engine\reverse-slop-engine.exe'
 }
 $summary | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $logDir 'summary.json')
 
@@ -141,7 +202,7 @@ if (-not $NoFrontend) {
     # %LOCALAPPDATA%. Keep the LOCALAPPDATA install as the source of truth
     # (tests and dev runs use it), then mirror it into build\ so the tauri
     # resource map can reference a repo-relative path
-    $magicmidaVersion = '2026-05-14' # sync with kVersion (magicmida.cpp) and $release (install_magicmida.ps1)
+    $magicmidaVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'magicmida-version.txt') -TotalCount 1).Trim()
     & powershell -NoProfile -File (Join-Path $PSScriptRoot 'install_magicmida.ps1')
     if ($LASTEXITCODE -ne 0) {
         if ($Full) { throw 'magicmida install failed, the full installer bundles the unpacker (network access needed)' }
@@ -287,6 +348,10 @@ if (-not $NoFrontend) {
     New-Item -ItemType Directory -Path $portable | Out-Null
     Copy-Item -LiteralPath (Join-Path $release 'reverse-slop-ui.exe') -Destination (Join-Path $portable 'reverse-slop.exe')
     Copy-Item -LiteralPath (Join-Path $release 'engine') -Destination $portable -Recurse
+    # license + third-party notices travel with every distribution (the
+    # installer gets them through the tauri resource map)
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $portable 'LICENSE.txt')
+    Copy-Item -LiteralPath (Join-Path $repoRoot 'THIRD_PARTY_NOTICES.md') -Destination (Join-Path $portable 'THIRD_PARTY_NOTICES.md')
     Write-Host "==> portable: $(Join-Path $portable 'reverse-slop.exe')"
     Write-Host '==> portable manifest:'
     Get-ChildItem -LiteralPath $portable -Recurse -File |

@@ -1,17 +1,19 @@
 #include "signatures.h"
-#include "signatures.h"
+#include "orbis_syscalls.h"
 #include <spdlog/spdlog.h>
 #include <cstring>
-#include <filesystem>
 
 namespace hype {
 
 namespace {
 
-Signature make_sig(const char* name, const char* lib, std::initializer_list<int> bytes) {
+Signature make_sig(const char* name, const char* lib, std::initializer_list<int> bytes,
+                   Arch arch = Arch::X64, SigFormat format = SigFormat::PE) {
     Signature s;
     s.name = name;
     s.library = lib;
+    s.arch = arch;
+    s.format = format;
     s.pattern.reserve(bytes.size());
     s.mask.reserve(bytes.size());
     for (int b : bytes) {
@@ -24,6 +26,17 @@ Signature make_sig(const char* name, const char* lib, std::initializer_list<int>
         }
     }
     return s;
+}
+
+// mov r10, rcx in both encodings, as libkernel stubs shuffle arg 4
+bool is_mov_r10_rcx(const u8* p) {
+    return (p[0] == 0x4C && p[1] == 0x8B && p[2] == 0xD1) ||
+           (p[0] == 0x49 && p[1] == 0x89 && p[2] == 0xCA);
+}
+
+// `mov r10, rcx ; syscall` at p
+bool is_r10_syscall(const u8* p, size_t len) {
+    return len >= 5 && is_mov_r10_rcx(p) && p[3] == 0x0F && p[4] == 0x05;
 }
 
 }
@@ -160,6 +173,7 @@ SignatureMatcher::SignatureMatcher() {
         {0x48, 0x83, 0xEC, 0x28, 0xE8, -1, -1, -1, -1, 0xB9, 0x19, 0x00, 0x00, 0x00}));
 
     // x86 patterns
+    const size_t x86_first = sigs_.size();
     sigs_.push_back(make_sig("__security_check_cookie", "msvcrt",
         {0x3B, 0x0D, -1, -1, -1, -1, 0x75, -1, 0xC3}));
 
@@ -186,6 +200,7 @@ SignatureMatcher::SignatureMatcher() {
 
     sigs_.push_back(make_sig("__except_handler4", "msvcrt",
         {0x8B, 0xFF, 0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x28, 0x89, 0x4D}));
+    for (size_t i = x86_first; i < sigs_.size(); ++i) sigs_[i].arch = Arch::X86;
 
     // strncmp
     sigs_.push_back(make_sig("strncmp", "msvcrt",
@@ -409,11 +424,86 @@ SignatureMatcher::SignatureMatcher() {
     sigs_.push_back(make_sig("_seh_filter_exe", "msvcrt",
         {0x48, 0x89, 0x5C, 0x24, -1, 0x48, 0x89, 0x74, 0x24, -1, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x8B, 0xDA, 0x8B, 0xF9}));
 
-    // FLIRT .sig loading removed: the extracted free-floating names were never
-    // consumed by match_functions, so the load was pure startup cost plus a
-    // misleading "FLIRT" label on results that only ever came from the
-    // built-in prefix patterns below.
+    // Orbis (PS4) / FreeBSD amd64, ELF only. Orbis libc and libkernel derive
+    // from FreeBSD 9, whose amd64 string primitives are hand-written assembly
+    // (lib/libc/amd64/string/*.S) and so byte-identical wherever they are
+    // statically linked (payload/homebrew ELFs, libkernel and kernel dumps).
+    // libkernel's syscall wrappers are named separately from the syscall
+    // number in syscall_stub_name()
+    // bcopy.S built as memcpy/memmove: mov rax,rdi ; mov rcx,rdx ; mov r8,rdi ;
+    // sub r8,rsi ; cmp r8,rcx ; jb overlap ; cld ; shr rcx,3 ; rep movsq
+    sigs_.push_back(make_sig("memcpy", "freebsd-libc",
+        {0x48, 0x89, 0xF8, 0x48, 0x89, 0xD1, 0x49, 0x89, 0xF8, 0x49, 0x29, 0xF0,
+         0x49, 0x39, 0xC8, 0x72, -1, 0xFC, 0x48, 0xC1, 0xE9, 0x03, 0xF3, 0x48, 0xA5},
+        Arch::X64, SigFormat::ELF));
+    // bcopy.S as bcopy: xchg rdi,rsi then the same body
+    sigs_.push_back(make_sig("bcopy", "freebsd-libc",
+        {0x48, 0x87, 0xFE, 0x48, 0x89, 0xD1, 0x49, 0x89, 0xF8, 0x49, 0x29, 0xF0,
+         0x49, 0x39, 0xC8, 0x72, -1, 0xFC, 0x48, 0xC1, 0xE9, 0x03, 0xF3, 0x48, 0xA5},
+        Arch::X64, SigFormat::ELF));
+    // memset.S: mov rax,rsi ; and rax,0xff ; mov rcx,rdx ; mov r11,rdi ; cld ;
+    // cmp rcx,0xf ; jle short
+    sigs_.push_back(make_sig("memset", "freebsd-libc",
+        {0x48, 0x89, 0xF0, 0x48, 0x25, 0xFF, 0x00, 0x00, 0x00, 0x48, 0x89, 0xD1,
+         0x49, 0x89, 0xFB, 0xFC, 0x48, 0x83, 0xF9, 0x0F, 0x7E},
+        Arch::X64, SigFormat::ELF));
+    // bzero.S: mov rcx,rsi ; xor eax,eax ; shr rcx,3 ; cld ; rep stosq ;
+    // mov rcx,rsi ; and rcx,7 ; rep stosb ; ret
+    sigs_.push_back(make_sig("bzero", "freebsd-libc",
+        {0x48, 0x89, 0xF1, 0x31, 0xC0, 0x48, 0xC1, 0xE9, 0x03, 0xFC, 0xF3, 0x48,
+         0xAB, 0x48, 0x89, 0xF1, 0x48, 0x83, 0xE1, 0x07, 0xF3, 0xAA, 0xC3},
+        Arch::X64, SigFormat::ELF));
+
     spdlog::info("signatures: loaded {} patterns", sigs_.size());
+}
+
+SigFormat SignatureMatcher::image_format(const PEImage& img) {
+    switch (img.format) {
+    case ImageFormat::PE:    return SigFormat::PE;
+    case ImageFormat::ELF:   return SigFormat::ELF;     // SELF payloads load as ELF
+    case ImageFormat::MachO: return SigFormat::MachO;
+    }
+    return SigFormat::Any;
+}
+
+int SignatureMatcher::sig_count(Arch arch, SigFormat format) const {
+    int n = 0;
+    for (const auto& s : sigs_)
+        if (s.arch == arch && (s.format == SigFormat::Any || s.format == format)) ++n;
+    return n;
+}
+
+std::string SignatureMatcher::syscall_stub_name(const u8* p, size_t len, va_t entry,
+                                                const PEImage& img) const {
+    u64  num = 0;
+    size_t load = 0;
+    if (len >= 7 && p[0] == 0x48 && p[1] == 0xC7 && p[2] == 0xC0) {   // mov rax, imm32
+        i32 v = 0;
+        std::memcpy(&v, p + 3, 4);
+        if (v < 0) return {};
+        num = static_cast<u64>(v);
+        load = 7;
+    } else if (len >= 5 && p[0] == 0xB8) {                              // mov eax, imm32
+        u32 v = 0;
+        std::memcpy(&v, p + 1, 4);
+        num = v;
+        load = 5;
+    } else {
+        return {};
+    }
+
+    bool stub = is_r10_syscall(p + load, len - load);
+    // payload SDK: mov rax, n ; jmp syscall_macro (mov r10, rcx ; syscall ...)
+    if (!stub && len >= load + 5 && p[load] == 0xE9) {
+        i32 rel = 0;
+        std::memcpy(&rel, p + load + 1, 4);
+        const va_t target = entry + load + 5 + static_cast<i64>(rel);
+        size_t tlen = 0;
+        if (const u8* t = func_bytes(target, img, &tlen)) stub = is_r10_syscall(t, tlen);
+    }
+    if (!stub) return {};
+    if (const char* n = orbis_syscall_name(num)) return std::string("sys_") + n;
+    return "sys_" + std::to_string(num);
 }
 
 bool SignatureMatcher::match_one(const u8* data, size_t len, const Signature& sig) const {
@@ -439,21 +529,41 @@ const u8* SignatureMatcher::func_bytes(va_t addr, const PEImage& img, size_t* ou
 }
 
 int SignatureMatcher::match_functions(AnalysisDB& db, const PEImage& img) {
+    const SigFormat format = image_format(img);
+    std::vector<const Signature*> eligible;
+    for (const auto& sig : sigs_)
+        if (sig.arch == img.arch &&
+            (sig.format == SigFormat::Any || sig.format == format))
+            eligible.push_back(&sig);
+    const bool orbis_stubs = format == SigFormat::ELF && img.arch == Arch::X64;
+    if (eligible.empty() && !orbis_stubs) {
+        spdlog::info("signatures: no signature set for this arch/format");
+        return 0;
+    }
+
     int matches = 0;
     for (auto& [entry, func] : db.funcs) {
+        const auto named = db.names.find(entry);
+        if (named != db.names.end() && !named->second.empty() &&
+            named->second.rfind("sub_", 0) != 0)
+            continue;   // export / symbol / thunk name beats a pattern guess
+
         size_t avail = 0;
         const u8* ptr = func_bytes(entry, img, &avail);
         if (!ptr || avail < 4) continue;
 
-        size_t check_len = std::min<size_t>(avail, 64);
-        for (auto& sig : sigs_) {
-            if (match_one(ptr, check_len, sig)) {
-                func.name = sig.name;
-                db.names[entry] = sig.name;
-                ++matches;
-                break;
+        const size_t check_len = std::min<size_t>(avail, 64);
+        std::string name;
+        if (orbis_stubs) name = syscall_stub_name(ptr, check_len, entry, img);
+        if (name.empty()) {
+            for (const Signature* sig : eligible) {
+                if (match_one(ptr, check_len, *sig)) { name = sig->name; break; }
             }
         }
+        if (name.empty()) continue;
+        func.name = name;
+        db.names[entry] = std::move(name);
+        ++matches;
     }
     spdlog::info("signatures: matched {} functions", matches);
     return matches;

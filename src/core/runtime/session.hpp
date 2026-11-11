@@ -36,10 +36,14 @@ public:
     io_result_t read(uintptr_t addr, void* buf, size_t len);
     io_result_t write(uintptr_t addr, const void* buf, size_t len);
 
-    // Access to underlying handle
+    // Access to underlying handle and the backend it was opened on (the
+    // session keeps using that backend even if the active one changes)
     const target_handle_t& handle() const noexcept;
+    backend_t*             backend() const noexcept;
+    const process_info_t&  info() const noexcept;
 
 private:
+    backend_t*      m_backend = nullptr;
     target_handle_t m_handle{};
     process_info_t  m_info{};
     int64_t         m_epoch_ms = 0;

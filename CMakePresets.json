@@ -10,16 +10,50 @@
       "name": "base",
       "hidden": true,
       "generator": "Ninja",
-      "binaryDir": "${sourceDir}/build",
+      "binaryDir": "${sourceDir}/build-${presetName}",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "SLOP_DEPS_DIR": "${sourceDir}/build-${presetName}/_deps"
       }
     },
     {
       "name": "ninja-msvc-release",
       "inherits": "base",
       "displayName": "Ninja + MSVC Release",
-      "description": "Primary supported configuration for reverse-slop"
+      "description": "Primary supported configuration for reverse-slop (shipped binaries)",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "SLOP_DEPS_DIR": "${sourceDir}/_ext"
+      }
+    },
+    {
+      "name": "ninja-msvc-debug",
+      "inherits": "base",
+      "displayName": "Ninja + MSVC Debug",
+      "description": "Debug build with the debug CRT, /RTC1 and full debug info",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "ninja-msvc-asan",
+      "inherits": "base",
+      "displayName": "Ninja + MSVC AddressSanitizer",
+      "description": "RelWithDebInfo with /fsanitize=address on every target (tests run with the ASan runtime)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SLOP_SANITIZE": "address"
+      }
+    },
+    {
+      "name": "ninja-msvc-analyze",
+      "inherits": "base",
+      "displayName": "Ninja + MSVC /analyze",
+      "description": "Release build with MSVC static analysis (/analyze) on first-party code",
+      "cacheVariables": {
+        "SLOP_ANALYZE": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -27,6 +61,59 @@
       "name": "ninja-msvc-release",
       "displayName": "Ninja + MSVC Release",
       "configurePreset": "ninja-msvc-release"
+    },
+    {
+      "name": "ninja-msvc-debug",
+      "displayName": "Ninja + MSVC Debug",
+      "configurePreset": "ninja-msvc-debug"
+    },
+    {
+      "name": "ninja-msvc-asan",
+      "displayName": "Ninja + MSVC AddressSanitizer",
+      "configurePreset": "ninja-msvc-asan"
+    },
+    {
+      "name": "ninja-msvc-analyze",
+      "displayName": "Ninja + MSVC /analyze",
+      "configurePreset": "ninja-msvc-analyze"
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "area"
+        }
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    },
+    {
+      "name": "ninja-msvc-release",
+      "inherits": "test-base",
+      "displayName": "All test areas (Release)",
+      "configurePreset": "ninja-msvc-release"
+    },
+    {
+      "name": "ninja-msvc-debug",
+      "inherits": "test-base",
+      "displayName": "All test areas (Debug)",
+      "configurePreset": "ninja-msvc-debug"
+    },
+    {
+      "name": "ninja-msvc-asan",
+      "inherits": "test-base",
+      "displayName": "All test areas (AddressSanitizer)",
+      "configurePreset": "ninja-msvc-asan",
+      "environment": {
+        "ASAN_OPTIONS": "detect_leaks=0:halt_on_error=1"
+      }
     }
   ]
 }

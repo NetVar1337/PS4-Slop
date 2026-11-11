@@ -32,6 +32,16 @@ std::string format_hex(std::span<const uint8_t> data, bool uppercase) {
     return out;
 }
 
+std::string format_hex_packed(std::span<const uint8_t> data, bool uppercase) {
+    const char* digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
+    std::string out(data.size() * 2, '\0');
+    for (size_t i = 0; i < data.size(); ++i) {
+        out[i * 2]     = digits[data[i] >> 4];
+        out[i * 2 + 1] = digits[data[i] & 0xF];
+    }
+    return out;
+}
+
 std::string format_as(std::span<const uint8_t> data, copy_dialect_t dialect) {
     char buf[8];
     std::string out;
@@ -41,12 +51,7 @@ std::string format_as(std::span<const uint8_t> data, copy_dialect_t dialect) {
         return format_hex(data, true);
 
     case copy_dialect_t::hex_nospace:
-        out.reserve(data.size() * 2);
-        for (auto b : data) {
-            std::snprintf(buf, sizeof(buf), "%02X", b);
-            out += buf;
-        }
-        return out;
+        return format_hex_packed(data, true);
 
     case copy_dialect_t::c_array:
         out = "{ ";

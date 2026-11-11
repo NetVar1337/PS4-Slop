@@ -5,12 +5,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search } from "lucide-react";
+import { escapeControl } from "@/lib/format";
+import { showInDisassembly } from "@/lib/navigate";
 import { hex, useDisasm } from "@/store/disasm";
 
 const kRow = 20;
 
 export default function StringsView() {
-  const { strings, stringsTruncated, loadStrings, gotoAddress, busy } = useDisasm();
+  const { strings, stringsTruncated, loadStrings, busy } = useDisasm();
   const [minChars, setMinChars] = useState(4);
   const [includeExec, setIncludeExec] = useState(false);
   const [filter, setFilter] = useState("");
@@ -37,9 +39,10 @@ export default function StringsView() {
     <div className="stack">
       <div className="view-bar">
         <div className="search" style={{ margin: 0, flex: 1 }}>
-          <Search size={13} />
+          <Search size={13} aria-hidden />
           <input
             value={filter}
+            aria-label="Filter strings"
             placeholder={`Filter ${strings.length} strings…`}
             onChange={(e) => setFilter(e.target.value)}
           />
@@ -85,15 +88,18 @@ export default function StringsView() {
                   style={{ top: v.start, height: kRow }}
                 >
                   <button
+                    type="button"
                     className="insn-va link"
-                    onClick={() => void gotoAddress(s.va)}
+                    onClick={() => showInDisassembly(s.va)}
                     data-tip="follow in disassembly"
+                    aria-label={`follow ${hex(s.va)} in disassembly`}
                   >
                     {hex(s.va)}
                   </button>
                   {s.utf16 && <span className="pill">w</span>}
                   <span className="insn-text" style={{ userSelect: "text" }}>
-                    {s.text}
+                    {/* one line per row: a raw newline would spill into the next row */}
+                    {escapeControl(s.text)}
                   </span>
                 </div>
               );

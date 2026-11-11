@@ -7,7 +7,9 @@
 
 #include "core/disasm/capstone_disasm.h"
 #include "core/infra/diag.hpp"
+#include "core/loader/elf_loader.h"
 #include "core/loader/macho_loader.h"
+#include "core/loader/self_loader.h"
 
 #include <algorithm>
 #include <cctype>
@@ -49,27 +51,12 @@ size_t analysis_insn_budget() {
 namespace {
 
 std::mutex g_decoder_mu;
-std::mutex g_capstone_mu;
 
 std::string upper_mnemonic(const char* s) {
     std::string out(s);
     for (char& c : out)
         c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return out;
-}
-
-// Capstone handles carry decode state: one per arch, used under g_capstone_mu
-hype::CapstoneDisasm& capstone_for(hype::Arch arch) {
-    struct handles_t {
-        hype::CapstoneDisasm arm64;
-        hype::CapstoneDisasm arm;
-        handles_t() {
-            arm64.set_arch(hype::Arch::ARM64);
-            arm.set_arch(hype::Arch::ARM);
-        }
-    };
-    static handles_t handles;
-    return arch == hype::Arch::ARM ? handles.arm : handles.arm64;
 }
 
 insn_t convert_arm(const hype::Insn& in) {
@@ -87,6 +74,34 @@ insn_t convert_arm(const hype::Insn& in) {
     case hype::InsnType::Jcc:  out.flow = flow_t::jcc;  break;
     case hype::InsnType::Ret:  out.flow = flow_t::ret;  break;
     default:                   out.flow = flow_t::none; break;
+    }
+
+    // operand records with Capstone register ids in the arm_* fields
+    for (uint8_t i = 0; i < in.op_count && out.op_count < ZYDIS_MAX_OPERAND_COUNT_VISIBLE; ++i) {
+        const hype::Operand& src = in.ops[i];
+        operand_t&           o   = out.ops[out.op_count++];
+        o.read  = src.read;
+        o.write = src.write;
+        switch (src.type) {
+        case hype::OpType::Reg:
+            o.cls     = op_class_t::reg;
+            o.arm_reg = src.reg;
+            break;
+        case hype::OpType::Imm:
+            o.cls = op_class_t::imm;
+            o.imm = src.val;
+            break;
+        case hype::OpType::Mem:
+            o.cls       = op_class_t::mem;
+            o.arm_base  = src.mem.base;
+            o.arm_index = src.mem.index;
+            o.scale     = src.mem.scale ? src.mem.scale : 1;
+            o.disp      = src.mem.disp;
+            break;
+        default:
+            o.cls = op_class_t::none;
+            break;
+        }
     }
 
     // b/bl/b.cond carry only the target; cbz/cbnz test a register first and
@@ -191,8 +206,8 @@ bool session_t::decode(uint64_t va, const uint8_t* buf, size_t len,
     if (!buf || len == 0) return false;
     hype::Insn in;
     if (is_arm(arch)) {
-        std::lock_guard lk(g_capstone_mu);
-        if (!capstone_for(arch).decode(va, buf, len, in)) return false;
+        // per-thread handle: concurrent MCP/UI decodes no longer serialize
+        if (!hype::thread_capstone(arch).decode(va, buf, len, in)) return false;
         out = convert_arm(in);
         return true;
     }
@@ -257,18 +272,36 @@ bool session_t::begin(const uint8_t* bytes, size_t len, uint64_t base_override) 
     }
 
     // thin or FAT Mach-O (an .ipa was already reduced to its executable by
-    // image_open), anything else must be a PE
-    const bool macho = hype::MachOLoader::is_macho(bytes, len);
+    // image_open), ELF (a SELF is unwrapped to its ELF first), else PE
     std::optional<hype::PEImage> parsed;
-    if (macho) {
+    const char* kind = "PE";
+    std::string why;
+    if (hype::MachOLoader::is_macho(bytes, len)) {
+        kind = "Mach-O";
         hype::MachOLoader loader;
+        parsed = loader.load_buffer(bytes, len);
+    } else if (hype::SELFLoader::is_self(bytes, len)) {
+        kind = "SELF";
+        auto ex = hype::SELFLoader::extract_elf(bytes, len);
+        if (!ex.ok) {
+            why = ": " + ex.error;
+        } else {
+            // the image borrows the rebuilt ELF, keep it alive with it
+            auto elf = std::make_shared<std::vector<uint8_t>>(std::move(ex.elf));
+            hype::ELFLoader loader;
+            parsed = loader.load_buffer(elf->data(), elf->size());
+            if (parsed) parsed->storage.push_back(std::move(elf));
+        }
+    } else if (hype::ELFLoader::is_elf(bytes, len)) {
+        kind = "ELF";
+        hype::ELFLoader loader;
         parsed = loader.load_buffer(bytes, len);
     } else {
         hype::PELoader loader;
         parsed = loader.load_buffer(bytes, len);
     }
     if (!parsed) {
-        set_error(macho ? "hyperion: Mach-O parse failed" : "hyperion: PE parse failed");
+        set_error(std::string("hyperion: ") + kind + " parse failed" + why);
         return false;
     }
     img_ = std::move(*parsed);
@@ -464,8 +497,29 @@ void session_t::build_interval_index() {
 }
 
 void session_t::invalidate_decomp_cache() {
+    std::lock_guard lk(decomp_mu_);
     decomp_cache_.clear();
+    decomp_lru_.clear();
     ++decomp_cache_gen_;
+}
+
+void session_t::set_decomp_cache_capacity(size_t n) {
+    std::lock_guard lk(decomp_mu_);
+    decomp_cache_cap_ = n ? n : 1;
+    while (decomp_cache_.size() > decomp_cache_cap_) {
+        decomp_cache_.erase(decomp_lru_.back().first);
+        decomp_lru_.pop_back();
+    }
+}
+
+size_t session_t::decomp_cache_size() const {
+    std::lock_guard lk(decomp_mu_);
+    return decomp_cache_.size();
+}
+
+bool session_t::decomp_cached(uint64_t entry) const {
+    std::lock_guard lk(decomp_mu_);
+    return decomp_cache_.count(entry) != 0;
 }
 
 bool session_t::decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
@@ -483,7 +537,9 @@ bool session_t::decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
         std::lock_guard lk(decomp_mu_);
         auto cached = decomp_cache_.find(f->entry);
         if (cached != decomp_cache_.end()) {
-            out = cached->second;
+            // hit: move to the most-recently-used end
+            decomp_lru_.splice(decomp_lru_.begin(), decomp_lru_, cached->second);
+            out = cached->second->second;
             return true;
         }
         hype::Decompiler dec;
@@ -492,10 +548,14 @@ bool session_t::decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
             err = "decompiler produced no output";
             return false;
         }
-        // Bound the cache so pathological decompile-everything sessions don't
-        // grow it without limit
-        if (decomp_cache_.size() >= 256) decomp_cache_.clear();
-        decomp_cache_[f->entry] = out;
+        // Bounded LRU: evict the least recently used function, never the
+        // whole cache (a full flush made every big-binary session thrash)
+        if (decomp_cache_.size() >= decomp_cache_cap_ && !decomp_lru_.empty()) {
+            decomp_cache_.erase(decomp_lru_.back().first);
+            decomp_lru_.pop_back();
+        }
+        decomp_lru_.emplace_front(f->entry, out);
+        decomp_cache_[f->entry] = decomp_lru_.begin();
     }
     return true;
 }

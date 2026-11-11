@@ -6,6 +6,8 @@
 
 #include "harness.hpp"
 
+#include "core/debugger/composite.hpp"
+#include "core/debugger/local_debugger.hpp"
 #include "core/mcp/mcp_tools.hpp"
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_ps4.hpp"
@@ -27,6 +29,9 @@
 #include <fstream>
 
 #include <atomic>
+#include <chrono>
+#include <functional>
+#include <iterator>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -52,14 +57,62 @@ wsa_init_t& wsa() {
     return w;
 }
 
-bool send_all(SOCKET s, const void* buf, size_t len) {
-    const char* p = static_cast<const char*>(buf);
-    size_t left = len;
+// fault injection for the fake payload's replies (server thread only):
+// fragmented / dribbled sends and a byte budget after which the connection
+// is cut mid-reply
+struct chaos_t {
+    std::atomic<bool>     fragment{false};    // replies leave 1-3 bytes per send
+    std::atomic<int>      dribble_ms{0};      // sleep between reply fragments
+    std::atomic<uint32_t> stall_cmd{0};       // never answer this command (one-shot)
+    std::atomic<uint32_t> close_cmd{0};       // cut the connection while answering (one-shot)
+    std::atomic<int>      close_after{0};     // reply bytes sent before the cut
+    std::atomic<uint32_t> garbage_cmd{0};     // answer with a non-status word (one-shot)
+    std::atomic<bool>     refuse_detach{false};
+    std::atomic<bool>     hide_game_pid{false};   // process list omits kFakePid
+    std::atomic<bool>     stack_truncate{false};  // bundle claims one frame more than it has
+    std::atomic<int>      disasm_extra{0};        // entries beyond the two canned ones
+    std::atomic<uint32_t> thread_count{2};
+};
+thread_local chaos_t* tl_chaos = nullptr;
+thread_local int tl_budget = -1;   // reply bytes left before the cut, -1 = unlimited
+
+bool send_raw(SOCKET s, const char* p, size_t left) {
     while (left > 0) {
         int n = ::send(s, p, static_cast<int>(left), 0);
         if (n <= 0) return false;
         p += n;
         left -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool send_all(SOCKET s, const void* buf, size_t len) {
+    const char* p = static_cast<const char*>(buf);
+    chaos_t* ch = tl_chaos;
+    if (!ch) return send_raw(s, p, len);
+    size_t left = len;
+    const bool frag = ch->fragment.load() || ch->dribble_ms.load() > 0;
+    int step = 1;
+    while (left > 0) {
+        size_t n = frag ? std::min<size_t>(left, static_cast<size_t>(step)) : left;
+        step = step % 3 + 1;
+        if (tl_budget >= 0) {
+            if (tl_budget == 0) {
+                ::shutdown(s, SD_BOTH);
+                return false;
+            }
+            n = std::min<size_t>(n, static_cast<size_t>(tl_budget));
+            tl_budget -= static_cast<int>(n);
+        }
+        if (!send_raw(s, p, n)) return false;
+        p += n;
+        left -= n;
+        if (ch->dribble_ms.load() > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(ch->dribble_ms.load()));
+    }
+    if (tl_budget == 0) {   // budget ended exactly at a reply boundary: cut now
+        ::shutdown(s, SD_BOTH);
+        return false;
     }
     return true;
 }
@@ -95,6 +148,10 @@ struct fake_ps4_server_t {
     uint32_t last_protect = 0xFFFFFFFF;
     std::map<uint32_t, ps4::reg64_t> thread_regs;
     std::vector<ps4::vm_map_entry_t> maps;
+    chaos_t chaos;
+    uint16_t event_port = ps4::kDebugPort;   // where the debug channel connects back
+    int connections = 0;                     // accepted command connections
+    int detach_count = 0;
 
     // debug-session state observed by the tests
     struct bp_t { bool enabled = false; uint64_t address = 0; };
@@ -121,10 +178,37 @@ struct fake_ps4_server_t {
     bool setdbregs_called = false;
     uint64_t last_fsgs_fs = 0, last_fsgs_gs = 0;
 
-    // send one packed 0x4A0 debug event on the port-755 connection
-    void send_event(uint32_t lwpid, uint32_t status, const char* name, uint64_t rip_override) {
+    // drop the port-755 channel the way the payload's debug cleanup does
+    // (debuggee gone): the debug session and its slots end with it
+    void close_event_channel() {
         std::lock_guard lk(mu);
-        if (event_fd == INVALID_SOCKET) return;
+        debug_attached = false;
+        bps.clear();
+        wps.clear();
+        if (event_fd != INVALID_SOCKET) {
+            ::shutdown(event_fd, SD_BOTH);
+            closesocket(event_fd);
+            event_fd = INVALID_SOCKET;
+        }
+    }
+
+    // raw bytes on the port-755 channel, in caller-chosen pieces
+    void send_event_bytes(const uint8_t* data, size_t n, size_t piece, int pause_ms) {
+        SOCKET ev = INVALID_SOCKET;
+        {
+            std::lock_guard lk(mu);
+            ev = event_fd;
+        }
+        if (ev == INVALID_SOCKET) return;
+        for (size_t off = 0; off < n; off += piece) {
+            send_raw(ev, reinterpret_cast<const char*>(data + off), std::min(piece, n - off));
+            if (pause_ms) std::this_thread::sleep_for(std::chrono::milliseconds(pause_ms));
+        }
+    }
+
+    ps4::debug_event_packet_t make_event(uint32_t lwpid, uint32_t status, const char* name,
+                                         uint64_t rip, uint64_t dr6) {
+        std::lock_guard lk(mu);
         ps4::debug_event_packet_t pkt{};
         pkt.lwpid  = lwpid;
         pkt.status = status;
@@ -137,25 +221,43 @@ struct fake_ps4_server_t {
             pkt.regs.rax = 0x2A;
             pkt.regs.rflags = 0x202;
         }
-        if (rip_override) pkt.regs.rip = rip_override;
+        if (rip) pkt.regs.rip = rip;
         for (int i = 0; i < 16; ++i)
             reinterpret_cast<uint64_t*>(pkt.dbregs)[i] = 0xD000 + i;
-        send_all(event_fd, &pkt, sizeof(pkt));
+        reinterpret_cast<uint64_t*>(pkt.dbregs)[6] = dr6;
+        return pkt;
+    }
+
+    // send one packed 0x4A0 debug event on the port-755 connection; dr6 says
+    // what kind of trap it was (0 = int3, bit i = DR slot i, 0x4000 = step)
+    void send_event(uint32_t lwpid, uint32_t status, const char* name, uint64_t rip_override,
+                    uint64_t dr6 = 0) {
+        const ps4::debug_event_packet_t pkt = make_event(lwpid, status, name, rip_override, dr6);
+        std::lock_guard lk(mu);
+        if (event_fd == INVALID_SOCKET) return;
+        send_raw(event_fd, reinterpret_cast<const char*>(&pkt), sizeof(pkt));
+    }
+
+    void add_map(const char* name, uint64_t start, uint64_t end, uint16_t prot) {
+        ps4::vm_map_entry_t m{};
+        std::strncpy(m.name, name, sizeof(m.name) - 1);
+        m.start = start;
+        m.end = end;
+        m.offset = 0;
+        m.prot = prot;
+        std::lock_guard lk(mu);
+        maps.push_back(m);
     }
 
     fake_ps4_server_t() {
         wsa();
-
-        auto add_map = [&](const char* name, uint64_t start, uint64_t end, uint16_t prot) {
-            ps4::vm_map_entry_t m{};
-            std::strncpy(m.name, name, sizeof(m.name) - 1);
-            m.start = start;
-            m.end = end;
-            m.offset = 0;
-            m.prot = prot;
-            maps.push_back(m);
-        };
-        add_map("/app0/eboot.bin", 0x400000, 0x500000, ps4::kVmProtRead | ps4::kVmProtExec);
+        // the eboot is mapped the way a real console maps a SELF: text,
+        // relro and data as separate entries of the same name (an anonymous
+        // mapping in between), no ELF header at the base
+        add_map("/app0/eboot.bin", 0x400000, 0x480000, ps4::kVmProtRead | ps4::kVmProtExec);
+        add_map("/app0/eboot.bin", 0x480000, 0x4C0000, ps4::kVmProtRead);
+        add_map("", 0x4C0000, 0x4C8000, ps4::kVmProtRead | ps4::kVmProtWrite);
+        add_map("/app0/eboot.bin", 0x4C8000, 0x500000, ps4::kVmProtRead | ps4::kVmProtWrite);
         add_map("/app0/libSceLibcInternal.sprx", 0x500000, 0x510000,
                 ps4::kVmProtRead | ps4::kVmProtExec);
         add_map("", 0x7FFF00000000ull, 0x7FFF00010000ull,
@@ -231,17 +333,68 @@ private:
     }
 
     void handle_conn(SOCKET c) {
+        tl_chaos = &chaos;
+        tl_budget = -1;
+        {
+            std::lock_guard lk(mu);
+            ++connections;
+        }
         while (!stop_flag) {
             ps4::packet_header_t hdr{};
-            if (!recv_all(c, &hdr, sizeof(hdr))) return;
-            if (hdr.magic != ps4::kPacketMagic) return;
+            if (!recv_all(c, &hdr, sizeof(hdr))) break;
+            if (hdr.magic != ps4::kPacketMagic) break;
             std::vector<uint8_t> body(hdr.datalen);
-            if (hdr.datalen > 0 && !recv_all(c, body.data(), hdr.datalen)) return;
-            if (!dispatch(c, hdr.cmd, body.data(), hdr.datalen)) return;
+            if (hdr.datalen > 0 && !recv_all(c, body.data(), hdr.datalen)) break;
+            const bool ok = dispatch(c, hdr.cmd, body.data(), hdr.datalen);
+            tl_budget = -1;
+            if (!ok) break;
+        }
+        // the payload keeps debug + auth state per connection: a dropped
+        // client loses its debuggee, its breakpoints and its auth bits
+        std::lock_guard lk(mu);
+        debug_attached = false;
+        debug_pid = 0;
+        bps.clear();
+        wps.clear();
+        auth_ok = false;
+        if (event_fd != INVALID_SOCKET) {
+            ::shutdown(event_fd, SD_BOTH);
+            closesocket(event_fd);
+            event_fd = INVALID_SOCKET;
+        }
+    }
+
+    // block until the client gives up on this connection (stall injection)
+    static void wait_for_close(SOCKET c, const std::atomic<bool>& stop) {
+        char sink[256];
+        while (!stop) {
+            fd_set rset;
+            FD_ZERO(&rset);
+            FD_SET(c, &rset);
+            timeval tv{0, 100 * 1000};
+            if (select(0, &rset, nullptr, nullptr, &tv) <= 0) continue;
+            if (::recv(c, sink, sizeof(sink), 0) <= 0) return;
         }
     }
 
     bool dispatch(SOCKET c, uint32_t cmd, const uint8_t* body, uint32_t bodylen) {
+        if (cmd != 0 && chaos.stall_cmd.load() == cmd) {
+            chaos.stall_cmd = 0;
+            wait_for_close(c, stop_flag);
+            return false;
+        }
+        if (cmd != 0 && chaos.close_cmd.load() == cmd) {
+            chaos.close_cmd = 0;
+            tl_budget = chaos.close_after.load();
+        }
+        if (cmd != 0 && chaos.garbage_cmd.load() == cmd) {
+            chaos.garbage_cmd = 0;
+            return send_u32(c, 0x12345678u);   // not a status word at all
+        }
+        return dispatch_cmd(c, cmd, body, bodylen);
+    }
+
+    bool dispatch_cmd(SOCKET c, uint32_t cmd, const uint8_t* body, uint32_t bodylen) {
         switch (cmd) {
         case ps4::CMD_VERSION: {
             const char* v = "1.3";
@@ -265,12 +418,15 @@ private:
             return send_u32(c, ps4::CMD_SUCCESS);
 
         case ps4::CMD_PROC_LIST: {
+            const bool hide = chaos.hide_game_pid.load();
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
-            if (!send_u32(c, 2)) return false;
+            if (!send_u32(c, hide ? 1u : 2u)) return false;
             ps4::proc_list_entry_t e{};
-            std::strncpy(e.p_comm, "eboot.bin", sizeof(e.p_comm) - 1);
-            e.pid = static_cast<int32_t>(kFakePid);
-            if (!send_all(c, &e, sizeof(e))) return false;
+            if (!hide) {
+                std::strncpy(e.p_comm, "eboot.bin", sizeof(e.p_comm) - 1);
+                e.pid = static_cast<int32_t>(kFakePid);
+                if (!send_all(c, &e, sizeof(e))) return false;
+            }
             std::memset(&e, 0, sizeof(e));
             std::strncpy(e.p_comm, "SceShellCore", sizeof(e.p_comm) - 1);
             e.pid = 42;
@@ -375,7 +531,7 @@ private:
             sockaddr_in a{};
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            a.sin_port = htons(ps4::kDebugPort);
+            a.sin_port = htons(event_port);
             if (::connect(ev, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
                 closesocket(ev);
                 send_u32(c, ps4::CMD_ERROR);
@@ -389,7 +545,11 @@ private:
 
         case ps4::CMD_DEBUG_DETACH: {
             std::lock_guard lk(mu);
+            ++detach_count;
+            if (chaos.refuse_detach.load()) return send_u32(c, ps4::CMD_ERROR);
             debug_attached = false;
+            bps.clear();
+            wps.clear();
             if (event_fd != INVALID_SOCKET) {
                 closesocket(event_fd);
                 event_fd = INVALID_SOCKET;
@@ -400,19 +560,23 @@ private:
         case ps4::CMD_DEBUG_GET_THREAD_LIST: {
             std::lock_guard lk(mu);
             if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
+            const uint32_t n = chaos.thread_count.load();
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
-            if (!send_u32(c, 2)) return false;
-            return send_u32(c, 101) && send_u32(c, 102);
+            if (!send_u32(c, n)) return false;
+            std::vector<uint32_t> ids(n);
+            for (uint32_t i = 0; i < n; ++i) ids[i] = 101 + i;
+            return n == 0 || send_all(c, ids.data(), ids.size() * sizeof(uint32_t));
         }
 
         case ps4::CMD_DEBUG_THREAD_INFO: {
             std::lock_guard lk(mu);
             if (!debug_attached) return send_u32(c, ps4::CMD_ERROR), true;
             const auto* p = reinterpret_cast<const ps4::debug_lwpid_packet_t*>(body);
-            struct { uint32_t lwpid; uint32_t priority; char name[32]; } r{};
+            ps4::debug_thread_info_response_t r{};
             r.lwpid = p->lwpid;
             r.priority = 80;
-            std::strncpy(r.name, "main", sizeof(r.name) - 1);
+            const std::string nm = p->lwpid == 101 ? "main" : "worker" + std::to_string(p->lwpid);
+            std::strncpy(r.name, nm.c_str(), sizeof(r.name) - 1);
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
             return send_all(c, &r, sizeof(r));
         }
@@ -473,6 +637,7 @@ private:
             const auto* p = reinterpret_cast<const ps4::debug_continue_packet_t*>(body);
             uint64_t hit = 0;
             bool wp_hit = false;
+            uint32_t wp_index = 0;
             {
                 std::lock_guard lk(mu);
                 last_continue_stop = p->stop;
@@ -481,13 +646,13 @@ private:
                     if (bp.enabled) { hit = bp.address; break; }
                 if (!hit)
                     for (const auto& [idx, wp] : wps)
-                        if (wp.enabled) { wp_hit = true; break; }
+                        if (wp.enabled) { wp_hit = true; wp_index = idx; break; }
             }
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
             // resuming into an armed breakpoint or watchpoint stops the main
             // thread with SIGTRAP (watchpoint: rip stays at the faulting insn)
-            if (p->stop == 0 && hit) send_event(101, 5u << 8, "main", hit);
-            else if (p->stop == 0 && wp_hit) send_event(101, 5u << 8, "main", 0);
+            if (p->stop == 0 && hit) send_event(101, 5u << 8, "main", hit, 0);
+            else if (p->stop == 0 && wp_hit) send_event(101, 5u << 8, "main", 0, 1ull << wp_index);
             return true;
         }
 
@@ -502,7 +667,7 @@ private:
                 newrip = r.rip;
             }
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
-            send_event(101, 5u << 8, "main", newrip);
+            send_event(101, 5u << 8, "main", newrip, 0x4000);
             return true;
         }
 
@@ -519,7 +684,7 @@ private:
                 newrip = r.rip;
             }
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
-            send_event(lw, 5u << 8, "worker", newrip);
+            send_event(lw, 5u << 8, "worker", newrip, 0x4000);
             return true;
         }
 
@@ -778,6 +943,15 @@ private:
             e.kind = 0x02;
             e.mnemonic_lo = 0x20;
             if (!send_all(c, &e, sizeof(e))) return false;
+            // a payload that ignores max_entries keeps streaming entries; the
+            // client must still read to the sentinel
+            for (int k = 0; k < chaos.disasm_extra.load(); ++k) {
+                std::memset(&e, 0, sizeof(e));
+                e.addr = dp->address + 4 + static_cast<uint64_t>(k);
+                e.length = 1;
+                e.mnemonic_lo = 0x30;
+                if (!send_all(c, &e, sizeof(e))) return false;
+            }
             uint8_t sentinel[ps4::kDisasmEntrySize];
             std::memset(sentinel, 0xFF, sizeof(sentinel));
             return send_all(c, sentinel, sizeof(sentinel));
@@ -838,7 +1012,8 @@ private:
                 cur_rsp = cur_rbp + 8;
                 cur_rbp = saved_rbp;
             }
-            std::memcpy(buf.data(), &n_frames, 4);
+            uint32_t claimed = n_frames + (chaos.stack_truncate.load() ? 1u : 0u);
+            std::memcpy(buf.data(), &claimed, 4);
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
             const uint32_t off = static_cast<uint32_t>(buf.size());
             if (!send_all(c, &off, sizeof(off))) return false;
@@ -846,10 +1021,10 @@ private:
         }
 
         case ps4::CMD_PROC_ASSEMBLE: {
+            // the asm text is the tail of the packet body (datalen = 12 + text)
             const uint32_t textlen = bodylen >= sizeof(ps4::proc_assemble_packet_t)
                 ? bodylen - static_cast<uint32_t>(sizeof(ps4::proc_assemble_packet_t)) : 0;
-            std::vector<uint8_t> t(textlen);
-            if (textlen && !recv_all(c, t.data(), textlen)) return false;
+            std::vector<uint8_t> t(body + (bodylen - textlen), body + bodylen);
             const std::string text(t.begin(), t.end());
             if (text.find("zzz") != std::string::npos) {
                 if (!send_u32(c, ps4::CMD_ERROR)) return false;
@@ -901,6 +1076,9 @@ private:
             { std::lock_guard lk(mu); last_print.assign(msg.begin(), msg.end()); }
             return send_u32(c, ps4::CMD_SUCCESS);
         }
+
+        case ps4::CMD_CONSOLE_INFO:   // payload: bare CMD_SUCCESS (ping variant)
+            return send_u32(c, ps4::CMD_SUCCESS);
 
         case ps4::CMD_CONSOLE_FOREGROUND_APP: {
             if (!send_u32(c, ps4::CMD_SUCCESS)) return false;
@@ -1023,28 +1201,45 @@ TEST_CASE(ps4_backend_handshake_and_enums) {
 
     auto regions = b.enum_regions(h);
     REQUIRE(regions.ok);
-    CHECK(regions.items.size() == 3u);
+    CHECK(regions.items.size() == 6u);   // eboot text/relro/data + anon gap + sprx + stack
     bool saw_eboot = false;
     for (const auto& r : regions.items) {
         if (r.base == 0x400000) {
             saw_eboot = true;
-            CHECK(r.size == 0x100000);
+            CHECK(r.size == 0x80000);    // the text segment only
             CHECK(r.protect == 0x20);   // PAGE_EXECUTE_READ
         }
     }
     CHECK(saw_eboot);
 
+    // one record per module: the three eboot segments coalesce into one
+    // module spanning text..data (item: per-segment "modules")
     auto mods = b.enum_modules(h);
     REQUIRE(mods.ok);
-    bool saw_mod = false;
+    int eboot_records = 0;
     for (const auto& m : mods.items) {
-        if (m.base == 0x400000) {
-            saw_mod = true;
-            REQUIRE_STR_EQ(m.name, "eboot.bin");
+        if (m.name == "eboot.bin") {
+            ++eboot_records;
+            CHECK(m.base == 0x400000);
+            CHECK(m.size == 0x100000);
             REQUIRE_STR_EQ(m.path, "/app0/eboot.bin");
         }
     }
-    CHECK(saw_mod);
+    CHECK(eboot_records == 1);
+    CHECK(mods.items.size() == 2u);   // eboot + libSceLibcInternal
+    auto segs = b.ps4_modules(h);
+    REQUIRE(segs.ok);
+    REQUIRE(!segs.items.empty());
+    CHECK(segs.items[0].name == "eboot.bin");
+    REQUIRE(segs.items[0].segments.size() == 3u);
+    CHECK(segs.items[0].segments[1].start == 0x480000);
+    CHECK(segs.items[0].segments[2].start == 0x4C8000);
+
+    // the handle knows its name/path without another enumeration
+    slop::core::runtime::process_info_t pi;
+    REQUIRE(b.handle_info(h, pi));
+    REQUIRE_STR_EQ(pi.path, "/app0/eboot.bin");
+    CHECK(pi.arch == slop::core::runtime::arch_t::x64);
 
     CHECK(b.query_arch(h) == slop::core::runtime::arch_t::x64);
     CHECK(b.query_elevation() == slop::core::runtime::elevation_t::system);
@@ -1649,7 +1844,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
         CHECK(a["modules"][0].value("name", "") == "eboot.bin");
         CHECK(a["modules"][0].value("base", 0) == 0x400000);
         CHECK(a.value("thread_count", 0) == 2);
-        CHECK(a.value("region_count", 0) == 3);
+        CHECK(a.value("region_count", 0) == 6);   // 6 raw vm maps; modules coalesce to 2
         REQUIRE(a.contains("candidates"));
         bool saw_game = false, saw_system = false;
         for (const auto& c : a["candidates"]) {
@@ -1875,7 +2070,11 @@ TEST_CASE(ps4_mcp_console_side_tooling) {
         CHECK(!e);
         if (e) std::printf("  ps4_dump_module err: %s\n", r.dump().c_str());
         CHECK(r.value("dumped", false) == true);
+        // all three segments (text, relro, data) of the coalesced module,
+        // not just the first map entry
         CHECK(r.value("bytes_written", 0) == 0x100000ull);
+        CHECK(r.value("segment_count", 0) == 3u);
+        CHECK(r.value("format", std::string{}) == "raw");
         std::ifstream f(out, std::ios::binary);
         REQUIRE(f.good());
         std::vector<uint8_t> head(16);
@@ -1905,4 +2104,962 @@ TEST_CASE(ps4_mcp_console_side_tooling) {
         json d = dbg({{"action", "ps4_detach"}}, e);
         CHECK(!e);
     }
+}
+
+// ===========================================================================
+// wire fault injection, reconnect, events, slots, composites, heartbeat
+
+namespace {
+
+namespace rt = slop::core::runtime;
+namespace dbgns = slop::core::debugger;
+
+bool wait_until(const std::function<bool()>& pred, int timeout_ms) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < until) {
+        if (pred()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return pred();
+}
+
+int64_t ms_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+
+} // namespace
+
+TEST_CASE(ps4_io_error_strings) {
+    CHECK(ps4::io_error_str(ps4::kErrNotConnected).find("not connected") != std::string::npos);
+    CHECK(ps4::io_error_str(ps4::kErrTimeout).find("did not answer in time") != std::string::npos);
+    CHECK(ps4::io_error_str(ps4::kErrDataNull).find("CMD_DATA_NULL") != std::string::npos);
+    CHECK(ps4::io_error_str(ps4::kErrNoSlot).find("no free slot") != std::string::npos);
+    // local backend Win32 codes get the system text
+    CHECK(ps4::io_error_str(ERROR_ACCESS_DENIED).find("Win32 error 5") == 0);
+    CHECK(ps4::io_error_str(0xE00000FFu).find("0xE00000FF") != std::string::npos);
+    CHECK(ps4::status_to_err(ps4::CMD_ALREADY_DEBUG) == ps4::kErrAlreadyDebug);
+    CHECK(ps4::status_to_err(0x12345678u) == ps4::kErrProtocol);
+}
+
+TEST_CASE(ps4_chaos_fragmented_replies_still_work) {
+    // every reply leaves the fake in 1..3-byte pieces: headers, status words
+    // and payloads all arrive split
+    server_guard_t g;
+    g.srv.chaos.fragment = true;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    CHECK(b.fw_string() == "11.00");
+    CHECK(b.ps4_authed());
+    auto procs = b.enum_processes();
+    REQUIRE(procs.ok);
+    CHECK(procs.items.size() == 2u);
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    std::vector<uint8_t> data(300);
+    for (size_t i = 0; i < data.size(); ++i) data[i] = static_cast<uint8_t>(i * 13);
+    REQUIRE(b.write_memory(h, 0x7FFF00000100ull, data.data(), data.size()).ok);
+    std::vector<uint8_t> back(data.size());
+    REQUIRE(b.read_memory(h, 0x7FFF00000100ull, back.data(), back.size()).ok);
+    CHECK(back == data);
+    CHECK(b.connected());
+    b.detach(h);
+}
+
+TEST_CASE(ps4_chaos_peer_close_drops_socket_and_reconnect_restores) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    uint32_t bpi = 0, wpi = 0;
+    REQUIRE(b.ps4_bp_arm(0x400500, backend_ps4_t::kAutoSlot, bpi).ok);
+    REQUIRE(b.ps4_wp_arm(0x7FFF00001000ull, 8, ps4::kWpWrite, backend_ps4_t::kAutoSlot, wpi).ok);
+
+    // the console drops the connection in the middle of a read reply
+    g.srv.chaos.close_after = 6;   // status word + 2 data bytes, then the cut
+    g.srv.chaos.close_cmd = ps4::CMD_PROC_READ;
+    uint8_t buf[64]{};
+    auto io = b.read_memory(h, 0x400000, buf, sizeof(buf));
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrRecvFailed);
+    CHECK(!b.connected());
+    CHECK(b.lost());
+    CHECK(b.drop_count() == 1u);
+    CHECK(!b.lost_reason().empty());
+    CHECK(!b.ps4_debug_attached());   // the payload drops debug state per connection
+    // slots are kept for the reconnect but are not armed right now
+    auto bps = b.ps4_breakpoints();
+    REQUIRE(bps.size() == 1u);
+    if (bps.size() != 1u)
+        std::printf("  chaos: bps.size=%zu wps.size=%zu\n", bps.size(), b.ps4_watchpoints().size());
+    CHECK(!bps[0].armed);
+
+    // every later call fails fast instead of paying another timeout
+    const auto t0 = std::chrono::steady_clock::now();
+    io = b.read_memory(h, 0x400000, buf, sizeof(buf));
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrNotConnected);
+    CHECK(!b.ping());
+    CHECK(ms_since(t0) < 500);
+
+    // reconnect: handshake + auth again, debuggee re-attached, slots re-armed
+    backend_ps4_t::reconnect_report_t rep;
+    REQUIRE(b.reconnect(err, &rep));
+    CHECK(b.connected());
+    CHECK(!b.lost());
+    CHECK(rep.authed);
+    CHECK(rep.debug_pid == kFakePid);
+    CHECK(rep.debug_restored);
+    CHECK(rep.bp_rearmed == 1u);
+    CHECK(rep.wp_rearmed == 1u);
+    CHECK(rep.bp_failed == 0u);
+    CHECK(b.ps4_debug_attached());
+    CHECK(g.srv.connections == 2);
+    CHECK(g.srv.bps[bpi].enabled);
+    CHECK(g.srv.bps[bpi].address == 0x400500);
+    CHECK(g.srv.wps[wpi].enabled);
+    CHECK(g.srv.wps[wpi].address == 0x7FFF00001000ull);
+    bps = b.ps4_breakpoints();
+    REQUIRE(bps.size() == 1u);
+    CHECK(bps[0].armed);
+    // the handle from before the drop keeps working
+    REQUIRE(b.read_memory(h, 0x400000, buf, sizeof(buf)).ok);
+    b.detach(h);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_chaos_stall_hits_idle_timeout) {
+    server_guard_t g;
+    backend_ps4_t b;
+    b.set_timeouts(250, 2000, 2000);
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    g.srv.chaos.stall_cmd = ps4::CMD_PROC_WRITE;   // the payload never answers
+    const uint8_t v[4] = {1, 2, 3, 4};
+    const auto t0 = std::chrono::steady_clock::now();
+    auto io = b.write_memory(h, 0x7FFF00000000ull, v, sizeof(v));
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrTimeout);
+    CHECK(ms_since(t0) < 1500);
+    CHECK(!b.connected());
+    // a fresh connection serves again
+    std::string rerr;
+    REQUIRE(b.reconnect(rerr));
+    CHECK(b.ping());
+    b.detach(h);
+}
+
+TEST_CASE(ps4_chaos_dribble_hits_command_deadline) {
+    // one byte every 40 ms never trips the 250 ms idle timeout, but the whole
+    // command budget (600 ms) stops it instead of stalling for minutes
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    b.set_timeouts(250, 600, 600);
+    std::vector<uint8_t> warm(16);
+    // fill the maps cache first so only the read itself is dribbled
+    REQUIRE(b.read_memory(h, 0x400000, warm.data(), warm.size()).ok);
+    g.srv.chaos.dribble_ms = 40;
+    std::vector<uint8_t> buf(512);
+    const auto t0 = std::chrono::steady_clock::now();
+    auto io = b.read_memory(h, 0x400000, buf.data(), buf.size());
+    const int64_t took = ms_since(t0);
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrTimeout);
+    CHECK(took >= 400);
+    CHECK(took < 3000);
+    CHECK(!b.connected());
+    g.srv.chaos.dribble_ms = 0;
+    b.detach(h);
+}
+
+TEST_CASE(ps4_chaos_garbage_status_is_protocol_error) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto h = b.attach(kFakePid);
+    REQUIRE(h.valid());
+    // a word that is no status at all means the stream is misaligned
+    g.srv.chaos.garbage_cmd = ps4::CMD_PROC_WRITE;
+    const uint8_t v[2] = {9, 9};
+    auto io = b.write_memory(h, 0x7FFF00000000ull, v, sizeof(v));
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrProtocol);
+    CHECK(!b.connected());
+    CHECK(b.lost_reason().find("desync") != std::string::npos);
+    // a non-success *status* is a clean error that keeps the connection
+    REQUIRE(b.reconnect(err));
+    auto bad = b.attach(9999);   // CMD_PROC_INFO -> CMD_ERROR, list fallback misses
+    CHECK(!bad.valid());
+    CHECK(b.connected());
+    b.detach(h);
+}
+
+TEST_CASE(ps4_disasm_region_drains_to_sentinel) {
+    server_guard_t g;
+    g.srv.chaos.disasm_extra = 50;   // the payload streams past max_entries
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    std::vector<backend_ps4_t::ps4_disasm_entry_t> out;
+    bool truncated = false;
+    auto io = b.ps4_disasm_region(kFakePid, 0x400000, 0x100, 10, out, &truncated);
+    REQUIRE(io.ok);
+    CHECK(out.size() == 10u);
+    CHECK(truncated);
+    // the stream is still aligned: the next command parses cleanly
+    CHECK(b.ping());
+    CHECK(b.connected());
+    io = b.ps4_disasm_region(kFakePid, 0x400000, 0x100, 100, out, &truncated);
+    REQUIRE(io.ok);
+    CHECK(out.size() == 52u);
+    CHECK(!truncated);
+    CHECK(b.ping());
+}
+
+TEST_CASE(ps4_read_stack_truncated_bundle_reports_error) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    // two-frame chain at 0x7FFF00007FF0 -> 0x7FFF00008100 -> 0
+    uint64_t v = 0x7FFF00008100ull;
+    g.srv.mem_write(0x7FFF00007FF0ull, reinterpret_cast<uint8_t*>(&v), 8);
+    v = 0x400111;
+    g.srv.mem_write(0x7FFF00007FF8ull, reinterpret_cast<uint8_t*>(&v), 8);
+    std::vector<backend_ps4_t::ps4_stack_frame_t> frames;
+    auto io = b.ps4_read_stack(kFakePid, 0x7FFF00007FF0ull, 0x7FFF00007F00ull, 8, frames);
+    REQUIRE(io.ok);
+    const size_t full = frames.size();
+    CHECK(full >= 2u);
+    g.srv.chaos.stack_truncate = true;   // bundle claims one frame more than it holds
+    io = b.ps4_read_stack(kFakePid, 0x7FFF00007FF0ull, 0x7FFF00007F00ull, 8, frames);
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrProtocol);
+    CHECK(frames.size() == full);   // what parsed is kept
+    CHECK(b.connected());           // the bundle was consumed: stream in sync
+    CHECK(b.ping());
+}
+
+TEST_CASE(ps4_threads_info_is_pipelined_with_names) {
+    server_guard_t g;
+    g.srv.chaos.thread_count = 150;   // three THREAD_INFO batches
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    auto thr = b.enum_threads(kFakePid);
+    REQUIRE(thr.ok);
+    REQUIRE(thr.items.size() == 150u);
+    REQUIRE_STR_EQ(thr.items[0].name, "main");
+    REQUIRE_STR_EQ(thr.items[149].name, "worker250");
+    for (const auto& t : thr.items) CHECK(t.priority == 80);
+    CHECK(b.ping());
+    b.disconnect();
+}
+
+TEST_CASE(ps4_scan_next_crosses_chunk_boundaries) {
+    server_guard_t g;
+    g.srv.add_map("", 0x10000000ull, 0x10040000ull, ps4::kVmProtRead | ps4::kVmProtWrite);
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(b.ps4_authed());
+
+    // unknown-initial-value seed scan: every aligned u32 of 256 KiB
+    std::vector<backend_ps4_t::ps4_scan_hit_t> hits;
+    auto io = b.ps4_scan_first(kFakePid, 0x10000000ull, 0x40000, ps4::kValU32, ps4::kCmpUnknown,
+                               4, {}, hits);
+    REQUIRE(io.ok);
+    REQUIRE(hits.size() == 65536u);   // 4 SCAN_COUNT chunks of 16384 entries (0x20000 bytes)
+
+    // two changes: one in the first chunk, one right at the start of the third
+    const uint32_t five = 5, seven = 7;
+    g.srv.mem_write(0x10000010ull, reinterpret_cast<const uint8_t*>(&five), 4);
+    g.srv.mem_write(0x10020000ull, reinterpret_cast<const uint8_t*>(&seven), 4);
+    std::vector<backend_ps4_t::ps4_scan_hit_t> changed;
+    io = b.ps4_scan_next(kFakePid, 0x10000000ull, ps4::kValU32, ps4::kCmpChanged, hits, {}, changed);
+    REQUIRE(io.ok);
+    REQUIRE(changed.size() == 2u);
+    CHECK(changed[0].addr == 0x10000010ull);
+    CHECK(changed[1].addr == 0x10020000ull);
+    std::vector<backend_ps4_t::ps4_scan_hit_t> same;
+    io = b.ps4_scan_next(kFakePid, 0x10000000ull, ps4::kValU32, ps4::kCmpUnchanged, changed, {}, same);
+    REQUIRE(io.ok);
+    CHECK(same.size() == 2u);
+
+    // malformed previous hits are refused before a byte goes out
+    auto bad = changed;
+    bad[1].value.pop_back();   // 3 bytes where the payload reads 4
+    std::vector<backend_ps4_t::ps4_scan_hit_t> none;
+    io = b.ps4_scan_next(kFakePid, 0x10000000ull, ps4::kValU32, ps4::kCmpChanged, bad, {}, none);
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrBadArg);
+    bad = changed;
+    bad[0].addr = 0x0FFFFFF0ull;   // below the base: no u32 offset
+    io = b.ps4_scan_next(kFakePid, 0x10000000ull, ps4::kValU32, ps4::kCmpChanged, bad, {}, none);
+    CHECK(io.error == ps4::kErrBadArg);
+    // a variable-width type needs seed data to define its width
+    io = b.ps4_scan_next(kFakePid, 0x10000000ull, ps4::kValArrBytes, ps4::kCmpChanged, changed, {}, none);
+    CHECK(io.error == ps4::kErrBadArg);
+    // an empty previous set sends no chunk at all (never a zero-length one)
+    io = b.ps4_scan_next(kFakePid, 0x10000000ull, ps4::kValU32, ps4::kCmpChanged, {}, {}, none);
+    REQUIRE(io.ok);
+    CHECK(none.empty());
+    CHECK(b.connected());
+    CHECK(b.ping());
+}
+
+TEST_CASE(ps4_event_reassembler_unit) {
+    constexpr size_t kN = ps4::kDebugEventSize;
+    std::vector<uint8_t> stream(kN * 3);
+    for (size_t i = 0; i < stream.size(); ++i) stream[i] = static_cast<uint8_t>(i * 7 + i / kN);
+    std::vector<std::vector<uint8_t>> got;
+    auto sink = [&](const uint8_t* p) { got.emplace_back(p, p + kN); };
+    // one byte at a time
+    {
+        rt::ps4_event_reassembler_t ra(kN);
+        size_t n = 0;
+        for (uint8_t byte : stream) n += ra.feed(&byte, 1, sink);
+        CHECK(n == 3u);
+        CHECK(ra.buffered() == 0u);
+    }
+    // ragged pieces: 1.5 packets, then the rest plus half a packet of the next feed
+    {
+        rt::ps4_event_reassembler_t ra(kN);
+        size_t n = ra.feed(stream.data(), kN + kN / 2, sink);
+        CHECK(n == 1u);
+        CHECK(ra.buffered() == kN / 2);
+        n = ra.feed(stream.data() + kN + kN / 2, kN + kN / 2, sink);
+        CHECK(n == 2u);
+        CHECK(ra.buffered() == 0u);
+    }
+    REQUIRE(got.size() == 6u);
+    for (size_t i = 0; i < 6; ++i)
+        CHECK(std::memcmp(got[i].data(), stream.data() + (i % 3) * kN, kN) == 0);
+    rt::ps4_event_t ev;
+    CHECK(!rt::ps4_decode_event(stream.data(), kN - 1, ev));
+}
+
+TEST_CASE(ps4_events_fragmented_on_the_wire) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    std::vector<uint8_t> wire;
+    for (uint32_t i = 0; i < 3; ++i) {
+        auto pkt = g.srv.make_event(7 + i, 5u << 8, "frag", 0x401000 + i, 0);
+        const auto* p = reinterpret_cast<const uint8_t*>(&pkt);
+        wire.insert(wire.end(), p, p + sizeof(pkt));
+    }
+    g.srv.send_event_bytes(wire.data(), wire.size(), 37, 1);   // 37-byte pieces
+    for (uint32_t i = 0; i < 3; ++i) {
+        rt::ps4_event_t ev{};
+        REQUIRE(b.ps4_wait_event(ev, 5000));
+        CHECK(ev.lwpid == 7 + i);
+        CHECK(ev.ctx.rip == 0x401000ull + i);
+        REQUIRE_STR_EQ(ev.thread_name, "frag");
+    }
+    CHECK(b.ps4_events_received() == 3u);
+    CHECK(b.ps4_events_dropped() == 0u);
+    b.disconnect();
+}
+
+TEST_CASE_TIMEOUT(ps4_event_queue_drop_is_counted, 120) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    constexpr uint32_t kTotal = 5000;
+    std::vector<uint8_t> wire;
+    wire.reserve(kTotal * ps4::kDebugEventSize);
+    for (uint32_t i = 0; i < kTotal; ++i) {
+        auto pkt = g.srv.make_event(i, 5u << 8, "storm", 0x400000 + i, 0);
+        const auto* p = reinterpret_cast<const uint8_t*>(&pkt);
+        wire.insert(wire.end(), p, p + sizeof(pkt));
+    }
+    g.srv.send_event_bytes(wire.data(), wire.size(), 0x10000, 0);
+    REQUIRE(wait_until([&] { return b.ps4_events_received() == kTotal; }, 30000));
+    const uint64_t cap = backend_ps4_t::kMaxQueuedEvents;
+    CHECK(b.ps4_pending_events() == cap);
+    CHECK(b.ps4_events_dropped() == kTotal - cap);
+    // the oldest were dropped: the queue starts at event #904
+    auto evs = b.ps4_drain_events(1, false);
+    REQUIRE(evs.size() == 1u);
+    CHECK(evs[0].lwpid == kTotal - cap);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_debug_session_end_clears_slots) {
+    server_guard_t g;
+    server_guard_t other;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+
+    // 1) the payload closes the event channel (debuggee gone)
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    uint32_t idx = 0;
+    REQUIRE(b.ps4_bp_arm(0x400500, backend_ps4_t::kAutoSlot, idx).ok);
+    CHECK(b.ps4_breakpoints().size() == 1u);
+    g.srv.close_event_channel();
+    REQUIRE(wait_until([&] { return !b.ps4_debug_attached(); }, 5000));
+    CHECK(b.ps4_breakpoints().empty());
+
+    // 2) a SIGKILL stop tears the session down
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    REQUIRE(b.ps4_bp_arm(0x400600, backend_ps4_t::kAutoSlot, idx).ok);
+    REQUIRE(b.ps4_wp_arm(0x7FFF00001000ull, 4, ps4::kWpWrite, backend_ps4_t::kAutoSlot, idx).ok);
+    g.srv.send_event(101, 9u << 8, "main", 0);
+    REQUIRE(wait_until([&] { return !b.ps4_debug_attached(); }, 5000));
+    CHECK(b.ps4_breakpoints().empty());
+    CHECK(b.ps4_watchpoints().empty());
+    g.srv.close_event_channel();   // the payload's own cleanup after the kill
+
+    // 3) explicit detach clears; disarming a slot we never armed fails
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    REQUIRE(b.ps4_bp_arm(0x400700, backend_ps4_t::kAutoSlot, idx).ok);
+    CHECK(b.ps4_wp_disarm(2).error == ps4::kErrNotArmed);
+    CHECK(b.ps4_bp_disarm_addr(0x999999).error == ps4::kErrNotArmed);
+    REQUIRE(b.ps4_debug_detach());
+    CHECK(b.ps4_breakpoints().empty());
+
+    // 4) connecting to another console starts from nothing
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    REQUIRE(b.ps4_bp_arm(0x400800, backend_ps4_t::kAutoSlot, idx).ok);
+    uint64_t stub = 0;
+    REQUIRE(b.ps4_install(kFakePid, stub).ok);
+    REQUIRE(b.connect("127.0.0.1", other.srv.port, err));
+    CHECK(!b.ps4_debug_attached());
+    CHECK(b.ps4_breakpoints().empty());
+    REQUIRE(b.ps4_install(kFakePid, stub).ok);
+    CHECK(other.srv.intall_count == 1);   // stub cache was per connection
+    b.disconnect();
+}
+
+TEST_CASE(ps4_slot_arming_reuses_and_reserves) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    uint32_t idx = 0;
+    // not attached: nothing is reserved
+    CHECK(b.ps4_bp_arm(0x400500, backend_ps4_t::kAutoSlot, idx).error == ps4::kErrNotAttached);
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    bool reused = true;
+    REQUIRE(b.ps4_bp_arm(0x400500, backend_ps4_t::kAutoSlot, idx, &reused).ok);
+    CHECK(idx == 0u);
+    CHECK(!reused);
+    uint32_t idx2 = 99;
+    REQUIRE(b.ps4_bp_arm(0x400500, backend_ps4_t::kAutoSlot, idx2, &reused).ok);
+    CHECK(idx2 == 0u);
+    CHECK(reused);
+    REQUIRE(b.ps4_bp_arm(0x400510, backend_ps4_t::kAutoSlot, idx2).ok);
+    CHECK(idx2 == 1u);
+    // fill the four DR slots, the fifth has nowhere to go
+    for (uint64_t i = 0; i < 4; ++i)
+        REQUIRE(b.ps4_wp_arm(0x7FFF00001000ull + i * 8, 8, ps4::kWpRdWr, backend_ps4_t::kAutoSlot, idx).ok);
+    CHECK(b.ps4_wp_arm(0x7FFF00002000ull, 8, ps4::kWpRdWr, backend_ps4_t::kAutoSlot, idx).error ==
+          ps4::kErrNoSlot);
+    CHECK(b.ps4_wp_arm(0x7FFF00002000ull, 3, ps4::kWpRdWr, backend_ps4_t::kAutoSlot, idx).error ==
+          ps4::kErrBadArg);
+    // a payload-side failure leaves the slot free again
+    CHECK(b.ps4_bp_arm(0x400520, 31, idx).error == ps4::kErrBadArg);
+    CHECK(b.ps4_breakpoints().size() == 2u);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_detach_refused_reports_both_pids) {
+    server_guard_t g;
+    backend_ps4_t b;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(b.ps4_debug_attach(kFakePid, err));
+    g.srv.chaos.refuse_detach = true;
+    std::string aerr;
+    CHECK(!b.ps4_debug_attach(42, aerr));
+    CHECK(aerr.find("refused to detach pid 1234") != std::string::npos);
+    CHECK(aerr.find("42") != std::string::npos);
+    CHECK(b.ps4_debug_pid() == kFakePid);   // still the old debuggee
+    CHECK(b.connected());
+    g.srv.chaos.refuse_detach = false;
+    REQUIRE(b.ps4_debug_attach(42, aerr));
+    CHECK(b.ps4_debug_pid() == 42u);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_debug_port_in_use_names_owner) {
+    server_guard_t g;
+    wsa();
+    SOCKET hog = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE(hog != INVALID_SOCKET);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    REQUIRE(bind(hog, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
+    REQUIRE(listen(hog, 1) == 0);
+    int alen = sizeof(a);
+    getsockname(hog, reinterpret_cast<sockaddr*>(&a), &alen);
+    const uint16_t port = ntohs(a.sin_port);
+
+    backend_ps4_t b;
+    b.set_event_port(port);
+    g.srv.event_port = port;
+    std::string err;
+    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    std::string aerr;
+    CHECK(!b.ps4_debug_attach(kFakePid, aerr));
+    CHECK(aerr.find("already in use by pid " + std::to_string(GetCurrentProcessId())) != std::string::npos);
+    CHECK(aerr.find("this process") != std::string::npos);
+    CHECK(b.connected());
+    closesocket(hog);
+    b.disconnect();
+}
+
+TEST_CASE(ps4_composites_on_console_debugger) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    auto dbg = [](const json& a, bool& is_err) {
+        return slop::core::mcp::call_tool("debugger", a, is_err);
+    };
+    bool e = false;
+    json r = dbg({{"action", "ps4_until"}, {"addr", 0x400500}}, e);
+    CHECK(e);   // needs a debug session first
+    r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
+    REQUIRE(!e);
+
+    // run until: one-shot bp, stop at it, slot released afterwards
+    r = dbg({{"action", "ps4_until"}, {"addr", 0x400500}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_until err: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("rip", 0) == 0x400500);
+    CHECK(r.value("debugger", std::string{}) == "ps4");
+    CHECK(!g.srv.bps[r.value("index", 0u)].enabled);
+    r = dbg({{"action", "ps4_bp_list"}}, e);
+    CHECK(r.value("count", 99) == 0);
+
+    // trace every call: three hits, args recorded, stays stopped
+    r = dbg({{"action", "ps4_trace_calls"}, {"addr", 0x400600}, {"count", 3}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    CHECK(r.value("hits_count", 0) == 3);
+    CHECK(r.value("stop_reason", std::string{}) == "count_reached");
+    REQUIRE(r["hits"].size() == 3u);
+    CHECK(r["hits"][2].value("rip", 0) == 0x400600);
+
+    // writer of an address: write watchpoint, stop event + callstack
+    r = dbg({{"action", "ps4_find_write"}, {"addr", 0x7FFF00002000ull}, {"len", 8},
+             {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    CHECK(r.value("halted", false) == true);
+    CHECK(r["event"].value("reason", std::string{}) == "watchpoint");
+    CHECK(r["callstack"].is_array());
+    CHECK(!g.srv.wps[r.value("index", 0u)].enabled);
+
+    // single-step trace
+    r = dbg({{"action", "ps4_trace_steps"}, {"lwpid", 101}, {"count", 3}, {"timeout_ms", 3000}}, e);
+    CHECK(!e);
+    REQUIRE(r["steps"].size() == 3u);
+    const uint64_t r0 = r["steps"][0].value("rip", 0ull);
+    CHECK(r["steps"][1].value("rip", 0ull) == r0 + 1);
+    CHECK(r["steps"][2].value("rip", 0ull) == r0 + 2);
+
+    // a stop that is not the target is resumed past; the user's own bp stays
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400700}}, e);
+    REQUIRE(!e);
+    r = dbg({{"action", "ps4_until"}, {"addr", 0x400800}, {"timeout_ms", 600}}, e);
+    CHECK(!e);
+    CHECK(r.value("halted", true) == false);
+    CHECK(r.value("skipped_stops", 0) > 0);
+    r = dbg({{"action", "ps4_bp_list"}}, e);
+    CHECK(r.value("count", 0) == 1);
+    r = dbg({{"action", "ps4_detach"}}, e);
+    CHECK(!e);
+}
+
+TEST_CASE(ps4_status_console_info_and_mcp_reconnect) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    bool e = false;
+    auto call = [&](const char* tool, const json& a) {
+        return slop::core::mcp::call_tool(tool, a, e);
+    };
+    json r = call("debugger", {{"action", "ps4_status"}});
+    CHECK(!e);
+    CHECK(r.value("fw", std::string{}) == "11.00");
+    CHECK(r.value("connected", false) == true);
+    CHECK(r.value("events_dropped", 99) == 0);
+    CHECK(r.value("lost", true) == false);
+    r = call("target", {{"action", "status"}});
+    CHECK(!e);
+    REQUIRE(r.contains("ps4"));
+    CHECK(r["ps4"].value("fw", std::string{}) == "11.00");
+    CHECK(r["ps4"].value("connected", false) == true);
+    r = call("debugger", {{"action", "ps4_console_info"}});
+    CHECK(!e);
+    if (e) std::printf("  ps4_console_info err: %s\n", r.dump().c_str());
+    CHECK(r.value("alive", false) == true);
+    CHECK(r.value("fw", std::string{}) == "11.00");
+    CHECK(r.value("platform", std::string{}) == "PS4");
+    CHECK(r.value("caps", std::string{}) == "1.1");
+    CHECK(r["foreground_app"].value("pid", 0) == kFakePid);
+
+    // the console drops mid-read: the error names it, status shows lost
+    g.srv.chaos.close_after = 0;
+    g.srv.chaos.close_cmd = ps4::CMD_PROC_READ;
+    r = call("memory", {{"action", "read"}, {"addr", 0x400000}, {"len", 16}});
+    CHECK(e);
+    r = call("target", {{"action", "status"}});
+    CHECK(!e);
+    CHECK(r["ps4"].value("connected", true) == false);
+    CHECK(r["ps4"].value("lost", false) == true);
+    CHECK(r.value("attached", false) == true);   // the session survives the drop
+    r = call("debugger", {{"action", "ps4_regs"}, {"lwpid", 101}});
+    CHECK(e);
+    CHECK(r.dump().find("ps4_reconnect") != std::string::npos);
+
+    r = call("target", {{"action", "ps4_reconnect"}});
+    CHECK(!e);
+    if (e) std::printf("  ps4_reconnect err: %s\n", r.dump().c_str());
+    CHECK(r.value("connected", false) == true);
+    CHECK(r.value("session_kept", false) == true);
+    r = call("memory", {{"action", "read"}, {"addr", 0x400000}, {"len", 16}});
+    CHECK(!e);
+}
+
+TEST_CASE(ps4_dump_module_rebuilds_elf_for_headerless_image) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    // no ELF header in console memory (the SELF loader does not map it);
+    // distinct bytes per segment so the file layout can be checked
+    const uint8_t text[8] = {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3};   // push rbp..ret
+    const uint8_t relro[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    const uint8_t data[4] = {0x11, 0x22, 0x33, 0x44};
+    g.srv.mem_write(0x400000, text, sizeof(text));
+    g.srv.mem_write(0x480010, relro, sizeof(relro));
+    g.srv.mem_write(0x4C8020, data, sizeof(data));
+    bool e = false;
+    const char* out = "ps4_dump_elf_test.elf";
+    json r = slop::core::mcp::call_tool("target",
+        {{"action", "ps4_dump_module"}, {"name", "eboot.bin"}, {"path", out}, {"format", "elf"}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_dump_module elf err: %s\n", r.dump().c_str());
+    CHECK(r.value("elf_header_in_memory", true) == false);
+    CHECK(r.value("segment_count", 0) == 3u);
+    std::ifstream f(out, std::ios::binary);
+    REQUIRE(f.good());
+    std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    f.close();
+    REQUIRE(file.size() > 64u + 3u * 56u);
+    CHECK(std::memcmp(file.data(), "\x7f" "ELF", 4) == 0);
+    CHECK(file[4] == 2);   // ELFCLASS64
+    uint16_t e_type = 0, e_machine = 0, e_phnum = 0;
+    uint64_t e_phoff = 0;
+    std::memcpy(&e_type, file.data() + 16, 2);
+    std::memcpy(&e_machine, file.data() + 18, 2);
+    std::memcpy(&e_phoff, file.data() + 32, 8);
+    std::memcpy(&e_phnum, file.data() + 56, 2);
+    CHECK(e_type == 2);      // ET_EXEC: p_vaddr are runtime addresses
+    CHECK(e_machine == 62);  // EM_X86_64
+    REQUIRE(e_phnum == 3);
+    const uint64_t want_va[3] = {0x400000, 0x480000, 0x4C8000};
+    const uint64_t want_sz[3] = {0x80000, 0x40000, 0x38000};
+    const uint32_t want_fl[3] = {5, 4, 6};   // R+X, R, R+W
+    const uint64_t probe[3] = {0x400000, 0x480010, 0x4C8020};
+    const uint8_t* probe_bytes[3] = {text, relro, data};
+    const size_t probe_len[3] = {sizeof(text), sizeof(relro), sizeof(data)};
+    for (int i = 0; i < 3; ++i) {
+        const uint8_t* ph = file.data() + e_phoff + static_cast<size_t>(i) * 56;
+        uint32_t p_type = 0, p_flags = 0;
+        uint64_t p_offset = 0, p_vaddr = 0, p_filesz = 0, p_memsz = 0;
+        std::memcpy(&p_type, ph, 4);
+        std::memcpy(&p_flags, ph + 4, 4);
+        std::memcpy(&p_offset, ph + 8, 8);
+        std::memcpy(&p_vaddr, ph + 16, 8);
+        std::memcpy(&p_filesz, ph + 32, 8);
+        std::memcpy(&p_memsz, ph + 40, 8);
+        CHECK(p_type == 1);
+        CHECK(p_vaddr == want_va[i]);
+        CHECK(p_filesz == want_sz[i]);
+        CHECK(p_memsz == want_sz[i]);
+        CHECK(p_flags == want_fl[i]);
+        CHECK(p_offset % 0x1000 == p_vaddr % 0x1000);
+        REQUIRE(p_offset + p_filesz <= file.size());
+        CHECK(std::memcmp(file.data() + p_offset + (probe[i] - p_vaddr), probe_bytes[i],
+                          probe_len[i]) == 0);
+    }
+    std::remove(out);
+
+    // raw + load is refused; load=true defaults to the rebuilt ELF and opens it
+    r = slop::core::mcp::call_tool("target",
+        {{"action", "ps4_dump_module"}, {"name", "eboot.bin"}, {"path", out},
+         {"format", "raw"}, {"load", true}}, e);
+    CHECK(e);
+    r = slop::core::mcp::call_tool("target",
+        {{"action", "ps4_dump_module"}, {"base", 0x400000}, {"path", out}, {"load", true}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ps4_dump_module load err: %s\n", r.dump().c_str());
+    CHECK(r.value("format", std::string{}) == "elf");
+    CHECK(r.value("loaded", false) == true);
+    if (!r.value("loaded", false)) std::printf("  load_note: %s\n", r.value("load_note", std::string{}).c_str());
+    json l = slop::core::mcp::call_tool("disasm", {{"action", "disassemble"}, {"addr", 0x400000}, {"count", 2}}, e);
+    CHECK(!e);
+    CHECK(l.dump().find("PUSH") != std::string::npos);   // engine emits capitalized mnemonics
+    slop::core::mcp::call_tool("disasm", {{"action", "unload"}}, e);
+    std::remove(out);
+}
+
+TEST_CASE(ps4_heartbeat_tolerates_misses_and_debug_sessions) {
+    namespace proc = slop::core::process;
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(proc::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    proc::target_set_heartbeat_interval_ms(0);
+    struct restore_t { ~restore_t() { slop::core::process::target_set_heartbeat_interval_ms(1000); } } restore;
+
+    // the pid vanishes from the list: two misses keep the session
+    g.srv.chaos.hide_game_pid = true;
+    proc::target_tick();
+    proc::target_tick();
+    CHECK(proc::active_session() != nullptr);
+    // the pid comes back: the miss counter resets
+    g.srv.chaos.hide_game_pid = false;
+    proc::target_tick();
+    g.srv.chaos.hide_game_pid = true;
+    proc::target_tick();
+    proc::target_tick();
+    CHECK(proc::active_session() != nullptr);
+
+    // while a debug session is attached the heartbeat stays off the wire
+    auto* p = rt::registry_ps4();
+    REQUIRE(p != nullptr);
+    REQUIRE(p->ps4_debug_attach(kFakePid, err));
+    for (int i = 0; i < 5; ++i) proc::target_tick();
+    CHECK(proc::active_session() != nullptr);
+    p->ps4_debug_detach();
+
+    // three consecutive misses drop it
+    proc::target_tick();
+    proc::target_tick();
+    proc::target_tick();
+    CHECK(proc::active_session() == nullptr);
+    g.srv.chaos.hide_game_pid = false;
+}
+
+TEST_CASE(ps4_backend_swap_detaches_session) {
+    namespace proc = slop::core::process;
+    server_guard_t a;
+    server_guard_t b2;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(proc::target_connect_ps4("127.0.0.1", a.srv.port, kFakePid, err));
+    auto held = proc::active_session();   // e.g. a long scan still holding it
+    REQUIRE(held && held->valid());
+    uint8_t v = 0x5A;
+    REQUIRE(held->write(0x7FFF00000040ull, &v, 1).ok);
+
+    // switching consoles detaches the session first ...
+    REQUIRE(rt::registry_connect_ps4("127.0.0.1", b2.srv.port, err));
+    CHECK(proc::active_session() == nullptr);
+    // ... and the old handle can never reach the new console
+    uint8_t got = 0;
+    auto io = held->read(0x7FFF00000040ull, &got, 1);
+    CHECK(!io.ok);
+    CHECK(io.error == ps4::kErrStaleHandle);
+    io = held->write(0x7FFF00000040ull, &v, 1);
+    CHECK(io.error == ps4::kErrStaleHandle);
+    CHECK(b2.srv.mem_byte(0x7FFF00000040ull) == 0);
+    held.reset();
+}
+
+namespace {
+
+// a local process running an endless call loop we can debug: cmd.exe-free
+// shellcode in a PING.EXE that idles for two minutes
+struct loop_target_t {
+    PROCESS_INFORMATION pi{};
+    uint64_t base = 0;
+    bool ok = false;
+
+    // 0x00 loop: rcx = ++counter; rdx = 0x1234; call func; pause; jmp loop
+    // 0x40 func: [data] = rcx; rax = rcx; ret       counter 0x100, data 0x108
+    static std::vector<uint8_t> code() {
+        std::vector<uint8_t> c(0x200, 0xCC);
+        const uint8_t loop[] = {0x48, 0x8B, 0x0D, 0xF9, 0x00, 0x00, 0x00,   // mov rcx,[rip+F9]
+                                0x48, 0xFF, 0xC1,                           // inc rcx
+                                0x48, 0x89, 0x0D, 0xEF, 0x00, 0x00, 0x00,   // mov [rip+EF],rcx
+                                0x48, 0xC7, 0xC2, 0x34, 0x12, 0x00, 0x00,   // mov rdx,0x1234
+                                0xE8, 0x23, 0x00, 0x00, 0x00,               // call 0x40
+                                0xF3, 0x90,                                 // pause
+                                0xEB, 0xDF};                                // jmp 0x00
+        const uint8_t func[] = {0x48, 0x89, 0x0D, 0xC1, 0x00, 0x00, 0x00,   // mov [rip+C1],rcx
+                                0x48, 0x89, 0xC8,                           // mov rax,rcx
+                                0xC3};                                      // ret
+        std::memcpy(c.data(), loop, sizeof(loop));
+        std::memcpy(c.data() + 0x40, func, sizeof(func));
+        std::memset(c.data() + 0x100, 0, 16);
+        return c;
+    }
+
+    loop_target_t() {
+        wchar_t cmd[] = L"C:\\Windows\\System32\\PING.EXE -n 120 127.0.0.1";
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESTDHANDLES;
+        SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+        HANDLE nul = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                 &sa, OPEN_EXISTING, 0, nullptr);
+        si.hStdInput = si.hStdOutput = si.hStdError = nul;
+        if (!CreateProcessW(nullptr, cmd, nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr,
+                            &si, &pi)) {
+            CloseHandle(nul);
+            return;
+        }
+        CloseHandle(nul);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));   // loader done
+        void* mem = VirtualAllocEx(pi.hProcess, nullptr, 0x1000, MEM_COMMIT | MEM_RESERVE,
+                                   PAGE_EXECUTE_READWRITE);
+        if (!mem) return;
+        base = reinterpret_cast<uint64_t>(mem);
+        const auto c = code();
+        SIZE_T n = 0;
+        if (!WriteProcessMemory(pi.hProcess, mem, c.data(), c.size(), &n) || n != c.size()) return;
+        FlushInstructionCache(pi.hProcess, mem, c.size());
+        HANDLE th = CreateRemoteThread(pi.hProcess, nullptr, 0,
+                                       reinterpret_cast<LPTHREAD_START_ROUTINE>(mem), nullptr, 0, nullptr);
+        if (!th) return;
+        CloseHandle(th);
+        ok = true;
+    }
+    ~loop_target_t() {
+        if (pi.hProcess) {
+            TerminateProcess(pi.hProcess, 0);
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hProcess);
+        }
+        if (pi.hThread) CloseHandle(pi.hThread);
+    }
+    bool alive() const { return pi.hProcess && WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT; }
+};
+
+} // namespace
+
+TEST_CASE_TIMEOUT(ps4_composites_on_local_debugger, 180) {
+    // the composite flows run unchanged on the local Win32 debugger, so they
+    // are exercised end to end without a console
+    slop::core::process::target_disconnect_ps4();
+    loop_target_t t;
+    REQUIRE(t.ok);
+    const uint64_t func = t.base + 0x40, data = t.base + 0x108;
+    {
+        dbgns::local_debugger_t d;
+        std::string err;
+        REQUIRE(d.attach(t.pi.dwProcessId, err));
+        if (!err.empty()) std::printf("  local attach: %s\n", err.c_str());
+
+        auto u = dbgns::run_until(d, func, 10000);
+        REQUIRE(u.ok);
+        REQUIRE(u.halted);
+        CHECK(u.ev.ctx.rip == func);
+        CHECK(u.ev.ctx.rdx == 0x1234);
+        CHECK(u.ev.reason == "breakpoint");
+        CHECK(d.breakpoints().empty());   // one-shot slot released
+        CHECK(d.stopped());
+
+        // three consecutive calls, rcx counts up by one per call
+        auto tc = dbgns::trace_calls(d, func, 3, 10000);
+        REQUIRE(tc.ok);
+        REQUIRE(tc.hits.size() == 3u);
+        CHECK(tc.hits[1].ctx.rcx == tc.hits[0].ctx.rcx + 1);
+        CHECK(tc.hits[2].ctx.rcx == tc.hits[1].ctx.rcx + 1);
+        CHECK(tc.stop_reason == "count_reached");
+
+        // step through func: mov [data] -> mov rax -> ret -> pause -> jmp
+        auto ts = dbgns::trace_steps(d, 0, 4, 10000);
+        REQUIRE(ts.ok);
+        REQUIRE(ts.steps.size() == 4u);
+        CHECK(ts.steps[0].rip == func + 0x7);
+        CHECK(ts.steps[1].rip == func + 0xA);
+        CHECK(ts.steps[2].rip == t.base + 0x1D);
+        CHECK(ts.steps[3].rip == t.base + 0x1F);
+        CHECK(ts.steps[0].nbytes == 16u);
+
+        // who writes data: the DR trap fires right after func's store
+        auto fw = dbgns::find_write(d, data, 8, 10000, 8);
+        REQUIRE(fw.ok);
+        REQUIRE(fw.halted);
+        CHECK(fw.ev.reason == "watchpoint");
+        CHECK(fw.ev.ctx.rip == func + 0x7);
+        REQUIRE(!fw.frames.empty());
+        CHECK(d.watchpoints().empty());
+
+        // reads hide our int3 bytes
+        uint32_t idx = 0;
+        bool reused = false;
+        REQUIRE(d.bp_arm(func, idx, reused).ok);
+        uint8_t byte = 0;
+        REQUIRE(d.read(func, &byte, 1));
+        CHECK(byte == 0x48);
+        REQUIRE(d.bp_disarm(func).ok);
+        CHECK(d.bp_disarm(func).error == ps4::kErrNotArmed);
+        d.detach();
+        CHECK(!d.attached());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(t.alive());   // detaching left the process running
+
+    // the same flow through MCP on an attached local test-lab session
+    REQUIRE(slop::core::process::target_attach(t.pi.dwProcessId));
+    bool e = false;
+    json r = slop::core::mcp::call_tool("debugger",
+        {{"action", "ps4_until"}, {"addr", func}, {"timeout_ms", 10000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  local ps4_until err: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("debugger", std::string{}) == "user");
+    CHECK(r.value("rip", 0ull) == func);
+    r = slop::core::mcp::call_tool("debugger",
+        {{"action", "ps4_trace_calls"}, {"addr", func}, {"count", 2}, {"timeout_ms", 10000}}, e);
+    CHECK(!e);
+    CHECK(r.value("hits_count", 0) == 2);
+    r = slop::core::mcp::call_tool("debugger", {{"action", "ps4_detach"}}, e);
+    CHECK(!e);
+    CHECK(r.value("was_attached", false) == true);
+    slop::core::process::target_detach();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(t.alive());
+}
+
+namespace slop::core::mcp::detail { size_t target_icon_cache_size(); }
+
+TEST_CASE(ps4_target_icon_cache_is_bounded) {
+    bool e = false;
+    for (int batch = 0; batch < 5; ++batch) {
+        json paths = json::array();
+        for (int i = 0; i < 64; ++i)
+            paths.push_back("C:\\nonexistent\\slop_icon_" + std::to_string(batch * 64 + i) + ".exe");
+        slop::core::mcp::call_tool("target", {{"action", "icon"}, {"paths", paths}}, e);
+        CHECK(!e);
+    }
+    CHECK(slop::core::mcp::detail::target_icon_cache_size() <= 256u);
+    CHECK(slop::core::mcp::detail::target_icon_cache_size() >= 64u);
 }

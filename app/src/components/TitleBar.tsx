@@ -1,27 +1,28 @@
 // app/src/components/TitleBar.tsx
 // custom titlebar, drag region and buttons through the tauri window api
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { Minus, Square, X } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { isInsecureDev, isTauri } from "@/lib/endpoint";
 import { call } from "@/lib/rpc";
 import { openBinary } from "@/lib/openBinary";
+import { kShortcuts } from "@/lib/shortcuts";
 import { useEngine } from "@/store/engine";
-import { useTheme, type ThemeName, kThemes } from "@/store/theme";
+import { useTheme, kThemes } from "@/store/theme";
 import { useUi } from "@/store/ui";
+import IconButton from "@/components/IconButton";
 import logoUrl from "@/assets/reverse-slop-icon.png";
 
 type MenuName = "File" | "View" | "Window" | "Theme" | "Help";
 
 async function windowAction(action: "minimize" | "toggleMaximize" | "close") {
-  try {
-    const mod = await import("@tauri-apps/api/window");
-    const win = mod.getCurrentWindow();
-    if (action === "minimize") await win.minimize();
-    else if (action === "toggleMaximize") await win.toggleMaximize();
-    else await win.close();
-  } catch {
-    // Running in a plain browser (npm run dev): nothing to drive
-  }
+  // Running in a plain browser (npm run dev): nothing to drive
+  if (!isTauri()) return;
+  const win = getCurrentWindow();
+  if (action === "minimize") await win.minimize();
+  else if (action === "toggleMaximize") await win.toggleMaximize();
+  else await win.close();
 }
 
 export default function TitleBar() {
@@ -33,6 +34,10 @@ export default function TitleBar() {
   const rail = useUi((s) => s.rail);
   const setRail = useUi((s) => s.setRail);
   const openSettings = useUi((s) => s.openSettings);
+  const setPaletteOpen = useUi((s) => s.setPaletteOpen);
+  const inspectorOpen = useUi((s) => s.inspectorOpen);
+  const setInspectorOpen = useUi((s) => s.setInspectorOpen);
+  const resetLayout = useUi((s) => s.resetLayout);
 
   useEffect(() => {
     if (open === null) return;
@@ -50,22 +55,39 @@ export default function TitleBar() {
     };
   }, [open]);
 
-  const menu = (name: MenuName, body: React.ReactNode) => (
+  const menu = (name: MenuName, body: ReactNode) => (
     <div className="menu-root" key={name}>
       <button
+        type="button"
         className="menu-button"
         data-open={open === name}
+        aria-haspopup="menu"
+        aria-expanded={open === name}
         onClick={() => setOpen(open === name ? null : name)}
         onMouseEnter={() => open !== null && setOpen(name)}
       >
         {name}
       </button>
       {open === name && (
-        <div className="menu-pop" onClick={() => setOpen(null)}>
+        <div className="menu-pop" role="menu" aria-label={name} onClick={() => setOpen(null)}>
           {body}
         </div>
       )}
     </div>
+  );
+
+  const item = (label: ReactNode, onClick: () => void, hint?: string, checked?: boolean) => (
+    <button
+      type="button"
+      role={checked === undefined ? "menuitem" : "menuitemradio"}
+      aria-checked={checked}
+      className="menu-item"
+      onClick={onClick}
+    >
+      <span>{label}</span>
+      {hint !== undefined && <span className="faint">{hint}</span>}
+      {checked === true && <span className="faint">●</span>}
+    </button>
   );
 
   return (
@@ -77,33 +99,28 @@ export default function TitleBar() {
       {menu(
         "File",
         <>
-          <button className="menu-item" onClick={() => void openBinary()}>
-            <span>Open binary…</span>
-            <span className="faint">Ctrl+O</span>
-          </button>
-          <button className="menu-item" onClick={() => setRail("targets")}>
-            Attach to process…
-          </button>
-          <div className="menu-sep" />
-          <button
-            className="menu-item"
-            onClick={() => {
-              // Ask the engine to run its own teardown (driver unload included)
-              // before the window goes away, so a closed UI never orphans state
+          {item("Open binary…", () => void openBinary(), "Ctrl+O")}
+          {item("Attach to process…", () => setRail("targets"))}
+          <div className="menu-sep" role="separator" />
+          {item(
+            "Exit",
+            () => {
+              // Ask the engine to run its own teardown before the window goes
+              // away, so a closed UI never orphans state
               void call("app", "shutdown", { reason: "File > Exit" }).finally(() =>
                 windowAction("close"),
               );
-            }}
-          >
-            <span>Exit</span>
-            <span className="faint">Alt+F4</span>
-          </button>
+            },
+            "Alt+F4",
+          )}
         </>,
       )}
 
       {menu(
         "View",
         <>
+          {item("Command palette…", () => setPaletteOpen(true), "Ctrl+K")}
+          <div className="menu-sep" role="separator" />
           {(
             [
               ["targets", "Targets"],
@@ -111,24 +128,24 @@ export default function TitleBar() {
               ["scripts", "Scripts"],
             ] as const
           ).map(([id, label]) => (
-            <button key={id} className="menu-item" onClick={() => setRail(id)}>
-              <span>{label}</span>
-              {rail === id && <span className="faint">●</span>}
-            </button>
+            <Fragment key={id}>{item(label, () => setRail(id), undefined, rail === id)}</Fragment>
           ))}
+          <div className="menu-sep" role="separator" />
+          {item(
+            inspectorOpen ? "Hide inspector" : "Show inspector",
+            () => setInspectorOpen(!inspectorOpen),
+            "Ctrl+Alt+I",
+          )}
+          {item("Reset layout", resetLayout)}
         </>,
       )}
 
       {menu(
         "Window",
         <>
-          <button className="menu-item" onClick={openSettings}>
-            Settings…
-          </button>
-          <div className="menu-sep" />
-          <button className="menu-item" onClick={() => window.location.reload()}>
-            Reload interface
-          </button>
+          {item("Settings…", openSettings, "Ctrl+,")}
+          <div className="menu-sep" role="separator" />
+          {item("Reload interface", () => window.location.reload())}
         </>,
       )}
 
@@ -136,39 +153,65 @@ export default function TitleBar() {
         "Theme",
         <>
           {kThemes.map((t) => (
-            <button
-              key={t.id}
-              className="menu-item"
-              onClick={() => setTheme(t.id as ThemeName)}
-            >
-              <span>{t.label}</span>
-              {theme === t.id && <span className="faint">●</span>}
-            </button>
+            <Fragment key={t.id}>
+              {item(t.label, () => setTheme(t.id), undefined, theme === t.id)}
+            </Fragment>
           ))}
         </>,
       )}
 
       {menu(
         "Help",
-        <button className="menu-item" disabled>
-          reverse-slop 0.1.1
-        </button>,
+        <>
+          {kShortcuts.map((s) => (
+            <div className="menu-item menu-static" key={s.keys}>
+              <span>{s.label}</span>
+              <span className="faint">{s.keys}</span>
+            </div>
+          ))}
+          <div className="menu-sep" role="separator" />
+          <div className="menu-item menu-static">reverse-slop 0.1.1</div>
+        </>,
       )}
 
       <div className="titlebar-drag" data-tauri-drag-region />
 
+      {isInsecureDev() && (
+        <span
+          className="insecure-badge"
+          role="status"
+          data-tip="Browser dev mode: connected to whatever listens on 127.0.0.1:8765 with no token or handshake"
+        >
+          insecure dev mode
+        </span>
+      )}
       {quitting !== null && <span className="faint">shutting down…</span>}
 
       <div className="win-buttons">
-        <button className="win-button" onClick={() => void windowAction("minimize")}>
+        <IconButton
+          tip="Minimize"
+          variant="bare"
+          className="win-button"
+          onClick={() => void windowAction("minimize")}
+        >
           <Minus size={14} />
-        </button>
-        <button className="win-button" onClick={() => void windowAction("toggleMaximize")}>
+        </IconButton>
+        <IconButton
+          tip="Maximize"
+          variant="bare"
+          className="win-button"
+          onClick={() => void windowAction("toggleMaximize")}
+        >
           <Square size={12} />
-        </button>
-        <button className="win-button close" onClick={() => void windowAction("close")}>
+        </IconButton>
+        <IconButton
+          tip="Close"
+          variant="bare"
+          className="win-button close"
+          onClick={() => void windowAction("close")}
+        >
           <X size={14} />
-        </button>
+        </IconButton>
       </div>
     </div>
   );

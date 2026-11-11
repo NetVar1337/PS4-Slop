@@ -1,4 +1,0 @@
-// src/engine/engine.rc — embeds the engine manifest as RT_MANIFEST (ID 1).
-#include <winres.h>
-
-1 24 "engine.manifest"

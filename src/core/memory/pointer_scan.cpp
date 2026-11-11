@@ -7,7 +7,10 @@
 #include "core/memory/read_util.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <thread>
+#include <unordered_map>
 
 namespace slop::core::memory {
 
@@ -55,14 +58,13 @@ pointer_scan(reader_t& r,
     const size_t align = std::max<size_t>(opt.alignment ? opt.alignment : 1, 1);
 
     // Merge the region set into aligned spans
-    struct span_t { uintptr_t begin; uintptr_t end; };
-    std::vector<span_t> spans;
+    std::vector<detail::read_range_t> spans;
     for (const auto& reg : regions) {
         if (reg.size < 8) continue;
         const uintptr_t b = (reg.base + align - 1) / align * align;
         const uintptr_t e = reg.base + reg.size;
         if (e <= b + 8) continue;
-        spans.push_back({b, e});
+        spans.push_back({b, static_cast<size_t>(e - b)});
     }
 
     std::vector<node_t> nodes;
@@ -71,41 +73,36 @@ pointer_scan(reader_t& r,
     nodes.push_back({opt.target, -1, 0});
     std::vector<size_t> frontier{0};
 
-    // One sweep over all spans: collect every aligned non-null qword
+    // One sweep over all spans: collect every aligned non-null qword. Chunks
+    // carry a 7-byte tail so qwords straddling a chunk border are kept
     std::vector<edge_t> edges;
-    constexpr size_t kChunk = 1u << 20;
+    const reader_hints_t hints = r.hints();
+    detail::chunk_walk_t walk;
+    walk.chunk      = hints.chunk_bytes ? hints.chunk_bytes : size_t{1} << 20;
+    walk.overlap    = 7;
+    walk.min_leaf   = 4096;   // unreadability is page granular
+    walk.read_ahead = hints.read_ahead;
 
-    auto sink = [&](uintptr_t run_addr, const uint8_t* data, size_t len) {
-        uintptr_t p = run_addr; // runs may start unaligned to `align`
+    auto sink = [&](size_t, uintptr_t run_addr, const uint8_t* data, size_t len,
+                    uintptr_t limit) -> bool {
         const uintptr_t run_end = run_addr + len;
-        // Align the starting pointer within the run
-        p = (p + align - 1) / align * align;
-        while (p + 8 <= run_end) {
+        // runs may start unaligned to `align`
+        uintptr_t p = (run_addr + align - 1) / align * align;
+        for (; p + 8 <= run_end && p < limit; p += align) {
             uint64_t v;
             std::memcpy(&v, data + (p - run_addr), 8);
-            if (v != 0) { // null pointers are noise
-                edges.push_back({v, p});
-                ++st.edges_explored;
-                if (st.edges_explored > infra::limits::max_pointer_edges) {
-                    st.truncated = true;
-                    return;
-                }
+            if (v == 0) continue; // null pointers are noise
+            edges.push_back({v, p});
+            ++st.edges_explored;
+            if (st.edges_explored > infra::limits::max_pointer_edges) {
+                st.truncated = true;
+                return false;
             }
-            p += align;
         }
+        return true;
     };
 
-    for (const auto& s : spans) {
-        if (st.truncated || tok.cancelled()) break;
-        uintptr_t cursor = s.begin;
-        while (cursor < s.end && !st.truncated) {
-            if (tok.cancelled()) { st.cancelled = true; break; }
-            const size_t want = static_cast<size_t>(
-                std::min<uint64_t>(kChunk, s.end - cursor));
-            detail::resilient_read(r, cursor, want, 8, tok, sink);
-            cursor += want;
-        }
-    }
+    detail::chunked_read(r, spans, walk, tok, sink);
 
     if (tok.cancelled()) { st.cancelled = true; }
     if (!edges.empty() && !st.cancelled) {
@@ -162,14 +159,10 @@ pointer_scan(reader_t& r,
             st.truncated = true;
             break;
         }
-        if (opt.only_module_backed) {
-            // Root (deepest holder) must live in a module-backed region
-            int64_t n = static_cast<int64_t>(i);
-            while (nodes[static_cast<size_t>(n)].parent > 0)
-                n = nodes[static_cast<size_t>(n)].parent;
-            if (!in_module_backed(nodes[static_cast<size_t>(n)].addr, regions))
-                continue;
-        }
+        // Root (the holder the chain starts from, i.e. node i itself) must
+        // live in a module-backed region so it survives restarts
+        if (opt.only_module_backed && !in_module_backed(nodes[i].addr, regions))
+            continue;
         pointer_chain_result_t chain;
         for (int64_t n = static_cast<int64_t>(i); n > 0;
              n = nodes[static_cast<size_t>(n)].parent) {
@@ -181,6 +174,100 @@ pointer_scan(reader_t& r,
     }
 
     return results;
+}
+
+namespace {
+
+// one pass worth of qword reads; chains sharing a root/prefix hit the cache
+class link_reader_t {
+public:
+    link_reader_t(reader_t& r, uint64_t& reads) : r_(r), reads_(reads) {}
+    std::optional<uint64_t> qword(uintptr_t addr) {
+        auto it = cache_.find(addr);
+        if (it != cache_.end()) return it->second;
+        uint64_t v = 0;
+        ++reads_;
+        std::optional<uint64_t> got;
+        if (r_.read(addr, &v, sizeof(v))) got = v;
+        cache_.emplace(addr, got);
+        return got;
+    }
+private:
+    reader_t&                                              r_;
+    uint64_t&                                              reads_;
+    std::unordered_map<uintptr_t, std::optional<uint64_t>> cache_;
+};
+
+template <class Q>
+std::optional<uintptr_t> resolve_with(Q&& qword, const pointer_chain_result_t& chain) {
+    if (chain.addresses.empty() || chain.offsets.size() != chain.addresses.size())
+        return std::nullopt;
+    uintptr_t p = chain.addresses.front();
+    for (const int64_t off : chain.offsets) {
+        const std::optional<uint64_t> v = qword(p);
+        if (!v) return std::nullopt;
+        p = static_cast<uintptr_t>(*v + static_cast<uint64_t>(off));
+    }
+    return p;
+}
+
+} // namespace
+
+std::optional<uintptr_t> pointer_chain_resolve(reader_t& r,
+                                               const pointer_chain_result_t& chain) {
+    return resolve_with([&](uintptr_t a) -> std::optional<uint64_t> {
+        uint64_t v = 0;
+        if (!r.read(a, &v, sizeof(v))) return std::nullopt;
+        return v;
+    }, chain);
+}
+
+std::vector<pointer_chain_result_t>
+pointer_verify(reader_t& r,
+               std::vector<pointer_chain_result_t> chains,
+               const pointer_verify_options_t& opt,
+               const infra::cancel_token_t& tok,
+               pointer_verify_stats_t* stats) {
+    pointer_verify_stats_t local{};
+    pointer_verify_stats_t& st = stats ? *stats : local;
+    st = {};
+    st.checked = chains.size();
+
+    const uint32_t samples  = std::clamp<uint32_t>(opt.samples, 1u, 64u);
+    const uint32_t interval = std::min<uint32_t>(opt.interval_ms, 60'000u);
+
+    for (uint32_t s = 0; s < samples && !chains.empty(); ++s) {
+        if (s > 0 && interval) {
+            // cancellable wait between samples
+            const auto until = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(interval);
+            while (std::chrono::steady_clock::now() < until && !tok.cancelled())
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (tok.cancelled()) { st.cancelled = true; break; }
+
+        link_reader_t links(r, st.reads);
+        auto qword = [&](uintptr_t a) { return links.qword(a); };
+        size_t keep = 0;
+        size_t i    = 0;
+        for (; i < chains.size(); ++i) {
+            if (tok.cancelled()) break;
+            const std::optional<uintptr_t> landed = resolve_with(qword, chains[i]);
+            if (!landed) { ++st.dropped_unreadable; continue; }
+            if (*landed != opt.target) { ++st.dropped_mismatch; continue; }
+            if (keep != i) chains[keep] = std::move(chains[i]);
+            ++keep;
+        }
+        // a cancelled pass keeps the chains it never got to (unverified)
+        for (; i < chains.size(); ++i, ++keep)
+            if (keep != i) chains[keep] = std::move(chains[i]);
+        chains.resize(keep);
+        if (tok.cancelled()) { st.cancelled = true; break; }
+        ++st.samples_done;
+    }
+
+    st.kept = chains.size();
+    return chains;
 }
 
 } // namespace slop::core::memory

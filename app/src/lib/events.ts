@@ -2,7 +2,9 @@
 // eventsource wrapper over the engine stream, the engine pushes state
 // changes and this hands them to subscribers
 
-import { baseUrl, getEndpoint } from "./rpc";
+import { baseUrl, call, getEndpoint } from "./rpc";
+
+export type ImageFormat = "pe" | "macho" | "elf" | "self";
 
 export type EngineEvent =
   | { type: "hello"; data: { output_revision: number } }
@@ -29,6 +31,7 @@ export type EngineEvent =
         error: string;
       };
     }
+  | { type: "image.changed"; data: { loaded: boolean; name?: string; format?: ImageFormat } }
   | { type: "watch.list"; data: { entries: WatchEntry[] } }
   | { type: "watch.values"; data: { attached: boolean; values: WatchValue[] } }
   | { type: "app.quitting"; data: { reason: string } }
@@ -64,15 +67,25 @@ const kEventNames: EventName[] = [
   "target.changed",
   "backend.changed",
   "hype.progress",
+  "image.changed",
   "watch.list",
   "watch.values",
   "app.quitting",
   "server.stopping",
 ];
 
+/** Reconnect delay grows on repeated failures so a dead engine is not hammered. */
+const kRetryMinMs = 1_000;
+const kRetryMaxMs = 8_000;
+
 const handlers = new Map<EventName, Set<Handler>>();
 let source: EventSource | null = null;
 let retry: ReturnType<typeof setTimeout> | null = null;
+let retryDelay = kRetryMinMs;
+let isOpen = false;
+/** Bumped by every connect/disconnect so stale async work can tell it lost. */
+let generation = 0;
+let reconnectHook: (() => Promise<void>) | null = null;
 const statusHandlers = new Set<(open: boolean) => void>();
 
 function emit(name: EventName, raw: string): void {
@@ -108,38 +121,92 @@ export function onConnectionChange(fn: (open: boolean) => void): () => void {
   };
 }
 
+/**
+ * Runs before every automatic reconnect. The Tauri shell uses it to re-resolve
+ * the endpoint, a restarted engine can come back on a different port.
+ */
+export function setReconnectHook(fn: (() => Promise<void>) | null): void {
+  reconnectHook = fn;
+}
+
 function setOpen(open: boolean): void {
+  // A drop is reported once; every open is reported, each one is a fresh
+  // stream and subscribers re-seed their snapshot on it
+  if (!open && !isOpen) return;
+  isOpen = open;
   for (const fn of statusHandlers) fn(open);
 }
 
-export function connect(): void {
-  disconnect();
-  // EventSource cannot send an Authorization header, so a token-protected
-  // engine takes it as a query parameter instead. The listener is loopback-only
-  // and the URL never leaves this process
-  const { token } = getEndpoint();
-  const url = `${baseUrl()}/events${token ? `?token=${encodeURIComponent(token)}` : ""}`;
+export function isConnected(): boolean {
+  return isOpen;
+}
+
+function scheduleRetry(gen: number): void {
+  if (retry !== null || gen !== generation) return;
+  const delay = retryDelay;
+  retryDelay = Math.min(kRetryMaxMs, retryDelay * 2);
+  retry = setTimeout(() => {
+    retry = null;
+    if (gen !== generation) return;
+    const hook = reconnectHook;
+    if (hook === null) {
+      connect();
+      return;
+    }
+    hook()
+      .catch(() => undefined)
+      .finally(() => {
+        if (gen === generation) connect();
+      });
+  }, delay);
+}
+
+function open(gen: number, url: string): void {
   const es = new EventSource(url);
   source = es;
-
-  es.onopen = () => setOpen(true);
+  es.onopen = () => {
+    retryDelay = kRetryMinMs;
+    setOpen(true);
+  };
   es.onerror = () => {
     setOpen(false);
-    // The engine may still be booting, or was restarted. Reconnect on a fixed
-    // delay rather than letting EventSource hammer it
-    if (retry === null && source === es) {
-      retry = setTimeout(() => {
-        retry = null;
-        if (source === es) connect();
-      }, 1000);
-    }
+    // The engine may still be booting, or was restarted. A ticket is single
+    // use, so the browser's own auto-reconnect cannot work: close and come
+    // back through connect() with a fresh one
+    if (source !== es) return;
+    es.close();
+    source = null;
+    scheduleRetry(gen);
   };
   for (const name of kEventNames) {
     es.addEventListener(name, (ev) => emit(name, (ev as MessageEvent<string>).data));
   }
 }
 
+/**
+ * EventSource cannot send an Authorization header. A token-protected engine
+ * hands out a single-use, short-lived ticket over the authenticated /api, and
+ * the stream URL carries only that, never the bearer token itself.
+ */
+export function connect(): void {
+  disconnect();
+  const gen = ++generation;
+  const { token } = getEndpoint();
+  if (token === "") {
+    open(gen, `${baseUrl()}/events`);
+    return;
+  }
+  call<{ ticket?: string }>("app", "events_ticket", {}, { timeoutMs: 10_000 })
+    .then((res) => {
+      if (gen !== generation) return;
+      if (typeof res.ticket !== "string" || res.ticket === "") throw new Error("no ticket");
+      open(gen, `${baseUrl()}/events?ticket=${encodeURIComponent(res.ticket)}`);
+    })
+    .catch(() => scheduleRetry(gen));
+}
+
 export function disconnect(): void {
+  generation++;
   if (retry !== null) {
     clearTimeout(retry);
     retry = null;
@@ -148,4 +215,5 @@ export function disconnect(): void {
     source.close();
     source = null;
   }
+  setOpen(false);
 }

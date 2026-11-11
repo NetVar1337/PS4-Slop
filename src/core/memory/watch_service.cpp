@@ -17,9 +17,10 @@ namespace {
 using json = nlohmann::json;
 namespace bus = infra::event_bus;
 
-// Ported verbatim from view_scanner.cpp: the watch pane never issued more than
-// 64 target reads per pass, so a 4096-entry list could not stall the caller
-constexpr int   kMaxLiveReads   = 64;
+// Per-pass target budgets: the watch pane never issued more than 64 reads per
+// pass (so a 4096-entry list could not stall the caller), and freeze
+// write-backs are capped too, each one is a full roundtrip on a console
+constexpr detail::pass_limits_t kPassLimits{64, 16};
 constexpr int64_t kSampleIntervalMs = 100;   // ~10 Hz
 
 struct state_t {
@@ -28,6 +29,7 @@ struct state_t {
     std::vector<value_t> last;
     uint64_t             next_id     = 1;
     int64_t              last_pass_ms = 0;
+    size_t               cursor       = 0;   // round-robin start for the budgets
 };
 
 state_t& st() {
@@ -206,12 +208,130 @@ size_t size() {
     return s.entries.size();
 }
 
+namespace detail {
+
+namespace {
+
+uint64_t width_mask(size_t n) noexcept {
+    return n >= 8 ? ~uint64_t{0} : ((uint64_t{1} << (n * 8)) - 1);
+}
+
+} // namespace
+
+std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
+                                 const std::vector<value_t>& prev,
+                                 pass_io_t& io, const pass_limits_t& lim,
+                                 size_t& cursor, pass_stats_t* stats) {
+    pass_stats_t local{};
+    pass_stats_t& st = stats ? *stats : local;
+    st = {};
+
+    const size_t count = entries.size();
+    std::vector<value_t> out(count);
+    if (count == 0) { cursor = 0; return out; }
+
+    auto previous = [&](uint64_t id) -> const value_t* {
+        for (const auto& v : prev) if (v.id == id) return &v;
+        return nullptr;
+    };
+
+    const size_t start = cursor % count;
+    bool   have_next = false;
+    size_t next      = start;
+    auto defer = [&](size_t idx) {
+        ++st.deferred;
+        if (!have_next) { have_next = true; next = idx; }
+    };
+
+    for (size_t k = 0; k < count; ++k) {
+        const size_t   idx = (start + k) % count;
+        const entry_t& e   = entries[idx];
+        const size_t   n   = value_size(e.width);
+        value_t&       v   = out[idx];
+        v.id   = e.id;
+        v.addr = e.addr;
+        v.held = e.freeze;
+
+        if (st.reads >= lim.max_reads) {
+            // out of read budget: keep showing what the last pass saw
+            if (const value_t* p = previous(e.id)) {
+                v.ok = p->ok; v.bits = p->bits; v.hold_failed = p->hold_failed;
+            }
+            defer(idx);
+            v.text = v.ok ? format_value_text(e.width, v.bits) : std::string("-");
+            continue;
+        }
+
+        uint64_t live = 0;
+        ++st.reads;
+        const bool read_ok = io.read(e.addr, &live, n);
+        live &= width_mask(n);
+        v.ok   = read_ok;
+        v.bits = read_ok ? live : 0;
+
+        if (e.freeze) {
+            const uint64_t hold = e.frozen_bits & width_mask(n);
+            if (read_ok && live == hold) {
+                // dirty check: the target already holds the value
+                ++st.clean_holds;
+                v.ok = true;
+                v.bits = hold;
+            } else if (st.writes >= lim.max_writes) {
+                // drifted but the write budget is spent: next pass starts here
+                if (const value_t* p = previous(e.id)) v.hold_failed = p->hold_failed;
+                defer(idx);
+            } else {
+                ++st.writes;
+                uint64_t buf = hold;
+                if (io.write(e.addr, &buf, n)) {
+                    v.ok = true;
+                    v.bits = hold;
+                } else {
+                    // the console rejected the hold (read-only page, detached
+                    // session...): surface it instead of claiming success
+                    ++st.write_failures;
+                    v.ok = false;
+                    v.hold_failed = true;
+                }
+            }
+        }
+
+        v.text = v.ok ? format_value_text(e.width, v.bits) : std::string("-");
+    }
+
+    cursor = have_next ? next : start;
+    return out;
+}
+
+} // namespace detail
+
+namespace {
+
+class session_io_t final : public detail::pass_io_t {
+public:
+    explicit session_io_t(runtime::session_t& s) : s_(s) {}
+    bool read(uint64_t addr, void* dst, size_t n) override {
+        const auto io = s_.read(static_cast<uintptr_t>(addr), dst, n);
+        return io.ok && io.bytes == n;
+    }
+    bool write(uint64_t addr, const void* src, size_t n) override {
+        const auto io = s_.write(static_cast<uintptr_t>(addr), src, n);
+        return io.ok && io.bytes == n;
+    }
+private:
+    runtime::session_t& s_;
+};
+
+} // namespace
+
 void tick() {
     state_t& s = st();
 
     // Snapshot under the lock, then touch the target outside it: a kernel-path
     // read must never be holding the list mutex that the UI thread wants
     std::vector<entry_t> snap;
+    std::vector<value_t> prev;
+    size_t cursor = 0;
     {
         std::lock_guard lk(s.mu);
         if (s.entries.empty()) {
@@ -221,7 +341,9 @@ void tick() {
         const int64_t now = infra::steady_ms();
         if (now - s.last_pass_ms < kSampleIntervalMs) return;
         s.last_pass_ms = now;
-        snap = s.entries;
+        snap   = s.entries;
+        prev   = s.last;
+        cursor = s.cursor;
     }
 
     auto session = process::active_session();
@@ -235,43 +357,16 @@ void tick() {
         return;
     }
 
-    std::vector<value_t> sampled;
-    sampled.reserve(snap.size());
-    int reads = 0;
-
-    for (const auto& e : snap) {
-        const size_t n = value_size(e.width);
-        value_t v;
-        v.id   = e.id;
-        v.addr = e.addr;
-        v.held = e.freeze;
-
-        uint64_t bits = 0;
-        if (reads < kMaxLiveReads &&
-            session->read(static_cast<uintptr_t>(e.addr), &bits, n).ok) {
-            ++reads;
-            v.ok   = true;
-            v.bits = bits;
-        }
-
-        if (e.freeze) {
-            // frozen entries report the held value and write it back with the same
-            // truncation the imgui path had
-            v.bits = e.frozen_bits;
-            v.ok   = true;
-            uint64_t hold = e.frozen_bits;
-            session->write(static_cast<uintptr_t>(e.addr), &hold, n);
-        }
-
-        v.text = v.ok ? format_value_text(e.width, v.bits) : std::string("-");
-        sampled.push_back(std::move(v));
-    }
+    session_io_t io(*session);
+    const std::vector<value_t> sampled =
+        detail::sample_pass(snap, prev, io, kPassLimits, cursor);
 
     // Track live values into frozen_bits while unfrozen so that flipping the
     // freeze on latches the value the caller is looking at
     bool changed = false;
     {
         std::lock_guard lk(s.mu);
+        s.cursor = cursor;
         for (const auto& v : sampled) {
             entry_t* e = find(s, v.id);
             if (e && !e->freeze && v.ok) e->frozen_bits = v.bits;
@@ -281,6 +376,8 @@ void tick() {
             for (size_t i = 0; i < sampled.size(); ++i) {
                 if (s.last[i].id != sampled[i].id ||
                     s.last[i].ok != sampled[i].ok ||
+                    s.last[i].held != sampled[i].held ||
+                    s.last[i].hold_failed != sampled[i].hold_failed ||
                     s.last[i].bits != sampled[i].bits) {
                     changed = true;
                     break;
@@ -298,6 +395,7 @@ void tick() {
                            {"addr", v.addr},
                            {"ok", v.ok},
                            {"held", v.held},
+                           {"hold_failed", v.hold_failed},
                            {"bits", v.bits},
                            {"text", v.text}});
     bus::publish("watch.values", json{{"attached", true},

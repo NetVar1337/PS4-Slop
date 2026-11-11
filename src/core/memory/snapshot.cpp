@@ -3,6 +3,7 @@
 #include "core/memory/snapshot.hpp"
 
 #include "core/infra/limits.hpp"
+#include "core/memory/read_util.hpp"
 
 #include <cstring>
 #include <vector>
@@ -26,40 +27,27 @@ region_snapshot_t snapshot_capture(reader_t& r, uintptr_t base, size_t size,
     snap.bytes.assign(size, 0x00);
     snap.size = size;
 
-    constexpr size_t kChunk = 1u << 20;
-    bool holes = false;
+    // chunked walk honouring the reader's hints: a console gets big chunks
+    // with read-ahead and page-granular hole probing (byte bisects would cost
+    // thousands of roundtrips per unreadable page); local readers keep the
+    // byte-exact hole map
+    const reader_hints_t hints = r.hints();
+    detail::chunk_walk_t walk;
+    walk.chunk      = hints.chunk_bytes ? hints.chunk_bytes : size_t{1} << 20;
+    walk.min_leaf   = hints.max_workers == 1 ? 4096 : 1;
+    walk.read_ahead = hints.read_ahead;
 
-    size_t cursor = 0;
-    while (cursor < size) {
-        if (tok.cancelled()) { snap.complete = false; return snap; }
+    uint64_t covered = 0;
+    detail::chunked_read(r, {{base, size}}, walk, tok,
+        [&](size_t, uintptr_t addr, const uint8_t* data, size_t len, uintptr_t) {
+            std::memcpy(snap.bytes.data() + (addr - base), data, len);
+            covered += len;
+            return true;
+        });
+    if (tok.cancelled()) { snap.complete = false; return snap; }
 
-        const size_t want = std::min(kChunk, size - cursor);
-
-        if (r.read(base + cursor, snap.bytes.data() + cursor, want)) {
-            cursor += want;
-            continue;
-        }
-
-        // Bisect down to byte granularity, zero-filling unreadable leaves
-        size_t seg_off = cursor;
-        size_t seg_len = want;
-        struct seg_t { size_t off; size_t len; };
-        std::vector<seg_t> stack{ {seg_off, seg_len} };
-
-        while (!stack.empty()) {
-            if (tok.cancelled()) { snap.complete = false; return snap; }
-            const seg_t s = stack.back();
-            stack.pop_back();
-
-            if (r.read(base + s.off, snap.bytes.data() + s.off, s.len)) continue;
-            if (s.len == 1) { holes = true; continue; }
-            const size_t half = s.len / 2;
-            stack.push_back({s.off, half});
-            stack.push_back({s.off + half, s.len - half});
-        }
-        cursor += want;
-    }
-
+    // unreadable leaves stay zero-filled
+    const bool holes = covered < size;
     snap.complete = !holes && !clamped;
     return snap;
 }

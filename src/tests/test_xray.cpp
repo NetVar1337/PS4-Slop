@@ -5,6 +5,7 @@
 
 #include "harness.hpp"
 
+#include "core/analysis/ps4_syscalls.hpp"
 #include "core/analysis/recover.hpp"
 #include "core/analysis/devirt.hpp"
 #include "core/analysis/xray.hpp"
@@ -12,6 +13,7 @@
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/pe_parser.hpp"
+#include "core/disasm/xrefs.hpp"
 #include "core/debugger/callstack.hpp"
 #include "core/re/type_catalog.hpp"
 
@@ -911,4 +913,195 @@ TEST_CASE(xray_detect_hooks_at_explicit_vas) {
     REQUIRE_EQ(hits.size(), 1u);
     REQUIRE_EQ(hits[0].address, hooked);
     REQUIRE_STR_EQ(hits[0].hook_type.c_str(), "jmp_rel32");
+}
+
+TEST_CASE(xray_syscalls_windows_and_ps4_stub_shapes) {
+    disasm::engine_t eng;
+    REQUIRE(eng.init());
+    synth_pe s;
+    s.code_va = s.base + 0x1000;
+
+    // NT stub: mov r10, rcx ; mov eax, 0x55 ; syscall ; ret
+    const uint64_t nt = s.emit({0x4C, 0x8B, 0xD1, 0xB8, 0x55, 0x00, 0x00, 0x00,
+                                0x0F, 0x05, 0xC3});
+    // Win10 NT stub with the SharedUserData check between number and syscall
+    const uint64_t nt10 = s.emit({0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0x00, 0x00, 0x00,
+                                  0xF6, 0x04, 0x25, 0x08, 0x03, 0xFE, 0x7F, 0x01,
+                                  0x75, 0x03, 0x0F, 0x05, 0xC3});
+    // libkernel wrapper: mov rax, 20 ; mov r10, rcx ; syscall ; jb err ; ret
+    const uint64_t lk = s.emit({0x48, 0xC7, 0xC0, 0x14, 0x00, 0x00, 0x00,
+                                0x49, 0x89, 0xCA, 0x0F, 0x05, 0x72, 0x01, 0xC3});
+    // payload style: mov eax, 591 ; syscall
+    const uint64_t pl = s.emit({0xB8, 0x4F, 0x02, 0x00, 0x00, 0x0F, 0x05, 0xC3});
+    // mov r8d, 5 ; syscall is not a number load
+    s.emit({0x41, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3});
+    s.finish();
+
+    auto r = s.ref(eng);
+    auto hits = xray::detect_syscalls(r, 0, 0);
+    REQUIRE_EQ(hits.size(), 4u);
+    REQUIRE_EQ(hits[0].address, nt);
+    REQUIRE_EQ(hits[0].ssn, 0x55u);
+    REQUIRE_STR_EQ(hits[0].pattern.c_str(), "mov_r10_rcx");
+    REQUIRE(hits[0].name.empty());
+    REQUIRE_EQ(hits[1].address, nt10);
+    REQUIRE_EQ(hits[1].ssn, 0x18u);
+    REQUIRE_EQ(hits[2].address, lk);
+    REQUIRE_STR_EQ(hits[2].pattern.c_str(), "mov_rax_r10_syscall");
+    REQUIRE_EQ(hits[3].address, pl);
+    REQUIRE_STR_EQ(hits[3].pattern.c_str(), "mov_eax_syscall");
+
+    r.abi = xray::syscall_abi_t::ps4;
+    hits = xray::detect_syscalls(r, lk, 15);
+    REQUIRE_EQ(hits.size(), 1u);
+    REQUIRE_EQ(hits[0].ssn, 20u);
+    REQUIRE_STR_EQ(hits[0].name.c_str(), "getpid");
+    hits = xray::detect_syscalls(r, pl, 8);
+    REQUIRE_EQ(hits.size(), 1u);
+    REQUIRE_STR_EQ(hits[0].name.c_str(), "dynlib_dlsym");
+    // the SharedUserData skip is Windows only
+    hits = xray::detect_syscalls(r, nt10, 21);
+    REQUIRE(hits.empty());
+}
+
+TEST_CASE(xray_ps4_syscall_table_names) {
+    namespace an = slop::core::analysis;
+    REQUIRE_STR_EQ(an::ps4_syscall_name(0), "syscall");
+    REQUIRE_STR_EQ(an::ps4_syscall_name(4), "write");
+    REQUIRE_STR_EQ(an::ps4_syscall_name(477), "mmap");
+    REQUIRE_STR_EQ(an::ps4_syscall_name(532), "regmgr_call");
+    REQUIRE_STR_EQ(an::ps4_syscall_name(594), "dynlib_load_prx");
+    REQUIRE_STR_EQ(an::ps4_syscall_name(99), "netcontrol");
+    REQUIRE(an::ps4_syscall_name(8) == nullptr);       // compat creat
+    REQUIRE(an::ps4_syscall_name(100000) == nullptr);
+    REQUIRE_GT(an::ps4_syscall_count(), 500u);
+}
+
+TEST_CASE(xray_function_index_finds_clang_frame_prologues) {
+    disasm::engine_t eng;
+    REQUIRE(eng.init());
+    synth_pe s;
+    s.code_va = s.base + 0x1000;
+    s.emit({0xC3});                                      // entry: ret
+    s.emit({0x0F, 0x1F, 0x40, 0x00});                    // LLVM 4-byte nop pad
+    // push rbp ; mov rbp,rsp ; pop rbp ; ret, reached by nothing
+    const uint64_t padded = s.emit({0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3});
+    s.emit({0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00});
+    const uint64_t padded10 = s.emit({0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3});
+    s.emit({0x48, 0x89, 0xC8});                           // mov rax, rcx (no pad)
+    const uint64_t unpadded = s.emit({0x55, 0x48, 0x89, 0xE5, 0x5D, 0xC3});
+    s.finish();
+
+    disasm::function_index_t fidx;
+    std::vector<float> seen;
+    REQUIRE(fidx.build(s.pe, s.file, eng, s.base, 100,
+                       [&](float p) { seen.push_back(p); }));
+    const auto has = [&](uint64_t va) {
+        for (const auto& f : fidx.functions()) if (f.va == va) return true;
+        return false;
+    };
+    REQUIRE(has(padded));
+    REQUIRE(has(padded10));
+    REQUIRE(!has(unpadded));
+    REQUIRE(!seen.empty());
+    REQUIRE_EQ(seen.back(), 1.0f);
+}
+
+TEST_CASE(xray_function_index_progress_tracks_swept_bytes) {
+    auto& fx = target_fixture();
+    size_t exec_bytes = 0;
+    for (const auto& sec : fx.pe.sections)
+        if (sec.is_executable()) exec_bytes += sec.raw_size;
+    REQUIRE_GT(exec_bytes, size_t{0x4000});
+
+    disasm::function_index_t fidx;
+    std::vector<float> seen;
+    // progress used to be functions found / max_functions, which stays near
+    // zero for the whole sweep; it is now the fraction of bytes swept
+    REQUIRE(fidx.build(fx.pe, fx.file, shared_eng(), fx.base, 100'000,
+                       [&](float p) { seen.push_back(p); }));
+    REQUIRE_GE(seen.size(), 3u);
+    for (size_t i = 1; i < seen.size(); ++i) REQUIRE_GE(seen[i], seen[i - 1]);
+    REQUIRE_EQ(seen.back(), 1.0f);
+    REQUIRE_GT(seen[seen.size() / 2], 0.2f);
+}
+
+namespace {
+
+// one 128 KiB executable section at rva 0x1000: `code_first` picks whether
+// call-dense code or random bytes come first
+struct entropy_split_image {
+    disasm::pe_image_t   pe;
+    std::vector<uint8_t> file;
+    uint64_t base = 0x10000000;
+    uint64_t target = 0;
+
+    explicit entropy_split_image(bool code_first) {
+        constexpr size_t kHalf = 64 * 1024;
+        std::vector<uint8_t> code;
+        code.reserve(kHalf);
+        target = base + 0x1000;   // every call lands on the section start
+        const size_t code_rva = code_first ? 0x1000 : 0x1000 + kHalf;
+        while (code.size() + 5 <= kHalf) {
+            const uint64_t site = base + code_rva + code.size();
+            const int32_t rel = static_cast<int32_t>(
+                static_cast<int64_t>(target) - static_cast<int64_t>(site + 5));
+            code.push_back(0xE8);
+            for (int b = 0; b < 4; ++b) code.push_back(static_cast<uint8_t>(rel >> (8 * b)));
+        }
+        code.resize(kHalf, 0x90);
+        std::vector<uint8_t> noise(kHalf);
+        uint32_t x = 0x12345678u;   // xorshift32, deterministic
+        for (auto& b : noise) {
+            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+            b = static_cast<uint8_t>(x);
+        }
+        file.assign(0x400, 0);
+        const auto& first = code_first ? code : noise;
+        const auto& second = code_first ? noise : code;
+        file.insert(file.end(), first.begin(), first.end());
+        file.insert(file.end(), second.begin(), second.end());
+
+        pe.ok = true;
+        pe.pe32plus = true;
+        pe.machine = 0x8664;
+        pe.image_base = base;
+        pe.size_of_image = 0x1000 + 2 * kHalf;
+        disasm::pe_section_t s;
+        std::memcpy(s.name, ".text", 5);
+        s.rva = 0x1000;
+        s.virtual_size = s.raw_size = static_cast<uint32_t>(2 * kHalf);
+        s.raw_offset = 0x400;
+        s.characteristics = 0x60000020;
+        pe.sections.push_back(s);
+    }
+};
+
+} // namespace
+
+TEST_CASE(xray_xref_entropy_gate_is_per_region) {
+    auto& eng = shared_eng();
+    constexpr uint64_t kHalf = 64 * 1024;
+    {
+        // packed head used to decide for the whole section (first 64 KiB
+        // sampled) and dropped every call in the plain tail
+        entropy_split_image img(false);
+        disasm::xref_index_t idx;
+        REQUIRE(idx.build(img.pe, img.file, eng, img.base));
+        const auto& refs = idx.refs_to(img.target);
+        REQUIRE_GT(refs.size(), size_t{10000});
+        for (const auto& r : idx.targets())
+            for (const auto& x : idx.refs_to(r))
+                REQUIRE_GE(x.from, img.base + 0x1000 + kHalf);
+    }
+    {
+        // plain head, packed tail: head indexed, tail noise ignored
+        entropy_split_image img(true);
+        disasm::xref_index_t idx;
+        REQUIRE(idx.build(img.pe, img.file, eng, img.base));
+        REQUIRE_GT(idx.refs_to(img.target).size(), size_t{10000});
+        for (const auto& r : idx.targets())
+            for (const auto& x : idx.refs_to(r))
+                REQUIRE_LT(x.from, img.base + 0x1000 + kHalf);
+    }
 }

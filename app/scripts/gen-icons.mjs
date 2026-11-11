@@ -213,8 +213,11 @@ const source = decodePng(readFileSync(sourcePath));
 console.log(`source: ${source.width}x${source.height} ${sourcePath}`);
 
 const sizes = [32, 128, 256, 512];
-const rendered = new Map(sizes.map((s) => [s, resample(source.rgba, source.width, source.height, s, s)]));
-for (const s of [16, 48, 64]) rendered.set(s, resample(source.rgba, source.width, source.height, s, s));
+const rendered = new Map(
+  sizes.map((s) => [s, resample(source.rgba, source.width, source.height, s, s)]),
+);
+for (const s of [16, 48, 64])
+  rendered.set(s, resample(source.rgba, source.width, source.height, s, s));
 
 const written = [];
 for (const size of sizes) {

@@ -18,7 +18,7 @@ struct deferred_action_t {
     uint64_t    id = 0;
     std::string kind;          // "call" | "kernel_read" | custom
     std::string params_json;   // opaque to the manager
-    std::string status;        // pending | done | failed | cancelled
+    std::string status;        // pending | running | done | failed | cancelled
     std::string result_json;   // filled by the executor callback
     int64_t     created_ms = 0;
 };

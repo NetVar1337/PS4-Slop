@@ -1,46 +1,47 @@
 // app/src/components/panels/WorkspacePanel.tsx
-// The tabbed centre area, shared across PE, Mach-O and live-target views.
+// The tabbed centre area, shared across ELF, PE, Mach-O and live-target views.
 
-import { useEffect, useState } from "react";
-import { FolderOpen, Plus, ScanSearch, X } from "lucide-react";
+import { FolderOpen, ScanSearch, X } from "lucide-react";
+import IconButton from "@/components/IconButton";
+import Tabs, { panelId, tabId } from "@/components/Tabs";
 import DisassemblyView from "@/components/panels/DisassemblyView";
 import DebuggerView from "@/components/panels/DebuggerView";
 import MemoryView from "@/components/panels/MemoryView";
 import PeView from "@/components/panels/PeView";
 import StringsView from "@/components/panels/StringsView";
+import { browserLabel, formatLabel } from "@/lib/format";
 import { openBinary } from "@/lib/openBinary";
 import { useEngine } from "@/store/engine";
 import { useDisasm } from "@/store/disasm";
+import { useUi, type WorkspaceTab } from "@/store/ui";
 
-type TabId = "disassembly" | "strings" | "memory" | "debugger" | "pe";
-
-// Which tabs read the static analysis session and which need a live process
+// Which tabs read the static analysis session and which need a live process.
 // Getting this wrong is what made Memory and Debugger look broken behind a
-// "no binary loaded" wall they never needed
-const kTabs: readonly { id: TabId; label: string; needs: "image" | "target" }[] = [
+// "no binary loaded" wall they never needed. The debugger renders its own
+// console / attach states.
+const kTabs: readonly { id: WorkspaceTab; label: string; needs: "image" | "target" | "none" }[] = [
   { id: "disassembly", label: "Disassembly", needs: "image" },
   { id: "strings", label: "Strings", needs: "image" },
   { id: "memory", label: "Memory", needs: "target" },
-  { id: "debugger", label: "Debugger", needs: "target" },
-  { id: "pe", label: "PE Browser", needs: "image" },
+  { id: "debugger", label: "Debugger", needs: "none" },
+  { id: "pe", label: "Image Browser", needs: "image" },
 ];
 
 export default function WorkspacePanel() {
-  const [active, setActive] = useState<TabId>("disassembly");
+  const active = useUi((s) => s.workspaceTab);
+  const setActive = useUi((s) => s.setWorkspaceTab);
   const target = useEngine((s) => s.target);
   const hype = useEngine((s) => s.hype);
-  const { image, busy, error, refreshLoaded, unload } = useDisasm();
-  // The session is shared with the ImGui shell and with agents, so the image can
-  // change without this window doing anything, re-read when the engine reports
-  // analysis movement
-  useEffect(() => {
-    void refreshLoaded();
-  }, [refreshLoaded, hype.has_image, hype.ready]);
+  // The session is shared with agents, so the image can change without this
+  // window doing anything; the engine store refreshes the mirror on
+  // image.changed / hype.progress and on every reconnect
+  const { image, busy, error, unload } = useDisasm();
 
-  const tabs = kTabs;
+  const tabLabel = (t: (typeof kTabs)[number]) =>
+    t.id === "pe" ? browserLabel(image.format) : t.label;
 
   const body = () => {
-    const tab = tabs.find((t) => t.id === active);
+    const tab = kTabs.find((t) => t.id === active);
 
     if (tab?.needs === "target" && !target.attached) {
       return (
@@ -74,14 +75,14 @@ export default function WorkspacePanel() {
             <div className="empty-hint">
               {target.attached
                 ? "Open a file, or dump a module from the attached target."
-                : "Open a binary, or attach to a process."}
+                : "Open an ELF / SELF / PRX, or connect a console and dump a module."}
             </div>
-            <button className="row-action" onClick={() => void openBinary()}>
-              <FolderOpen size={12} style={{ marginRight: 6, verticalAlign: -2 }} />
+            <button type="button" className="row-action" onClick={() => void openBinary()}>
+              <FolderOpen size={12} style={{ marginRight: 6, verticalAlign: -2 }} aria-hidden />
               Open binary…
             </button>
             {error !== null && (
-              <div className="empty-hint" style={{ color: "var(--danger)" }}>
+              <div className="empty-hint error-text" role="alert">
                 {error}
               </div>
             )}
@@ -104,61 +105,57 @@ export default function WorkspacePanel() {
     }
   };
 
-  const warning = image.warning || (image.encrypted === true
-    ? "Encrypted image: on-disk code is protected; disassembly may be invalid."
-    : undefined);
+  const warning =
+    image.warning ||
+    (image.encrypted === true
+      ? "Encrypted image: on-disk code is protected; disassembly may be invalid."
+      : undefined);
 
   return (
     <div className="panel">
       <div className="tabs">
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            className="tab"
-            data-active={active === t.id}
-            onClick={() => setActive(t.id)}
-          >
-            {t.id === "pe" && image.format === "macho" ? "Mach-O Browser" : t.label}
-          </button>
-        ))}
-        <button className="tab" data-tip="Add view">
-          <Plus size={13} />
-        </button>
+        <Tabs<WorkspaceTab>
+          items={kTabs.map((t) => ({ id: t.id, label: tabLabel(t) }))}
+          active={active}
+          onChange={setActive}
+          label="Workspace views"
+          idPrefix="workspace"
+        />
         <div className="spacer" />
         {image.ready && (
-          <span
-            className="faint"
-            style={{ alignSelf: "center", fontSize: "var(--type-small)", marginRight: 8 }}
-          >
+          <span className="faint workspace-meta">
             {image.name}
-            {image.format !== undefined ? ` · ${image.format === "macho" ? "Mach-O" : "PE"}` : ""}
+            {image.format !== undefined ? ` · ${formatLabel(image.format)}` : ""}
             {image.arch !== undefined ? ` · ${image.arch}` : ""}
             {hype.running ? ` · analyzing ${Math.round(hype.progress * 100)}%` : ""}
           </span>
         )}
-        <button
-          className="icon-button"
+        <IconButton
+          tip={image.ready ? "Close binary" : "Open binary…"}
           style={{ alignSelf: "center", marginRight: 6 }}
-          data-tip={image.ready ? "Close binary" : "Open binary…"}
           onClick={() => void (image.ready ? unload() : openBinary())}
         >
           {image.ready ? <X size={14} /> : <FolderOpen size={14} />}
-        </button>
+        </IconButton>
       </div>
-      {image.ready && warning !== undefined && (
+      <div className="workspace-body">
+        {image.ready && warning !== undefined && (
+          <div className="workspace-warning" role="alert">
+            {warning}
+          </div>
+        )}
         <div
-          className="empty-hint"
-          role="alert"
-          style={{ padding: "var(--pad-sm) var(--pad-md)", color: "var(--warning)" }}
+          className="panel-body"
+          style={{ overflow: "hidden" }}
+          role="tabpanel"
+          id={panelId("workspace", active)}
+          aria-labelledby={tabId("workspace", active)}
         >
-          {warning}
-        </div>
-      )}
-      <div className="panel-body" style={{ overflow: "hidden" }}>
-        {/* Keyed on the active tab so the enter animation replays on every
-            switch rather than only on first mount. */}
-        <div className="view-swap" key={active}>
-          {body()}
+          {/* Keyed on the active tab so the enter animation replays on every
+              switch rather than only on first mount. */}
+          <div className="view-swap" key={active}>
+            {body()}
+          </div>
         </div>
       </div>
     </div>

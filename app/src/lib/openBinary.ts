@@ -1,26 +1,34 @@
 // app/src/lib/openBinary.ts
 // file picker, tauri dialog in the shell and a prompt in a plain browser
 
+import { open } from "@tauri-apps/plugin-dialog";
+import { isTauri } from "@/lib/endpoint";
 import { useDisasm } from "@/store/disasm";
+
+export const kBinaryFilters = [
+  {
+    name: "Binaries",
+    extensions: ["bin", "elf", "self", "prx", "sprx", "exe", "dll", "sys", "efi", "ipa"],
+  },
+  { name: "PS4 executables", extensions: ["bin", "elf", "self", "prx", "sprx"] },
+  { name: "PE executables", extensions: ["exe", "dll", "sys", "efi"] },
+  { name: "iOS apps", extensions: ["ipa"] },
+  { name: "All files", extensions: ["*"] },
+];
 
 export async function openBinary(): Promise<void> {
   let path: string | null = null;
 
-  try {
-    const dialog = await import("@tauri-apps/plugin-dialog");
-    const picked = await dialog.open({
+  if (isTauri()) {
+    const picked = await open({
       multiple: false,
       directory: false,
       title: "Open binary for analysis",
-      filters: [
-        { name: "Binaries and iOS apps", extensions: ["exe", "dll", "sys", "efi", "bin", "ipa"] },
-        { name: "Executables", extensions: ["exe", "dll", "sys", "efi", "bin"] },
-        { name: "iOS apps", extensions: ["ipa"] },
-        { name: "All files", extensions: ["*"] },
-      ],
+      filters: kBinaryFilters,
     });
     path = typeof picked === "string" ? picked : null;
-  } catch {
+  } else {
+    // Browser dev mode has no native dialog
     const typed = window.prompt("Path to binary");
     path = typed !== null && typed.trim() !== "" ? typed.trim() : null;
   }

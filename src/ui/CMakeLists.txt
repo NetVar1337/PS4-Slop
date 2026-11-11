@@ -32,5 +32,5 @@ target_include_directories(slop_ui PUBLIC "${CMAKE_SOURCE_DIR}/src")
 target_link_libraries(slop_ui PUBLIC slop_imgui slop_core)
 
 if(MSVC)
-    target_compile_options(slop_ui PRIVATE /W4)
+    target_compile_options(slop_ui PRIVATE /W4 /WX)
 endif()

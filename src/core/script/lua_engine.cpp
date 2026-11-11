@@ -6,16 +6,22 @@
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/hyperion_session.hpp"
+#include "core/infra/settings.hpp"
+#include "core/mcp/mcp_tools.hpp"
 #include "core/memory/memscan.hpp"
+#include "core/memory/session_reader.hpp"
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/scan_bridge.hpp"
 
 #include <lua.hpp>
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <optional>
@@ -33,21 +39,71 @@ namespace disasm = slop::core::disasm;
 namespace analysis = slop::core::analysis;
 namespace hs = slop::core::disasm::hyperion_session;
 namespace ds = slop::core::disasm::binary_state;
+using json = nlohmann::json;
 
-constexpr const char* kOutputKey = "__slop_output";
-constexpr const char* kDeadlineKey = "__slop_deadline";
+// per-run state, it is also the allocator userdata so every binding reaches
+// it through lua_getallocf without a registry lookup
+struct script_ctx_t {
+    std::string           output;
+    bool                  output_truncated = false;
+    int64_t               deadline_ms = 0;   // steady clock
+    infra::cancel_token_t cancel;
+    std::mutex*           tool_mu = nullptr;
+    bool                  unsafe = false;
+    size_t                mem_used  = 0;
+    size_t                mem_peak  = 0;
+    size_t                mem_limit = kDefaultMemLimit;
+};
 
-thread_local int64_t t_deadline_ms = 0;
+int64_t now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+script_ctx_t* ctx_of(lua_State* L) {
+    void* ud = nullptr;
+    lua_getallocf(L, &ud);
+    return static_cast<script_ctx_t*>(ud);
+}
+
+// milliseconds left in the script budget, 0 once spent
+int64_t remaining_ms(lua_State* L) {
+    const int64_t left = ctx_of(L)->deadline_ms - now_ms();
+    return left > 0 ? left : 0;
+}
+
+// lua heap capped at mem_limit; growth past it fails as a lua memory error,
+// shrinking never fails (lua relies on that)
+void* capped_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
+    auto* c = static_cast<script_ctx_t*>(ud);
+    const size_t old = ptr ? osize : 0;   // osize is a type tag when ptr is null
+    if (nsize == 0) {
+        c->mem_used -= old;
+        std::free(ptr);
+        return nullptr;
+    }
+    if (nsize > old && c->mem_used - old + nsize > c->mem_limit) return nullptr;
+    void* p = std::realloc(ptr, nsize);
+    if (!p) return nullptr;
+    c->mem_used = c->mem_used - old + nsize;
+    c->mem_peak = std::max(c->mem_peak, c->mem_used);
+    return p;
+}
 
 void out_append(lua_State* L, const std::string& s) {
-    lua_getfield(L, LUA_REGISTRYINDEX, kOutputKey);
-    auto* buf = static_cast<std::string*>(lua_touserdata(L, -1));
-    lua_pop(L, 1);
-    if (buf) *buf += s;
+    script_ctx_t* c = ctx_of(L);
+    if (c->output_truncated) return;
+    if (c->output.size() + s.size() > kMaxOutputBytes) {
+        c->output.append(s, 0, kMaxOutputBytes - c->output.size());
+        c->output += "\n[output truncated]\n";
+        c->output_truncated = true;
+        return;
+    }
+    c->output += s;
 }
 
 uint64_t to_addr(lua_State* L, int idx) {
-    if (lua_isstring(L, idx)) {
+    if (lua_type(L, idx) == LUA_TSTRING) {
         const char* s = lua_tostring(L, idx);
         return std::strtoull(s, nullptr, 0);
     }
@@ -68,7 +124,9 @@ int l_log(lua_State* L) {
 }
 
 int l_version(lua_State* L) {
-    lua_pushstring(L, "reverse-slop script engine (Lua 5.4)");
+    lua_pushstring(L, ctx_of(L)->unsafe
+                          ? "reverse-slop script engine (Lua 5.4, unsafe stdlib)"
+                          : "reverse-slop script engine (Lua 5.4, sandboxed)");
     return 1;
 }
 
@@ -114,6 +172,18 @@ const char* xref_kind_name_lua(hype::XrefType t) {
     }
 }
 
+// auto names (empty, or sub_<hex> with whatever padding or rva base the
+// producer used) become the canonical sub_<VA uppercase hex>, the same name
+// the mcp tools and the ui show; real names pass through
+std::string display_name(std::string name, uint64_t va) {
+    if (name.size() > 4 && name.compare(0, 4, "sub_") == 0 &&
+        std::all_of(name.begin() + 4, name.end(), [](char c) {
+            return std::isxdigit(static_cast<unsigned char>(c)) != 0;
+        }))
+        name.clear();
+    return name.empty() ? disasm::default_function_name(va) : name;
+}
+
 // lua errors longjmp past c++ destructors so never raise while a binary
 // lock is alive, capture the error, drop the lock, then raise
 // and while the lock is held read bin fields directly since the helpers
@@ -138,11 +208,6 @@ hs::session_t* pinned_hype(std::string& err) {
 }
 
 // target
-
-bool session_valid() {
-    auto s = process::active_session();
-    return s && s->valid();
-}
 
 const char* arch_name(runtime::arch_t a) {
     switch (a) {
@@ -175,7 +240,7 @@ int l_target_attach(lua_State* L) {
     const bool ok = process::target_attach(static_cast<uint32_t>(pid));
     lua_pushboolean(L, ok);
     if (!ok) { lua_pushstring(L, "attach failed"); return 2; }
-    auto s = process::active_session();
+    const auto s = process::active_session();
     lua_pushstring(L, s ? s->name().c_str() : "");
     return 2;
 }
@@ -184,24 +249,28 @@ int l_target_status(lua_State* L) {
     lua_createtable(L, 0, 4);
     lua_pushstring(L, runtime::active_badge());
     lua_setfield(L, -2, "backend");
-    auto s = process::active_session();
-    lua_pushboolean(L, session_valid());
+    const auto s = process::active_session();
+    const bool attached = s && s->valid();
+    lua_pushboolean(L, attached);
     lua_setfield(L, -2, "attached");
-    if (session_valid()) {
-        auto s2 = process::active_session();
-        lua_pushinteger(L, s2->pid());         lua_setfield(L, -2, "pid");
-        lua_pushstring(L, s2->name().c_str()); lua_setfield(L, -2, "name");
+    if (attached) {
+        lua_pushinteger(L, s->pid());         lua_setfield(L, -2, "pid");
+        lua_pushstring(L, s->name().c_str()); lua_setfield(L, -2, "name");
     }
     return 1;
 }
 
 // memory
 
-runtime::session_t& need_session_lua(lua_State* L) {
+// the shared_ptr keeps the session alive for the whole binding call even
+// when another thread detaches meanwhile; null when nothing usable is attached
+std::shared_ptr<runtime::session_t> live_session() {
     auto s = process::active_session();
-    if (!s || !s->valid()) lua_fail(L, "no target attached");
-    return *s;
+    if (!s || !s->valid()) return nullptr;
+    return s;
 }
+
+constexpr const char* kNoTarget = "no target attached";
 
 std::vector<uint8_t> hex_decode_str(const std::string& hex, bool* ok) {
     std::vector<uint8_t> out;
@@ -220,29 +289,79 @@ std::vector<uint8_t> hex_decode_str(const std::string& hex, bool* ok) {
     return out;
 }
 
-int l_mem_read(lua_State* L) {
-    auto& s = need_session_lua(L);
+std::string hex_encode(const uint8_t* p, size_t n) {
+    static constexpr char kDigits[] = "0123456789abcdef";
+    std::string out(n * 2, '0');
+    for (size_t i = 0; i < n; ++i) {
+        out[i * 2]     = kDigits[p[i] >> 4];
+        out[i * 2 + 1] = kDigits[p[i] & 0xF];
+    }
+    return out;
+}
+
+// read_hex pushes the bytes as a lowercase hex string, read_bytes as a raw
+// binary string; a short read returns the bytes that were read
+int mem_read_common(lua_State* L, bool as_hex) {
     const uint64_t addr = to_addr(L, 1);
     const uint64_t len = to_addr(L, 2);
-    if (len == 0 || len > (1ull << 20)) return lua_fail(L, "bad length");
-    std::vector<uint8_t> buf(static_cast<size_t>(len));
-    auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
-    if (!io.ok) return lua_fail(L, "read failed");
-    lua_pushlstring(L, reinterpret_cast<const char*>(buf.data()), buf.size());
+    if (len == 0 || len > (1ull << 20)) return lua_fail(L, "bad length (1..1048576)");
+    std::string err;
+    {
+        const auto s = live_session();
+        if (!s) {
+            err = kNoTarget;
+        } else {
+            std::vector<uint8_t> buf(static_cast<size_t>(len));
+            const auto io = s->read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+            if (!io.ok || io.bytes == 0) {
+                char msg[96];
+                std::snprintf(msg, sizeof(msg), "read failed at 0x%llX (error %u)",
+                              static_cast<unsigned long long>(addr), io.error);
+                err = msg;
+            } else {
+                const size_t n = std::min(io.bytes, buf.size());
+                if (as_hex) {
+                    const std::string hex = hex_encode(buf.data(), n);
+                    lua_pushlstring(L, hex.data(), hex.size());
+                } else {
+                    lua_pushlstring(L, reinterpret_cast<const char*>(buf.data()), n);
+                }
+            }
+        }
+    }
+    if (!err.empty()) return lua_fail(L, err.c_str());
     return 1;
 }
 
+int l_mem_read_hex(lua_State* L)   { return mem_read_common(L, true); }
+int l_mem_read_bytes(lua_State* L) { return mem_read_common(L, false); }
+
 int l_mem_write(lua_State* L) {
-    auto& s = need_session_lua(L);
     const uint64_t addr = to_addr(L, 1);
     size_t hex_len = 0;
     const char* hex = luaL_checklstring(L, 2, &hex_len);
-    bool ok = false;
-    auto bytes = hex_decode_str(std::string(hex, hex_len), &ok);
-    if (!ok || bytes.empty()) return lua_fail(L, "bad hex payload");
-    auto io = s.write(static_cast<uintptr_t>(addr), bytes.data(), bytes.size());
-    if (!io.ok) return lua_fail(L, "write failed");
-    lua_pushinteger(L, static_cast<lua_Integer>(io.bytes));
+    std::string err;
+    {
+        bool ok = false;
+        const auto bytes = hex_decode_str(std::string(hex, hex_len), &ok);
+        const auto s = live_session();
+        if (!ok || bytes.empty()) {
+            err = "bad hex payload";
+        } else if (!s) {
+            err = kNoTarget;
+        } else {
+            const auto io = s->write(static_cast<uintptr_t>(addr), bytes.data(), bytes.size());
+            if (!io.ok) {
+                char msg[96];
+                std::snprintf(msg, sizeof(msg), "write failed at 0x%llX (error %u)",
+                              static_cast<unsigned long long>(addr), io.error);
+                err = msg;
+            } else {
+                lua_pushinteger(L, static_cast<lua_Integer>(io.bytes));
+            }
+        }
+    }
+    if (!err.empty()) return lua_fail(L, err.c_str());
     return 1;
 }
 
@@ -260,17 +379,29 @@ memory::value_width_t parse_width(const std::string& w) {
     return memory::value_width_t::i32;
 }
 
+// stops the scan once the script budget is spent or the call is cancelled,
+// so a scan over a large console address space cannot outlive the script
 struct lua_reader_t final : memory::reader_t {
-    runtime::session_t& s;
-    explicit lua_reader_t(runtime::session_t& sess) : s(sess) {}
+    runtime::session_t&       s;
+    const script_ctx_t&       ctx;
+    infra::cancel_source_t&   stop;
+    lua_reader_t(runtime::session_t& sess, const script_ctx_t& c, infra::cancel_source_t& st)
+        : s(sess), ctx(c), stop(st) {}
     bool read(uintptr_t addr, void* dst, size_t len) override {
+        if (ctx.cancel.cancelled() || now_ms() > ctx.deadline_ms) {
+            stop.request();
+            return false;
+        }
         auto io = s.read(addr, dst, len);
         return io.ok && io.bytes == len;
+    }
+    // one worker + large read-ahead chunks on a console (single ps4debug socket)
+    memory::reader_hints_t hints() const noexcept override {
+        return memory::hints_for_backend(runtime::active_kind());
     }
 };
 
 int l_mem_scan(lua_State* L) {
-    auto& sess = need_session_lua(L);
     luaL_checktype(L, 1, LUA_TTABLE);
 
     auto field_s = [&](const char* k) -> std::optional<std::string> {
@@ -320,57 +451,76 @@ int l_mem_scan(lua_State* L) {
         cfg.value2 = memory::value_to_double(width, *v2);
     }
 
-    infra::cancel_token_t tok;
-    lua_reader_t reader(sess);
-
-    // Region set from the active backend (ps4 wire reads on a console)
-    auto regions = runtime::target_scan_regions(sess.handle());
-
-    memory::memscan_t engine;
     std::string err;
-    engine.first_scan(reader, std::move(regions), cfg, tok, &err);
-    if (!err.empty()) return lua_fail(L, err.c_str());
+    {
+        const auto sess = live_session();
+        if (!sess) {
+            err = kNoTarget;
+        } else {
+            infra::cancel_source_t stop;
+            lua_reader_t reader(*sess, *ctx_of(L), stop);
 
-    const auto& hits = engine.results();
-    lua_createtable(L, 0, static_cast<int>(std::min<size_t>(hits.size(), 10000)));
-    int i = 1;
-    for (const auto& h : hits) {
-        if (i > 10000) break;
-        lua_pushinteger(L, static_cast<lua_Integer>(h.address));
-        lua_rawseti(L, -2, i++);
+            // Region set from the active backend (ps4 wire reads on a console)
+            auto regions = runtime::target_scan_regions(sess->handle());
+
+            memory::memscan_t engine;
+            engine.first_scan(reader, std::move(regions), cfg, stop.token(), &err);
+            if (stop.requested())
+                err = ctx_of(L)->cancel.cancelled()
+                          ? "mem.scan cancelled"
+                          : "mem.scan stopped: script execution timed out";
+            if (err.empty()) {
+                const auto& hits = engine.results();
+                lua_createtable(L, static_cast<int>(std::min<size_t>(hits.size(), 10000)), 0);
+                int i = 1;
+                for (const auto& h : hits) {
+                    if (i > 10000) break;
+                    lua_pushinteger(L, static_cast<lua_Integer>(h.address));
+                    lua_rawseti(L, -2, i++);
+                }
+            }
+        }
     }
+    if (!err.empty()) return lua_fail(L, err.c_str());
     return 1;
 }
 
 // live disasm
 
-disasm::engine_t& shared_engine() {
-    static disasm::engine_t eng;
-    return eng;
-}
-
 int l_disasm_disassemble(lua_State* L) {
-    auto& s = need_session_lua(L);
     const uint64_t addr = to_addr(L, 1);
     const uint64_t count_req = to_addr(L, 2);
     const int count = static_cast<int>(
         std::min<uint64_t>(count_req ? count_req : 32, 512));
-    auto& eng = shared_engine();
-    if (!eng.ok() && !eng.init()) return lua_fail(L, "zydis init failed");
-
-    std::vector<uint8_t> buf(static_cast<size_t>(count) * 16 + 16);
-    auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
-    if (!io.ok) return lua_fail(L, "cannot read code range");
-
-    lua_createtable(L, 0, count);
-    size_t off = 0;
-    for (int i = 1; i <= count; ++i) {
-        auto insn = eng.decode(addr + off, buf.data() + off, buf.size() - off);
-        if (!insn) break;
-        lua_pushstring(L, insn->text.c_str());
-        lua_rawseti(L, -2, i);
-        off += insn->length;
+    // one engine per thread, concurrent scripts never share decoder state
+    thread_local disasm::engine_t eng;
+    std::string err;
+    {
+        const auto s = live_session();
+        if (!s) {
+            err = kNoTarget;
+        } else if (!eng.ok() && !eng.init()) {
+            err = "zydis init failed";
+        } else {
+            std::vector<uint8_t> buf(static_cast<size_t>(count) * 16 + 16);
+            const auto io = s->read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+            if (!io.ok || io.bytes == 0) {
+                err = "cannot read code range";
+            } else {
+                const size_t avail = std::min(io.bytes, buf.size());
+                lua_createtable(L, count, 0);
+                size_t off = 0;
+                for (int i = 1; i <= count && off < avail; ++i) {
+                    auto insn = eng.decode(addr + off, buf.data() + off, avail - off);
+                    if (!insn) break;
+                    lua_pushstring(L, insn->text.c_str());
+                    lua_rawseti(L, -2, i);
+                    off += insn->length;
+                }
+            }
+        }
     }
+    if (!err.empty()) return lua_fail(L, err.c_str());
     return 1;
 }
 
@@ -491,10 +641,12 @@ int l_image_status(lua_State* L) {
 }
 
 int l_image_wait_ready(lua_State* L) {
-    const uint64_t timeout_ms = lua_gettop(L) >= 1 ? to_addr(L, 1) : 30000;
+    // never past the script budget: the hook cannot fire while we sleep here
+    const uint64_t timeout_req = lua_gettop(L) >= 1 ? to_addr(L, 1) : 30000;
+    const int64_t budget = std::min<int64_t>(
+        static_cast<int64_t>(std::min<uint64_t>(timeout_req, 300000)), remaining_ms(L));
     const auto deadline =
-        std::chrono::steady_clock::now() +
-        std::chrono::milliseconds(std::clamp<uint64_t>(timeout_ms, 0, 300000));
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(budget);
     for (;;) {
         std::string err;
         bool ready = false;
@@ -518,7 +670,8 @@ int l_image_wait_ready(lua_State* L) {
             lua_pushboolean(L, false);
             return 1;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (ctx_of(L)->cancel.cancelled()) return lua_fail(L, "script cancelled");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 }
 
@@ -610,7 +763,7 @@ int l_disasm_functions(lua_State* L) {
         lua_setfield(L, -2, "va");
         lua_pushinteger(L, static_cast<lua_Integer>(f.size));
         lua_setfield(L, -2, "size");
-        // Name: user symbol > hyperion name > sub_<rva>
+        // Name: user symbol > hyperion name > sub_<VA>
         std::string name;
         const auto sit = bin.symbols.find(f.va);
         if (sit != bin.symbols.end()) {
@@ -624,12 +777,7 @@ int l_disasm_functions(lua_State* L) {
             if (fit != hdb->funcs.end() && !fit->second.name.empty())
                 name = fit->second.name;
         }
-        if (name.empty()) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "sub_%llX",
-                          static_cast<unsigned long long>(f.va - bin.base));
-            name = buf;
-        }
+        name = display_name(std::move(name), f.va);
         lua_pushstring(L, name.c_str());
         lua_setfield(L, -2, "name");
         if (hdb) {
@@ -660,9 +808,6 @@ int l_disasm_function_at(lua_State* L) {
     auto& bin = ds::get();
     if (bin.hype && bin.hype->ready()) {
         if (const hype::Function* f = bin.hype->function_at(va); f) {
-            const uint64_t img_base =
-                bin.hype->db().image_base ? bin.hype->db().image_base
-                                          : bin.base;
             std::string name;
             const auto sit = bin.symbols.find(f->entry);
             if (sit != bin.symbols.end()) name = sit->second;
@@ -671,12 +816,7 @@ int l_disasm_function_at(lua_State* L) {
                 if (nit != bin.hype->db().names.end()) name = nit->second;
             }
             if (name.empty() && !f->name.empty()) name = f->name;
-            if (name.empty()) {
-                char buf[32];
-                std::snprintf(buf, sizeof(buf), "sub_%llX",
-                              static_cast<unsigned long long>(f->entry - img_base));
-                name = buf;
-            }
+            name = display_name(std::move(name), f->entry);
             lua_createtable(L, 0, 4);
             lua_pushinteger(L, static_cast<lua_Integer>(f->entry));
             lua_setfield(L, -2, "va");
@@ -700,16 +840,11 @@ int l_disasm_function_at(lua_State* L) {
         for (const auto& fn : bin.fns.functions())
             if (fn.va == f) { size = fn.size; break; }
         // Read the symbol directly, ds::symbol_name() re-takes this mutex
-        // Fall back to sub_<rva> so a function entry is never nameless
+        // Fall back to sub_<VA> so a function entry is never nameless
         std::string name;
         const auto sit = bin.symbols.find(f);
         if (sit != bin.symbols.end()) name = sit->second;
-        if (name.empty()) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "sub_%llX",
-                          static_cast<unsigned long long>(f - bin.base));
-            name = buf;
-        }
+        name = display_name(std::move(name), f);
         lua_createtable(L, 0, 3);
         lua_pushinteger(L, static_cast<lua_Integer>(f));
         lua_setfield(L, -2, "va");
@@ -907,7 +1042,7 @@ int l_name_get(lua_State* L) {
     {
         ds::binary_lock_t lock;
         auto& bin = ds::get();
-        // user symbol > hyperion name > sub_<rva> (same precedence as decomp)
+        // user symbol > hyperion name > sub_<VA> (same precedence as decomp)
         // bin.symbols is read directly, symbol_name() re-takes this mutex
         const auto sit = bin.symbols.find(va);
         if (sit != bin.symbols.end()) name = sit->second;
@@ -916,15 +1051,14 @@ int l_name_get(lua_State* L) {
             if (nit != bin.hype->db().names.end()) name = nit->second;
         }
         if (name.empty()) {
-            // If a legacy-index function starts here, fall back to sub_<rva>
+            // a legacy-index function starting here gets the canonical sub_ name
             for (const auto& f : bin.fns.functions())
                 if (f.va == va) {
-                    char buf[32];
-                    std::snprintf(buf, sizeof(buf), "sub_%llX",
-                                  static_cast<unsigned long long>(va - bin.base));
-                    name = buf;
+                    name = disasm::default_function_name(va);
                     break;
                 }
+        } else {
+            name = display_name(std::move(name), va);
         }
     }
     if (name.empty()) { lua_pushnil(L); return 1; }
@@ -1044,8 +1178,8 @@ int l_decomp_function(lua_State* L) {
                 auto& bin = ds::get();
                 const auto& db = hype->db();
 
-                // display name precedence, user symbol then hyperion name then sub rva,
-                // read directly since the helper re takes the mutex
+                // display name precedence, user symbol then hyperion name then
+                // sub_<VA>, read directly since the helper re takes the mutex
                 std::string fname;
                 const auto sit = bin.symbols.find(entry);
                 if (sit != bin.symbols.end()) fname = sit->second;
@@ -1053,14 +1187,7 @@ int l_decomp_function(lua_State* L) {
                     const auto nit = db.names.find(entry);
                     if (nit != db.names.end()) fname = nit->second;
                 }
-                const uint64_t img_base =
-                    db.image_base ? db.image_base : bin.base;
-                if (fname.empty()) {
-                    char buf[32];
-                    std::snprintf(buf, sizeof(buf), "sub_%llX",
-                                  static_cast<unsigned long long>(entry - img_base));
-                    fname = buf;
-                }
+                fname = display_name(std::move(fname), entry);
 
                 lua_createtable(L, 0, 5);
                 lua_pushinteger(L, static_cast<lua_Integer>(entry));
@@ -1356,132 +1483,696 @@ void append_value(lua_State* L, int idx, int depth) {
     }
 }
 
+// count hook: every kHookInstructions vm instructions, raise once the
+// budget is spent or the caller cancelled
 void timeout_hook(lua_State* L, lua_Debug*) {
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count() >
-        t_deadline_ms) {
-        luaL_where(L, 1);
-        lua_pushstring(L, "script execution timed out");
-        lua_concat(L, 2);
-        lua_error(L);
+    const script_ctx_t* c = ctx_of(L);
+    const char* why = c->cancel.cancelled()       ? "script cancelled"
+                    : now_ms() > c->deadline_ms   ? "script execution timed out"
+                                                  : nullptr;
+    if (!why) return;
+    luaL_where(L, 1);
+    lua_pushstring(L, why);
+    lua_concat(L, 2);
+    lua_error(L);
+}
+
+// per binding serialization with the mcp tools: the tool mutex is taken for
+// one binding call, never across the script. waiting for it honours the
+// script deadline and cancellation, and the binding runs under lua_pcall so
+// the mutex is released before any lua error propagates
+bool acquire_tool_lock(const script_ctx_t* c) {
+    if (!c->tool_mu) return true;
+    for (;;) {
+        if (c->tool_mu->try_lock()) return true;
+        if (c->cancel.cancelled() || now_ms() > c->deadline_ms) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
-} // namespace
+int locked_call(lua_State* L, lua_CFunction f) {
+    const script_ctx_t* c = ctx_of(L);
+    const int nargs = lua_gettop(L);
+    lua_pushcfunction(L, f);
+    lua_insert(L, 1);
+    if (!acquire_tool_lock(c))
+        return lua_fail(L, c->cancel.cancelled()
+                               ? "script cancelled while waiting for the tool lock"
+                               : "script execution timed out while waiting for the tool lock");
+    const int st = lua_pcall(L, nargs, LUA_MULTRET, 0);
+    if (c->tool_mu) c->tool_mu->unlock();
+    if (st != LUA_OK) return lua_error(L);
+    return lua_gettop(L);
+}
 
-lua_run_result_t lua_run(const std::string& code, int timeout_ms) {
-    lua_run_result_t res;
+template <lua_CFunction F>
+int locked(lua_State* L) {
+    return locked_call(L, F);
+}
 
-    lua_State* L = luaL_newstate();
-    if (!L) {
-        res.error = "lua_newstate failed";
-        return res;
+// json <-> lua for the bindings that run mcp actions
+
+constexpr int kMaxJsonDepth = 32;
+
+void push_json(lua_State* L, const json& j, int depth) {
+    if (depth > kMaxJsonDepth) { lua_pushnil(L); return; }
+    switch (j.type()) {
+    case json::value_t::object: {
+        lua_createtable(L, 0, static_cast<int>(std::min<size_t>(j.size(), 4096)));
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            if (it.value().is_null()) continue;
+            push_json(L, it.value(), depth + 1);
+            lua_setfield(L, -2, it.key().c_str());
+        }
+        return;
+    }
+    case json::value_t::array: {
+        lua_createtable(L, static_cast<int>(std::min<size_t>(j.size(), 65536)), 0);
+        lua_Integer i = 1;
+        for (const auto& v : j) {
+            push_json(L, v, depth + 1);
+            lua_rawseti(L, -2, i++);
+        }
+        return;
+    }
+    case json::value_t::string: {
+        const auto& s = j.get_ref<const std::string&>();
+        lua_pushlstring(L, s.data(), s.size());
+        return;
+    }
+    case json::value_t::boolean:
+        lua_pushboolean(L, j.get<bool>());
+        return;
+    case json::value_t::number_unsigned:
+        // addresses keep their 64-bit pattern (lua integers are signed)
+        lua_pushinteger(L, static_cast<lua_Integer>(j.get<uint64_t>()));
+        return;
+    case json::value_t::number_integer:
+        lua_pushinteger(L, static_cast<lua_Integer>(j.get<int64_t>()));
+        return;
+    case json::value_t::number_float:
+        lua_pushnumber(L, j.get<double>());
+        return;
+    default:
+        lua_pushnil(L);
+        return;
+    }
+}
+
+// a sequence 1..n becomes an array, anything else an object; integers keep
+// their bit pattern as unsigned so high addresses survive. err is set for
+// values json cannot carry (functions, userdata, cycles past the depth cap)
+json lua_to_json(lua_State* L, int idx, int depth, std::string& err) {
+    const int at = lua_absindex(L, idx);
+    switch (lua_type(L, at)) {
+    case LUA_TNIL:     return nullptr;
+    case LUA_TBOOLEAN: return lua_toboolean(L, at) != 0;
+    case LUA_TNUMBER:
+        if (lua_isinteger(L, at))
+            return static_cast<uint64_t>(lua_tointeger(L, at));
+        return lua_tonumber(L, at);
+    case LUA_TSTRING: {
+        size_t len = 0;
+        const char* s = lua_tolstring(L, at, &len);
+        return std::string(s, len);
+    }
+    case LUA_TTABLE: {
+        if (depth > kMaxJsonDepth) { err = "table nesting too deep"; return nullptr; }
+        const lua_Unsigned n = lua_rawlen(L, at);
+        size_t keys = 0;
+        bool seq = true;
+        lua_pushnil(L);
+        while (lua_next(L, at) != 0) {
+            ++keys;
+            if (!lua_isinteger(L, -2) || lua_tointeger(L, -2) < 1 ||
+                static_cast<lua_Unsigned>(lua_tointeger(L, -2)) > n)
+                seq = false;
+            lua_pop(L, 1);
+        }
+        if (keys > 0 && seq && keys == n) {
+            json arr = json::array();
+            for (lua_Unsigned i = 1; i <= n && err.empty(); ++i) {
+                lua_rawgeti(L, at, static_cast<lua_Integer>(i));
+                arr.push_back(lua_to_json(L, -1, depth + 1, err));
+                lua_pop(L, 1);
+            }
+            return arr;
+        }
+        json obj = json::object();
+        lua_pushnil(L);
+        while (err.empty() && lua_next(L, at) != 0) {
+            std::string key;
+            if (lua_type(L, -2) == LUA_TSTRING) {
+                key = lua_tostring(L, -2);
+            } else if (lua_isinteger(L, -2)) {
+                key = std::to_string(lua_tointeger(L, -2));
+            } else {
+                err = "table keys must be strings or integers";
+                lua_pop(L, 2);
+                break;
+            }
+            obj[key] = lua_to_json(L, -1, depth + 1, err);
+            lua_pop(L, 1);
+        }
+        return obj;
+    }
+    default:
+        err = std::string("cannot pass a ") + luaL_typename(L, at) + " to an mcp action";
+        return nullptr;
+    }
+}
+
+// argument access for the mcp-action bindings that never raises: problems
+// land in err so no lua error fires while the json/string locals are alive
+struct arg_reader_t {
+    lua_State*   L;
+    std::string& err;
+
+    bool has(int idx) const { return !lua_isnoneornil(L, idx); }
+
+    uint64_t u64(int idx, const char* what) {
+        if (!has(idx)) {
+            if (err.empty()) err = std::string(what) + " required";
+            return 0;
+        }
+        return to_addr(L, idx);
     }
 
-    std::string output;
-    t_deadline_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count() +
-        std::clamp<int64_t>(timeout_ms, 500, 60000);
+    std::string str(int idx, const char* what) {
+        if (lua_type(L, idx) != LUA_TSTRING) {
+            if (err.empty()) err = std::string(what) + " must be a string";
+            return {};
+        }
+        size_t len = 0;
+        const char* s = lua_tolstring(L, idx, &len);
+        return std::string(s, len);
+    }
 
-    luaL_openlibs(L);
+    // a blocking wait never outlives the script: the requested timeout is
+    // cut to the remaining budget, a spent budget is the timeout error
+    int64_t budget(int idx, int64_t def) {
+        const int64_t req = has(idx) ? static_cast<int64_t>(to_addr(L, idx)) : def;
+        const int64_t left = remaining_ms(L);
+        if (left <= 0 && err.empty()) err = "script execution timed out";
+        return std::clamp<int64_t>(req, 1, std::max<int64_t>(1, std::min<int64_t>(left, kMaxTimeoutMs)));
+    }
+};
 
-    lua_pushlightuserdata(L, &output);
-    lua_setfield(L, LUA_REGISTRYINDEX, kOutputKey);
-    lua_pushlightuserdata(L, &t_deadline_ms);
-    lua_setfield(L, LUA_REGISTRYINDEX, kDeadlineKey);
-    lua_sethook(L, timeout_hook, LUA_MASKCOUNT, 5'000'000);
+using fill_fn = void (*)(arg_reader_t&, json&);
+
+// builds the arguments, runs one mcp tool call (call_tool takes the tool
+// mutex itself, so these bindings are never wrapped in locked<>) and leaves
+// either the result table (true) or the error message (false) on the stack
+bool mcp_action_impl(lua_State* L, const char* tool, const char* action, fill_fn fill) {
+    std::string err;
+    json args = {{"action", action}};
+    arg_reader_t rd{L, err};
+    if (fill) fill(rd, args);
+    if (err.empty()) {
+        bool is_error = false;
+        const json out = mcp::call_tool(tool, args, is_error, ctx_of(L)->cancel);
+        if (!is_error) {
+            push_json(L, out, 0);
+            return true;
+        }
+        const auto it = out.find("error");
+        err = it != out.end() && it->is_string() ? it->get<std::string>()
+                                                  : std::string(tool) + " action failed";
+    }
+    lua_pushlstring(L, err.data(), err.size());
+    return false;
+}
+
+// raises from a frame without C++ locals
+__declspec(noinline) int mcp_action(lua_State* L, const char* tool, const char* action,
+                                    fill_fn fill = nullptr) {
+    if (mcp_action_impl(L, tool, action, fill)) return 1;
+    luaL_where(L, 1);
+    lua_insert(L, -2);
+    lua_concat(L, 2);
+    return lua_error(L);
+}
+
+// slop.ps4: console connection (target ps4_* / debugger status)
+
+void fill_host_port(arg_reader_t& a, json& j) {
+    j["host"] = a.str(1, "host");
+    if (a.has(2)) j["port"] = a.u64(2, "port");
+}
+
+int l_ps4_connect(lua_State* L)    { return mcp_action(L, "target", "ps4_connect", fill_host_port); }
+int l_ps4_auto(lua_State* L)       { return mcp_action(L, "target", "ps4_auto", fill_host_port); }
+int l_ps4_disconnect(lua_State* L) { return mcp_action(L, "target", "ps4_disconnect"); }
+int l_ps4_status(lua_State* L)     { return mcp_action(L, "debugger", "status"); }
+
+// slop.debugger: the debugger ps4_* actions
+
+int l_dbg_status(lua_State* L)     { return mcp_action(L, "debugger", "ps4_status"); }
+int l_dbg_detach(lua_State* L)     { return mcp_action(L, "debugger", "ps4_detach"); }
+int l_dbg_bp_list(lua_State* L)    { return mcp_action(L, "debugger", "ps4_bp_list"); }
+int l_dbg_watch_list(lua_State* L) { return mcp_action(L, "debugger", "ps4_watch_list"); }
+
+int l_dbg_attach(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_attach", [](arg_reader_t& a, json& j) {
+        j["pid"] = a.u64(1, "pid");
+    });
+}
+
+int l_dbg_bp_set(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_bp_set", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+        if (a.has(2)) j["index"] = a.u64(2, "index");
+    });
+}
+
+int l_dbg_bp_clear(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_bp_clear", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+    });
+}
+
+int l_dbg_watch_set(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_watch_set", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+        if (a.has(2)) j["len"] = a.u64(2, "len");
+        if (a.has(3)) j["type"] = a.u64(3, "type");
+    });
+}
+
+int l_dbg_watch_clear(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_watch_clear", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+    });
+}
+
+int l_dbg_continue(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_continue", [](arg_reader_t& a, json& j) {
+        if (a.has(1)) j["stop"] = a.u64(1, "stop");
+    });
+}
+
+int l_dbg_step(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_step", [](arg_reader_t& a, json& j) {
+        if (a.has(1)) j["lwpid"] = a.u64(1, "lwpid");
+    });
+}
+
+int l_dbg_suspend(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_suspend", [](arg_reader_t& a, json& j) {
+        j["lwpid"] = a.u64(1, "lwpid");
+    });
+}
+
+int l_dbg_resume(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_resume", [](arg_reader_t& a, json& j) {
+        j["lwpid"] = a.u64(1, "lwpid");
+    });
+}
+
+int l_dbg_wait(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_wait", [](arg_reader_t& a, json& j) {
+        j["timeout_ms"] = a.budget(1, 5000);
+    });
+}
+
+int l_dbg_events(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_events", [](arg_reader_t& a, json& j) {
+        if (a.has(1)) j["max"] = a.u64(1, "max");
+    });
+}
+
+int l_dbg_regs(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_regs", [](arg_reader_t& a, json& j) {
+        if (a.has(1)) j["lwpid"] = a.u64(1, "lwpid");
+    });
+}
+
+int l_dbg_set_reg(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_set_reg", [](arg_reader_t& a, json& j) {
+        j["lwpid"] = a.u64(1, "lwpid");
+        j["name"]  = a.str(2, "name");
+        j["value"] = a.u64(3, "value");
+    });
+}
+
+int l_dbg_callstack(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_callstack", [](arg_reader_t& a, json& j) {
+        if (a.has(1)) j["lwpid"] = a.u64(1, "lwpid");
+        if (a.has(2)) j["depth"] = a.u64(2, "depth");
+    });
+}
+
+int l_dbg_call(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_call", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+        if (a.has(2)) {
+            if (lua_type(a.L, 2) != LUA_TTABLE) {
+                if (a.err.empty()) a.err = "debugger.call: args must be a table";
+                return;
+            }
+            const lua_Unsigned n = lua_rawlen(a.L, 2);
+            if (n > 6) {
+                if (a.err.empty())
+                    a.err = "debugger.call: at most 6 arguments (rdi,rsi,rdx,rcx,r8,r9)";
+                return;
+            }
+            json args = json::array();
+            for (lua_Unsigned i = 1; i <= n; ++i) {
+                lua_rawgeti(a.L, 2, static_cast<lua_Integer>(i));
+                args.push_back(to_addr(a.L, -1));
+                lua_pop(a.L, 1);
+            }
+            j["args"] = std::move(args);
+        }
+        if (a.has(3)) j["pid"] = a.u64(3, "pid");
+    });
+}
+
+int l_dbg_run_until(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_until", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+        j["timeout_ms"] = a.budget(2, 30000);
+    });
+}
+
+int l_dbg_find_write(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_find_write", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+        if (a.has(2)) j["len"] = a.u64(2, "len");
+        j["timeout_ms"] = a.budget(3, 30000);
+    });
+}
+
+int l_dbg_trace_calls(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_trace_calls", [](arg_reader_t& a, json& j) {
+        j["addr"] = a.u64(1, "addr");
+        if (a.has(2)) j["count"] = a.u64(2, "count");
+        j["timeout_ms"] = a.budget(3, 5000);
+    });
+}
+
+// actions that read host files are host access, not console access
+bool host_file_action(const std::string& action) {
+    return action == "ps4_elf_rpc" || action == "ps4_elf_load";
+}
+
+// slop.debugger.action(name, params): any debugger ps4_* action by name
+// ("bp_set" and "ps4_bp_set" both work); params is a table of the mcp args.
+// the action name is resolved into args["action"] by the fill step
+int l_dbg_action(lua_State* L) {
+    return mcp_action(L, "debugger", "", [](arg_reader_t& a, json& j) {
+        std::string action = a.str(1, "action name");
+        if (!a.err.empty()) return;
+        if (a.has(2)) {
+            if (lua_type(a.L, 2) != LUA_TTABLE) {
+                a.err = "debugger.action: params must be a table";
+                return;
+            }
+            json params = lua_to_json(a.L, 2, 0, a.err);
+            if (!a.err.empty()) return;
+            if (params.is_object()) j.update(params);   // {} decodes as an object too
+        }
+        if (action.rfind("ps4_", 0) != 0) action = "ps4_" + action;
+        if (host_file_action(action) && !ctx_of(a.L)->unsafe) {
+            a.err = action + " reads a host file; it needs the script_unsafe setting";
+            return;
+        }
+        j["action"] = std::move(action);
+    });
+}
+
+// sandbox
+
+// load() with the mode forced to text: binary chunks can break out of the vm
+int l_load_text(lua_State* L) {
+    const int keep = lua_gettop(L) >= 4 ? 4 : 3;   // env stays absent unless passed
+    lua_settop(L, keep);
+    lua_pushliteral(L, "t");
+    lua_replace(L, 3);
+    lua_pushvalue(L, lua_upvalueindex(1));
+    lua_insert(L, 1);
+    lua_call(L, keep, LUA_MULTRET);
+    return lua_gettop(L);
+}
+
+void open_sandboxed(lua_State* L) {
+    static const luaL_Reg kLibs[] = {
+        {LUA_GNAME,       luaopen_base},
+        {LUA_STRLIBNAME,  luaopen_string},
+        {LUA_TABLIBNAME,  luaopen_table},
+        {LUA_MATHLIBNAME, luaopen_math},
+        {LUA_UTF8LIBNAME, luaopen_utf8},
+    };
+    for (const auto& lib : kLibs) {
+        luaL_requiref(L, lib.name, lib.func, 1);
+        lua_pop(L, 1);
+    }
+    // base without the file loaders, text-only load
+    lua_pushnil(L);
+    lua_setglobal(L, "dofile");
+    lua_pushnil(L);
+    lua_setglobal(L, "loadfile");
+    lua_getglobal(L, "load");
+    lua_pushcclosure(L, l_load_text, 1);
+    lua_setglobal(L, "load");
+    // os reduced to the clock functions, the module itself stays unreachable
+    luaL_requiref(L, LUA_OSLIBNAME, luaopen_os, 0);
+    lua_createtable(L, 0, 3);
+    for (const char* fn : {"clock", "time", "difftime"}) {
+        lua_getfield(L, -2, fn);
+        lua_setfield(L, -2, fn);
+    }
+    lua_setglobal(L, "os");
+    lua_pop(L, 1);
+}
+
+void set_funcs(lua_State* L, const luaL_Reg* regs) {
+    for (; regs->name; ++regs) {
+        lua_pushcfunction(L, regs->func);
+        lua_setfield(L, -2, regs->name);
+    }
+}
+
+// opens the libraries and builds the slop table; runs under lua_pcall so a
+// memory-limit failure during setup is an error, not a panic
+int open_env(lua_State* L) {
+    if (ctx_of(L)->unsafe) luaL_openlibs(L);
+    else open_sandboxed(L);
 
     lua_pushcfunction(L, l_log);
     lua_setglobal(L, "print");
 
-    lua_createtable(L, 0, 8);
+    lua_createtable(L, 0, 12);
     lua_pushcfunction(L, l_version); lua_setfield(L, -2, "version");
     lua_pushcfunction(L, l_log);     lua_setfield(L, -2, "log");
 
+    static const luaL_Reg kTarget[] = {
+        {"list",   locked<l_target_list>},
+        {"attach", locked<l_target_attach>},
+        {"status", locked<l_target_status>},
+        {nullptr, nullptr},
+    };
     lua_createtable(L, 0, 3);
-    lua_pushcfunction(L, l_target_list);   lua_setfield(L, -2, "list");
-    lua_pushcfunction(L, l_target_attach); lua_setfield(L, -2, "attach");
-    lua_pushcfunction(L, l_target_status); lua_setfield(L, -2, "status");
+    set_funcs(L, kTarget);
     lua_setfield(L, -2, "target");
 
-    lua_createtable(L, 0, 3);
-    lua_pushcfunction(L, l_mem_read);  lua_setfield(L, -2, "read_hex");
-    lua_pushcfunction(L, l_mem_write); lua_setfield(L, -2, "write_hex");
-    lua_pushcfunction(L, l_mem_scan);  lua_setfield(L, -2, "scan");
+    static const luaL_Reg kMem[] = {
+        {"read_hex",   locked<l_mem_read_hex>},
+        {"read_bytes", locked<l_mem_read_bytes>},
+        {"write_hex",  locked<l_mem_write>},
+        {"scan",       locked<l_mem_scan>},
+        {nullptr, nullptr},
+    };
+    lua_createtable(L, 0, 4);
+    set_funcs(L, kMem);
     lua_setfield(L, -2, "mem");
 
+    static const luaL_Reg kDisasm[] = {
+        // live-target disassembly (attached process memory)
+        {"disassemble",     locked<l_disasm_disassemble>},
+        // static analysis over the loaded image, the IDA-style surface
+        {"decode",          locked<l_disasm_decode>},
+        {"functions",       locked<l_disasm_functions>},
+        {"function_at",     locked<l_disasm_function_at>},
+        {"xrefs_to",        locked<l_disasm_xrefs_to>},
+        {"strings",         locked<l_disasm_strings>},
+        {"pe",              locked<l_disasm_pe>},
+        {"bytes",           locked<l_image_bytes>},
+        // names/comments/bookmarks, persisted per binary hash, shared with
+        // the UI and the MCP tools
+        {"name",            locked<l_name_get>},
+        {"set_name",        locked<l_name_set>},
+        {"comment",         locked<l_comment_get>},
+        {"set_comment",     locked<l_comment_set>},
+        {"bookmark_toggle", locked<l_bookmark_toggle>},
+        {"bookmarks",       locked<l_bookmarks>},
+        {nullptr, nullptr},
+    };
     lua_createtable(L, 0, 14);
-    // Live-target disassembly (attached process memory)
-    lua_pushcfunction(L, l_disasm_disassemble);
-    lua_setfield(L, -2, "disassemble");
-    // Static analysis over the loaded image, the IDA-style surface
-    lua_pushcfunction(L, l_disasm_decode);        lua_setfield(L, -2, "decode");
-    lua_pushcfunction(L, l_disasm_functions);     lua_setfield(L, -2, "functions");
-    lua_pushcfunction(L, l_disasm_function_at);   lua_setfield(L, -2, "function_at");
-    lua_pushcfunction(L, l_disasm_xrefs_to);      lua_setfield(L, -2, "xrefs_to");
-    lua_pushcfunction(L, l_disasm_strings);       lua_setfield(L, -2, "strings");
-    lua_pushcfunction(L, l_disasm_pe);            lua_setfield(L, -2, "pe");
-    lua_pushcfunction(L, l_image_bytes);          lua_setfield(L, -2, "bytes");
-    // Names/comments/bookmarks, persisted per binary hash, shared with the
-    // UI and the MCP tools
-    lua_pushcfunction(L, l_name_get);             lua_setfield(L, -2, "name");
-    lua_pushcfunction(L, l_name_set);             lua_setfield(L, -2, "set_name");
-    lua_pushcfunction(L, l_comment_get);          lua_setfield(L, -2, "comment");
-    lua_pushcfunction(L, l_comment_set);          lua_setfield(L, -2, "set_comment");
-    lua_pushcfunction(L, l_bookmark_toggle);      lua_setfield(L, -2, "bookmark_toggle");
-    lua_pushcfunction(L, l_bookmarks);            lua_setfield(L, -2, "bookmarks");
+    set_funcs(L, kDisasm);
     lua_setfield(L, -2, "disasm");
 
+    static const luaL_Reg kAnalyze[] = {
+        {"packer", locked<l_analyze_packer>},
+        {nullptr, nullptr},
+    };
     lua_createtable(L, 0, 1);
-    lua_pushcfunction(L, l_analyze_packer);
-    lua_setfield(L, -2, "packer");
+    set_funcs(L, kAnalyze);
     lua_setfield(L, -2, "analyze");
 
-    // the image session surface, load, load from target, unload, status,
-    // wait ready
+    // wait_ready only polls under the binary lock, holding the tool mutex
+    // while it sleeps would stall every other tool
+    static const luaL_Reg kImage[] = {
+        {"load",             locked<l_image_load>},
+        {"load_from_target", locked<l_image_load_from_target>},
+        {"unload",           locked<l_image_unload>},
+        {"status",           locked<l_image_status>},
+        {"wait_ready",       l_image_wait_ready},
+        {nullptr, nullptr},
+    };
     lua_createtable(L, 0, 5);
-    lua_pushcfunction(L, l_image_load);           lua_setfield(L, -2, "load");
-    lua_pushcfunction(L, l_image_load_from_target);
-    lua_setfield(L, -2, "load_from_target");
-    lua_pushcfunction(L, l_image_unload);         lua_setfield(L, -2, "unload");
-    lua_pushcfunction(L, l_image_status);         lua_setfield(L, -2, "status");
-    lua_pushcfunction(L, l_image_wait_ready);     lua_setfield(L, -2, "wait_ready");
+    set_funcs(L, kImage);
     lua_setfield(L, -2, "image");
 
-    // Decompiler + hyperion-rich analysis (requires analysis-ready session)
-
-    // Decompiler + hyperion-rich analysis (requires analysis-ready session)
+    // decompiler + hyperion-rich analysis (requires analysis-ready session)
+    static const luaL_Reg kDecomp[] = {
+        {"decompile", locked<l_decomp_function>},
+        {"blocks",    locked<l_decomp_blocks>},
+        {"vtables",   locked<l_decomp_vtables>},
+        {"globals",   locked<l_decomp_globals>},
+        {"rtti",      locked<l_decomp_rtti>},
+        {nullptr, nullptr},
+    };
     lua_createtable(L, 0, 5);
-    lua_pushcfunction(L, l_decomp_function);      lua_setfield(L, -2, "decompile");
-    lua_pushcfunction(L, l_decomp_blocks);        lua_setfield(L, -2, "blocks");
-    lua_pushcfunction(L, l_decomp_vtables);       lua_setfield(L, -2, "vtables");
-    lua_pushcfunction(L, l_decomp_globals);       lua_setfield(L, -2, "globals");
-    lua_pushcfunction(L, l_decomp_rtti);          lua_setfield(L, -2, "rtti");
+    set_funcs(L, kDecomp);
     lua_setfield(L, -2, "decomp");
 
-    lua_setglobal(L, "slop");
+    // console connection; each call is one mcp action (call_tool locks)
+    static const luaL_Reg kPs4[] = {
+        {"connect",    l_ps4_connect},
+        {"disconnect", l_ps4_disconnect},
+        {"auto",       l_ps4_auto},
+        {"status",     l_ps4_status},
+        {nullptr, nullptr},
+    };
+    lua_createtable(L, 0, 4);
+    set_funcs(L, kPs4);
+    lua_setfield(L, -2, "ps4");
 
-    if (luaL_loadbuffer(L, code.c_str(), code.size(), "=slop_script")
-        != LUA_OK) {
-        res.error = lua_tostring(L, -1) ? lua_tostring(L, -1) : "load failed";
-        lua_close(L);
-        res.output = output;
+    static const luaL_Reg kDebugger[] = {
+        {"status",      l_dbg_status},
+        {"attach",      l_dbg_attach},
+        {"detach",      l_dbg_detach},
+        {"bp_set",      l_dbg_bp_set},
+        {"bp_clear",    l_dbg_bp_clear},
+        {"bp_list",     l_dbg_bp_list},
+        {"watch_set",   l_dbg_watch_set},
+        {"watch_clear", l_dbg_watch_clear},
+        {"watch_list",  l_dbg_watch_list},
+        {"continue",    l_dbg_continue},
+        {"step",        l_dbg_step},
+        {"suspend",     l_dbg_suspend},
+        {"resume",      l_dbg_resume},
+        {"wait",        l_dbg_wait},
+        {"events",      l_dbg_events},
+        {"regs",        l_dbg_regs},
+        {"set_reg",     l_dbg_set_reg},
+        {"callstack",   l_dbg_callstack},
+        {"call",        l_dbg_call},
+        {"run_until",   l_dbg_run_until},
+        {"find_write",  l_dbg_find_write},
+        {"trace_calls", l_dbg_trace_calls},
+        {"action",      l_dbg_action},
+        {nullptr, nullptr},
+    };
+    lua_createtable(L, 0, 23);
+    set_funcs(L, kDebugger);
+    lua_setfield(L, -2, "debugger");
+
+    lua_setglobal(L, "slop");
+    return 0;
+}
+
+// the script's return value goes into the output; protected because
+// __len/__index metamethods can run lua code (and hit the hook)
+int serialize_return(lua_State* L) {
+    out_append(L, "return: ");
+    append_value(L, 1, 0);
+    out_append(L, "\n");
+    return 0;
+}
+
+std::string lua_error_text(lua_State* L, int status, const script_ctx_t& ctx,
+                           const char* fallback) {
+    if (status == LUA_ERRMEM)
+        return "script exceeded the memory limit (" +
+               std::to_string(ctx.mem_limit >> 20) + " MiB)";
+    const char* msg = lua_tostring(L, -1);
+    return msg ? msg : fallback;
+}
+
+} // namespace
+
+int clamp_timeout_ms(int64_t ms) noexcept {
+    return static_cast<int>(std::clamp<int64_t>(ms, kMinTimeoutMs, kMaxTimeoutMs));
+}
+
+lua_run_result_t lua_run(const std::string& code, int timeout_ms) {
+    lua_run_options_t opt;
+    opt.timeout_ms = timeout_ms;
+    return lua_run(code, opt);
+}
+
+lua_run_result_t lua_run(const std::string& code, const lua_run_options_t& opt) {
+    lua_run_result_t res;
+
+    // ctx outlives the state: lua_close still frees through capped_alloc
+    script_ctx_t ctx;
+    ctx.cancel    = opt.cancel;
+    ctx.tool_mu   = opt.tool_mutex;
+    ctx.mem_limit = opt.mem_limit ? opt.mem_limit : kDefaultMemLimit;
+    ctx.unsafe    = opt.unsafe ? *opt.unsafe
+                               : infra::settings::get<bool>("script_unsafe", false);
+    res.timeout_ms = clamp_timeout_ms(opt.timeout_ms);
+    res.unsafe     = ctx.unsafe;
+    ctx.deadline_ms = now_ms() + res.timeout_ms;
+
+    lua_State* L = lua_newstate(capped_alloc, &ctx);
+    if (!L) {
+        res.error = "lua_newstate failed (memory limit too small?)";
         return res;
     }
-    // one result slot, the return value is serialized into the output so
-    // return x is not lost
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-        res.error = lua_tostring(L, -1) ? lua_tostring(L, -1) : "runtime error";
+
+    lua_pushcfunction(L, open_env);
+    int st = lua_pcall(L, 0, 0, 0);
+    if (st != LUA_OK) {
+        res.error = "script environment setup failed: " +
+                    lua_error_text(L, st, ctx, "unknown error");
     } else {
-        res.ok = true;
-        out_append(L, "return: ");
-        append_value(L, -1, 0);
-        out_append(L, "\n");
+        lua_sethook(L, timeout_hook, LUA_MASKCOUNT, kHookInstructions);
+        // sandboxed runs refuse precompiled chunks for the same reason as load()
+        st = luaL_loadbufferx(L, code.c_str(), code.size(), "=slop_script",
+                              ctx.unsafe ? nullptr : "t");
+        if (st != LUA_OK) {
+            res.error = lua_error_text(L, st, ctx, "load failed");
+        } else if ((st = lua_pcall(L, 0, 1, 0)) != LUA_OK) {
+            // one result slot: the return value is serialized into the
+            // output so return x is not lost
+            res.error = lua_error_text(L, st, ctx, "runtime error");
+        } else {
+            res.ok = true;
+            lua_pushcfunction(L, serialize_return);
+            lua_insert(L, -2);
+            if ((st = lua_pcall(L, 1, 0, 0)) != LUA_OK)
+                out_append(L, "\n[return value not serialized: " +
+                                  lua_error_text(L, st, ctx, "error") + "]\n");
+        }
     }
 
-    res.output = output;
     lua_close(L);
+    res.output = std::move(ctx.output);
+    res.output_truncated = ctx.output_truncated;
+    res.peak_mem = ctx.mem_peak;
     return res;
 }
 

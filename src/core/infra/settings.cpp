@@ -1,129 +1,144 @@
 #include "core/infra/settings.hpp"
 #include "core/infra/paths.hpp"
 
+#include <windows.h>
+#include <bcrypt.h>
+
+#include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <sstream>
 
-#include <nlohmann/json.hpp>
+#pragma comment(lib, "bcrypt.lib")
 
 namespace slop::core::infra::settings {
 
 namespace {
 
+constexpr uint16_t kDefaultPort = 8765;
+
 std::mutex      g_mu;
 nlohmann::json  g_data = nlohmann::json::object();
+std::string     g_file;          // empty = paths::settings_file()
+
+const std::string& path_locked() {
+    return g_file.empty() ? paths::settings_file() : g_file;
+}
+
+bool save_locked() {
+    const std::string& p = path_locked();
+    if (p.empty()) return false;
+    return paths::write_file_atomic(p, g_data.dump(2));
+}
+
+// keep the unreadable original around so a hand edit with a typo is recoverable
+void backup_corrupt_locked(const std::string& p) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count();
+    std::error_code ec;
+    std::filesystem::copy_file(p, p + ".corrupt-" + std::to_string(ms),
+                               std::filesystem::copy_options::overwrite_existing, ec);
+}
 
 } // namespace
 
+std::string generate_token() {
+    unsigned char buf[32]{};
+    if (!BCRYPT_SUCCESS(::BCryptGenRandom(nullptr, buf, sizeof(buf),
+                                          BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
+        return {};
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(sizeof(buf) * 2);
+    for (unsigned char b : buf) {
+        out.push_back(kHex[b >> 4]);
+        out.push_back(kHex[b & 0xF]);
+    }
+    return out;
+}
+
 void load() {
     std::lock_guard lk(g_mu);
-    std::ifstream f(paths::settings_file());
-    if (!f.is_open()) {
-        g_data = nlohmann::json::object();
-        return;
+    const std::string& p = path_locked();
+    g_data = nlohmann::json::object();
+    bool dirty = false;
+
+    std::ifstream f(p, std::ios::binary);
+    if (f.is_open()) {
+        std::stringstream ss;
+        ss << f.rdbuf();
+        f.close();
+        nlohmann::json parsed = nlohmann::json::parse(ss.str(), nullptr, false);
+        if (!parsed.is_discarded() && parsed.is_object()) {
+            g_data = std::move(parsed);
+        } else {
+            backup_corrupt_locked(p);
+            dirty = true;
+        }
     }
-    try {
-        f >> g_data;
-    } catch (...) {
-        g_data = nlohmann::json::object();
+
+    // first run (or a wiped token) gets a fresh bearer token so the server is never open by default
+    const auto tok = g_data.find("mcp_token");
+    if (tok == g_data.end() || !tok->is_string() || tok->get_ref<const std::string&>().empty()) {
+        const std::string t = generate_token();
+        if (!t.empty()) {
+            g_data["mcp_token"] = t;
+            dirty = true;
+        }
     }
+    if (dirty) save_locked();
 }
 
-void save() {
+bool save() {
     std::lock_guard lk(g_mu);
-    // write to a temp then rename
-    const std::string tmp = paths::settings_file() + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if (!f.is_open()) return;
-        f << g_data.dump(2);
-    }
-    // best effort rename
-    std::error_code ec;
-    std::filesystem::rename(tmp, paths::settings_file(), ec);
-    if (ec) {
-        // fall back to remove then rename
-        std::filesystem::remove(paths::settings_file(), ec);
-        std::filesystem::rename(tmp, paths::settings_file(), ec);
-    }
+    return save_locked();
 }
 
-uint32_t layout_version() {
+void set_file_for_testing(std::string path) {
     std::lock_guard lk(g_mu);
-    return g_data.value("layout_version", 0u);
+    g_file = std::move(path);
+    g_data = nlohmann::json::object();
 }
 
-void set_layout_version(uint32_t v) {
+const std::string& file() {
     std::lock_guard lk(g_mu);
-    g_data["layout_version"] = v;
+    return path_locked();
 }
 
-std::string last_target_name() {
+nlohmann::json get_json(std::string_view key) {
     std::lock_guard lk(g_mu);
-    return g_data.value("last_target_name", std::string{});
+    const auto it = g_data.find(key);
+    return it == g_data.end() ? nlohmann::json() : *it;
 }
 
-uint32_t last_target_pid() {
+bool set(std::string_view key, nlohmann::json value) {
     std::lock_guard lk(g_mu);
-    return g_data.value("last_target_pid", 0u);
+    if (value.is_null())
+        g_data.erase(std::string(key));
+    else
+        g_data[std::string(key)] = std::move(value);
+    return save_locked();
 }
 
-void set_last_target(const std::string& name, uint32_t pid) {
+nlohmann::json snapshot() {
     std::lock_guard lk(g_mu);
-    g_data["last_target_name"] = name;
-    g_data["last_target_pid"]  = pid;
+    return g_data;
 }
 
-bool mcp_enabled() {
-    std::lock_guard lk(g_mu);
-    return g_data.value("mcp_enabled", true);
-}
+bool mcp_enabled() { return get<bool>("mcp_enabled", true); }
 
 uint16_t mcp_port() {
-    std::lock_guard lk(g_mu);
-    return static_cast<uint16_t>(g_data.value("mcp_port", 8765));
+    const int64_t p = get<int64_t>("mcp_port", kDefaultPort);
+    if (p < 1 || p > 65535) return kDefaultPort;
+    return static_cast<uint16_t>(p);
 }
 
-std::string mcp_token() {
-    std::lock_guard lk(g_mu);
-    return g_data.value("mcp_token", std::string{});
-}
+std::string mcp_token() { return get<std::string>("mcp_token", {}); }
 
-void set_mcp(bool enabled, uint16_t port, const std::string& token) {
-    std::lock_guard lk(g_mu);
-    g_data["mcp_enabled"] = enabled;
-    g_data["mcp_port"]    = port;
-    g_data["mcp_token"]   = token;
-}
+bool mcp_onboarded() { return get<bool>("mcp_onboarded", false); }
 
-bool mcp_onboarded() {
-    std::lock_guard lk(g_mu);
-    return g_data.value("mcp_onboarded", false);
-}
-
-void set_mcp_onboarded(bool v) {
-    std::lock_guard lk(g_mu);
-    g_data["mcp_onboarded"] = v;
-}
-
-bool stealth_peb_spoof() {
-    std::lock_guard lk(g_mu);
-    return g_data.value("stealth_peb_spoof", true);
-}
-
-void set_stealth_peb_spoof(bool v) {
-    std::lock_guard lk(g_mu);
-    g_data["stealth_peb_spoof"] = v;
-}
-
-bool stealth_kernel_debug() {
-    std::lock_guard lk(g_mu);
-    return g_data.value("stealth_kernel_debug", true);
-}
-
-void set_stealth_kernel_debug(bool v) {
-    std::lock_guard lk(g_mu);
-    g_data["stealth_kernel_debug"] = v;
-}
+void set_mcp_onboarded(bool v) { set("mcp_onboarded", v); }
 
 } // namespace slop::core::infra::settings

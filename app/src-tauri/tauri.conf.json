@@ -35,8 +35,11 @@
     "active": true,
     "targets": ["nsis"],
     "icon": ["icons/icon.png", "icons/icon.ico"],
+    "licenseFile": "../../LICENSE",
     "resources": {
-      "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe"
+      "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe",
+      "../../LICENSE": "LICENSE.txt",
+      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
     },
     "windows": {
       "nsis": {

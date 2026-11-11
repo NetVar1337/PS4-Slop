@@ -17,6 +17,15 @@ private:
     Varnode reg_vn(int reg_id);
     Varnode operand_read(const Insn& insn, int idx, PcodeBlock& out);
     void operand_write(const Insn& insn, int idx, Varnode val, PcodeBlock& out);
+    // `w2, uxtb` / `x2, lsl #3` source modifiers of a register operand
+    Varnode extend(Varnode v, IndexExt ext, PcodeBlock& out);
+    Varnode shifted(Varnode v, const Operand& op, PcodeBlock& out);
+    // effective address of memory operand `idx` (index extended and scaled;
+    // the bare base for post-index forms)
+    Varnode mem_address(const Insn& insn, int idx, PcodeBlock& out);
+    // base register update of a pre-/post-index memory operand
+    void writeback(const Insn& insn, int idx, PcodeBlock& out);
+    int mem_operand(const Insn& insn) const;
     
     Varnode alloc_temp(int sz = 8);
     void emit(PcodeBlock& b, PcodeOp op, Varnode out, std::vector<Varnode> in, va_t a = 0);

@@ -23,9 +23,9 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <!-- Matches the ImGui shell. The kernel bridge maps slopdrvr, which
-             needs administrator rights; the engine sidecar inherits this token
-             so only one UAC prompt appears for the whole app. -->
+        <!-- Matches the ImGui shell. Host packet capture (SIO_RCVALL raw
+             sockets) needs administrator rights; the engine sidecar inherits
+             this token so only one UAC prompt appears for the whole app. -->
         <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
       </requestedPrivileges>
     </security>

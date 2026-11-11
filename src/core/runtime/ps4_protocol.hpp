@@ -6,10 +6,48 @@
 // and debugger/source/*.c at the pinned commit. Every multi-byte field on the
 // wire is little-endian; the payload sends packed structs raw.
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace slop::core::runtime::ps4 {
+
+// every packed struct below is sent/received raw; the wire is little-endian
+static_assert(std::endian::native == std::endian::little,
+              "ps4debug-NG wire structs are sent raw and assume a little-endian host");
+
+// ---------------------------------------------------------------------------
+// io_result_t.error codes produced by backend_ps4_t. They live above the
+// Win32 error range used by the local backend so one table can name both.
+// io_error_str() turns any code into text for MCP/UI messages.
+enum io_err_t : uint32_t {
+    kErrNone           = 0,
+    kErrNotConnected   = 0xE0000001,  // no live console connection
+    kErrSendFailed     = 0xE0000002,  // send failed; connection dropped
+    kErrRecvFailed     = 0xE0000003,  // receive failed / peer closed; connection dropped
+    kErrTimeout        = 0xE0000004,  // per-chunk or whole-command deadline exceeded
+    kErrStatus         = 0xE0000005,  // payload answered CMD_ERROR
+    kErrProtocol       = 0xE0000006,  // malformed reply (stream desync)
+    kErrBadArg         = 0xE0000007,  // rejected client-side before sending
+    kErrUnmapped       = 0xE0000008,  // range not mapped / lacks the needed protection
+    kErrNotAttached    = 0xE0000009,  // needs a ps4 debug session
+    kErrAlreadyDebug   = 0xE000000A,  // payload answered CMD_ALREADY_DEBUG
+    kErrDataNull       = 0xE000000B,  // payload answered CMD_DATA_NULL
+    kErrTooMuchData    = 0xE000000C,  // payload answered CMD_TOO_MUCH_DATA
+    kErrNoSlot         = 0xE000000D,  // no free breakpoint/watchpoint slot
+    kErrNotArmed       = 0xE000000E,  // slot/address not armed by this client
+    kErrStaleHandle    = 0xE000000F,  // handle from an earlier console connection
+    kErrAsm            = 0xE0000010,  // on-device assembler reported an error
+    kErrListen         = 0xE0000011,  // cannot listen on the debug-event port
+    kErrDetachFailed   = 0xE0000012,  // previous debuggee could not be detached
+    kErrTooMany        = 0xE0000013,  // result larger than the client cap
+    kErrSlotBusy       = 0xE0000014,  // slot is being (re)armed by another call
+};
+
+// human readable text for any io_result_t.error (ps4 codes above, Win32
+// codes from the local backend otherwise)
+std::string io_error_str(uint32_t code);
 
 constexpr uint32_t kPacketMagic   = 0xFFAABBCC;
 constexpr uint16_t kDefaultPort   = 744;    // main command server (TCP)
@@ -159,6 +197,17 @@ constexpr uint32_t CMD_TOO_MUCH_DATA = 0xF0000002;
 constexpr uint32_t CMD_DATA_NULL     = 0xF0000003;
 constexpr uint32_t CMD_ALREADY_DEBUG = 0xF0000004;
 
+// map a non-success payload status word to an io_err_t
+constexpr uint32_t status_to_err(uint32_t st) {
+    switch (st) {
+    case CMD_DATA_NULL:     return kErrDataNull;
+    case CMD_TOO_MUCH_DATA: return kErrTooMuchData;
+    case CMD_ALREADY_DEBUG: return kErrAlreadyDebug;
+    case CMD_ERROR:         return kErrStatus;
+    default:                return kErrProtocol;   // not a status word at all
+    }
+}
+
 // FreeBSD VM_PROT_* flags used by CMD_PROC_PROTECT (not Windows PAGE_*)
 constexpr uint32_t kVmProtNone  = 0;
 constexpr uint32_t kVmProtRead  = 1;
@@ -253,6 +302,15 @@ struct debug_attach_packet_t {
 struct debug_lwpid_packet_t {
     uint32_t lwpid;
 };
+
+// CMD_DEBUG_THREAD_INFO reply body after the status word (40 bytes)
+struct debug_thread_info_response_t {
+    uint32_t lwpid;
+    uint32_t priority;
+    char     name[32];
+};
+
+static_assert(sizeof(debug_thread_info_response_t) == 40, "thread info reply is 40 bytes");
 
 struct debug_setregs_packet_t {
     uint32_t lwpid;
