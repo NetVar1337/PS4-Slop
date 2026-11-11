@@ -9,6 +9,7 @@
 #include "core/runtime/backend_ps4.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/broker.hpp"
+#include "core/runtime/ps4_protocol.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
