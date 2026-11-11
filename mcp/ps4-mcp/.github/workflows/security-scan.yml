@@ -1,0 +1,21 @@
+name: security-scan
+
+# The org-wide security scan: committed secrets, tracked credential files and high or critical
+# dependency advisories. It lives in May-Ethereal/.github so that every repository runs the
+# same checks instead of a slightly different copy.
+#
+# The reference is pinned to the commit that introduced the reusable workflow. It can be moved
+# to @main once May-Ethereal/.github#1 is merged.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: May-Ethereal/.github/.github/workflows/reusable-security-scan.yml@563ed7d771436f3bbe0445e90a969b03c7430561

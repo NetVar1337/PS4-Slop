@@ -1,0 +1,5 @@
+CompileFlags:
+  Add:
+    - -Iinternals/include
+    - -Iexamples/game/src
+    - -std=c++17

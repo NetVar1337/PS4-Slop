@@ -1,0 +1,683 @@
+[
+ {
+  "name": "project_open",
+  "description": "Create or select the current per-game project (local index under the artifact directory; never touches the console). Identify it by title_id (+ app_version) or name, or select an existing project id. With no arguments, lists projects and the active one.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "title_id": {
+     "type": "string",
+     "description": "PS4 title id, e.g. CUSA12345",
+     "minLength": 1,
+     "maxLength": 32
+    },
+    "name": {
+     "type": "string",
+     "description": "Human-readable game/project name",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "app_version": {
+     "type": "string",
+     "description": "Application version, e.g. 01.02",
+     "minLength": 1,
+     "maxLength": 32
+    },
+    "content_id": {
+     "type": "string",
+     "description": "Content id",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "description": {
+     "type": "string",
+     "description": "Free-form description",
+     "minLength": 0,
+     "maxLength": 2048
+    },
+    "tags": {
+     "type": "array",
+     "maxItems": 32,
+     "items": {
+      "type": "string",
+      "description": "Tag",
+      "minLength": 1,
+      "maxLength": 64
+     }
+    },
+    "create": {
+     "type": "boolean",
+     "description": "Create when missing (default true)"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_record",
+  "description": "Attach artifacts (metadata auto-read from provenance sidecars: kind, sha256, tool, module, pid, address), module hashes, notes, findings and open questions to the current project; resolve questions by record id. Tags apply to every record in the call (or to the project when given alone).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "artifacts": {
+     "type": "array",
+     "maxItems": 100,
+     "items": {
+      "type": "string",
+      "description": "Relative path inside configured artifact directory",
+      "minLength": 1,
+      "maxLength": 1024
+     }
+    },
+    "modules": {
+     "type": "array",
+     "maxItems": 100,
+     "items": {
+      "type": "object",
+      "properties": {
+       "name": {
+        "type": "string",
+        "description": "Module name",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "sha256": {
+        "type": "string",
+        "description": "SHA-256 hex",
+        "pattern": "^[0-9a-fA-F]{64}$",
+        "minLength": 64,
+        "maxLength": 64
+       },
+       "base": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "size": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 1099511627776
+       },
+       "path": {
+        "type": "string",
+        "description": "Source path or artifact",
+        "minLength": 1,
+        "maxLength": 1024
+       },
+       "version": {
+        "type": "string",
+        "description": "Module/app version",
+        "minLength": 1,
+        "maxLength": 64
+       },
+       "executable_text_sha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+       }
+      },
+      "required": [
+       "name"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "notes": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "string",
+      "description": "Note text",
+      "minLength": 1,
+      "maxLength": 8192
+     }
+    },
+    "tags": {
+     "type": "array",
+     "maxItems": 32,
+     "items": {
+      "type": "string",
+      "description": "Tag",
+      "minLength": 1,
+      "maxLength": 64
+     }
+    },
+    "findings": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "object",
+      "properties": {
+       "title": {
+        "type": "string",
+        "description": "Finding title",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "text": {
+        "type": "string",
+        "description": "Details",
+        "minLength": 0,
+        "maxLength": 8192
+       },
+       "address": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "module": {
+        "type": "string",
+        "description": "Module name",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "severity": {
+        "type": "string",
+        "enum": [
+         "info",
+         "low",
+         "medium",
+         "high"
+        ]
+       },
+       "evidence": {
+        "type": "array",
+        "maxItems": 20,
+        "items": {
+         "type": "string",
+         "description": "Artifact path or evidence reference",
+         "minLength": 1,
+         "maxLength": 1024
+        }
+       },
+       "tags": {
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+         "type": "string",
+         "description": "Tag",
+         "minLength": 1,
+         "maxLength": 64
+        }
+       }
+      },
+      "required": [
+       "title"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "questions": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "object",
+      "properties": {
+       "text": {
+        "type": "string",
+        "description": "Open question",
+        "minLength": 1,
+        "maxLength": 4096
+       },
+       "address": {
+        "type": "string",
+        "description": "Unsigned address or RVA, e.g. 0x400000; string avoids JSON precision loss",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "module": {
+        "type": "string",
+        "description": "Module name",
+        "minLength": 1,
+        "maxLength": 256
+       },
+       "tags": {
+        "type": "array",
+        "maxItems": 32,
+        "items": {
+         "type": "string",
+         "description": "Tag",
+         "minLength": 1,
+         "maxLength": 64
+        }
+       }
+      },
+      "required": [
+       "text"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "resolve_questions": {
+     "type": "array",
+     "maxItems": 50,
+     "items": {
+      "type": "string",
+      "description": "Question record id",
+      "minLength": 1,
+      "maxLength": 14,
+      "pattern": "^r-[0-9a-f]{12}$"
+     }
+    },
+    "resolution": {
+     "type": "string",
+     "description": "Answer recorded with resolve_questions",
+     "minLength": 0,
+     "maxLength": 8192
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_query",
+  "description": "Filter the current project's records by type, artifact kind, tool, tag, module name/sha256, free text and ISO time range; returns a bounded page (newest first by default).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "type": {
+     "type": "string",
+     "enum": [
+      "artifact",
+      "module",
+      "note",
+      "finding",
+      "question",
+      "resolution"
+     ]
+    },
+    "kind": {
+     "type": "string",
+     "description": "Artifact kind, e.g. elfdump or coverage",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "tool": {
+     "type": "string",
+     "description": "Producing tool name",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "tag": {
+     "type": "string",
+     "description": "Tag",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "module": {
+     "type": "string",
+     "description": "Module name substring",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "SHA-256 hex",
+     "pattern": "^[0-9a-fA-F]{64}$",
+     "minLength": 64,
+     "maxLength": 64
+    },
+    "text": {
+     "type": "string",
+     "description": "Case-insensitive text match",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "since": {
+     "type": "string",
+     "description": "Inclusive ISO-8601 lower bound, e.g. 2026-11-01",
+     "minLength": 1,
+     "maxLength": 40
+    },
+    "until": {
+     "type": "string",
+     "description": "Inclusive ISO-8601 upper bound",
+     "minLength": 1,
+     "maxLength": 40
+    },
+    "offset": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 1000000
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100
+    },
+    "order": {
+     "type": "string",
+     "enum": [
+      "newest",
+      "oldest"
+     ]
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_summary",
+  "description": "What exists for this game: modules and hashes, dumps, traces, coverage, annotations, findings, open questions, tag and artifact-kind counts.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "limit": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 100
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_export_offsets",
+  "description": "Export the active project's evidence annotations (annotation_save records) into a generated C++ offsets header plus a ps4wb-offsets-v1 JSON manifest: per-module namespaces, RVA constants with comments, and runtime verify fingerprints sliced from a recorded dump artifact of the same module when available. Fully local; emits two offsets artifacts.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Restrict the export to one recorded module hash",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "namespace": {
+     "type": "string",
+     "description": "C++ namespace for the generated header; defaults to the project name slug",
+     "minLength": 1,
+     "maxLength": 64
+    },
+    "verify_bytes": {
+     "type": "integer",
+     "description": "Verify fingerprint length per offset, sliced from a recorded dump (default 16)",
+     "minimum": 1,
+     "maximum": 32
+    },
+   "archive": {
+    "type": "boolean",
+    "description": "Also write the generated header and manifest into the registered repository's offsets/<module_sha256[:16]>/ per-build store"
+   }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_export_target",
+  "description": "Emit a ready-to-stage ps4wb-internals-target-v1 manifest from the active project: identity from project/module records, executable-text hash from the module record, and absolute-address fingerprints from annotations plus optional signature_sites (RVAs verified unique by signature_make). Fingerprint bytes come from the recorded dump of the same module; anything unproven is skipped, never fabricated.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string",
+     "description": "Project id (from project_open); defaults to the active project",
+     "minLength": 1,
+     "maxLength": 96,
+     "pattern": "^[A-Za-z0-9_-]{1,96}$"
+    },
+    "module_sha256": {
+     "type": "string",
+     "description": "Module to target; required when several modules have annotations",
+     "pattern": "^[0-9a-f]{64}$"
+    },
+    "image_base": {
+     "type": "string",
+     "description": "Runtime module base for absolute fingerprints; defaults to the module record's base",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "process_name": {
+     "type": "string",
+     "maxLength": 256
+    },
+    "process_path": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "status_magic": {
+     "type": "string",
+     "description": "Payload status magic (default 0x5053494E 'PSIN')",
+     "maxLength": 20,
+     "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+    },
+    "verify_bytes": {
+     "type": "integer",
+     "description": "Fingerprint length per site (default 16, max 32)",
+     "minimum": 1,
+     "maximum": 32
+    },
+    "signature_sites": {
+     "type": "array",
+     "description": "RVAs verified unique by signature_make; each becomes an absolute-address fingerprint",
+     "maxItems": 64,
+     "items": {
+      "type": "string",
+      "maxLength": 20,
+      "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+     }
+    },
+    "pointers": {
+     "type": "array",
+     "description": "Optional pointer checks: absolute address + expected uint64",
+     "maxItems": 64,
+     "items": {
+      "type": "object",
+      "properties": {
+       "address": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       },
+       "expected": {
+        "type": "string",
+        "maxLength": 20,
+        "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"
+       }
+      },
+      "required": [
+       "address",
+       "expected"
+      ],
+      "additionalProperties": false
+     }
+    },
+    "rpc_version": {
+     "const": 1,
+     "type": "integer"
+    },
+    "staging": {
+     "enum": [
+      "immediate",
+      "elf_rpc"
+     ],
+     "type": "string"
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "recipe_list",
+  "description": "List built-in recipes (bounded chains of tool calls) with their inputs, steps and whether every step tool is currently available.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {},
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "recipe_run",
+  "description": "Run a recipe: built-in by name, a JSON recipe artifact, or an inline ps4wb-recipe-v1 definition. Steps run in order with ${input} / ${steps.N.path} / ${steps.N.@artifact} substitution, stop on the first error and return per-step summaries. Every step is validated and permission-checked exactly like a direct tool call; recipes cannot nest. Through the broker, recipes containing debugger control steps require the caller to hold the debug lease.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "recipe": {
+     "type": "string",
+     "description": "Built-in recipe name (see recipe_list)",
+     "minLength": 1,
+     "maxLength": 64,
+     "pattern": "^[A-Za-z0-9_]{1,64}$"
+    },
+    "recipe_artifact": {
+     "type": "string",
+     "description": "Relative path of a ps4wb-recipe-v1 JSON artifact",
+     "minLength": 1,
+     "maxLength": 1024
+    },
+    "definition": {
+     "type": "object",
+     "description": "Inline ps4wb-recipe-v1 recipe: {format,name,description,inputs,steps:[{tool,arguments}]}"
+    },
+    "inputs": {
+     "type": "object",
+     "description": "Recipe input values"
+    },
+    "dry_run": {
+     "type": "boolean",
+     "description": "Resolve and show the plan without calling any tool"
+    },
+    "max_steps": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 32
+    }
+   },
+   "required": [],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": true,
+   "idempotentHint": false,
+   "openWorldHint": false
+  },
+  "permission": null
+ },
+ {
+  "name": "project_bind_module",
+  "description": "Bind a captured ELF to the observed process/title and active project; separately hash live executable maps, record base and verification evidence. Read-only toward the console.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "project": {
+     "type": "string"
+    },
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "artifact": {
+     "type": "string"
+    },
+    "module": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "pid",
+    "artifact"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": true,
+   "openWorldHint": true
+  },
+  "permission": null
+ }
+]

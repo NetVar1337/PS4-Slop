@@ -1,0 +1,110 @@
+[
+  {
+    "name": "payload_stage",
+    "description": "Stage one hash-qualified ELF through ps4debug-NG CMD_PROC_ELF_RPC after exact target identity, executable-text, fingerprint and pointer verification. Resolves payload_rpc_entry without calling the raw image entry, rejects duplicate residency, reuses one RPC stub per PID, and waits for a ready heartbeat. Never retries an uncertain upload.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "target": {"type": "string", "maxLength": 1024, "description": "ps4wb-internals-target-v1 JSON artifact"},
+        "payload": {"type": "string", "maxLength": 1024, "description": "ELF artifact containing an exported payload_rpc_entry"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Expected and hardware-qualified ELF SHA-256"}
+      },
+      "required": ["pid", "target", "payload", "sha256"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "payload_recover",
+    "description": "Revalidate the exact target, find one payload_rpc_entry signature in bounded anonymous executable mappings, reuse/install the RPC stub, and verify payload status. Does not upload another ELF.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "target": {"type": "string", "maxLength": 1024},
+        "payload": {"type": "string", "maxLength": 1024},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "required": ["pid", "target", "payload", "sha256"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "payload_status",
+    "description": "Call command 0 on a staged/recovered payload after checking process identity and the resident RPC signature. Returns validated lifecycle, initialization stage and heartbeat.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"pid": {"type": "integer", "minimum": 1, "maximum": 2147483647}},
+      "required": ["pid"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "payload_rpc",
+    "description": "Invoke a bounded numeric command on the already staged/recovered payload RPC entry, never an arbitrary address. RPC implementations must be atomic and non-blocking. Commands 0 and 2 additionally validate the status response.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "command": {"type": "integer", "minimum": 0, "maximum": 255},
+        "argument": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "First uint64 argument (default 0)"},
+        "argument2": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Second uint64 argument (default 0)"}
+      },
+      "required": ["pid", "command"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "payload_shutdown",
+    "description": "Request payload RPC command 2. The runtime disables features and removes owned hooks on its own thread; the image may intentionally remain resident and inert if restoration fails. This is not an ELF unload.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {"pid": {"type": "integer", "minimum": 1, "maximum": 2147483647}},
+      "required": ["pid"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "payload_run",
+    "description": "One-shot ELF execution through CMD_PROC_ELF: validates ELF64/ET_DYN/x86-64 and the hardware-qualified SHA-256 allowlist, then the server spawns the raw image entry. No target manifest or RPC symbol required. Never use for resident RPC payloads (use payload_stage).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "payload": {"type": "string", "maxLength": 1024, "description": "ELF artifact to execute"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Expected and hardware-qualified ELF SHA-256"}
+      },
+      "required": ["pid", "payload", "sha256"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  },
+  {
+    "name": "process_call",
+    "description": "Call a fingerprint-pinned function in the target process through the RPC stub (CMD_PROC_CALL, 68-byte body, six SysV u64 arguments). The ps4wb-internals-target-v1 manifest must contain a fingerprint at exactly the call address; its expected bytes are re-verified before every call. Identity is re-checked, every call is audited, and failures are never retried.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "target": {"type": "string", "maxLength": 1024, "description": "ps4wb-internals-target-v1 JSON artifact whose fingerprints pin the call address"},
+        "address": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$", "description": "Function address, pinned by a manifest fingerprint"},
+        "arguments": {"type": "array", "maxItems": 6, "items": {"type": "string", "maxLength": 20, "pattern": "^(0x[0-9a-fA-F]{1,16}|[0-9]{1,20})$"}, "description": "Up to six SysV u64 arguments (rdi,rsi,rdx,rcx,r8,r9)"}
+      },
+      "required": ["pid", "target", "address"],
+      "additionalProperties": false
+    },
+    "annotations": {"readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true},
+    "permission": "process_inject"
+  }
+]

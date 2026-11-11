@@ -1,0 +1,174 @@
+name: release
+
+# Builds and publishes a signed release.
+#
+#   git tag v0.3.0 && git push origin v0.3.0
+#
+# The tag has to match the version in Cargo.toml and pyproject.toml, otherwise the release is
+# refused: a tag that does not describe the code it points at is worse than no tag.
+#
+# Every artifact is signed with Sigstore keyless signing, and the release carries a manifest
+# with the hashes and the signer identity, so a consumer can check both.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "The tag to release, for example v0.3.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - name: Check that the tag matches the versions in the repository
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then tag="${{ inputs.tag }}"; fi
+          cargo_version=$(python3 -c "import tomllib,sys;print(tomllib.load(open('Cargo.toml','rb'))['package']['version'])")
+          python_version=$(python3 -c "import tomllib,sys;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=$tag cargo=$cargo_version python=$python_version"
+          if [ "$tag" != "v$cargo_version" ]; then
+            echo "::error::the tag $tag does not match the Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          if [ "$cargo_version" != "$python_version" ]; then
+            echo "::error::Cargo.toml says $cargo_version and pyproject.toml says $python_version"
+            exit 1
+          fi
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: ps4-mcp-linux-x86_64
+          - os: windows-latest
+            asset: ps4-mcp-windows-x86_64.exe
+          - os: macos-latest
+            asset: ps4-mcp-macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: stable
+      - name: Test
+        run: cargo test --locked
+      - name: Build the release binaries
+        run: cargo build --release --locked --bin ps4-mcp
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Flat, platform-named files: `ps4-mcp update` picks its asset by name,
+          # and `gh release create ./*` cannot upload directories.
+          mkdir -p dist
+          binary="target/release/ps4-mcp.exe"
+          [ -f "$binary" ] || binary="target/release/ps4-mcp"
+          cp "$binary" "dist/${{ matrix.asset }}"
+          (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532
+        with:
+          cosign-release: "v3.1.4"
+      - name: Sign the artifacts and publish the manifest
+        run: |
+          set -euo pipefail
+          cd dist
+          shopt -s nullglob
+          signed=0
+          for artifact in *; do
+            case "$artifact" in
+              *.sha256|*.sigstore.json|release-manifest.json*) continue ;;
+            esac
+            cosign sign-blob --yes --bundle "$artifact.sigstore.json" "$artifact"
+            signed=$((signed + 1))
+          done
+          if [ "$signed" -eq 0 ]; then
+            echo "::error::no artifact was signed"
+            exit 1
+          fi
+          commit=$(git -C .. rev-parse HEAD)
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/${GITHUB_WORKFLOW_REF##*/}@${GITHUB_REF}"
+          python3 - "$commit" "$identity" <<'PY' > release-manifest.json
+          import glob, hashlib, json, sys
+          commit, identity = sys.argv[1], sys.argv[2]
+          entries = []
+          for path in sorted(glob.glob("*")):
+              if path.endswith(".sha256") or path.endswith(".sigstore.json") or path == "release-manifest.json":
+                  continue
+              entries.append({
+                  "artifact": path,
+                  "sha256": hashlib.sha256(open(path, "rb").read()).hexdigest(),
+                  "bundle": path + ".sigstore.json",
+                  "signer_identity": identity,
+                  "source_commit": commit,
+              })
+          print(json.dumps({
+              "format": "ethereal-release-manifest-v1",
+              "source_commit": commit,
+              "signer_identity": identity,
+              "artifacts": entries,
+          }, indent=2, sort_keys=True))
+          PY
+          cosign sign-blob --yes --bundle release-manifest.json.sigstore.json release-manifest.json
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd dist
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber ./*
+          else
+            gh release create "$TAG" ./* --title "$TAG" --generate-notes
+          fi

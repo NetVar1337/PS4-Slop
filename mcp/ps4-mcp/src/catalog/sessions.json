@@ -1,0 +1,62 @@
+[
+ {
+  "name": "recipe_session",
+  "description": "Create, advance, inspect, cancel or explicitly retry a durable recipe session. Advance defaults to one step; progress persists across calls and restarts. Uncertain mutations never auto retry.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "action": {
+     "enum": [
+      "create",
+      "advance",
+      "status",
+      "cancel",
+      "retry",
+      "revise"
+     ],
+     "type": "string"
+    },
+    "session": {
+     "type": "string",
+     "pattern": "^[a-f0-9]{32}$"
+    },
+    "recipe": {
+     "type": "string"
+    },
+    "recipe_artifact": {
+     "type": "string"
+    },
+    "definition": {
+     "type": "object"
+    },
+    "inputs": {
+     "type": "object"
+    },
+    "max_steps": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 32
+    },
+    "step": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 31
+    },
+    "recovery_evidence": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "action"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": false,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ }
+]

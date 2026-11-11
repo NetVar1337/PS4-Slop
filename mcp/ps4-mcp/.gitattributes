@@ -1,0 +1,5 @@
+# Templates are embedded with include_bytes! and compared byte-for-byte; keep LF on Windows checkouts.
+* text=auto eol=lf
+*.png binary
+*.elf binary
+*.bin binary

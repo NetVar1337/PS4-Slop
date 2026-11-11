@@ -1,0 +1,88 @@
+[
+ {
+  "name": "memory_image_capture",
+  "description": "Capture bounded, explicit readable module/heap ranges into a sparse, hash-bound replay image accepted by engine/metadata readers offline. Missing pages stay holes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "maxLength": 1024
+    },
+    "max_bytes": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 536870912
+    },
+    "ranges": {
+     "type": "array",
+     "maxItems": 1024,
+     "items": {
+      "type": "object",
+      "properties": {
+       "address": {
+        "type": "string",
+        "maxLength": 1024
+       },
+       "length": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 536870912
+       }
+      },
+      "required": [
+       "address",
+       "length"
+      ],
+      "additionalProperties": false
+     }
+    }
+   },
+   "required": [
+    "pid"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ },
+ {
+  "name": "module_capture",
+  "description": "Capture a complete mapped module as ELF. If original ELF headers are not mapped, synthesize a PT_LOAD container from observed readable mappings without inventing symbols or missing bytes.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "pid": {
+     "type": "integer",
+     "minimum": 1,
+     "maximum": 2147483647
+    },
+    "module": {
+     "type": "string",
+     "maxLength": 256
+    }
+   },
+   "required": [
+    "pid"
+   ],
+   "additionalProperties": false
+  },
+  "annotations": {
+   "readOnlyHint": true,
+   "destructiveHint": false,
+   "idempotentHint": false,
+   "openWorldHint": true
+  },
+  "permission": null
+ }
+]
