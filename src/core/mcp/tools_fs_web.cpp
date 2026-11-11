@@ -213,7 +213,8 @@ json tool_web(const json& args) {
             if (!args.contains("body")) fail("missing body");
             const json& b = args.at("body");
             req.method = "POST";
-            req.body = b.is_string() ? b.get<std::string>() : b.dump();
+            req.body = b.is_string() ? b.get<std::string>()
+                                     : b.dump(-1, ' ', false, json::error_handler_t::replace);
             req.content_type = args.value("content_type", std::string{"application/json"});
         }
         const uint64_t offset = args.contains("offset") ? parse_addr(args, "offset") : 0;

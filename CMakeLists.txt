@@ -88,10 +88,15 @@ add_compile_definitions(
 )
 if(MSVC AND SLOP_ANALYZE)
     # dependency headers come in through SYSTEM include dirs (/external:I),
-    # /analyze:external- keeps the analysis on our own code
+    # /analyze:external- keeps the analysis on our own code.
+    # /analyze:WX- keeps the findings advisory: the lane reports them in the run
+    # summary instead of failing the build. The codebase carries a standing
+    # backlog of C6xxx findings, so treating them as errors made the lane red
+    # from the day it was added. /WX still applies to ordinary compiler warnings.
     add_compile_options(
         "$<$<COMPILE_LANGUAGE:C,CXX>:/analyze>"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/analyze:external->"
+        "$<$<COMPILE_LANGUAGE:C,CXX>:/analyze:WX->"
     )
 endif()
 

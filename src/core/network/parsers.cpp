@@ -397,7 +397,7 @@ bool v6_checksum_ok(const ip_addr_t& src, const ip_addr_t& dst, uint8_t proto,
     sum += proto;
     size_t i = 0;
     for (; i + 1 < n; i += 2) sum += be16(d + i);
-    if (i < n) sum += static_cast<uint32_t>(d[i]) << 8;
+    if (i < n) sum += static_cast<uint64_t>(d[i]) << 8;
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
     return sum == 0xFFFF;
 }

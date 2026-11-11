@@ -37,7 +37,7 @@ json tool_persist(const json& args) {
         if (!args.contains("name") || !args.contains("data"))
             fail("missing name/data");
         check_name(args, "name");
-        payload = args.at("data").dump();
+        payload = args.at("data").dump(-1, ' ', false, json::error_handler_t::replace);
         check_payload("data", payload.size(), kMaxSessionBytes);
     } else if (action == "kv_set") {
         if (!args.contains("key") || !args.contains("value"))
