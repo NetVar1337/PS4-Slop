@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ps4debug-mcp"
+version = "0.1.0"
+description = "MCP server + Python client for the ps4debug-NG payload (jailbroken PS4 debugger)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "GPL-3.0-only" }
+dependencies = [
+    "mcp>=1.8,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ps4debug-mcp = "ps4debug_ng.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
