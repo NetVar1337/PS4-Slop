@@ -18,16 +18,17 @@ not merged and will not be extended.
 | afterglow-web | `host` MCP tool: HTTP payload host with index page, `/files/<name>`, auto `/manifest.json` (sha256 per file), token required on non-loopback binds, `put` action | `src/core/mcp/tools_host.cpp` |
 | ps4-injection-lab | Homebrew injection recipe book (userland methods only) | `docs/injection/README.md` |
 | ps4debug-NG | Already the wire transport; fork extensions exposed as `ps4_*` actions | `src/core/runtime/backend_ps4.cpp` |
+| PS4-MCP | Session broker (`broker_gate`, client registry) + GDB Remote Serial bridge (full RSP: threads, regs, memory, breakpoints/watchpoints, async stop replies) so the UI, MCP agents and a GDB client share one console connection | `src/core/runtime/broker.*`, `src/core/runtime/gdb_rsp.*`, `gdb` tool in `src/core/mcp/tools_gdb.cpp` |
 
 ## Still external (by design)
 
 - **ps4debug-mcp** (Python client/CLI) stays a standalone companion client;
   its safety model is now also enforced server-side in this repo, so agents
   get the same guarantees through the built-in MCP server.
-- **PS4-MCP** (Rust rmcp server) keeps the session broker, GDB Remote bridge
-  (`rsp.rs`) and IDA/Ghidra adapters. Next integration step: port the broker
-  + GDB-RSP bridge into `src/core/runtime` so one console connection can be
-  shared by the UI, the MCP server and a GDB client at the same time.
+- **PS4-MCP** (Rust rmcp server) keeps the IDA/Ghidra/Binary Ninja adapters.
+  Its session broker + GDB-RSP bridge (`src/rsp.rs`) is now ported into
+  `src/core/runtime` (see above); next step is the adapters under
+  `integrations/`.
 
 ## Explicitly not merged
 
