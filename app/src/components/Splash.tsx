@@ -25,8 +25,8 @@ export default function Splash() {
   return (
     <div className="splash">
       <div className="splash-card">
-        <img className="splash-logo" src={logoUrl} alt="reverse-slop" draggable={false} />
-        <div className="splash-title">reverse-slop</div>
+        <img className="splash-logo" src={logoUrl} alt="SlopStation" draggable={false} />
+        <div className="splash-title">SlopStation</div>
         <div className="faint" style={{ fontSize: "var(--type-small)" }}>
           ps4 reverse-engineering workbench, booting
         </div>

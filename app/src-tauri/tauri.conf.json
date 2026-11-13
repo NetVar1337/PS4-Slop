@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "reverse-slop",
-  "version": "0.1.1",
-  "identifier": "dev.reverse-slop.ui",
+  "productName": "SlopStation",
+  "version": "0.2.0",
+  "identifier": "dev.slopstation.ui",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "reverse-slop",
+        "title": "SlopStation",
         "width": 1680,
         "height": 980,
         "minWidth": 1100,
@@ -31,19 +31,36 @@
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; connect-src 'self' http://127.0.0.1:* http://localhost:* ipc: http://ipc.localhost"
     }
   },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/NetVar1337/SlopStation/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFEMjMyNTk4QzdDRUYwQTAKUldTZzhNN0htQ1VqcmRmQXNWNjlmWC85RzdHSmJaS2wyaVgybDJrN1ZBUXFqdVRjQzNVcTA4R2EK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "licenseFile": "../../LICENSE",
     "resources": {
       "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe",
       "../../LICENSE": "LICENSE.txt",
-      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../../build/ps4debug-ng": "payloads/ps4debug-ng"
     },
     "windows": {
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "currentUser"
       }
     }
   }

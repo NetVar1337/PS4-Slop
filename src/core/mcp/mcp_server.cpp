@@ -63,7 +63,7 @@ thread_local bool t_used_primary = false;
 
 constexpr const char* kLatestProtocol = "2025-06-18";
 constexpr const char* kSupportedProtocols[] = {"2025-06-18", "2025-03-26", "2024-11-05"};
-constexpr const char* kServerName      = "reverse-slop";
+constexpr const char* kServerName      = "slopstation";
 #ifdef SLOP_VERSION_STRING
 constexpr const char* kServerVersion   = SLOP_VERSION_STRING;   // root VERSION file
 #else

@@ -532,7 +532,7 @@ TEST_CASE(infra_onboard_survives_non_object_mcp_and_refreshes_stale_entries) {
     const fs::path vscode = tmp.dir / "appdata" / "Code" / "User" / "settings.json";
     const fs::path cursor = tmp.dir / "profile" / ".cursor" / "mcp.json";
     spit(vscode, R"({"mcp": true, "editor.fontSize": 14})");
-    spit(cursor, R"({"mcpServers":{"reverse-slop":{"url":"http://127.0.0.1:1111/mcp","env":{"K":"V"}},"other":{"url":"x"}}})");
+    spit(cursor, R"({"mcpServers":{"slopstation":{"url":"http://127.0.0.1:1111/mcp","env":{"K":"V"}},"other":{"url":"x"}}})");
 
     const auto results = onboard::install_all(8765, "tok-new");
     bool vscode_err = false;
@@ -544,7 +544,7 @@ TEST_CASE(infra_onboard_survives_non_object_mcp_and_refreshes_stale_entries) {
 
     // stale port/token rewritten in place, user keys and other servers kept
     const njson c = njson::parse(slurp(cursor));
-    const njson& ours = c.at("mcpServers").at("reverse-slop");
+    const njson& ours = c.at("mcpServers").at("slopstation");
     REQUIRE_STR_EQ(ours.at("url").get<std::string>().c_str(), "http://127.0.0.1:8765/mcp");
     REQUIRE_STR_EQ(ours.at("headers").at("Authorization").get<std::string>().c_str(),
                    "Bearer tok-new");
@@ -557,7 +557,7 @@ TEST_CASE(infra_onboard_survives_non_object_mcp_and_refreshes_stale_entries) {
     fs::remove(windsurf);
     onboard::refresh_existing(9000, "tok-2");
     REQUIRE(!fs::exists(windsurf));
-    REQUIRE_STR_EQ(njson::parse(slurp(cursor)).at("mcpServers").at("reverse-slop")
+    REQUIRE_STR_EQ(njson::parse(slurp(cursor)).at("mcpServers").at("slopstation")
                        .at("url").get<std::string>().c_str(),
                    "http://127.0.0.1:9000/mcp");
 }

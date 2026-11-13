@@ -1509,6 +1509,26 @@ html[data-motion="off"] *::after {
   border-bottom: 1px solid var(--danger);
 }
 
+.update-banner {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-1));
+  border-bottom-color: var(--accent);
+}
+
+.update-progress {
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.update-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
 .splash-error {
   display: flex;
   align-items: center;
@@ -1564,6 +1584,40 @@ html[data-motion="off"] *::after {
   gap: var(--pad-md);
   padding: var(--pad-lg);
   text-align: center;
+}
+
+.payload-card {
+  display: grid;
+  gap: var(--pad-xs);
+  width: min(420px, 100%);
+  margin: 0 auto;
+  padding: var(--pad-sm) var(--pad-md);
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-1);
+}
+
+.payload-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--pad-sm);
+}
+
+.payload-title {
+  font-size: var(--type-small);
+  color: var(--text);
+}
+
+.payload-hint {
+  font-size: var(--type-small);
+  color: var(--text-faint);
+}
+
+.payload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pad-xs);
 }
 
 .targets-list {

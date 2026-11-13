@@ -170,7 +170,7 @@ export default function TitleBar() {
             </div>
           ))}
           <div className="menu-sep" role="separator" />
-          <div className="menu-item menu-static">reverse-slop 0.1.1</div>
+          <div className="menu-item menu-static">SlopStation</div>
         </>,
       )}
 

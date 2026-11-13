@@ -10,10 +10,12 @@ import IconButton from "@/components/IconButton";
 import Modal from "@/components/Modal";
 import { getEndpoint } from "@/lib/rpc";
 import { copyText } from "@/lib/clipboard";
+import { isTauri } from "@/lib/endpoint";
 import { useEngine } from "@/store/engine";
 import { kMotionOptions, osPrefersReduced, useMotion } from "@/store/motion";
 import { useSettings } from "@/store/settings";
 import { kThemes, useTheme } from "@/store/theme";
+import { useUpdater } from "@/store/updater";
 
 type Props = { onClose: () => void };
 
@@ -87,7 +89,28 @@ export default function SettingsModal({ onClose }: Props) {
   const [allowlist, setAllowlist] = useState("");
   const [proxyToken, setProxyToken] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
+  const [appVersion, setAppVersion] = useState("");
   const endpoint = getEndpoint();
+  const updatePhase = useUpdater((s) => s.phase);
+  const updateVersion = useUpdater((s) => s.version);
+  const updateProgress = useUpdater((s) => s.progress);
+  const updateError = useUpdater((s) => s.error);
+  const checkUpdates = useUpdater((s) => s.check);
+  const installUpdate = useUpdater((s) => s.install);
+
+  useEffect(() => {
+    if (!isTauri()) return;
+    let alive = true;
+    void import("@tauri-apps/api/app")
+      .then(({ getVersion }) => getVersion())
+      .then((v) => {
+        if (alive) setAppVersion(v);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     void load();
@@ -104,6 +127,18 @@ export default function SettingsModal({ onClose }: Props) {
   const mcpUrl = `http://127.0.0.1:${endpoint.port}/mcp`;
   const tokenState =
     settings?.mcp_token === "set" ? "set" : settings?.mcp_token === "unset" ? "unset" : "unknown";
+  const updateStatus =
+    updatePhase === "checking"
+      ? "Checking…"
+      : updatePhase === "available"
+        ? `v${updateVersion} is available.`
+        : updatePhase === "downloading"
+          ? `Downloading…${updateProgress >= 0 ? ` ${Math.round(updateProgress * 100)}%` : ""}`
+          : updatePhase === "ready"
+            ? "Installing; the app will restart."
+            : updatePhase === "error"
+              ? `Update failed: ${updateError}`
+              : "Up to date.";
 
   const saveAllowlist = () => {
     const hosts = allowlist
@@ -118,8 +153,8 @@ export default function SettingsModal({ onClose }: Props) {
       <div className="modal-body">
         <div className="settings-brand">
           <img src={logoUrl} alt="" draggable={false} />
-          <div className="settings-brand-name">reverse-slop</div>
-          <div className="settings-brand-sub">v0.1.1 · {backend.badge} engine</div>
+          <div className="settings-brand-name">SlopStation</div>
+          <div className="settings-brand-sub">v{appVersion || "dev"} · {backend.badge} engine</div>
         </div>
 
         <fieldset className="settings-group">
@@ -194,6 +229,29 @@ export default function SettingsModal({ onClose }: Props) {
               <CopyButton text={mcpUrl} tip="Copy MCP URL" />
             </div>
             <div>ui auth: {endpoint.token === "" ? "none (browser dev mode)" : "bearer token"}</div>
+          </div>
+        </fieldset>
+
+        <fieldset className="settings-group">
+          <legend className="settings-label">Updates</legend>
+          <div className="settings-rows">
+            <div>version: {appVersion || "dev"}</div>
+            <div>{updateStatus}</div>
+            <div className="settings-choices">
+              <button
+                type="button"
+                className="row-action"
+                disabled={updatePhase === "checking" || updatePhase === "downloading"}
+                onClick={() => void checkUpdates(true)}
+              >
+                {updatePhase === "checking" ? "Checking…" : "Check for updates"}
+              </button>
+              {updatePhase === "available" && (
+                <button type="button" className="row-action" onClick={() => void installUpdate()}>
+                  Install v{updateVersion} &amp; restart
+                </button>
+              )}
+            </div>
           </div>
         </fieldset>
 

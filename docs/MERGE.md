@@ -1,6 +1,6 @@
 # Ecosystem merge plan
 
-How the sibling projects fold into reverse-slop (PS4-Slop), what landed, and
+How the sibling projects fold into SlopStation, what landed, and
 what was deliberately left out.
 
 Scope rule: everything merged here is for **hardware you own** — homebrew

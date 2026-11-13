@@ -1,5 +1,5 @@
 // src/core/infra/mcp_onboard.cpp
-// drops the reverse-slop mcp entry into every ai client config we know about
+// drops the SlopStation mcp entry into every ai client config we know about
 // runs once on first boot and skips anything that already has us registered
 //
 // every client wants a slightly different entry shape:
@@ -66,7 +66,7 @@ bool write_json_file(const std::string& path, const json& j) {
 
 // entry builder
 
-constexpr const char* kServerName = "reverse-slop";
+constexpr const char* kServerName = "slopstation";
 
 // bare url entry, no "transport" key since nobody reads one
 json make_mcp_entry(uint16_t port, const std::string& token) {
