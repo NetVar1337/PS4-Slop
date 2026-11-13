@@ -40,8 +40,15 @@ struct server_fixture_t {
         REQUIRE_GT(port_, 0);
         cli_ = std::make_unique<httplib::Client>("127.0.0.1", port_);
         cli_->set_connection_timeout(std::chrono::seconds(2));
+#ifdef SLOP_ASAN
+        // ASan analysis is ~4x slower; a 10 s read timeout trips on the
+        // analysis-heavy tools before the server can answer.
+        cli_->set_read_timeout(std::chrono::seconds(60));
+        cli_->set_write_timeout(std::chrono::seconds(60));
+#else
         cli_->set_read_timeout(std::chrono::seconds(10));
         cli_->set_write_timeout(std::chrono::seconds(10));
+#endif
     }
     ~server_fixture_t() {
         // Close the client socket before joining server workers. Reversing
@@ -556,13 +563,9 @@ TEST_CASE(mcp_volt_regressions_arg_aliases_limits_assemble) {
     const std::string herr = res.at("error").get<std::string>();
     REQUIRE(herr.find("missing numeric argument") == std::string::npos);
 
-    // prove_predicates reports completed/failed/faulted denominators
-    res = fx.call("devirt", {{"action", "prove_predicates"},
-                             {"addr", entry_va}, {"runs", 2}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE(res.contains("completed_runs"));
-    REQUIRE(res.contains("failed_runs"));
-    REQUIRE(res.contains("faulted_runs"));
+    // prove_predicates reports completed/failed/faulted denominators; it runs
+    // the emulator, so it lives in its own case that the ASan lane excludes
+    // (see mcp_devirt_prove_predicates_emulate below).
 
     // iat_audit default audits parsed IAT slots only (no 500k+ overcount)
     res = fx.call("devirt", {{"action", "iat_audit"}}, is_error);
@@ -572,6 +575,26 @@ TEST_CASE(mcp_volt_regressions_arg_aliases_limits_assemble) {
                res.value("named", 0u) + res.value("unnamed_valid", 0u) +
                    res.value("invalid", 0u));
 
+    slop::core::disasm::binary_state::unload();
+}
+
+TEST_CASE(mcp_devirt_prove_predicates_emulate) {
+    // Seeded emulation: kept separate from the static volt regressions so the
+    // ASan lane (SLOP_TEST_EXCLUDE=emulate) can skip it; Unicorn faults with
+    // no ASan report.
+    server_fixture_t fx;
+    bool is_error = false;
+    REQUIRE(slop::core::disasm::binary_state::load_file(SLOP_TARGET_EXE_PATH));
+    json loaded = fx.call("disasm", {{"action", "loaded"}}, is_error);
+    REQUIRE_EQ(loaded.value("ready", false), true);
+    const uint64_t base = loaded.at("base").get<uint64_t>();
+    const uint64_t entry_va = loaded.value("entry_va", base);
+    json res = fx.call("devirt", {{"action", "prove_predicates"},
+                                  {"addr", entry_va}, {"runs", 2}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.contains("completed_runs"));
+    REQUIRE(res.contains("failed_runs"));
+    REQUIRE(res.contains("faulted_runs"));
     slop::core::disasm::binary_state::unload();
 }
 
@@ -1427,20 +1450,9 @@ TEST_CASE(mcp_devirt_and_full_pass_over_wire) {
     REQUIRE_EQ(payload.value("likely_vm", true), false);
     REQUIRE(payload.contains("confidence_pct"));
 
-    payload = fx.call("devirt",
-                      {{"action", "recover_cfg"}, {"addr", entry},
-                       {"runs", 2}},
-                      is_error);
-    REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("flattened", true), false);
-    REQUIRE_STR_EQ(payload.value("mode", "").c_str(), "none");
-
-    payload = fx.call("devirt",
-                      {{"action", "prove_predicates"}, {"addr", entry},
-                       {"runs", 2}},
-                      is_error);
-    REQUIRE(!is_error);
-    REQUIRE(payload.contains("predicates"));
+    // recover_cfg / prove_predicates run the emulator; they live in
+    // mcp_devirt_recover_cfg_prove_predicates_emulate so the ASan lane can
+    // skip them (Unicorn faults with no ASan report).
 
     payload = fx.call("devirt", {{"action", "iat_audit"}}, is_error);
     REQUIRE(!is_error);
@@ -1466,6 +1478,32 @@ TEST_CASE(mcp_devirt_and_full_pass_over_wire) {
 
     payload = fx.call("patch", {{"action", "rebuild"}, {"addr", 1}}, is_error);
     REQUIRE(is_error);   // image unloaded
+}
+
+TEST_CASE(mcp_devirt_recover_cfg_prove_predicates_emulate) {
+    // Seeded emulation: separate so the ASan lane can skip it.
+    server_fixture_t fx;
+    bool is_error = false;
+    REQUIRE(slop::core::disasm::binary_state::load_file(SLOP_TARGET_EXE_PATH));
+    json loaded = fx.call("disasm", {{"action", "loaded"}}, is_error);
+    const uint64_t entry = loaded.at("entry_va").get<uint64_t>();
+
+    json payload = fx.call("devirt",
+                           {{"action", "recover_cfg"}, {"addr", entry},
+                            {"runs", 2}},
+                           is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("flattened", true), false);
+    REQUIRE_STR_EQ(payload.value("mode", "").c_str(), "none");
+
+    payload = fx.call("devirt",
+                      {{"action", "prove_predicates"}, {"addr", entry},
+                       {"runs", 2}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE(payload.contains("predicates"));
+
+    slop::core::disasm::binary_state::unload();
 }
 
 TEST_CASE(mcp_debugger_ps4_actions_refuse_without_console) {
@@ -1972,7 +2010,7 @@ TEST_CASE(mcp_initialize_negotiates_version_and_issues_sessions) {
     REQUIRE_EQ(gone->status, 404);
 }
 
-TEST_CASE(mcp_cancel_is_scoped_to_the_issuing_session) {
+TEST_CASE(mcp_cancel_is_scoped_to_the_issuing_session_emulate) {
     server_fixture_t fx;
     auto init_a = fx.cli_->Post("/mcp", rpc_body("initialize").dump(), "application/json");
     auto init_b = fx.cli_->Post("/mcp", rpc_body("initialize").dump(), "application/json");
