@@ -18,7 +18,10 @@ struct entry_t {
     value_width_t width       = value_width_t::u32;
     std::string   label;
     bool          freeze      = false;
+    bool          freeze_once = false;   // release after the first write-back
     uint64_t      frozen_bits = 0;
+    uint64_t      pre_freeze_bits = 0;   // value before the hold, for undo
+    bool          pre_freeze_valid = false;
 };
 
 struct value_t {
@@ -26,6 +29,7 @@ struct value_t {
     uint64_t    addr = 0;
     bool        ok   = false;   // live read succeeded on the last pass
     bool        held = false;   // value is being held by a freeze write
+    bool        wrote = false;  // the hold landed (write or already-equal)
     bool        hold_failed = false; // the freeze write-back was rejected
     uint64_t    bits = 0;
     std::string text;           // format_value_text(width, bits)
@@ -40,6 +44,12 @@ void clear();
 // Toggle the freeze hold. Turning it on latches the most recently sampled
 // value, matching the ImGui checkbox behaviour it replaces
 bool set_freeze(uint64_t id, bool on);
+
+// Freeze until the first successful write-back, then release (safe poke)
+bool set_freeze_once(uint64_t id);
+
+// Release the hold and restore the value captured when it was armed
+bool undo_freeze(uint64_t id, std::string* err = nullptr);
 
 // Overwrite the target now and, when frozen, latch the new value as the hold
 bool poke(uint64_t id, uint64_t bits, std::string* err = nullptr);

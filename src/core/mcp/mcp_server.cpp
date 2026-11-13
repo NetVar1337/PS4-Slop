@@ -272,6 +272,10 @@ json handle_request(const json& req, const std::string& session) {
         if (!params.is_object() || !params.contains("name") || !params.at("name").is_string())
             return rpc_error(-32602, "tools/call: missing tool name", id);
         const std::string name = params.at("name").get<std::string>();
+        // `app` is UI plumbing (settings, token rotation, shutdown) and is not
+        // in tools/list; keep it off the agent-facing transport entirely.
+        if (name == "app")
+            return rpc_error(-32601, "tool not found: app (UI-only)", id);
         const json args = params.contains("arguments") ? params.at("arguments") : json::object();
 
         bool is_error = false;
@@ -331,7 +335,8 @@ json handle_api(const json& req, infra::cancel_token_t cancel) {
     args["action"] = req.at("action");
 
     bool is_error = false;
-    json payload = call_tool(tool, args, is_error, cancel);
+    // /api is the UI channel and is the only caller allowed to reach `app`
+    json payload = call_tool(tool, args, is_error, cancel, /*allow_app=*/true);
     json out{{"ok", !is_error}, {"data", std::move(payload)}};
     if (req.contains("id")) out["id"] = req.at("id");
     return out;

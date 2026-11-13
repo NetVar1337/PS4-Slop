@@ -196,7 +196,10 @@ bool MetadataReader::parse_streams(const u8* root, size_t size) {
     // version_len(4) version[..] flags(2) streams(2), then stream headers.
     u32 ver_len = 0;
     std::memcpy(&ver_len, root + 12, 4);
-    if (ver_len > size) return false;
+    // The version string starts at +16, so it must fit in the remaining bytes;
+    // the old check compared it against the whole buffer and let strnlen read
+    // past the end on a crafted header.
+    if (ver_len > size - 16) return false;
     size_t pos = 16 + ((static_cast<size_t>(ver_len) + 3) & ~size_t(3));
     if (pos + 4 > size) return false;
 
@@ -216,6 +219,11 @@ bool MetadataReader::parse_streams(const u8* root, size_t size) {
         const char* name = reinterpret_cast<const char*>(root + pos);
         size_t name_max = size - pos;
         size_t name_len = strnlen(name, name_max);
+        // A name that fills the remaining buffer has no NUL; comparing it with
+        // strcmp would read past the end. Compare length + bytes instead.
+        const auto name_is = [&](const char* lit, size_t lit_len) {
+            return name_len == lit_len && std::memcmp(name, lit, lit_len) == 0;
+        };
         pos += (name_len + 4) & ~size_t(3);     // NUL-terminated, padded to 4
 
         // Clamp the stream to the metadata region; a corrupt offset/size just
@@ -229,13 +237,13 @@ bool MetadataReader::parse_streams(const u8* root, size_t size) {
             tables_stream_ = data; tables_stream_sz_ = sz;
         } else if (name_len == 2 && name[0] == '#' && name[1] == '-') {
             tables_stream_ = data; tables_stream_sz_ = sz;   // uncompressed variant
-        } else if (std::strcmp(name, "#Strings") == 0) {
+        } else if (name_is("#Strings", 8)) {
             strings_ = data; strings_sz_ = sz;
-        } else if (std::strcmp(name, "#US") == 0) {
+        } else if (name_is("#US", 3)) {
             us_ = data; us_sz_ = sz;
-        } else if (std::strcmp(name, "#Blob") == 0) {
+        } else if (name_is("#Blob", 5)) {
             blob_ = data; blob_sz_ = sz;
-        } else if (std::strcmp(name, "#GUID") == 0) {
+        } else if (name_is("#GUID", 5)) {
             guid_ = data; guid_sz_ = sz;
         }
     }
@@ -331,53 +339,72 @@ void MetadataReader::compute_layout() {
     for (u32 tbl = 0; tbl < mdt::kCount; ++tbl) {
         TableInfo& ti = tables_[tbl];
         if (ti.rows == 0) continue;
-        if (cursor <= tables_stream_sz_) ti.data = tables_stream_ + cursor;
+        if (ti.row_size == 0) { ti.rows = 0; continue; }
+        // A row count is attacker-controlled. Clamp it to the bytes that
+        // actually remain in the tables stream before anything sizes a vector
+        // or walks a row: this is what made the owner-table fill below an
+        // out-of-bounds write on a crafted assembly.
+        const size_t avail = cursor <= tables_stream_sz_ ? tables_stream_sz_ - cursor : 0;
+        const size_t fit = avail / ti.row_size;
+        if (static_cast<size_t>(ti.rows) > fit) ti.rows = static_cast<u32>(fit);
+        if (ti.rows == 0) continue;
+        ti.data = tables_stream_ + cursor;
         cursor += static_cast<size_t>(ti.rows) * ti.row_size;
     }
 
     // method_rid -> owning TypeDef, field_rid -> owning TypeDef. A TypeDef owns
     // the method/field rids from its list column up to the next TypeDef's.
-    u32 type_rows = table_rows(mdt::TypeDef);
-    u32 meth_rows = table_rows(mdt::MethodDef);
-    u32 fld_rows  = table_rows(mdt::Field);
-    method_owner_.assign(meth_rows + 2, 0);
-    field_owner_.assign(fld_rows + 2, 0);
+    const u32 type_rows = table_rows(mdt::TypeDef);
+    const u32 meth_rows = table_rows(mdt::MethodDef);
+    const u32 fld_rows  = table_rows(mdt::Field);
+    // size_t sizing: `meth_rows + 2` wraps in u32 when the row count is near
+    // 0xFFFFFFFF, which used to leave a 1-element vector for a huge fill loop.
+    method_owner_.assign(static_cast<size_t>(meth_rows) + 2, 0);
+    field_owner_.assign(static_cast<size_t>(fld_rows) + 2, 0);
     for (u32 t = 1; t <= type_rows; ++t) {
         TypeDefRow cur = type_def(t);
-        u32 m_end = (t < type_rows) ? type_def(t + 1).method_list : meth_rows + 1;
-        u32 f_end = (t < type_rows) ? type_def(t + 1).field_list  : fld_rows + 1;
-        for (u32 m = cur.method_list; m < m_end && m <= meth_rows; ++m) method_owner_[m] = t;
-        for (u32 f = cur.field_list;  f < f_end && f <= fld_rows;  ++f) field_owner_[f] = t;
+        const uint64_t m_end = (t < type_rows)
+            ? type_def(t + 1).method_list : static_cast<uint64_t>(meth_rows) + 1;
+        const uint64_t f_end = (t < type_rows)
+            ? type_def(t + 1).field_list  : static_cast<uint64_t>(fld_rows) + 1;
+        for (uint64_t m = cur.method_list; m < m_end && m <= meth_rows; ++m)
+            if (m < method_owner_.size()) method_owner_[static_cast<size_t>(m)] = t;
+        for (uint64_t f = cur.field_list;  f < f_end && f <= fld_rows;  ++f)
+            if (f < field_owner_.size()) field_owner_[static_cast<size_t>(f)] = t;
     }
 
     // property_rid / event_rid -> owning TypeDef, via the PropertyMap / EventMap
     // ranges (each map row names a TypeDef and the first property/event it owns;
     // the run ends where the next map row begins).
-    u32 prop_rows  = table_rows(mdt::Property);
-    u32 event_rows = table_rows(mdt::Event);
-    property_owner_.assign(prop_rows + 2, 0);
-    event_owner_.assign(event_rows + 2, 0);
-    u32 pmap_rows = table_rows(mdt::PropertyMap);
+    const u32 prop_rows  = table_rows(mdt::Property);
+    const u32 event_rows = table_rows(mdt::Event);
+    property_owner_.assign(static_cast<size_t>(prop_rows) + 2, 0);
+    event_owner_.assign(static_cast<size_t>(event_rows) + 2, 0);
+    const u32 pmap_rows = table_rows(mdt::PropertyMap);
     for (u32 i = 1; i <= pmap_rows; ++i) {
-        u32 parent = read_col(mdt::PropertyMap, i, 0);
-        u32 start  = read_col(mdt::PropertyMap, i, 1);
-        u32 end    = (i < pmap_rows) ? read_col(mdt::PropertyMap, i + 1, 1) : prop_rows + 1;
-        for (u32 p = start; p < end && p <= prop_rows; ++p) property_owner_[p] = parent;
+        const u32 parent = read_col(mdt::PropertyMap, i, 0);
+        const u32 start  = read_col(mdt::PropertyMap, i, 1);
+        const uint64_t end = (i < pmap_rows)
+            ? read_col(mdt::PropertyMap, i + 1, 1) : static_cast<uint64_t>(prop_rows) + 1;
+        for (uint64_t p = start; p < end && p <= prop_rows; ++p)
+            if (p < property_owner_.size()) property_owner_[static_cast<size_t>(p)] = parent;
     }
-    u32 emap_rows = table_rows(mdt::EventMap);
+    const u32 emap_rows = table_rows(mdt::EventMap);
     for (u32 i = 1; i <= emap_rows; ++i) {
-        u32 parent = read_col(mdt::EventMap, i, 0);
-        u32 start  = read_col(mdt::EventMap, i, 1);
-        u32 end    = (i < emap_rows) ? read_col(mdt::EventMap, i + 1, 1) : event_rows + 1;
-        for (u32 e = start; e < end && e <= event_rows; ++e) event_owner_[e] = parent;
+        const u32 parent = read_col(mdt::EventMap, i, 0);
+        const u32 start  = read_col(mdt::EventMap, i, 1);
+        const uint64_t end = (i < emap_rows)
+            ? read_col(mdt::EventMap, i + 1, 1) : static_cast<uint64_t>(event_rows) + 1;
+        for (uint64_t e = start; e < end && e <= event_rows; ++e)
+            if (e < event_owner_.size()) event_owner_[static_cast<size_t>(e)] = parent;
     }
 
     // nested type -> enclosing type, straight from the NestedClass table.
-    nested_enclosing_.assign(type_rows + 2, 0);
-    u32 nest_rows = table_rows(mdt::NestedClass);
+    nested_enclosing_.assign(static_cast<size_t>(type_rows) + 2, 0);
+    const u32 nest_rows = table_rows(mdt::NestedClass);
     for (u32 i = 1; i <= nest_rows; ++i) {
-        u32 nested = read_col(mdt::NestedClass, i, 0);
-        u32 encl   = read_col(mdt::NestedClass, i, 1);
+        const u32 nested = read_col(mdt::NestedClass, i, 0);
+        const u32 encl   = read_col(mdt::NestedClass, i, 1);
         if (nested >= 1 && nested <= type_rows) nested_enclosing_[nested] = encl;
     }
 
@@ -589,11 +616,18 @@ std::string MetadataReader::type_name(u32 token) const {
         std::string name = string_at(read_col(mdt::TypeRef, rid, 1));
         std::string ns = string_at(read_col(mdt::TypeRef, rid, 2));
         std::string self = ns.empty() ? name : ns + "." + name;
-        // A TypeRef whose scope is another TypeRef is a nested type.
+        // A TypeRef whose scope is another TypeRef is a nested type. Walk the
+        // chain iteratively: a crafted assembly can make it self-referential,
+        // and the recursive form had no depth or cycle guard.
         TokenRef scope = decode_coded(Coded::ResolutionScope, rs);
-        if (scope.table == mdt::TypeRef && scope.rid) {
-            std::string outer = type_name((mdt::TypeRef << 24) | scope.rid);
-            if (!outer.empty()) self = outer + "/" + self;
+        int depth = 0;
+        while (scope.table == mdt::TypeRef && scope.rid && depth++ < kMaxNestDepth) {
+            const std::string oname = string_at(read_col(mdt::TypeRef, scope.rid, 1));
+            const std::string ons   = string_at(read_col(mdt::TypeRef, scope.rid, 2));
+            if (!oname.empty())
+                self = (ons.empty() ? oname : ons + "." + oname) + "/" + self;
+            scope = decode_coded(Coded::ResolutionScope,
+                                 read_col(mdt::TypeRef, scope.rid, 0));
         }
         return self;
     }
@@ -698,8 +732,10 @@ std::string MetadataReader::token_name(u32 token) const {
 
 // ---- Signatures ---------------------------------------------------------
 
-std::string MetadataReader::read_type(const u8*& p, const u8* end) const {
+std::string MetadataReader::read_type(const u8*& p, const u8* end, int depth) const {
     if (p >= end) return "?";
+    // A blob of 0x0F (PTR) bytes used to recurse until the stack died.
+    if (depth > 32) return "?";
     u8 et = *p++;
 
     // Skip custom modifiers, keep the underlying type.
@@ -714,27 +750,32 @@ std::string MetadataReader::read_type(const u8*& p, const u8* end) const {
 
     switch (et) {
     case ET_PINNED: {
-        return read_type(p, end) + " pinned";
+        return read_type(p, end, depth + 1) + " pinned";
     }
     case ET_BYREF: {
-        return read_type(p, end) + "&";
+        return read_type(p, end, depth + 1) + "&";
     }
     case ET_PTR: {
-        return read_type(p, end) + "*";
+        return read_type(p, end, depth + 1) + "*";
     }
     case ET_SZARRAY: {
-        return read_type(p, end) + "[]";
+        return read_type(p, end, depth + 1) + "[]";
     }
     case ET_ARRAY: {
-        std::string elem = read_type(p, end);
+        std::string elem = read_type(p, end, depth + 1);
         u32 rank = 0;
         read_compressed(p, end, rank);
         u32 num_sizes = 0;
         read_compressed(p, end, num_sizes);
+        // Each compressed integer can declare 2^29 elements; cap the loops so
+        // a short hostile blob cannot spin for billions of iterations.
+        if (num_sizes > 64) num_sizes = 64;
         for (u32 i = 0; i < num_sizes; ++i) { u32 s = 0; read_compressed(p, end, s); }
         u32 num_lo = 0;
         read_compressed(p, end, num_lo);
+        if (num_lo > 64) num_lo = 64;
         for (u32 i = 0; i < num_lo; ++i) { u32 s = 0; read_compressed(p, end, s); }
+        if (rank > 64) rank = 64;   // rank used to size a 512 MB string
         std::string dims(rank ? rank - 1 : 0, ',');
         return elem + "[" + dims + "]";
     }
@@ -747,13 +788,13 @@ std::string MetadataReader::read_type(const u8*& p, const u8* end) const {
         return type_name(tok);
     }
     case ET_GENERICINST: {
-        std::string base = read_type(p, end);   // CLASS/VALUETYPE + token
+        std::string base = read_type(p, end, depth + 1);   // CLASS/VALUETYPE + token
         u32 argc = 0;
         read_compressed(p, end, argc);
         std::string args;
         for (u32 i = 0; i < argc && i < 64; ++i) {
             if (i) args += ",";
-            args += read_type(p, end);
+            args += read_type(p, end, depth + 1);
         }
         // Strip the CLR arity marker (`Name`1) for a cleaner C#-style rendering.
         auto tick = base.rfind('`');
@@ -773,7 +814,7 @@ std::string MetadataReader::read_type(const u8*& p, const u8* end) const {
         // Best-effort: consume calling conv + param count + (params+1) types.
         if (p < end) ++p;                        // calling convention
         u32 pc = 0; read_compressed(p, end, pc);
-        for (u32 i = 0; i <= pc && i < 256; ++i) read_type(p, end);
+        for (u32 i = 0; i <= pc && i < 256; ++i) read_type(p, end, depth + 1);
         return "method*";
     }
     case ET_OBJECT: return "object";

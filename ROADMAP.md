@@ -25,6 +25,23 @@ Prioritized from the full audit ([`docs/AUDIT.md`](docs/AUDIT.md), 115 items). S
       `integrations/ps4-mcp-adapters/` with an MCP shim client for the built-in
       server (see its README for the op mapping).
 
+## Landed (audit-fixes branch, 2026-11-13)
+
+- P0/P1 correctness and security: .NET metadata row clamp (heap OOB write),
+  MCP `app` boundary, audit/proxy secret redaction, `fs` engine-data guard,
+  GDB r8-r15 mapping, port-755 peer pinning + per-connection drain,
+  watch freeze latch, stash overlap, Lua `image.load` gate, fail-closed token,
+  type-catalog deadlock, zip empty deflate, PE offset fixes, loader caps,
+  Mach-O entry underflow, decompiler depth guard, `parallel_for` safety.
+- Console readiness: auto-reconnect with backoff, conditional breakpoints,
+  scan save/load, freeze-once/undo, `ps4_status` capability report.
+- CI: the `mcp` area runs under ASan without the Unicorn cases; Tauri CSP
+  hardening.
+
+Still open from this audit: UI panels for the non-memory tools, hit-count
+breakpoints, coverage/fuzz lanes, gitleaks, pcap import, ARM64 emulation,
+PS5 backend, Linux engine port.
+
 ## Next milestone — v0.2 "agent-grade" (P1)
 
 Test visibility and agent-facing surface, because that is where the leverage is:

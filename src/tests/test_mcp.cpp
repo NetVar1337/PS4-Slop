@@ -40,8 +40,15 @@ struct server_fixture_t {
         REQUIRE_GT(port_, 0);
         cli_ = std::make_unique<httplib::Client>("127.0.0.1", port_);
         cli_->set_connection_timeout(std::chrono::seconds(2));
+#ifdef SLOP_ASAN
+        // ASan analysis is ~4x slower; a 10 s read timeout trips on the
+        // analysis-heavy tools before the server can answer.
+        cli_->set_read_timeout(std::chrono::seconds(60));
+        cli_->set_write_timeout(std::chrono::seconds(60));
+#else
         cli_->set_read_timeout(std::chrono::seconds(10));
         cli_->set_write_timeout(std::chrono::seconds(10));
+#endif
     }
     ~server_fixture_t() {
         // Close the client socket before joining server workers. Reversing
@@ -63,6 +70,16 @@ struct server_fixture_t {
             std::printf("  [rpc %s] status=%d body=%.400s\n",
                         method.c_str(), res->status, res->body.c_str());
         REQUIRE_EQ(res->status, 200);
+        return json::parse(res->body);
+    }
+
+    // /api helper (the UI channel; the only one allowed to reach `app`)
+    json api(const std::string& tool, const std::string& action,
+             const json& params = json::object()) {
+        json req = {{"tool", tool}, {"action", action}};
+        if (!params.empty()) req["params"] = params;
+        auto res = cli_->Post("/api", req.dump(), "application/json");
+        REQUIRE(res);
         return json::parse(res->body);
     }
 
@@ -546,13 +563,9 @@ TEST_CASE(mcp_volt_regressions_arg_aliases_limits_assemble) {
     const std::string herr = res.at("error").get<std::string>();
     REQUIRE(herr.find("missing numeric argument") == std::string::npos);
 
-    // prove_predicates reports completed/failed/faulted denominators
-    res = fx.call("devirt", {{"action", "prove_predicates"},
-                             {"addr", entry_va}, {"runs", 2}}, is_error);
-    REQUIRE(!is_error);
-    REQUIRE(res.contains("completed_runs"));
-    REQUIRE(res.contains("failed_runs"));
-    REQUIRE(res.contains("faulted_runs"));
+    // prove_predicates reports completed/failed/faulted denominators; it runs
+    // the emulator, so it lives in its own case that the ASan lane excludes
+    // (see mcp_devirt_prove_predicates_emulate below).
 
     // iat_audit default audits parsed IAT slots only (no 500k+ overcount)
     res = fx.call("devirt", {{"action", "iat_audit"}}, is_error);
@@ -562,6 +575,26 @@ TEST_CASE(mcp_volt_regressions_arg_aliases_limits_assemble) {
                res.value("named", 0u) + res.value("unnamed_valid", 0u) +
                    res.value("invalid", 0u));
 
+    slop::core::disasm::binary_state::unload();
+}
+
+TEST_CASE(mcp_devirt_prove_predicates_emulate) {
+    // Seeded emulation: kept separate from the static volt regressions so the
+    // ASan lane (SLOP_TEST_EXCLUDE=emulate) can skip it; Unicorn faults with
+    // no ASan report.
+    server_fixture_t fx;
+    bool is_error = false;
+    REQUIRE(slop::core::disasm::binary_state::load_file(SLOP_TARGET_EXE_PATH));
+    json loaded = fx.call("disasm", {{"action", "loaded"}}, is_error);
+    REQUIRE_EQ(loaded.value("ready", false), true);
+    const uint64_t base = loaded.at("base").get<uint64_t>();
+    const uint64_t entry_va = loaded.value("entry_va", base);
+    json res = fx.call("devirt", {{"action", "prove_predicates"},
+                                  {"addr", entry_va}, {"runs", 2}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE(res.contains("completed_runs"));
+    REQUIRE(res.contains("failed_runs"));
+    REQUIRE(res.contains("faulted_runs"));
     slop::core::disasm::binary_state::unload();
 }
 
@@ -1129,6 +1162,12 @@ TEST_CASE(mcp_script_run_roundtrip) {
 }
 
 TEST_CASE(mcp_script_static_analysis_surface) {
+    // the script loads the fixture from disk, which the sandbox refuses
+    struct unsafe_guard_t {
+        bool prev = slop::core::infra::settings::get<bool>("script_unsafe", false);
+        unsafe_guard_t() { slop::core::infra::settings::set("script_unsafe", true); }
+        ~unsafe_guard_t() { slop::core::infra::settings::set("script_unsafe", prev); }
+    } unsafe_guard;
     server_fixture_t fx;
     bool is_error = false;
 
@@ -1411,20 +1450,9 @@ TEST_CASE(mcp_devirt_and_full_pass_over_wire) {
     REQUIRE_EQ(payload.value("likely_vm", true), false);
     REQUIRE(payload.contains("confidence_pct"));
 
-    payload = fx.call("devirt",
-                      {{"action", "recover_cfg"}, {"addr", entry},
-                       {"runs", 2}},
-                      is_error);
-    REQUIRE(!is_error);
-    REQUIRE_EQ(payload.value("flattened", true), false);
-    REQUIRE_STR_EQ(payload.value("mode", "").c_str(), "none");
-
-    payload = fx.call("devirt",
-                      {{"action", "prove_predicates"}, {"addr", entry},
-                       {"runs", 2}},
-                      is_error);
-    REQUIRE(!is_error);
-    REQUIRE(payload.contains("predicates"));
+    // recover_cfg / prove_predicates run the emulator; they live in
+    // mcp_devirt_recover_cfg_prove_predicates_emulate so the ASan lane can
+    // skip them (Unicorn faults with no ASan report).
 
     payload = fx.call("devirt", {{"action", "iat_audit"}}, is_error);
     REQUIRE(!is_error);
@@ -1450,6 +1478,32 @@ TEST_CASE(mcp_devirt_and_full_pass_over_wire) {
 
     payload = fx.call("patch", {{"action", "rebuild"}, {"addr", 1}}, is_error);
     REQUIRE(is_error);   // image unloaded
+}
+
+TEST_CASE(mcp_devirt_recover_cfg_prove_predicates_emulate) {
+    // Seeded emulation: separate so the ASan lane can skip it.
+    server_fixture_t fx;
+    bool is_error = false;
+    REQUIRE(slop::core::disasm::binary_state::load_file(SLOP_TARGET_EXE_PATH));
+    json loaded = fx.call("disasm", {{"action", "loaded"}}, is_error);
+    const uint64_t entry = loaded.at("entry_va").get<uint64_t>();
+
+    json payload = fx.call("devirt",
+                           {{"action", "recover_cfg"}, {"addr", entry},
+                            {"runs", 2}},
+                           is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("flattened", true), false);
+    REQUIRE_STR_EQ(payload.value("mode", "").c_str(), "none");
+
+    payload = fx.call("devirt",
+                      {{"action", "prove_predicates"}, {"addr", entry},
+                       {"runs", 2}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE(payload.contains("predicates"));
+
+    slop::core::disasm::binary_state::unload();
 }
 
 TEST_CASE(mcp_debugger_ps4_actions_refuse_without_console) {
@@ -1956,7 +2010,7 @@ TEST_CASE(mcp_initialize_negotiates_version_and_issues_sessions) {
     REQUIRE_EQ(gone->status, 404);
 }
 
-TEST_CASE(mcp_cancel_is_scoped_to_the_issuing_session) {
+TEST_CASE(mcp_cancel_is_scoped_to_the_issuing_session_emulate) {
     server_fixture_t fx;
     auto init_a = fx.cli_->Post("/mcp", rpc_body("initialize").dump(), "application/json");
     auto init_b = fx.cli_->Post("/mcp", rpc_body("initialize").dump(), "application/json");
@@ -2072,21 +2126,26 @@ TEST_CASE(mcp_stream_cap_keeps_workers_free) {
 TEST_CASE(mcp_app_settings_api_redacts_and_validates) {
     scratch_settings_t scratch;
     server_fixture_t fx;
-    bool is_error = false;
-    json got = fx.call("app", {{"action", "settings_get"}}, is_error);
-    REQUIRE(!is_error);
+
+    // `app` is UI plumbing: reachable on /api, rejected on the agent transport
+    json denied = fx.rpc("tools/call", {{"name", "app"},
+                                        {"arguments", {{"action", "settings_get"}}}});
+    REQUIRE(denied.contains("error"));
+    REQUIRE(denied.at("error").at("message").get<std::string>().find("UI-only") !=
+            std::string::npos);
+
+    json got = fx.api("app", "settings_get").at("data");
     REQUIRE_STR_EQ(got.at("mcp_token").get<std::string>().c_str(), "set");
 
-    fx.call("app", {{"action", "settings_set"}, {"key", "mcp_token"}, {"value", "x"}}, is_error);
-    REQUIRE(is_error);
-    fx.call("app", {{"action", "settings_set"}, {"key", "mcp_port"}, {"value", 70000}}, is_error);
-    REQUIRE(is_error);
-    json set = fx.call("app", {{"action", "settings_set"}, {"key", "script_unsafe"}, {"value", true}},
-                       is_error);
-    REQUIRE(!is_error);
+    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_token"}, {"value", "x"}})
+                 .value("ok", true));
+    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 70000}})
+                 .value("ok", true));
+    json set = fx.api("app", "settings_set", {{"key", "script_unsafe"}, {"value", true}})
+                   .at("data");
     REQUIRE(set.value("ok", false));
     REQUIRE(slop::core::infra::settings::get<bool>("script_unsafe", false));
-    set = fx.call("app", {{"action", "settings_set"}, {"key", "mcp_port"}, {"value", 9100}}, is_error);
+    set = fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 9100}}).at("data");
     REQUIRE(set.value("restart_required", false));
 }
 
@@ -2099,7 +2158,8 @@ TEST_CASE(mcp_rotate_token_applies_live) {
     const std::string old_tok = cfg.token;
     const json req = {{"tool", "app"}, {"action", "rotate_token"}};
 
-    // a supervisor-token caller rotates; its own bearer keeps working
+    // the per-launch supervisor token (extra) is the UI's token, so it rotates;
+    // its own bearer keeps working and the new bearer is returned once
     auto sup = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
     REQUIRE(sup);
     const json sup_out = json::parse(sup->body).at("data");

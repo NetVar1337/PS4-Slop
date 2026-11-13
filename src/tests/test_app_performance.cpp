@@ -40,7 +40,8 @@ TEST_CASE(app_perf_diag_tail_and_revision) {
     CHECK(infra::diag::snapshot(9000, 32).entries.empty());
     CHECK(infra::diag::snapshot(0, 0).entries.empty());
     bool error = false;
-    const auto reply = mcp::call_tool("app", {{"action", "diag"}, {"limit", 2}}, error);
+    const auto reply = mcp::call_tool("app", {{"action", "diag"}, {"limit", 2}}, error,
+                                      /*cancel=*/{}, /*allow_app=*/true);
     CHECK(!error);
     CHECK(reply.dump().find("8999") != std::string::npos);
 }

@@ -42,6 +42,7 @@ private:
     std::unordered_set<int> inline_temps_;
     std::unordered_set<int> call_result_vars_;
     bool is_void_func_ = false;
+    int expr_depth_ = 0;   // recursion guard for cyclic temp/alias chains
     std::string func_name_;
 };
 

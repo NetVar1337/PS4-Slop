@@ -212,6 +212,10 @@ json tool_guide(const json& args);
 json tool_host(const json& args);
 json tool_gdb(const json& args);
 
+// conditional breakpoints live in tools_debugger.cpp; a console disconnect
+// must drop them so stale addresses never re-arm in a new session
+void clear_breakpoint_conditions();
+
 } // namespace detail
 
 } // namespace slop::core::mcp

@@ -75,6 +75,14 @@ std::string Emitter::varnode_str(const Varnode& vn) {
 }
 
 std::string Emitter::expr_str(const CExpr& e) {
+    // A cyclic temp/alias chain (hostile or mis-lifted) used to recurse until
+    // the stack died; bail out with a placeholder past a sane depth.
+    struct depth_guard_t {
+        int& d;
+        explicit depth_guard_t(int& v) : d(v) { ++d; }
+        ~depth_guard_t() { --d; }
+    } depth_guard(expr_depth_);
+    if (expr_depth_ > 64) return "...";
     if (e.is_var()) {
         if (e.vn.is_temp() && inline_temps_.count(e.vn.id)) {
             auto dit = temp_defs_.find(e.vn.id);

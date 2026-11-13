@@ -292,6 +292,7 @@ json tool_target(const json& args) {
 
     if (action == "ps4_disconnect") {
         process::target_disconnect_ps4();
+        clear_breakpoint_conditions();
         g_scan.engine.reset();
         g_scan.used = false;
         g_scan.pid = 0;

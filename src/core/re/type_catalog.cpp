@@ -20,7 +20,9 @@ namespace {
 using json = nlohmann::json;
 
 struct catalog_t {
-    std::mutex mu;
+    // recursive: add_member holds the lock and layout_struct() calls
+    // get_struct()/get_enum(), which take it again
+    std::recursive_mutex mu;
     std::map<std::string, struct_def_t> structs;
     std::map<std::string, enum_def_t>   enums;
     uint64_t bound_hash = 0;             // binary hash this catalog mirrors

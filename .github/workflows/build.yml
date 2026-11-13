@@ -157,6 +157,12 @@ jobs:
         shell: pwsh
         run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestExclude "slop_tests_emu|slop_tests_mcp|slop_tests_xray"
 
+      # The mcp area is the HTTP/JSON/SSE/fs/web surface; run it under ASan
+      # without the Unicorn-backed emulate cases (see src/tests/CMakeLists.txt).
+      - name: mcp area under ASan (minus Unicorn cases)
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel mcpnoemu
+
   # MSVC /analyze over first-party code (preset ninja-msvc-analyze). Findings
   # are listed in the run summary.
   analyze:

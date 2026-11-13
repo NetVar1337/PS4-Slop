@@ -77,6 +77,16 @@ foreach(_area IN LISTS _slop_test_areas)
     )
 endforeach()
 
+# ASan lane: the mcp area is the HTTP/JSON/SSE/fs/web attack surface, but a
+# few of its cases drive the Unicorn emulator (incompatible with ASan). Run
+# the area without those cases so the transport stays sanitized.
+add_test(NAME slop_tests_mcp_noemu COMMAND slop_tests)
+set_tests_properties(slop_tests_mcp_noemu PROPERTIES
+    ENVIRONMENT "SLOP_TEST_AREA=mcp;SLOP_TEST_EXCLUDE=emulate"
+    LABELS "slop;asan;mcpnoemu"
+    TIMEOUT 1800
+)
+
 add_test(NAME slop_tests_all COMMAND slop_tests)
 set_tests_properties(slop_tests_all PROPERTIES
     LABELS "slop;all"

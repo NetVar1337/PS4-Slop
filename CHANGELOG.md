@@ -9,6 +9,58 @@ section matching the pushed tag as the GitHub release notes.
 
 ### Added
 
+- `memory.scan_save` / `memory.scan_load`: persist an address-list scan to
+  `%LOCALAPPDATA%\reverse-slop\scans\<name>.json` and resume it after an engine
+  restart (rows are capped at 500k; a pid mismatch needs `force:true`).
+- `memory.watch_freeze_once` and `memory.watch_undo`: a hold that releases after
+  the first write-back, and a restore of the value captured when the freeze was
+  armed.
+- `ps4_status` now reports a `capabilities` object (native scan, turbo scan,
+  write_multi, proc_modules, proc_snapshot, assemble, elf_rpc, gdb bridge) and a
+  `payload_note`, so an upstream ps4debug-NG payload is visible before a command
+  fails.
+- Automatic console reconnect with exponential backoff after a dropped
+  connection (`ps4_auto_reconnect` setting, default on). An intentional
+  `ps4_disconnect` is never undone.
+
+### Fixed
+
+- .NET metadata: attacker-controlled table row counts are clamped to the
+  stream before any vector is sized (the owner-table fill was a heap OOB write
+  on a crafted assembly); signature/TypeRef recursion is depth- and cycle-capped;
+  the EH-section walk can no longer spin on a zero-size section.
+- MCP: the hidden `app` tool (settings, token rotation, shutdown) is rejected on
+  `/mcp` and remains reachable only through the UI `/api` channel; `proxy replay`
+  and `fs` writes are classified as mutating for the confirm gate.
+- Audit log and `proxy.entry` redact bearer tokens, `Authorization`, `Cookie`
+  and token-ish query values by default (`reveal:true` opts out per call).
+- `fs` refuses paths inside the engine data dir (settings, token, audit log,
+  session store), including hits from search/grep walks.
+- GDB Remote: `P`/`G` reads and writes map r8-r15 to their real registers
+  (the old code added the register index to the value).
+- Debug-event listener on TCP 755 accepts only the attached console, and each
+  connection is drained on its own thread so a silent peer cannot block the
+  payload's connect-back.
+- `watch_add {freeze:true}` latches the live value instead of writing zero.
+- Unknown-initial rescans compare values that straddle a stash chunk boundary.
+- Lua sandbox: `slop.image.load` requires `script_unsafe` (host file access).
+- Empty bearer token fails closed: a token is generated and persisted, or the
+  MCP server refuses to start.
+- `types.add_member` no longer self-deadlocks on the catalog mutex.
+- ZIP: valid zero-length deflated entries extract (zlib needs a non-zero output
+  window).
+- PE parser: `e_lfanew + 24` no longer truncates to 16 bits, section offset
+  arithmetic widens before adding, a zero-raw-size section no longer hides
+  later sections, and an unmapped import-name RVA no longer reads offset 0.
+- Loaders: SELF rebuilds and ELF files are capped at 2 GiB; Mach-O `LC_MAIN`
+  entry underflow is guarded.
+- Decompiler expression emission is depth-capped; `parallel_for` swallows a
+  throwing body and cannot hang on a concurrent pool stop.
+- ASan lane runs the `mcp` area (minus the Unicorn-backed emulate cases) so the
+  HTTP/JSON/SSE/fs surface is sanitized.
+- Tauri CSP adds `script-src`, `object-src 'none'`, `base-uri 'none'` and
+  `frame-ancestors 'none'`; the proxy token field is masked.
+
 - `app/e2e`: end-to-end driver that spawns the real engine and the
   `SlopTarget` fixture — `npm run smoke` (API battery, also runs in the new
   nightly CI lane `.github/workflows/e2e.yml`) and `npm run screenshots`,

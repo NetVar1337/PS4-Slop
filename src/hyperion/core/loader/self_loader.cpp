@@ -121,7 +121,9 @@ SelfExtractResult SELFLoader::extract_elf(const u8* data, size_t size) {
             return fail(fmt::format("program header {} has an implausible extent", i));
         out_size = std::max(out_size, phs[i].offset + phs[i].filesz);
     }
-    if (out_size > (u64{1} << 34)) return fail("rebuilt ELF would exceed 16 GiB");
+    // Match the PE/Mach-O loader cap. 16 GiB let a ~200-byte hostile SELF
+    // force a single huge zero-fill allocation.
+    if (out_size > (u64{1} << 31)) return fail("rebuilt ELF would exceed 2 GiB");
 
     r.elf.assign(static_cast<size_t>(out_size), 0);
     std::memcpy(r.elf.data(), eh, kEhdrSize);

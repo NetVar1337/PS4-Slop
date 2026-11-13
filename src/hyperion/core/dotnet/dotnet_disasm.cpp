@@ -193,8 +193,10 @@ bool DotNetDisassembler::load(const PEImage& img) {
     const u32 type_rows  = (std::min)(md_.table_rows(mdt::TypeDef), kMaxTypes);
     const u32 meth_rows  = (std::min)(md_.table_rows(mdt::MethodDef), kMaxMethods);
     const u32 field_rows = (std::min)(md_.table_rows(mdt::Field), kMaxTypes * 4);
-    const u32 prop_rows  = md_.table_rows(mdt::Property);
-    const u32 event_rows = md_.table_rows(mdt::Event);
+    // Property/Event rows were the only tables not clamped; a crafted count
+    // asked reserve() for 4 GiB and turned the attach loop into a billion spins.
+    const u32 prop_rows  = (std::min)(md_.table_rows(mdt::Property), kMaxTypes * 4);
+    const u32 event_rows = (std::min)(md_.table_rows(mdt::Event), kMaxTypes * 4);
 
     image_.types.reserve(type_rows);
     image_.methods.reserve(meth_rows);
@@ -543,8 +545,11 @@ void DotNetDisassembler::decode_body(const PEImage& img, DnMethod& m) const {
             }
             if (!(kind & 0x80)) break;   // no more sections
             // data_size covers the section including its 4-byte header; the
-            // next section begins there, DWORD-aligned.
-            sect_off = (sect_off + data_size + 3) & ~size_t(3);
+            // next section begins there, DWORD-aligned. A zero-size section
+            // with the "more" bit set must not leave sect_off unchanged.
+            const size_t next = (sect_off + data_size + 3) & ~size_t(3);
+            if (next <= sect_off) break;
+            sect_off = next;
         }
     }
 }

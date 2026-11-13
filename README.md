@@ -225,7 +225,11 @@ Pseudocode), an Unpacker view and `F12` frame metrics.
 - AOB wildcard search, pointer-chain scans, signature generation, live crypto-constant search.
 - Memory snapshots with compare/list/free.
 - Shared watchlist sampled about 10 Hz with freeze writes; UI and MCP edits appear in both.
+  `watch_freeze_once` releases after the first write-back and `watch_undo` restores
+  the value captured when the freeze was armed.
 - Pointer-chain scans can be re-verified over multiple samples (`pointerscan_verify`).
+- `scan_save` / `scan_load` persist an address-list scan and resume it after an
+  engine restart.
 
 ### Live debugging
 
@@ -409,7 +413,7 @@ Every tool takes an `action`; `tools/list` returns the exact schemas.
 | Tool       | Actions                                                                                                                                                                                                                                                                                 |
 | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `target`   | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_dump_module`                                                                        |
-| `memory`   | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `pointerscan_verify` |
+| `memory`   | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `scan_save`, `scan_load`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `watch_undo`, `watch_freeze_once`, `pointerscan_verify` |
 | `debugger` | `status` plus all `ps4_*` actions above                                                                                                                                                                                                                                                 |
 | `disasm`   | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed`                                                                                                        |
 | `decomp`   | `function`                                                                                                                                                                                                                                                                              |
@@ -637,7 +641,9 @@ touches the filesystem and network.
   segments and fails with a precise message on encrypted ones — analyze decrypted ELF
   dumps (for example from `ps4_dump_module`), not retail `eboot.bin`/`.sprx` files.
 - **One console at a time.** A dropped console connection fails fast and
-  `target.ps4_reconnect` restores the session, breakpoints and scan state.
+  reconnects automatically with exponential backoff (disable with the
+  `ps4_auto_reconnect` setting); `target.ps4_reconnect` restores the session,
+  breakpoints and scan state on demand.
 - **Host-only network capture** sees the analysis PC's traffic (IPv4 and IPv6), not the
   console's, unless the console's traffic is routed through the PC — filter by the
   console IP with `capture_start {host}`.
@@ -669,7 +675,8 @@ touches the filesystem and network.
   `web_allow_private` or `web_allowlist` says otherwise; the HTTP proxy is a plain relay
   unless `proxy_token` is set.
 - The `fs` tool can reach every path the engine user can — the bearer token is the only
-  gate. Run the engine as a low-privilege user where practical.
+  gate — except the engine data dir (settings, token, audit log, session store),
+  which `fs` refuses. Run the engine as a low-privilege user where practical.
 - Proxy MITM installs a local CA into your user trust store (with consent) and can log
   full HTTPS requests; `mitm_uninstall` removes the trust, keys and files. Captured
   traffic may contain credentials — treat `sessions.db` and capture exports as sensitive.

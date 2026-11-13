@@ -215,7 +215,10 @@ bool archive_t::extract(const entry_t& e, std::vector<uint8_t>& out,
         uint8_t  dummy    = 0;
         uint8_t* out_base = usize ? out.data() : &dummy;
         size_t   in_left  = csize;
-        size_t   out_left = usize;
+        // zlib needs a non-zero output window to make progress; with
+        // avail_out == 0 it returns Z_BUF_ERROR even for a valid empty
+        // deflate stream, so give an empty entry one scratch byte.
+        size_t   out_left = usize ? usize : 1;
         zs.next_in  = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(src));
         zs.next_out = out_base;
         std::string err;

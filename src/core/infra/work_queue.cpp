@@ -190,13 +190,22 @@ void parallel_for(size_t count, const cancel_token_t& tok,
 
     const uint32_t spawn = std::min(n, static_cast<uint32_t>(count));
 
+    // A throwing body must not terminate the worker thread (std::terminate) or
+    // skip the done counter, which would hang the caller forever.
+    const auto run_body = [&](size_t idx, uint32_t slot) {
+        try {
+            body(idx, slot);
+        } catch (...) {
+        }
+    };
+
     for (uint32_t slot = 0; slot < spawn; ++slot) {
         const bool queued = pool::submit([&, slot] {
             for (;;) {
                 if (tok.cancelled()) break;
                 const size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= count) break;
-                body(idx, slot);
+                run_body(idx, slot);
             }
             workers_done.fetch_add(1, std::memory_order_release);
             done_cv.notify_one();
@@ -208,17 +217,19 @@ void parallel_for(size_t count, const cancel_token_t& tok,
                 if (tok.cancelled()) break;
                 const size_t idx = next_index.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= count) break;
-                body(idx, slot);
+                run_body(idx, slot);
             }
             workers_done.fetch_add(1, std::memory_order_release);
             done_cv.notify_one();
         }
     }
 
-    // wait for the workers
+    // wait for the workers; a concurrent pool stop() drops queued tasks, so
+    // the done counter may never reach spawn. Do not block shutdown forever.
     std::unique_lock lk(done_mu);
     done_cv.wait(lk, [&] {
-        return workers_done.load(std::memory_order_acquire) >= spawn;
+        return workers_done.load(std::memory_order_acquire) >= spawn ||
+               g_pool.stopping.load(std::memory_order_acquire);
     });
 }
 

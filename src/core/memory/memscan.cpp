@@ -616,8 +616,12 @@ void walk_regions(reader_t& r, const std::vector<scan_region_t>& regs,
     if (regs.empty()) return;
     detail::chunk_walk_t walk;
     walk.chunk      = cfg.chunk_bytes ? cfg.chunk_bytes : infra::limits::scan_chunk_bytes;
-    // stash copies must not overlap (the rescan would compare slots twice)
-    walk.overlap    = stash_mode ? 0 : value_overlap(cfg);
+    // The stash needs the same overlap as a normal walk: without it the last
+    // width-1 slots of every chunk are never compared by the rescan, because
+    // the old bytes for a value straddling the chunk boundary are missing.
+    // Duplicate comparisons are avoided by start_limit in scan_run, which only
+    // accepts slots that start before the chunk's owned end.
+    walk.overlap    = value_overlap(cfg);
     walk.min_leaf   = 4096;
     walk.read_ahead = read_ahead;
 
@@ -686,6 +690,28 @@ void memscan_t::reset() {
     region_scan_active_ = false;
     address_list_ = false;
     last_width_ = value_width_t::u32;
+}
+
+bool memscan_t::export_results(std::vector<scan_result_t>& out, value_width_t& width) const {
+    if (!address_list_ && !region_scan_active_) return false;
+    out = results_;
+    width = last_width_;
+    return true;
+}
+
+bool memscan_t::import_results(std::vector<scan_result_t> results, value_width_t width) {
+    if (results.empty()) return false;
+    results_ = std::move(results);
+    stash_.clear();
+    stash_.shrink_to_fit();
+    region_scan_active_ = false;
+    address_list_ = true;
+    last_width_ = width;
+    stats_ = {};
+    stats_.found = results_.size();
+    progress_.clear();
+    progress_.found.store(results_.size(), std::memory_order_relaxed);
+    return true;
 }
 
 bool memscan_t::first_scan(reader_t& r,

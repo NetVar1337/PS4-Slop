@@ -3,6 +3,10 @@
 
 #include "core/mcp/tools_common.hpp"
 
+#include <filesystem>
+
+#include "core/infra/paths.hpp"
+
 namespace slop::core::mcp::detail {
 
 
@@ -10,6 +14,31 @@ namespace {
 
 constexpr size_t kReadDefault = 64u << 10;   // fs.read_file default page
 constexpr size_t kReadMax     = 1u << 20;    // per call, the response carries it twice at most
+
+// The engine data dir holds the bearer token, the audit log and the session
+// store. fs is intentionally broad, but a token holder must not be able to
+// read or rewrite those files through it.
+bool under_engine_data(const std::string& p) {
+    if (p.empty()) return false;
+    const std::string& data_dir = infra::paths::app_data();
+    if (data_dir.empty()) return false;   // paths not initialised: no jail target
+    std::error_code ec;
+    const auto root = std::filesystem::weakly_canonical(
+        std::filesystem::path(data_dir), ec);
+    if (ec) return false;
+    const auto full = std::filesystem::weakly_canonical(std::filesystem::path(p), ec);
+    if (ec) return false;
+    const auto rel = std::filesystem::relative(full, root, ec);
+    if (ec || rel.empty()) return false;
+    const auto first = rel.begin();
+    return first != rel.end() && *first != "..";
+}
+
+void guard_engine_data(const std::string& key, const std::string& p) {
+    if (under_engine_data(p))
+        fail("fs: " + key + " points into the engine data directory; settings, "
+             "tokens and session stores are not reachable through fs");
+}
 
 // valid utf-8 without NULs reads back as text, anything else as hex
 bool looks_text(const std::vector<uint8_t>& b) {
@@ -37,6 +66,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     if (action == "read_file") {
         if (!args.contains("path")) fail("missing path");
         const std::string path = args.at("path").get<std::string>();
+        guard_engine_data("path", path);
         const uint64_t offset = args.contains("offset") ? parse_addr(args, "offset") : 0;
         const size_t want = args.contains("max_bytes")
             ? static_cast<size_t>(std::min<uint64_t>(parse_addr(args, "max_bytes"), kReadMax))
@@ -67,6 +97,8 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     }
     if (action == "write_file") {
         if (!args.contains("path")) fail("missing path");
+        const std::string path = args.at("path").get<std::string>();
+        guard_engine_data("path", path);
         std::vector<uint8_t> bytes;
         if (args.contains("hex"))
             bytes = hex_decode(args.at("hex").get<std::string>());
@@ -76,16 +108,16 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
             bytes.assign(text.begin(), text.end());
         }
         std::string err;
-        if (!util::write_file(args.at("path").get<std::string>(), bytes,
-                              args.value("append", false), &err))
+        if (!util::write_file(path, bytes, args.value("append", false), &err))
             fail(err);
-        return {{"written", bytes.size()}, {"path", args.at("path")}};
+        return {{"written", bytes.size()}, {"path", path}};
     }
     if (action == "list_directory") {
         if (!args.contains("path")) fail("missing path");
+        const std::string path = args.at("path").get<std::string>();
+        guard_engine_data("path", path);
         std::string err;
-        auto items = util::list_directory(
-            args.at("path").get<std::string>(), &err);
+        auto items = util::list_directory(path, &err);
         if (items.empty() && !err.empty()) fail(err);
         json arr = json::array();
         for (const auto& e : items)
@@ -100,44 +132,53 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     }
     if (action == "create_directory") {
         if (!args.contains("path")) fail("missing path");
+        const std::string path = args.at("path").get<std::string>();
+        guard_engine_data("path", path);
         std::string err;
-        if (!util::create_directory(args.at("path").get<std::string>(),
-                                    &err))
+        if (!util::create_directory(path, &err))
             fail(err);
         return {{"created", true}};
     }
     if (action == "delete_path") {
         if (!args.contains("path")) fail("missing path");
+        const std::string path = args.at("path").get<std::string>();
+        guard_engine_data("path", path);
         std::string err;
-        if (!util::delete_path(args.at("path").get<std::string>(), &err))
+        if (!util::delete_path(path, &err))
             fail(err);
         return {{"deleted", true}};
     }
     if (action == "search_files") {
         if (!args.contains("root") || !args.contains("needle"))
             fail("missing root/needle");
+        const std::string root = args.at("root").get<std::string>();
+        guard_engine_data("root", root);
         auto hits = util::search_files(
-            args.at("root").get<std::string>(),
-            args.at("needle").get<std::string>(),
+            root, args.at("needle").get<std::string>(),
             std::min<size_t>(args.value("limit", 200u), 2000u), cancel);
         json arr = json::array();
-        for (const auto& h : hits)
+        for (const auto& h : hits) {
+            if (under_engine_data(h.path)) continue;   // a walk may cross the data dir
             arr.push_back({{"path", h.path}, {"size", h.size},
                            {"directory", h.directory}});
+        }
         return {{"matches", arr}, {"count", arr.size()}, {"cancelled", cancel.cancelled()}};
     }
     if (action == "grep_in_files") {
         if (!args.contains("root") || !args.contains("needle"))
             fail("missing root/needle");
+        const std::string root = args.at("root").get<std::string>();
+        guard_engine_data("root", root);
         auto hits = util::grep_in_files(
-            args.at("root").get<std::string>(),
-            args.at("needle").get<std::string>(),
+            root, args.at("needle").get<std::string>(),
             args.value("suffix", std::string{}),
             std::min<size_t>(args.value("limit", 200u), 2000u), cancel);
         json arr = json::array();
-        for (const auto& h : hits)
+        for (const auto& h : hits) {
+            if (under_engine_data(h.path)) continue;   // never echo settings/token lines
             arr.push_back({{"path", h.path}, {"line", h.line},
                            {"text", h.text}});
+        }
         return {{"hits", arr}, {"count", arr.size()}, {"cancelled", cancel.cancelled()}};
     }
 

@@ -164,10 +164,82 @@ std::vector<std::string> string_list(const json& args, const char* key) {
     return out;
 }
 
+// Captured traffic is credentials by default: redact the head lines that carry
+// auth before anything leaves the engine (proxy.entry, the audit log, an agent).
+std::string redact_http_head(const std::string& in) {
+    static const char* kSensitive[] = {
+        "authorization", "proxy-authorization", "cookie", "set-cookie",
+        "x-api-key", "x-auth-token", "x-csrf-token"
+    };
+    std::string out;
+    out.reserve(in.size());
+    size_t pos = 0;
+    while (pos < in.size()) {
+        const size_t eol = in.find("\r\n", pos);
+        const size_t end = eol == std::string::npos ? in.size() : eol;
+        const std::string line = in.substr(pos, end - pos);
+        if (line.empty()) {                 // end of head: body stays verbatim
+            out.append(in, pos, std::string::npos);
+            break;
+        }
+        const size_t colon = line.find(':');
+        bool redacted = false;
+        if (colon != std::string::npos) {
+            std::string name = line.substr(0, colon);
+            for (char& c : name)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (const char* n : kSensitive) {
+                if (name == n) {
+                    out += line.substr(0, colon + 1);
+                    out += " <redacted>";
+                    redacted = true;
+                    break;
+                }
+            }
+        }
+        if (!redacted) out += line;
+        if (eol == std::string::npos) break;
+        out += "\r\n";
+        pos = eol + 2;
+    }
+    return out;
+}
+
+// Mask token-ish query values in a URL path (kept for display/replay safety).
+std::string redact_query(std::string path) {
+    static const char* kKeys[] = {"token", "key", "auth", "sig", "session", "password"};
+    const size_t q = path.find('?');
+    if (q == std::string::npos) return path;
+    std::string out = path.substr(0, q + 1);
+    size_t pos = q + 1;
+    while (pos <= path.size()) {
+        const size_t amp = path.find('&', pos);
+        const size_t end = amp == std::string::npos ? path.size() : amp;
+        std::string pair = path.substr(pos, end - pos);
+        const size_t eq = pair.find('=');
+        if (eq != std::string::npos) {
+            std::string name = pair.substr(0, eq);
+            for (char& c : name)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            for (const char* k : kKeys) {
+                if (name.find(k) != std::string::npos) {
+                    pair = pair.substr(0, eq + 1) + "<redacted>";
+                    break;
+                }
+            }
+        }
+        out += pair;
+        if (amp == std::string::npos) break;
+        out += '&';
+        pos = amp + 1;
+    }
+    return out;
+}
+
 json entry_summary(const network::proxy_entry_t& e) {
     json o = {{"id", e.id}, {"at_ms", e.at_ms}, {"kind", e.kind}, {"client", e.client},
               {"method", e.method}, {"host", e.host}, {"port", e.port},
-              {"path", e.path}, {"status", e.status},
+              {"path", redact_query(e.path)}, {"status", e.status},
               {"req_bytes", e.req_bytes}, {"resp_bytes", e.resp_bytes},
               {"replayable", e.replayable}};
     if (!e.sni.empty()) o["sni"] = e.sni;
@@ -519,14 +591,21 @@ json tool_proxy(const json& args) {
         if (!e) fail("unknown entry id");
         json o = entry_summary(*e);
         o["request_truncated"] = e->request_truncated;
+        // Credentials are redacted unless the caller explicitly asks to reveal
+        // them; the audit log only ever sees the redacted form.
+        const bool reveal = args.value("reveal", false);
+        o["redacted"] = !reveal;
         if (!e->raw_request.empty()) {
             const size_t n = std::min<size_t>(e->raw_request.size(), 4096);
-            o["request_text"] = printable(e->raw_request.data(), n);
+            std::string head = printable(e->raw_request.data(), n);
+            o["request_text"] = reveal ? head : redact_http_head(head);
             o["request_bytes_captured"] = e->raw_request.size();
         }
-        if (!e->response_head.empty())
-            o["response_head_text"] = printable(e->response_head.data(),
-                                                std::min<size_t>(e->response_head.size(), 4096));
+        if (!e->response_head.empty()) {
+            std::string head = printable(e->response_head.data(),
+                                         std::min<size_t>(e->response_head.size(), 4096));
+            o["response_head_text"] = reveal ? head : redact_http_head(head);
+        }
         return o;
     }
     if (action == "replay") {

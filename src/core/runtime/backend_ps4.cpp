@@ -446,10 +446,33 @@ public:
     // attach id currently in flight (set by ensure_debug before ATTACH)
     std::atomic<uint64_t> current_attach{0};
 
+    // Only the console we attached to may deliver stop events. Port 755 is
+    // bound on every interface because the payload connects back to us, so
+    // without this any LAN host could forge a stop (fake RIP/DR6) or send
+    // SIGKILL. 0 = no filter yet (before the first attach).
+    void set_peer(const std::string& host) {
+        uint32_t addr = 0;
+        addrinfo hints{};
+        hints.ai_family   = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* res = nullptr;
+        if (::getaddrinfo(host.c_str(), nullptr, &hints, &res) == 0 && res) {
+            addr = reinterpret_cast<sockaddr_in*>(res->ai_addr)->sin_addr.s_addr;
+            ::freeaddrinfo(res);
+        }
+        allow_peer_.store(addr);
+    }
+
     // false + err on failure (port in use names the owner)
     bool start(uint16_t port, std::string& err) {
+        // A stop() in flight closes the socket and joins the accept thread
+        // without holding mu_ the whole time; starting in that window used to
+        // return true for a listener that no longer accepts (the payload's
+        // connect-back then sat in a dead backlog and the attach timed out).
+        for (int i = 0; i < 200 && stopping_.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         std::lock_guard lk(mu_);
-        if (running_) {
+        if (running_ && !stop_ && listen_fd_.load() != INVALID_SOCKET) {
             if (port == port_) return true;
             err = "debug-event listener already bound to port " + std::to_string(port_);
             return false;
@@ -491,9 +514,13 @@ public:
     }
 
     void stop() {
+        stopping_.store(true, std::memory_order_release);
         {
             std::lock_guard lk(mu_);
-            if (!running_) return;
+            if (!running_) {
+                stopping_.store(false, std::memory_order_release);
+                return;
+            }
             stop_ = true;
         }
         SOCKET s = listen_fd_.exchange(INVALID_SOCKET);
@@ -502,8 +529,16 @@ public:
             closesocket(s);
         }
         if (th_.joinable()) th_.join();
+        std::vector<std::thread> conns;
+        {
+            std::lock_guard lk(mu_);
+            conns.swap(conns_);
+        }
+        for (auto& t : conns)
+            if (t.joinable()) t.join();
         std::lock_guard lk(mu_);
         running_ = false;
+        stopping_.store(false, std::memory_order_release);
     }
 
     bool running() const {
@@ -512,8 +547,34 @@ public:
     }
 
 private:
-    void run() {
+    // Drain one event connection. Runs on its own thread so a silent peer can
+    // no longer block accept() and starve the console's connect-back.
+    void drain(SOCKET c, uint64_t attach_id) {
         ps4_event_reassembler_t ra(ps4::kDebugEventSize);
+        // short recv timeout so stop_ is noticed even with no traffic
+        DWORD rt = 500;
+        setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rt), sizeof(rt));
+        uint8_t buf[0x8000];
+        bool peer_closed = false;
+        while (!stop_) {
+            const int n = ::recv(c, reinterpret_cast<char*>(buf), sizeof(buf), 0);
+            if (n == 0) { peer_closed = true; break; }   // server closed the channel
+            if (n < 0) {
+                // the recv timeout exists only to notice stop_; keep the
+                // connection open so later events from the payload arrive
+                if (WSAGetLastError() == WSAETIMEDOUT) continue;
+                peer_closed = true;
+                break;
+            }
+            ra.feed(buf, static_cast<size_t>(n), [this](const uint8_t* pkt) {
+                if (on_packet) on_packet(pkt);
+            });
+        }
+        closesocket(c);
+        if (peer_closed && on_closed) on_closed(attach_id);
+    }
+
+    void run() {
         while (!stop_) {
             const SOCKET ls = listen_fd_.load();
             if (ls == INVALID_SOCKET) break;
@@ -524,38 +585,27 @@ private:
             tv.tv_sec  = 0;
             tv.tv_usec = 200 * 1000;
             if (select(0, &rset, nullptr, nullptr, &tv) <= 0) continue;
-            SOCKET c = accept(ls, nullptr, nullptr);
+            sockaddr_in peer{};
+            int peer_len = static_cast<int>(sizeof(peer));
+            SOCKET c = accept(ls, reinterpret_cast<sockaddr*>(&peer), &peer_len);
             if (c == INVALID_SOCKET) continue;
-            const uint64_t attach_id = current_attach.load();
-            // short recv timeout so stop_ is noticed even with no traffic
-            DWORD rt = 500;
-            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rt), sizeof(rt));
-            // drain this event connection until the server drops it; TCP can
-            // split/coalesce the fixed 0x4A0 packets, so reassemble the stream
-            ra.reset();
-            uint8_t buf[0x8000];
-            bool peer_closed = false;
-            while (!stop_) {
-                const int n = ::recv(c, reinterpret_cast<char*>(buf), sizeof(buf), 0);
-                if (n == 0) { peer_closed = true; break; }   // server closed the channel
-                if (n < 0) {
-                    // the recv timeout exists only to notice stop_; keep the
-                    // connection open so later events from the payload arrive
-                    if (WSAGetLastError() == WSAETIMEDOUT) continue;
-                    peer_closed = true;
-                    break;
-                }
-                ra.feed(buf, static_cast<size_t>(n), [this](const uint8_t* pkt) {
-                    if (on_packet) on_packet(pkt);
-                });
+            const uint32_t want = allow_peer_.load();
+            if (want != 0 && peer.sin_addr.s_addr != want) {
+                closesocket(c);   // not the console this session is attached to
+                continue;
             }
-            closesocket(c);
-            if (peer_closed && on_closed) on_closed(attach_id);
+            const uint64_t attach_id = current_attach.load();
+            std::lock_guard lk(mu_);
+            if (conns_.size() >= 4) { closesocket(c); continue; }
+            conns_.emplace_back([this, c, attach_id] { drain(c, attach_id); });
         }
     }
 
     mutable std::mutex mu_;
     std::atomic<SOCKET> listen_fd_{INVALID_SOCKET};
+    std::atomic<uint32_t> allow_peer_{0};
+    std::atomic<bool>     stopping_{false};   // stop() in flight
+    std::vector<std::thread> conns_;   // guarded by mu_
     uint16_t port_ = 0;
     std::thread th_;
     std::atomic<bool> stop_{false};
@@ -1176,7 +1226,12 @@ struct backend_ps4_t::impl_t {
             std::lock_guard dl(dbg_mu);
             end_debug_session_locked("");
         }
-        // the payload connects back to us on 755 or attach fails
+        // the payload connects back to us on 755 or attach fails; pin the
+        // listener to this console so another LAN host cannot forge events
+        {
+            std::lock_guard il(info_mu);
+            if (!host.empty()) listener.set_peer(host);
+        }
         std::string lerr;
         if (!listener.start(event_port, lerr)) {
             detail = lerr;

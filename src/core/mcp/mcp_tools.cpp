@@ -63,8 +63,12 @@ bool action_mutating(const std::string& tool, const std::string& action) {
     if (tool == "gdb")
         return action != "status";
     if (tool == "proxy")
-        return action != "status" && action != "entries" && action != "entry" &&
-               action != "replay";
+        // replay re-sends captured POST/PUT/DELETE requests, so it is a write
+        return action != "status" && action != "entries" && action != "entry";
+    if (tool == "fs")
+        // reads and walks are safe; create/write/delete are host mutations
+        return action != "read_file" && action != "list_directory" &&
+               action != "search_files" && action != "grep_in_files";
     if (tool == "network")
         return action != "packets" && action != "dns" && action != "stats" &&
                action != "connections" && action != "streams" &&
@@ -73,6 +77,34 @@ bool action_mutating(const std::string& tool, const std::string& action) {
 }
 
 std::mutex g_audit_mu;
+
+// The audit log is a plaintext file on disk; bearer tokens, proxy credentials
+// and cookies must never land in it. Redact by key before the dump, including
+// nested objects (host.start returns a token, app.rotate_token returns the new
+// primary bearer, proxy.entry returns captured Authorization/Cookie headers).
+bool audit_sensitive_key(const std::string& key) {
+    std::string k;
+    k.reserve(key.size());
+    for (char c : key) k.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    static const char* kSensitive[] = {
+        "token", "authorization", "cookie", "password", "secret", "api_key",
+        "apikey", "credential"
+    };
+    for (const char* s : kSensitive)
+        if (k.find(s) != std::string::npos) return true;
+    return false;
+}
+
+void audit_redact(json& v) {
+    if (v.is_object()) {
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (audit_sensitive_key(it.key())) it.value() = "<redacted>";
+            else audit_redact(it.value());
+        }
+    } else if (v.is_array()) {
+        for (auto& e : v) audit_redact(e);
+    }
+}
 
 void audit_log(const std::string& tool, const json& args, const json& out,
                bool is_error) {
@@ -84,21 +116,25 @@ void audit_log(const std::string& tool, const json& args, const json& out,
                         .count();
     // memory reads can hand back junk bytes, so never let the audit sink throw
     // on invalid utf8 (that would turn a good tool call into a 500)
-    const std::string args_dump = args.dump(-1, ' ', false, json::error_handler_t::replace);
-    const std::string out_dump  = out.dump(-1, ' ', false, json::error_handler_t::replace);
+    json args_safe = args;
+    json out_safe  = out;
+    audit_redact(args_safe);
+    audit_redact(out_safe);
+    const std::string args_dump = args_safe.dump(-1, ' ', false, json::error_handler_t::replace);
+    const std::string out_dump  = out_safe.dump(-1, ' ', false, json::error_handler_t::replace);
     constexpr size_t kCap = 2048;
     json line = {{"ts_ms", ms},
                  {"tool", tool},
                  {"action", args.is_object() ? args.value("action", std::string{})
                                              : std::string{}},
                  {"ok", !is_error}};
-    if (args_dump.size() <= kCap) line["args"] = args;
+    if (args_dump.size() <= kCap) line["args"] = args_safe;
     else line["args_truncated"] = args_dump.substr(0, kCap);
     if (is_error) {
-        if (out.is_object() && out.contains("error")) line["error"] = out["error"];
+        if (out_safe.is_object() && out_safe.contains("error")) line["error"] = out_safe["error"];
         else line["error"] = out_dump.substr(0, kCap);
     } else if (out_dump.size() <= kCap) {
-        line["result"] = out;
+        line["result"] = out_safe;
     } else {
         line["result_truncated"] = out_dump.substr(0, kCap);
     }
@@ -817,12 +853,12 @@ void list_tools(json& out) {
     const char* target_schema =
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["list","attach","detach","status","modules","dump_module","threads","regions","handles","heaps","heap_blocks","icon","ps4_connect","ps4_disconnect","ps4_reconnect","ps4_auto","ps4_discover","ps4_dump_module"]},"pid":{"type":"integer"},"host":{"type":"string","description":"PS4 IP, or \"auto\"/\"discover\": UDP broadcast probe (255.255.255.255:1010, magic 0xFFFFAAAA) picks the first answering console"},"port":{"type":"integer"},"timeout_ms":{"type":"integer","description":"ps4_discover: probe listen time in ms (default 2000, max 60000)"},"confirm":{"type":"boolean","description":"required on mutating actions while the mcp_require_confirm setting is on"},"base":{"type":"integer"},"name":{"type":"string"},"path":{"type":"string"},"paths":{"type":"array","items":{"type":"string"}},"heap_base":{"type":"integer"},"max_blocks":{"type":"integer","minimum":1,"maximum":1048576},"load":{"type":"boolean"},"strict":{"type":"boolean"},"format":{"type":"string","enum":["raw","elf"],"description":"ps4_dump_module output: raw mapped span (default) or a rebuilt loadable ELF64 (default when load=true)"}},"required":["action"]})json";
     const char* memory_schema =
-        R"json({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","aob","pointerscan","pointerscan_verify","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"],"description":"value type; byte counts 1/2/4/8 are also accepted as u8/u16/u32/u64"},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"},"engine":{"type":"string","enum":["auto","console","host"],"description":"aob: console runs the search on the PS4 (all hits, needs ps4_auth), host streams memory over the wire; auto prefers console"},"chains":{"type":"array","description":"pointerscan_verify: chains to re-check ({addresses[],offsets[]} or {base,offsets[]}); default is the last pointerscan list","items":{"type":"object"}},"samples":{"type":"integer","minimum":1,"maximum":64,"description":"pointerscan_verify: passes; a chain survives only if it lands on target every time"},"interval_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"pointerscan_verify: wait between samples"}},"required":["action"]})json";
+        R"json({"type":"object","properties":{"action":{"type":"string","enum":["read","write","scan","rescan","scan_state","scan_reset","scan_save","scan_load","aob","pointerscan","pointerscan_verify","snapshot","snapshots","diff","snapshot_free","protect","alloc","free","siggen","live_crypto","watch_list","watch_add","watch_remove","watch_clear","watch_set","watch_undo","watch_freeze_once"]},"addr":{"type":"integer"},"len":{"type":"integer"},"format":{"type":"string","enum":["hex","utf8","u8","u32","u64","f32","f64"]},"hex":{"type":"string"},"kind":{"type":"string","enum":["exact","between","bigger","smaller","unknown","increased","increased_by","increased_percent","decreased","decreased_by","decreased_percent","changed","unchanged"]},"width":{"type":"string","enum":["i8","u8","i16","u16","i32","u32","i64","u64","f32","f64","all"],"description":"value type; byte counts 1/2/4/8 are also accepted as u8/u16/u32/u64"},"rounding":{"type":"string","enum":["exact","rounded","truncated","extreme"]},"value":{},"value2":{},"begin":{"type":"integer"},"end":{"type":"integer"},"pattern":{"type":"string"},"tail":{"type":"string"},"writable":{"oneOf":[{"type":"string","enum":["any","include","exclude"]},{"type":"boolean"}]},"executable":{"type":"string","enum":["any","include","exclude"]},"copy_on_write":{"type":"string","enum":["any","include","exclude"]},"mem_private":{"type":"boolean"},"mem_image":{"type":"boolean"},"mem_mapped":{"type":"boolean"},"read_only":{"type":"boolean"},"no_exec":{"type":"boolean"},"threads":{"type":"integer","minimum":0,"maximum":64},"chunk_bytes":{"type":"integer","minimum":1},"max_results":{"type":"integer","minimum":1},"prot":{"type":"integer"},"target":{"type":"integer"},"depth":{"type":"integer"},"min_offset":{"type":"integer"},"max_offset":{"type":"integer"},"alignment":{"type":"integer"},"static_roots":{"type":"boolean"},"frontier_cap":{"type":"integer","minimum":1},"max_bytes":{"type":"integer"},"a":{"type":"integer"},"b":{"type":"integer"},"id":{"type":"integer"},"all":{"type":"boolean"},"limit":{"type":"integer"},"label":{"type":"string"},"freeze":{"type":"boolean"},"engine":{"type":"string","enum":["auto","console","host"],"description":"aob: console runs the search on the PS4 (all hits, needs ps4_auth), host streams memory over the wire; auto prefers console"},"chains":{"type":"array","description":"pointerscan_verify: chains to re-check ({addresses[],offsets[]} or {base,offsets[]}); default is the last pointerscan list","items":{"type":"object"}},"samples":{"type":"integer","minimum":1,"maximum":64,"description":"pointerscan_verify: passes; a chain survives only if it lands on target every time"},"interval_ms":{"type":"integer","minimum":0,"maximum":60000,"description":"pointerscan_verify: wait between samples"}},"required":["action"]})json";
     const char* disasm_schema =
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["assemble","disassemble","loaded","pe","functions","xrefs","strings","symbols","symbol_set","blocks","globals","vtables","load","unload","analyze_stop","managed"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"count":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer","description":"load: runtime base to rebase the image to, 0 keeps its own base"},"relocate":{"type":"boolean","description":"load: apply ELF/SELF relocations at the session base, default true; pass false for memory dumps"},"name":{"type":"string"},"text":{"type":"string"},"limit":{"type":"integer"},"offset":{"type":"integer","description":"functions: index of the first matched row to return"},"filter":{"type":"string","description":"functions: case-insensitive substring of the function name or hex VA"},"min_chars":{"type":"integer"},"include_exec":{"type":"boolean"},"method_token":{"type":"integer"},"type":{"type":"string"},"type_filter":{"type":"string"}},"required":["action"]})json";
     const char* debugger_schema =
 
-        R"json({"type":"object","properties":{"base":{"type":"integer","description":"module base used to rebase addresses for this action, default 0"},"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_console_info","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_turbo_caps","ps4_turbo_scan","ps4_turbo_rescan","ps4_turbo_results","ps4_turbo_end","ps4_turbo_config","ps4_turbo_regions","ps4_turbo_cancel","ps4_write_multi","ps4_modules","ps4_snapshot","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer","description":"ps4_scan_aob legacy form: return only the max_matches-th match; omit to get every match"},"limit":{"type":"integer","description":"ps4_scan_aob: most matches to return (default 4096)"},"unique":{"type":["boolean","integer"]},"asm":{"type":"string"},"syntax":{"type":"integer","description":"Keystone syntax: 0 default/Intel, 1 Intel, 2 ATT, 3 NASM, 4 MASM, 5 GAS"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"},"regions":{"type":"string"},"resident":{"type":"boolean"},"snapshot":{"type":"boolean"},"aliasing":{"type":"boolean"},"parallel":{"type":"boolean"},"keep_first":{"type":"boolean"},"keep_previous":{"type":"boolean"},"include_zeros":{"type":"boolean"},"float":{"type":"string"},"float_exponent":{"type":"integer"},"mask_hex":{"type":"string"},"start":{"type":"integer"},"ram_mb":{"type":"integer"},"spill_path":{"type":"string"},"probe_bytes":{"type":"integer"},"writes":{"type":"array","items":{"type":"object"}},"status":{"type":"boolean"},"confirm":{"type":"boolean","description":"required on mutating ps4_* actions while the mcp_require_confirm setting is on"}},"required":["action"]})json";
+        R"json({"type":"object","properties":{"base":{"type":"integer","description":"module base used to rebase addresses for this action, default 0"},"action":{"type":"string","enum":["status","ps4_attach","ps4_detach","ps4_status","ps4_console_info","ps4_bp_set","ps4_bp_clear","ps4_watch_set","ps4_watch_clear","ps4_continue","ps4_step","ps4_suspend","ps4_resume","ps4_process_stop","ps4_regs","ps4_set_reg","ps4_dbregs","ps4_wait","ps4_events","ps4_callstack","ps4_call","ps4_bp_list","ps4_watch_list","ps4_until","ps4_find_write","ps4_trace_calls","ps4_trace_steps","ps4_auth","ps4_scan","ps4_rescan","ps4_scan_all","ps4_scan_aob","ps4_scan_state","ps4_scan_reset","ps4_turbo_caps","ps4_turbo_scan","ps4_turbo_rescan","ps4_turbo_results","ps4_turbo_end","ps4_turbo_config","ps4_turbo_regions","ps4_turbo_cancel","ps4_write_multi","ps4_modules","ps4_snapshot","ps4_disasm","ps4_xrefs","ps4_xrefs_to","ps4_stack","ps4_assemble","ps4_elf_rpc","ps4_elf_load","ps4_notify","ps4_print","ps4_app","ps4_fpregs","ps4_set_fpregs","ps4_set_dbregs","ps4_fsgs","ps4_set_fsgs"]},"pid":{"type":"integer"},"addr":{"type":"integer"},"type":{"type":"integer"},"len":{"type":"integer"},"timeout_ms":{"type":"integer"},"max_frames":{"type":"integer"},"name":{"type":"string"},"value":{},"count":{"type":"integer"},"lwpid":{"type":"integer"},"index":{"type":"integer"},"stop":{"type":"integer"},"state":{"type":"integer"},"max":{"type":"integer"},"clear":{"type":"boolean"},"depth":{"type":"integer"},"args":{"type":"array","items":{}},"value_type":{"type":"string"},"width":{"type":"string"},"compare":{"type":"string"},"kind":{"type":"string"},"hex":{"type":"string"},"pattern":{"type":"string"},"alignment":{"type":"integer"},"max_matches":{"type":"integer","description":"ps4_scan_aob legacy form: return only the max_matches-th match; omit to get every match"},"limit":{"type":"integer","description":"ps4_scan_aob: most matches to return (default 4096)"},"unique":{"type":["boolean","integer"]},"asm":{"type":"string"},"syntax":{"type":"integer","description":"Keystone syntax: 0 default/Intel, 1 Intel, 2 ATT, 3 NASM, 4 MASM, 5 GAS"},"msg":{"type":"string"},"path":{"type":"string"},"target":{"type":"integer"},"rbp":{"type":"integer"},"rsp":{"type":"integer"},"fs_base":{"type":"integer"},"gs_base":{"type":"integer"},"regions":{"type":"string"},"resident":{"type":"boolean"},"snapshot":{"type":"boolean"},"aliasing":{"type":"boolean"},"parallel":{"type":"boolean"},"keep_first":{"type":"boolean"},"keep_previous":{"type":"boolean"},"include_zeros":{"type":"boolean"},"float":{"type":"string"},"float_exponent":{"type":"integer"},"mask_hex":{"type":"string"},"start":{"type":"integer"},"ram_mb":{"type":"integer"},"spill_path":{"type":"string"},"probe_bytes":{"type":"integer"},"writes":{"type":"array","items":{"type":"object"}},"status":{"type":"boolean"},"confirm":{"type":"boolean","description":"required on mutating ps4_* actions while the mcp_require_confirm setting is on"},"condition":{"type":"string","description":"ps4_bp_set: client-side condition, register op value (== != > < >= <= &), e.g. \"rax==0x10\"; ps4_wait resumes while it is false and reports condition_skipped"}},"required":["action"]})json";
 
     const char* xray_schema =
         R"json({"type":"object","properties":{"action":{"type":"string","enum":["cfg","complexity","cff","obfuscation","strings_recon","indirect_calls","anti_analysis","hooks","syscalls","apihash","entropy","pages","crypto_range","gadgets"]},"addr":{"type":"integer"},"va":{"type":"integer"},"address":{"type":"integer"},"size":{"type":"integer"},"len":{"type":"integer"},"length":{"type":"integer"},"path":{"type":"string"},"base":{"type":"integer"},"window_size":{"type":"integer"},"window":{"type":"integer"},"window_limit":{"type":"integer"},"page_size":{"type":"integer"},"max_functions":{"type":"integer"},"hash":{},"hashes":{"type":"array"},"algorithm":{"type":"string"},"limit":{"type":"integer"}},"required":["action"]})json";
@@ -1053,10 +1089,17 @@ static nlohmann::json call_tool_inner(const std::string& name,
 }
 
 nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
-                         bool& is_error, infra::cancel_token_t cancel) {
+                         bool& is_error, infra::cancel_token_t cancel,
+                         bool allow_app) {
     // ps4debug-mcp safety model: when mcp_require_confirm is on, mutating
     // console/target actions need "confirm": true; every call (allowed or
     // refused) is appended to the JSONL audit log
+    if (name == "app" && !allow_app) {
+        is_error = true;
+        json err = {{"error", "app is UI-only and not exposed over MCP"}};
+        audit_log(name, args, err, true);
+        return err;
+    }
     const std::string action =
         args.is_object() ? args.value("action", std::string{}) : std::string{};
     if (infra::settings::mcp_require_confirm() && action_mutating(name, action) &&
