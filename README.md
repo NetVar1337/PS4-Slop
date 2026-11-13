@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml"><img alt="build" src="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml/badge.svg"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.2.0-informational">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.1-informational">
   <img alt="platform" src="https://img.shields.io/badge/host-Windows%2010%2F11%20x64-blue">
   <img alt="target" src="https://img.shields.io/badge/target-PS4%20%2B%20ps4debug--NG-black">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -497,7 +497,7 @@ powershell -File tools/build.ps1 -NoFrontend   # C++ only, fastest loop
 
 | Switch | Effect |
 | --- | --- |
-| _(none)_ | C++ engine + Tauri app: single-file portable (`dist\reverse-slop\`) + per-user NSIS installer |
+| _(none)_ | C++ engine + Tauri app: single-file portable (`dist\SlopStation\`) + per-user NSIS installer |
 | `-NoFrontend` | C++ targets only |
 | `-FullClean` | Delete `build/` before configuring |
 | `-PlanOnly` | Configure without compiling |
@@ -526,7 +526,7 @@ Outputs:
 ```text
 build\src\engine\reverse-slop-engine.exe                     headless engine
 build\src\app\reverse-slop.exe                               legacy ImGui shell
-dist\reverse-slop\SlopStation.exe                            portable single file (engine embedded by CI)
+dist\SlopStation\SlopStation.exe                            portable single file (engine embedded by CI)
 app\src-tauri\target\release\bundle\nsis\...-setup.exe       per-user installer
 app\src-tauri\target\release\bundle\nsis\...-setup.exe.sig   updater signature (when the signing key is set)
 ```

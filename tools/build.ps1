@@ -367,7 +367,7 @@ if (-not $NoFrontend) {
     # overlay), so that build is one file; a local build without the overlay
     # still ships the engine\ dir.
     $release = Join-Path $appDir 'src-tauri\target\release'
-    $portable = Join-Path $repoRoot 'dist\reverse-slop'
+    $portable = Join-Path $repoRoot 'dist\SlopStation'
     if (Test-Path -LiteralPath $portable) { Remove-Item -LiteralPath $portable -Recurse -Force }
     New-Item -ItemType Directory -Path $portable | Out-Null
     $portableExe = Join-Path $portable 'SlopStation.exe'
