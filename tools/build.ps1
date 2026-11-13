@@ -173,13 +173,16 @@ if ($Test) {
     $ctestArgs = @('--test-dir', $binaryDir, '--output-on-failure', '--no-tests=error', '-L', $TestLabel)
     if ($TestExclude) { $ctestArgs += @('-E', $TestExclude) }
     & $vsCTest @ctestArgs
-    if ($LASTEXITCODE -ne 0) {
-        # slop_tests_ps4 has a known intermittent watchdog hang that lands on a
-        # different test each run (the debug-event listener and the fake
-        # payload's port-755 channel). Retry only the entries that failed, so a
-        # real regression still fails twice while the flake does not redden the
-        # lane.
-        Write-Host "==> tests failed, retrying the failed entries once"
+    # slop_tests_ps4 has a known intermittent watchdog hang that lands on a
+    # different test each run (the debug-event listener and the fake payload's
+    # port-755 channel). Retry only the entries that failed, up to twice, with
+    # a short pause so the listener port settles; a real regression still fails
+    # every attempt while the flake does not redden the lane.
+    $retry = 0
+    while ($LASTEXITCODE -ne 0 -and $retry -lt 2) {
+        ++$retry
+        Write-Host "==> tests failed, retrying the failed entries (retry $retry/2)"
+        Start-Sleep -Seconds 2
         & $vsCTest --test-dir $binaryDir --output-on-failure --rerun-failed
     }
     if ($LASTEXITCODE -ne 0) { throw "tests failed (exit $LASTEXITCODE)" }

@@ -423,8 +423,22 @@ private:
         tl_chaos = &chaos;
         tl_budget = -1;
         {
+            // The payload keeps debug + auth state per connection. Reset it
+            // when the new connection starts, not when the old one ends: the
+            // old handler's cleanup could otherwise wipe the re-armed slots
+            // of a reconnect that already landed.
             std::lock_guard lk(mu);
             ++connections;
+            debug_attached = false;
+            debug_pid = 0;
+            bps.clear();
+            wps.clear();
+            auth_ok = false;
+            if (event_fd != INVALID_SOCKET) {
+                ::shutdown(event_fd, SD_BOTH);
+                closesocket(event_fd);
+                event_fd = INVALID_SOCKET;
+            }
         }
         handle_conn_loop(c);
         {
@@ -435,19 +449,6 @@ private:
                 turbo_recs.clear();
                 turbo_owner = INVALID_SOCKET;
             }
-        }
-        // the payload keeps debug + auth state per connection: a dropped
-        // client loses its debuggee, its breakpoints and its auth bits
-        std::lock_guard lk(mu);
-        debug_attached = false;
-        debug_pid = 0;
-        bps.clear();
-        wps.clear();
-        auth_ok = false;
-        if (event_fd != INVALID_SOCKET) {
-            ::shutdown(event_fd, SD_BOTH);
-            closesocket(event_fd);
-            event_fd = INVALID_SOCKET;
         }
         // like free_client: a failed handler closes the client. Shut the
         // socket down so the backend sees the hang-up; the handle itself is
@@ -649,7 +650,32 @@ private:
             a.sin_family = AF_INET;
             a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
             a.sin_port = htons(event_port);
-            if (::connect(ev, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) {
+            // Bound the connect: a listener that stopped accepting must fail
+            // the attach fast instead of blocking this handler (and the test)
+            // for the whole command budget.
+            u_long nb = 1;
+            ::ioctlsocket(ev, FIONBIO, &nb);
+            int rc = ::connect(ev, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            if (rc != 0 && ::WSAGetLastError() == WSAEWOULDBLOCK) {
+                fd_set wf;
+                FD_ZERO(&wf);
+                FD_SET(ev, &wf);
+                timeval tv{};
+                tv.tv_sec = 2;
+                rc = ::select(0, nullptr, &wf, nullptr, &tv);
+                int soerr = 0;
+                int slen = sizeof(soerr);
+                if (rc <= 0 ||
+                    ::getsockopt(ev, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char*>(&soerr), &slen) != 0 ||
+                    soerr != 0)
+                    rc = -1;
+                else
+                    rc = 0;
+            }
+            nb = 0;
+            ::ioctlsocket(ev, FIONBIO, &nb);
+            if (rc != 0) {
                 closesocket(ev);
                 send_u32(c, ps4::CMD_ERROR);
                 return true;

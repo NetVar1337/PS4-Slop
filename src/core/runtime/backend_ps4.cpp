@@ -465,8 +465,14 @@ public:
 
     // false + err on failure (port in use names the owner)
     bool start(uint16_t port, std::string& err) {
+        // A stop() in flight closes the socket and joins the accept thread
+        // without holding mu_ the whole time; starting in that window used to
+        // return true for a listener that no longer accepts (the payload's
+        // connect-back then sat in a dead backlog and the attach timed out).
+        for (int i = 0; i < 200 && stopping_.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         std::lock_guard lk(mu_);
-        if (running_) {
+        if (running_ && !stop_ && listen_fd_.load() != INVALID_SOCKET) {
             if (port == port_) return true;
             err = "debug-event listener already bound to port " + std::to_string(port_);
             return false;
@@ -508,9 +514,13 @@ public:
     }
 
     void stop() {
+        stopping_.store(true, std::memory_order_release);
         {
             std::lock_guard lk(mu_);
-            if (!running_) return;
+            if (!running_) {
+                stopping_.store(false, std::memory_order_release);
+                return;
+            }
             stop_ = true;
         }
         SOCKET s = listen_fd_.exchange(INVALID_SOCKET);
@@ -528,6 +538,7 @@ public:
             if (t.joinable()) t.join();
         std::lock_guard lk(mu_);
         running_ = false;
+        stopping_.store(false, std::memory_order_release);
     }
 
     bool running() const {
@@ -593,6 +604,7 @@ private:
     mutable std::mutex mu_;
     std::atomic<SOCKET> listen_fd_{INVALID_SOCKET};
     std::atomic<uint32_t> allow_peer_{0};
+    std::atomic<bool>     stopping_{false};   // stop() in flight
     std::vector<std::thread> conns_;   // guarded by mu_
     uint16_t port_ = 0;
     std::thread th_;
