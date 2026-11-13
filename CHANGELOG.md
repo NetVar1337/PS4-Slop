@@ -5,10 +5,16 @@ All notable changes to reverse-slop are documented here. The format follows
 [Semantic Versioning](https://semver.org/). The release job publishes the
 section matching the pushed tag as the GitHub release notes.
 
-## [Unreleased]
+## [0.2.0] - 2026-11-13
 
 ### Added
 
+- Auto-update: release builds check GitHub on launch, download the signed
+  installer with progress, and offer **Install & restart**; Settings → Updates
+  shows the running version and a manual check.
+- Single-file portable: the packaging job appends the engine to the app exe
+  (`SLOPENG1` overlay) and extracts it on first run, so the portable download
+  is one exe. The installer still ships the engine resource.
 - `memory.scan_save` / `memory.scan_load`: persist an address-list scan to
   `%LOCALAPPDATA%\reverse-slop\scans\<name>.json` and resume it after an engine
   restart (rows are capped at 500k; a pid mismatch needs `force:true`).
@@ -60,6 +66,16 @@ section matching the pushed tag as the GitHub release notes.
   HTTP/JSON/SSE/fs surface is sanitized.
 - Tauri CSP adds `script-src`, `object-src 'none'`, `base-uri 'none'` and
   `frame-ancestors 'none'`; the proxy token field is masked.
+
+### Changed
+
+- The NSIS installer installs per-user (`currentUser`), so installs and
+  updates need no UAC prompt.
+- CI: PRs run only the lanes their paths touch; ASan, `/analyze`, clang-tidy
+  and packaging run on main/tags (a PR can opt into packaging with the
+  `ci:package` label). The test lane retries only failed CTest entries.
+- Release builds sign the installer for the Tauri updater and publish
+  `latest.json` next to the setup exe.
 
 - `app/e2e`: end-to-end driver that spawns the real engine and the
   `SlopTarget` fixture — `npm run smoke` (API battery, also runs in the new

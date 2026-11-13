@@ -78,7 +78,7 @@ jobs:
   # C++ engine (shipped) + the legacy ImGui shell (compile check only).
   cxx:
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:package')
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -272,7 +272,7 @@ jobs:
   # Tests live in their own parallel ubuntu lane; this job only compiles.
   frontend-build:
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true'
+    if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true' || contains(github.event.pull_request.labels.*.name, 'ci:package')
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -353,9 +353,9 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     needs: [changes, cxx, frontend-build]
-    # Packaging is the release gate: main, tags and manual runs. PRs validate
-    # the engine and the frontend in their own lanes.
-    if: github.event_name != 'pull_request'
+    # Packaging is the release gate: main, tags and manual runs. A PR can
+    # opt in with the ci:package label when it changes the bundle.
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:package')
     env:
       # secrets are not usable in step `if:`; expose presence as a flag
       SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_SIGNING_ENDPOINT != '' && secrets.AZURE_SIGNING_ACCOUNT != '' && secrets.AZURE_SIGNING_PROFILE != '' }}

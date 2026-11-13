@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/NetVar1337/PS4-Slop/actions/workflows/build.yml"><img alt="build" src="https://github.com/NetVar1337/PS4-Slop/actions/workflows/build.yml/badge.svg"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.1.1-informational">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.0-informational">
   <img alt="platform" src="https://img.shields.io/badge/host-Windows%2010%2F11%20x64-blue">
   <img alt="target" src="https://img.shields.io/badge/target-PS4%20%2B%20ps4debug--NG-black">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -101,9 +101,21 @@ powershell -File tools/build.ps1 -NoFrontend   # C++ only, fastest loop
 
 **3. Run**
 
+Install once (per-user, no admin prompt) and launch from the Start menu:
+
 ```powershell
-.\dist\reverse-slop\reverse-slop.exe      # desktop app (spawns the engine as a sidecar)
+.\app\src-tauri\target\release\bundle\nsis\reverse-slop_<version>_x64-setup.exe
 ```
+
+Or run the portable single file; it carries the engine and needs no installer:
+
+```powershell
+.\dist\reverse-slop\reverse-slop.exe
+```
+
+Release builds check GitHub for a newer installer on launch, download it in the
+background and offer **Install & restart** in the banner. **Settings → Updates**
+has a manual check and shows the running version.
 
 **4. Connect the console**
 
@@ -520,7 +532,7 @@ Capstone, Unicorn, nlohmann/json, cpp-httplib, SQLite, Lua, fmt, spdlog, zlib).
 
 | Switch           | Effect                                                                                                 |
 | ---------------- | ------------------------------------------------------------------------------------------------------ |
-| _(none)_         | C++ engine + Tauri portable folder (`dist\reverse-slop\`) + NSIS installer                             |
+| _(none)_         | C++ engine + Tauri app: single-file portable (`dist\reverse-slop\`) + per-user NSIS installer         |
 | `-NoFrontend`    | C++ targets only                                                                                       |
 | `-FullClean`     | Delete `build/` before configuring                                                                     |
 | `-PlanOnly`      | Configure without compiling                                                                            |
@@ -549,8 +561,9 @@ Outputs:
 ```text
 build\src\engine\reverse-slop-engine.exe                     headless engine
 build\src\app\reverse-slop.exe                               legacy ImGui shell
-dist\reverse-slop\reverse-slop.exe                           portable Tauri app (carries engine\)
-app\src-tauri\target\release\bundle\nsis\...-setup.exe       per-machine installer
+dist\reverse-slop\reverse-slop.exe                           portable Tauri app (engine embedded by CI; local builds carry engine\)
+app\src-tauri\target\release\bundle\nsis\...-setup.exe       per-user installer
+app\src-tauri\target\release\bundle\nsis\...-setup.exe.sig   updater signature (when the signing key is set)
 ```
 
 Release Tauri builds request elevation so the engine can capture packets; debug builds run
