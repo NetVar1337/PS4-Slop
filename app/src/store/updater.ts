@@ -65,7 +65,12 @@ export const useUpdater = create<UpdaterStore>((set, get) => ({
       set({ phase: "available", version: update.version, notes: update.body ?? "" });
       void manual;
     } catch (e) {
-      set({ phase: "error", error: e instanceof Error ? e.message : String(e) });
+      // An offline launch must not nag; only a manual check surfaces the error.
+      if (manual) {
+        set({ phase: "error", error: e instanceof Error ? e.message : String(e) });
+      } else {
+        set({ phase: "idle", error: null });
+      }
     }
   },
 
