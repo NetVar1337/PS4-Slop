@@ -62,5 +62,5 @@ $manifest = [ordered]@{
     license      = 'GPL-3.0'
     source       = 'https://github.com/Pharaoh2k/ps4debug-NG'
 }
-$manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding utf8
+[IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 4), [Text.UTF8Encoding]::new($false))
 Write-Host "==> ps4debug-NG ${tag} staged: $binPath (sha256 $sha)"

@@ -52,7 +52,9 @@ struct Asset {
 
 fn read_manifest(dir: &Path) -> Option<PayloadInfo> {
     let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
-    let m: Manifest = serde_json::from_str(&text).ok()?;
+    // PowerShell 5.1's utf8 encoding writes a BOM; tolerate it.
+    let text = text.trim_start_matches('\u{feff}');
+    let m: Manifest = serde_json::from_str(text).ok()?;
     let bin = dir.join("ps4debug-ng.bin");
     if !bin.is_file() {
         return None;
