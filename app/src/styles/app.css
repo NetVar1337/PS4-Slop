@@ -1509,6 +1509,26 @@ html[data-motion="off"] *::after {
   border-bottom: 1px solid var(--danger);
 }
 
+.update-banner {
+  background: color-mix(in srgb, var(--accent) 16%, var(--bg-1));
+  border-bottom-color: var(--accent);
+}
+
+.update-progress {
+  flex: 1;
+  height: 3px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.update-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
 .splash-error {
   display: flex;
   align-items: center;

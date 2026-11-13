@@ -290,6 +290,12 @@ if (-not $NoFrontend) {
             Write-Host '==> magicmida absent, bundling without the Themida unpacker'
         }
         $bundleOverride = @{ resources = $resources }
+        # Updater artifacts (installer .sig, consumed by latest.json) need the
+        # signing key; CI sets it for release builds. Local builds without the
+        # key still produce the plain installer.
+        if ($env:TAURI_SIGNING_PRIVATE_KEY -or $env:TAURI_SIGNING_PRIVATE_KEY_PATH) {
+            $bundleOverride['createUpdaterArtifacts'] = $true
+        }
         if ($Full -and -not $OnlineWebview) {
             # embed the whole webview2 runtime so a machine with neither
             # webview2 nor internet still installs, adds ~130 MB to the setup exe.
@@ -356,15 +362,31 @@ if (-not $NoFrontend) {
         Write-Host '    target machine needs: windows (internet if webview bootstrapper needs the runtime)'
     }
 
-    # Portable layout: the exe plus the engine\ resource dir it looks for next to
-    # itself, so the app runs off a copied folder with no installer and no build
-    # tree. ponytail: a straight copy, Tauri has no portable bundle target
+    # Portable layout: the app exe plus the engine\ dir it looks for next to
+    # itself. The packaging job appends the engine to the exe (SLOPENG1
+    # overlay), so that build is one file; a local build without the overlay
+    # still ships the engine\ dir.
     $release = Join-Path $appDir 'src-tauri\target\release'
     $portable = Join-Path $repoRoot 'dist\reverse-slop'
     if (Test-Path -LiteralPath $portable) { Remove-Item -LiteralPath $portable -Recurse -Force }
     New-Item -ItemType Directory -Path $portable | Out-Null
-    Copy-Item -LiteralPath (Join-Path $release 'reverse-slop-ui.exe') -Destination (Join-Path $portable 'reverse-slop.exe')
-    Copy-Item -LiteralPath (Join-Path $release 'engine') -Destination $portable -Recurse
+    $portableExe = Join-Path $portable 'reverse-slop.exe'
+    Copy-Item -LiteralPath (Join-Path $release 'reverse-slop-ui.exe') -Destination $portableExe
+    $embedded = $false
+    $fs = [IO.File]::OpenRead($portableExe)
+    try {
+        if ($fs.Length -ge 24) {
+            $fs.Seek(-24, [IO.SeekOrigin]::End) | Out-Null
+            $footer = [byte[]]::new(24)
+            $fs.Read($footer, 0, 24) | Out-Null
+            $embedded = [Text.Encoding]::ASCII.GetString($footer, 0, 8) -eq 'SLOPENG1'
+        }
+    } finally { $fs.Close() }
+    if (-not $embedded) {
+        Copy-Item -LiteralPath (Join-Path $release 'engine') -Destination $portable -Recurse
+    } else {
+        Write-Host '==> portable: engine embedded in the exe (single file)'
+    }
     # license + third-party notices travel with every distribution (the
     # installer gets them through the tauri resource map)
     Copy-Item -LiteralPath (Join-Path $repoRoot 'LICENSE') -Destination (Join-Path $portable 'LICENSE.txt')

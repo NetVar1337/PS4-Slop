@@ -46,8 +46,39 @@ jobs:
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
           ./tools/sync_version.ps1 -Check -Tag $tag
 
+  # Path filter: a docs-only or frontend-only PR skips the C++ lanes and vice
+  # versa. Push/tag/dispatch runs always execute every lane, so main and
+  # releases keep the full gate; PRs get the build + tests + frontend lanes.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      cpp: ${{ steps.filter.outputs.cpp }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        with:
+          filters: |
+            cpp:
+              - 'src/**'
+              - 'CMakeLists.txt'
+              - 'CMakePresets.json'
+              - 'cmake/**'
+              - '_ext/**'
+              - 'tools/**'
+              - '.github/workflows/build.yml'
+            frontend:
+              - 'app/**'
+              - '.github/workflows/build.yml'
+
   # C++ engine (shipped) + the legacy ImGui shell (compile check only).
   cxx:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -87,6 +118,8 @@ jobs:
 
   # Every test area registered with CTest (one entry per src/tests/test_*.cpp).
   tests:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true'
     runs-on: windows-2022
     timeout-minutes: 45
     env:
@@ -124,8 +157,12 @@ jobs:
           path: mcp_live_results.json
           if-no-files-found: ignore
 
-  # Same suite under MSVC AddressSanitizer (preset ninja-msvc-asan).
+  # Same suite under MSVC AddressSanitizer (preset ninja-msvc-asan). Main,
+  # tags and manual runs only: it is the slowest lane and PRs already get the
+  # plain test areas.
   asan:
+    needs: changes
+    if: github.event_name != 'pull_request'
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -164,8 +201,10 @@ jobs:
         run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel mcpnoemu
 
   # MSVC /analyze over first-party code (preset ninja-msvc-analyze). Findings
-  # are listed in the run summary.
+  # are listed in the run summary. Main, tags and manual runs only.
   analyze:
+    needs: changes
+    if: github.event_name != 'pull_request'
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -202,7 +241,10 @@ jobs:
           }
 
   # clang-tidy (.clang-tidy) over first-party code via compile_commands.json.
+  # Main, tags and manual runs only.
   clang-tidy:
+    needs: changes
+    if: github.event_name != 'pull_request'
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -229,6 +271,8 @@ jobs:
   # Compile the real frontend immediately, independently of native sidecars.
   # Tests live in their own parallel ubuntu lane; this job only compiles.
   frontend-build:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true'
     runs-on: windows-2022
     timeout-minutes: 30
     env:
@@ -282,6 +326,8 @@ jobs:
   # Frontend unit tests on linux: pure node/vite, no windows toolchain needed,
   # fully parallel with every compile lane.
   frontend-tests:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -306,10 +352,17 @@ jobs:
   bundle:
     runs-on: windows-2022
     timeout-minutes: 30
-    needs: [cxx, frontend-build]
+    needs: [changes, cxx, frontend-build]
+    # Packaging is the release gate: main, tags and manual runs. PRs validate
+    # the engine and the frontend in their own lanes.
+    if: github.event_name != 'pull_request'
     env:
       # secrets are not usable in step `if:`; expose presence as a flag
       SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_SIGNING_ENDPOINT != '' && secrets.AZURE_SIGNING_ACCOUNT != '' && secrets.AZURE_SIGNING_PROFILE != '' }}
+      # Tauri updater signing: build.ps1 turns on createUpdaterArtifacts when
+      # this is set, and the installer .sig lands next to the setup exe.
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -363,7 +416,7 @@ jobs:
           Copy-Item -LiteralPath $f[0].FullName -Destination build/src/engine/reverse-slop-engine.exe -Force
           Get-ChildItem build/src/engine
 
-      - name: sign engine + frontend binaries
+      - name: sign engine
         if: env.SIGNING_ENABLED == 'true'
         uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
         with:
@@ -373,9 +426,40 @@ jobs:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
-          files: |
-            ${{ github.workspace }}\build\src\engine\reverse-slop-engine.exe
-            ${{ github.workspace }}\app\src-tauri\target\release\reverse-slop-ui.exe
+          files: ${{ github.workspace }}\build\src\engine\reverse-slop-engine.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: embed the engine into the app exe (single-file portable)
+        shell: pwsh
+        run: |
+          $app = 'app/src-tauri/target/release/reverse-slop-ui.exe'
+          $eng = 'build/src/engine/reverse-slop-engine.exe'
+          $bytes = [IO.File]::ReadAllBytes($eng)
+          $appLen = (Get-Item -LiteralPath $app).Length
+          $fs = [IO.File]::Open($app, 'Append')
+          try {
+            $fs.Write($bytes, 0, $bytes.Length)
+            $bw = [IO.BinaryWriter]::new($fs)
+            $bw.Write([Text.Encoding]::ASCII.GetBytes('SLOPENG1'))
+            $bw.Write([uint64]$appLen)
+            $bw.Write([uint64]$bytes.Length)
+            $bw.Flush()
+          } finally { $fs.Close() }
+          Write-Host "embedded $($bytes.Length) engine bytes at offset $appLen"
+
+      - name: sign frontend binary
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\app\src-tauri\target\release\reverse-slop-ui.exe
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
@@ -395,6 +479,14 @@ jobs:
           $match = @($all | Where-Object Name -Like "*_${version}_*")
           if ($match.Count -ne 1) { throw "expected one installer for $version, found: $($all.Name -join ', ')" }
           "path=$($match[0].FullName)" >> $env:GITHUB_OUTPUT
+          $sig = "$($match[0].FullName).sig"
+          if (Test-Path -LiteralPath $sig) {
+            "sig=$sig" >> $env:GITHUB_OUTPUT
+          } elseif ($env:GITHUB_REF_TYPE -eq 'tag') {
+            throw "updater signature missing on a tag build: $sig (set TAURI_SIGNING_PRIVATE_KEY)"
+          } else {
+            Write-Host "no updater signature (signing key not set)"
+          }
 
       - name: sign the installer
         if: env.SIGNING_ENABLED == 'true'
@@ -415,7 +507,7 @@ jobs:
         if: env.SIGNING_ENABLED == 'true'
         shell: pwsh
         run: |
-          foreach ($f in @('dist/reverse-slop/reverse-slop.exe', 'dist/reverse-slop/engine/reverse-slop-engine.exe', '${{ steps.setup.outputs.path }}')) {
+          foreach ($f in @('dist/reverse-slop/reverse-slop.exe', 'build/src/engine/reverse-slop-engine.exe', '${{ steps.setup.outputs.path }}')) {
             $sig = Get-AuthenticodeSignature -LiteralPath $f
             if ($sig.Status -ne 'Valid') { throw "$f signature status: $($sig.Status)" }
             Write-Host "signed: $f ($($sig.SignerCertificate.Subject))"
@@ -428,6 +520,9 @@ jobs:
           $ref = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "$((Get-Content VERSION -TotalCount 1).Trim())-$($env:GITHUB_SHA.Substring(0, 8))" }
           Compress-Archive -Path dist/reverse-slop -DestinationPath (Join-Path $out "reverse-slop-portable-$ref.zip")
           Copy-Item -LiteralPath '${{ steps.setup.outputs.path }}' -Destination $out
+          if ('${{ steps.setup.outputs.sig }}' -ne '') {
+            Copy-Item -LiteralPath '${{ steps.setup.outputs.sig }}' -Destination $out
+          }
           Push-Location $out
           Get-ChildItem -File | Where-Object Name -NE 'SHA256SUMS' | Sort-Object Name | ForEach-Object {
             "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
@@ -442,7 +537,6 @@ jobs:
           compression-level: 0
           path: |
             dist/reverse-slop/reverse-slop.exe
-            dist/reverse-slop/engine
             dist/reverse-slop/LICENSE.txt
             dist/reverse-slop/THIRD_PARTY_NOTICES.md
           if-no-files-found: error
@@ -505,6 +599,18 @@ jobs:
             echo "CHANGELOG.md has no entry for [$version]" >&2
             exit 1
           fi
+          # updater manifest: the Tauri updater reads this from the latest
+          # release and verifies the installer against the embedded public key
+          setup=$(cd _release && ls *-setup.exe | head -1)
+          sig=$(cat "_release/${setup}.sig")
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${setup}"
+          jq -n --arg v "$version" --arg notes "$(cat notes.md)" \
+                --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --arg sig "$sig" --arg url "$url" \
+            '{version:$v, notes:$notes, pub_date:$date,
+              platforms:{"windows-x86_64":{signature:$sig, url:$url}}}' \
+            > _release/latest.json
+          cat _release/latest.json
           # first run on a tag creates the release, a rerun or a manual dispatch
           # on the same tag just replaces its assets
           if ! gh release view "$TAG" > /dev/null 2>&1; then

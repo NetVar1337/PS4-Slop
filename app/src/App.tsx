@@ -24,6 +24,7 @@ import { useShortcuts } from "@/lib/shortcuts";
 import { useEngine } from "@/store/engine";
 import { useOutput } from "@/store/output";
 import { kLayoutVars, useUi, type LayoutVar } from "@/store/ui";
+import { useUpdater } from "@/store/updater";
 import { useWatch } from "@/store/watch";
 
 /** Post-boot failures (snapshot, engine crash) surface here, not on the splash. */
@@ -54,6 +55,65 @@ function EngineBanner() {
           <X size={13} />
         </IconButton>
       )}
+    </div>
+  );
+}
+
+/** Update check, download and restart, surfaced above the workspace. */
+function UpdateBanner() {
+  const phase = useUpdater((s) => s.phase);
+  const version = useUpdater((s) => s.version);
+  const progress = useUpdater((s) => s.progress);
+  const error = useUpdater((s) => s.error);
+  const dismissed = useUpdater((s) => s.dismissed);
+  const install = useUpdater((s) => s.install);
+  const dismiss = useUpdater((s) => s.dismiss);
+  const check = useUpdater((s) => s.check);
+  if (dismissed || phase === "idle" || phase === "checking") return null;
+  if (phase === "available") {
+    return (
+      <div className="engine-banner update-banner" role="status">
+        <span>Update v{version} is available.</span>
+        <div className="spacer" />
+        <button type="button" className="row-action" onClick={() => void install()}>
+          Install &amp; restart
+        </button>
+        <IconButton tip="Dismiss" onClick={dismiss}>
+          <X size={13} />
+        </IconButton>
+      </div>
+    );
+  }
+  if (phase === "downloading") {
+    const pct = progress < 0 ? null : Math.round(progress * 100);
+    return (
+      <div className="engine-banner update-banner" role="status">
+        <span>
+          Downloading update v{version}…{pct === null ? "" : ` ${pct}%`}
+        </span>
+        <div className="update-progress" aria-hidden>
+          <span style={{ width: pct === null ? "100%" : `${pct}%` }} />
+        </div>
+      </div>
+    );
+  }
+  if (phase === "ready") {
+    return (
+      <div className="engine-banner update-banner" role="status">
+        <span>Update installed. Restarting…</span>
+      </div>
+    );
+  }
+  return (
+    <div className="engine-banner update-banner" role="alert">
+      <span>Update failed: {error}</span>
+      <div className="spacer" />
+      <button type="button" className="row-action" onClick={() => void check(true)}>
+        <RotateCcw size={11} aria-hidden /> Retry
+      </button>
+      <IconButton tip="Dismiss" onClick={dismiss}>
+        <X size={13} />
+      </IconButton>
     </div>
   );
 }
@@ -92,6 +152,9 @@ export default function App() {
     const detachOutput = attachOutput();
     const detachWatch = attachWatch();
     void start();
+    // Release builds check for a newer installer once per launch; browser dev
+    // and offline runs resolve to a no-op.
+    void useUpdater.getState().check();
     return () => {
       detachOutput();
       detachWatch();
@@ -120,6 +183,7 @@ export default function App() {
       ) : (
         <div className="app-shell">
           <EngineBanner />
+          <UpdateBanner />
           <main className="app-body" data-inspector={inspectorOpen ? "open" : "closed"}>
             <ActivityRail active={rail} onSelect={setRail} onSettings={openSettings} />
 

@@ -62,13 +62,60 @@ fn sidecar_path(app: &AppHandle) -> Result<PathBuf, String> {
     };
 
     #[cfg(debug_assertions)]
-    let found = dev_tree(NAME).or_else(installed);
+    let found = dev_tree(NAME)
+        .or_else(installed)
+        .or_else(|| embedded_engine(app));
     #[cfg(not(debug_assertions))]
-    let found = installed();
+    let found = installed().or_else(|| embedded_engine(app));
 
     found.ok_or_else(|| {
         format!("{NAME} not found, build it with tools/build.ps1 (SLOP_BUILD_ENGINE=ON)")
     })
+}
+
+/// The packaging job can append the engine to this exe as an overlay:
+/// `[ui exe][engine bytes][b"SLOPENG1"][u64 offset][u64 size]`. PE loaders
+/// ignore the overlay, so a portable build is one file. The bytes are
+/// extracted once into the app-local data dir and reused by size (an upgrade
+/// changes the size and re-extracts).
+fn embedded_engine(app: &AppHandle) -> Option<PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let exe = std::env::current_exe().ok()?;
+    let mut file = std::fs::File::open(&exe).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len < 24 {
+        return None;
+    }
+    file.seek(SeekFrom::End(-24)).ok()?;
+    let mut footer = [0u8; 24];
+    file.read_exact(&mut footer).ok()?;
+    if &footer[..8] != b"SLOPENG1" {
+        return None;
+    }
+    let offset = u64::from_le_bytes(footer[8..16].try_into().ok()?);
+    let size = u64::from_le_bytes(footer[16..24].try_into().ok()?);
+    if size == 0 || offset.checked_add(size)? > len - 24 {
+        return None;
+    }
+
+    let dir = app.path().app_local_data_dir().ok()?.join("engine");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("reverse-slop-engine-{size}.exe"));
+    if std::fs::metadata(&path).map(|m| m.len() == size).unwrap_or(false) {
+        return Some(path);
+    }
+
+    let mut bytes = vec![0u8; size as usize];
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    file.read_exact(&mut bytes).ok()?;
+    let tmp = path.with_extension("exe.tmp");
+    std::fs::write(&tmp, &bytes).ok()?;
+    // a wrong-size stale copy can exist from an interrupted run; rename over
+    // it only after removing it (Windows rename does not replace)
+    let _ = std::fs::remove_file(&path);
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
 }
 
 /// the cmake output tree, compiled into debug builds only so release binaries
@@ -141,6 +188,8 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .manage(Engine::new(Arc::clone(&log)))
         .invoke_handler(tauri::generate_handler![
             engine_endpoint,
