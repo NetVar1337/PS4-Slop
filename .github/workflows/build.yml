@@ -161,10 +161,7 @@ jobs:
       # without the Unicorn-backed emulate cases (see src/tests/CMakeLists.txt).
       - name: mcp area under ASan (minus Unicorn cases)
         shell: pwsh
-        run: |
-          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          $ctest = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\ctest.exe'
-          & $ctest --test-dir build-ninja-msvc-asan -R slop_tests_mcp_noemu --output-on-failure
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-asan -NoFrontend -Targets "slop_tests" -CmakeExtra "-DSLOP_BUILD_UI=OFF" -Test -TestLabel mcpnoemu
 
   # MSVC /analyze over first-party code (preset ninja-msvc-analyze). Findings
   # are listed in the run summary.

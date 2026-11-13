@@ -83,7 +83,7 @@ endforeach()
 add_test(NAME slop_tests_mcp_noemu COMMAND slop_tests)
 set_tests_properties(slop_tests_mcp_noemu PROPERTIES
     ENVIRONMENT "SLOP_TEST_AREA=mcp;SLOP_TEST_EXCLUDE=emulate"
-    LABELS "slop;asan"
+    LABELS "slop;asan;mcpnoemu"
     TIMEOUT 1800
 )
 
