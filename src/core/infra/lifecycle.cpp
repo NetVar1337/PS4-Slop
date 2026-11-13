@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <dpapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -37,6 +38,11 @@ namespace {
 
 using json = nlohmann::json;
 namespace bus = event_bus;
+
+// Auto-reconnect a dropped console on a worker thread: reconnect() opens a TCP
+// socket and can block for seconds, so it must not run on the 10 ms tick.
+std::thread       g_auto_thread;
+std::atomic<bool> g_auto_stop{false};
 
 struct state_t {
     std::mutex        mu;
@@ -159,9 +165,19 @@ void start_mcp() {
     // so the persisted one never has to travel over stdout
     if (const char* env_tok = std::getenv("SLOP_MCP_TOKEN"); env_tok && *env_tok)
         cfg.extra_tokens.emplace_back(env_tok);
-    if (cfg.token.empty())
-        bus::output("WARNING: mcp_token is empty, the mcp server accepts unauthenticated "
-                    "requests from any local process");
+    if (cfg.token.empty() && cfg.extra_tokens.empty()) {
+        // Fail closed. An empty token used to mean "no auth" (the server
+        // accepted any local process); generate and persist one instead, and
+        // refuse to start rather than expose an open endpoint if that fails.
+        const std::string tok = settings::generate_token();
+        if (tok.empty() || !settings::set("mcp_token", tok)) {
+            bus::output("mcp_token is empty and could not be generated; refusing to start "
+                        "an unauthenticated MCP server");
+            return;
+        }
+        cfg.token = tok;
+        bus::output("mcp_token was empty; generated a new bearer token");
+    }
 
     // port taken means fall back to an ephemeral one and skip onboarding so clients stay pointed at the owner
     bool ephemeral = false;
@@ -303,6 +319,30 @@ void tick() {
     jobs::reap();
     memory::watch::tick();
 
+    // A dropped console comes back on its own with exponential backoff; the
+    // session, breakpoints and slots are restored by reconnect(). Opt out with
+    // ps4_auto_reconnect=false. disconnect() clears "lost", so an intentional
+    // disconnect is never undone.
+    if (!g_auto_thread.joinable() &&
+        settings::get<bool>("ps4_auto_reconnect", true) &&
+        runtime::registry_ps4_lost()) {
+        g_auto_stop.store(false);
+        g_auto_thread = std::thread([] {
+            int backoff_ms = 1000;
+            while (!g_auto_stop.load() && runtime::registry_ps4_lost()) {
+                std::string err;
+                if (runtime::registry_ps4_reconnect(err)) break;
+                for (int waited = 0; waited < backoff_ms && !g_auto_stop.load(); waited += 100)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                backoff_ms = (std::min)(backoff_ms * 2, 30000);
+            }
+        });
+    }
+    if (g_auto_thread.joinable() && !runtime::registry_ps4_lost()) {
+        g_auto_stop.store(true);
+        g_auto_thread.join();
+    }
+
     // mirror state at 10hz for the stream since polling over a socket isnt free anymore
     const int64_t now = steady_ms();
     if (now - s.last_tick_ms < 100) return;
@@ -334,6 +374,9 @@ void tick() {
 void shutdown() {
     state_t& s = st();
     if (s.torn_down.exchange(true)) return;
+
+    g_auto_stop.store(true);
+    if (g_auto_thread.joinable()) g_auto_thread.join();
 
     remove_endpoint();
     mcp::stop();

@@ -358,6 +358,10 @@ std::optional<PEImage> ELFLoader::load(const std::filesystem::path& path) {
 
     const auto end = f.tellg();
     if (end < 52) return std::nullopt;
+    // Same 2 GiB cap as the PE and Mach-O loaders; without it any path could
+    // be read whole into memory.
+    constexpr std::streamoff kMaxFile = 2ll << 30;
+    if (end > kMaxFile) return std::nullopt;
     const size_t sz = static_cast<size_t>(end);
     f.seekg(0);
 

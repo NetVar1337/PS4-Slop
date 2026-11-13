@@ -201,6 +201,11 @@ public:
 
     void reset();
 
+    // Persist/restore the address-list state so a scan survives an engine
+    // restart. Only the result rows are portable; the region stash is not.
+    bool export_results(std::vector<scan_result_t>& out, value_width_t& width) const;
+    bool import_results(std::vector<scan_result_t> results, value_width_t width);
+
     const std::vector<scan_result_t>& results() const noexcept { return results_; }
     scan_stats_t                      stats()   const noexcept { return stats_; }
     const scan_progress_t&            progress() const noexcept { return progress_; }

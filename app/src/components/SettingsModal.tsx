@@ -284,9 +284,10 @@ export default function SettingsModal({ onClose }: Props) {
             <input
               className="addr-input mono"
               style={{ width: "100%" }}
+              type="password"
               value={proxyToken}
               spellCheck={false}
-              autoComplete="off"
+              autoComplete="new-password"
               onChange={(e) => setProxyToken(e.target.value)}
               onBlur={() => {
                 if (proxyToken !== (settings?.proxy_token ?? ""))

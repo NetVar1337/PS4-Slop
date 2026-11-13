@@ -686,11 +686,17 @@ void MachOLoader::resolve_base_entry(PEImage& img) {
     else
         img.base = low_vmaddr_ != INVALID_VA ? low_vmaddr_ : 0;
 
-    // LC_MAIN's entryoff is a file offset into __TEXT
-    if (have_main_)
-        img.entry = have_text_ ? text_vmaddr_ + entryoff_ - text_fileoff_ : img.base + entryoff_;
-    else if (have_thread_)
+    // LC_MAIN's entryoff is a file offset into __TEXT. Guard the subtraction:
+    // entryoff_ < text_fileoff_ underflowed to a bogus entry VA.
+    if (have_main_) {
+        if (have_text_ && entryoff_ >= text_fileoff_)
+            img.entry = text_vmaddr_ + entryoff_ - text_fileoff_;
+        else if (!have_text_)
+            img.entry = img.base + entryoff_;
+        // else: LC_MAIN disagrees with __TEXT; leave 0 for the segment fallback
+    } else if (have_thread_) {
         img.entry = thread_pc_;
+    }
 
     // thumb entry points carry the mode in bit 0
     if (img.arch == Arch::ARM) img.entry &= ~va_t(1);

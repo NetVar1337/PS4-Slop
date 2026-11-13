@@ -12,9 +12,12 @@ namespace slop::core::mcp {
 // fills out the tools/list entries
 void list_tools(nlohmann::json& out);
 
-// runs a tool call, sets is_error on failure and never throws
+// runs a tool call, sets is_error on failure and never throws.
+// allow_app is the UI channel (/api) only: `app` carries settings/token/shutdown
+// and must stay unreachable from the agent-facing MCP endpoint.
 nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
-                         bool& is_error, infra::cancel_token_t cancel = {});
+                         bool& is_error, infra::cancel_token_t cancel = {},
+                         bool allow_app = false);
 
 // drop tool state on shutdown
 void shutdown_tools();

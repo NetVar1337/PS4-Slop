@@ -66,6 +66,16 @@ struct server_fixture_t {
         return json::parse(res->body);
     }
 
+    // /api helper (the UI channel; the only one allowed to reach `app`)
+    json api(const std::string& tool, const std::string& action,
+             const json& params = json::object()) {
+        json req = {{"tool", tool}, {"action", action}};
+        if (!params.empty()) req["params"] = params;
+        auto res = cli_->Post("/api", req.dump(), "application/json");
+        REQUIRE(res);
+        return json::parse(res->body);
+    }
+
     // tools/call helper then returns the parsed payload + error flag
     json call(const std::string& tool, const json& args, bool& is_error) {
         json res = rpc("tools/call", {{"name", tool}, {"arguments", args}});
@@ -1129,6 +1139,12 @@ TEST_CASE(mcp_script_run_roundtrip) {
 }
 
 TEST_CASE(mcp_script_static_analysis_surface) {
+    // the script loads the fixture from disk, which the sandbox refuses
+    struct unsafe_guard_t {
+        bool prev = slop::core::infra::settings::get<bool>("script_unsafe", false);
+        unsafe_guard_t() { slop::core::infra::settings::set("script_unsafe", true); }
+        ~unsafe_guard_t() { slop::core::infra::settings::set("script_unsafe", prev); }
+    } unsafe_guard;
     server_fixture_t fx;
     bool is_error = false;
 
@@ -2072,21 +2088,26 @@ TEST_CASE(mcp_stream_cap_keeps_workers_free) {
 TEST_CASE(mcp_app_settings_api_redacts_and_validates) {
     scratch_settings_t scratch;
     server_fixture_t fx;
-    bool is_error = false;
-    json got = fx.call("app", {{"action", "settings_get"}}, is_error);
-    REQUIRE(!is_error);
+
+    // `app` is UI plumbing: reachable on /api, rejected on the agent transport
+    json denied = fx.rpc("tools/call", {{"name", "app"},
+                                        {"arguments", {{"action", "settings_get"}}}});
+    REQUIRE(denied.contains("error"));
+    REQUIRE(denied.at("error").at("message").get<std::string>().find("UI-only") !=
+            std::string::npos);
+
+    json got = fx.api("app", "settings_get").at("data");
     REQUIRE_STR_EQ(got.at("mcp_token").get<std::string>().c_str(), "set");
 
-    fx.call("app", {{"action", "settings_set"}, {"key", "mcp_token"}, {"value", "x"}}, is_error);
-    REQUIRE(is_error);
-    fx.call("app", {{"action", "settings_set"}, {"key", "mcp_port"}, {"value", 70000}}, is_error);
-    REQUIRE(is_error);
-    json set = fx.call("app", {{"action", "settings_set"}, {"key", "script_unsafe"}, {"value", true}},
-                       is_error);
-    REQUIRE(!is_error);
+    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_token"}, {"value", "x"}})
+                 .value("ok", true));
+    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 70000}})
+                 .value("ok", true));
+    json set = fx.api("app", "settings_set", {{"key", "script_unsafe"}, {"value", true}})
+                   .at("data");
     REQUIRE(set.value("ok", false));
     REQUIRE(slop::core::infra::settings::get<bool>("script_unsafe", false));
-    set = fx.call("app", {{"action", "settings_set"}, {"key", "mcp_port"}, {"value", 9100}}, is_error);
+    set = fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 9100}}).at("data");
     REQUIRE(set.value("restart_required", false));
 }
 
@@ -2099,7 +2120,8 @@ TEST_CASE(mcp_rotate_token_applies_live) {
     const std::string old_tok = cfg.token;
     const json req = {{"tool", "app"}, {"action", "rotate_token"}};
 
-    // a supervisor-token caller rotates; its own bearer keeps working
+    // the per-launch supervisor token (extra) is the UI's token, so it rotates;
+    // its own bearer keeps working and the new bearer is returned once
     auto sup = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
     REQUIRE(sup);
     const json sup_out = json::parse(sup->body).at("data");

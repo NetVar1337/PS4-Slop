@@ -40,9 +40,14 @@ std::string lua_path_literal(const char* path) {
 // Run a static-analysis script against the built SlopTarget fixture with a
 // generous timeout (hyperion analysis + decompile paths need it)
 lua_run_result_t run_static(const std::string& body, int timeout_ms = 60000) {
+    // Loading the fixture is host file access, which the sandbox refuses; the
+    // static-analysis tests run with script_unsafe semantics.
+    lua_run_options_t opt;
+    opt.timeout_ms = timeout_ms;
+    opt.unsafe = true;
     return lua_run(
         "local ok = slop.image.load(" + lua_path_literal(SLOP_TARGET_EXE_PATH) + ")\n"
-        "assert(ok, \"image load failed\")\n" + body, timeout_ms);
+        "assert(ok, \"image load failed\")\n" + body, opt);
 }
 
 void dump_on_fail(const lua_run_result_t& r) {
@@ -397,6 +402,9 @@ TEST_CASE(lua_decomp_before_ready_reports_pending_state) {
     // Load synchronously and immediately ask the decompiler for the richest
     // path without calling wait_ready, the error must name the pending
     // analysis (or, on a very fast machine that already finished, succeed)
+    lua_run_options_t opt;
+    opt.timeout_ms = 60000;
+    opt.unsafe = true;   // loads the fixture from disk
     auto r = lua_run(
         "local ok = slop.image.load(" + lua_path_literal(SLOP_TARGET_EXE_PATH) + ")\n"
         "assert(ok)\n"
@@ -405,7 +413,7 @@ TEST_CASE(lua_decomp_before_ready_reports_pending_state) {
         "local ok2 = slop.image.load(" + lua_path_literal(SLOP_TARGET_EXE_PATH) + ")\n"
         "assert(ok2)\n"
         "local ok3, err = pcall(slop.decomp.vtables)\n"
-        "return ok3", 60000);
+        "return ok3", opt);
     REQUIRE(r.ok);   // pcall guards either outcome; the point is no crash/lockup
     dump_on_fail(r);
 }
@@ -717,6 +725,8 @@ TEST_CASE(lua_debugger_bindings_route_through_mcp_actions) {
         assert(not ok and tostring(err):find("connected console"), tostring(err))
         -- host-file actions stay closed in the sandbox
         ok, err = pcall(slop.debugger.action, "elf_load", {path = "C:/x.elf"})
+        assert(not ok and tostring(err):find("script_unsafe"), tostring(err))
+        ok, err = pcall(slop.image.load, "C:/x.elf")
         assert(not ok and tostring(err):find("script_unsafe"), tostring(err))
         ok, err = pcall(slop.debugger.action, "bp_set", {addr = print})
         assert(not ok and tostring(err):find("cannot pass"), tostring(err))

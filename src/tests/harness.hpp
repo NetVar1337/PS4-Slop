@@ -8,6 +8,8 @@
 //                     name minus "test_" and the extension (test_network.cpp ->
 //                     "network"). CTest registers one entry per area.
 //   SLOP_TEST_FILTER  substring of the test case name.
+//   SLOP_TEST_EXCLUDE comma-separated substrings to skip (used by the ASan
+//                     lane to run the mcp area without the Unicorn cases).
 // Watchdog:
 //   every test runs under a deadline (TEST_CASE: SLOP_TEST_TIMEOUT_SEC, default
 //   300 s; TEST_CASE_TIMEOUT(name, seconds) overrides it per test). A test that
@@ -240,9 +242,27 @@ inline bool area_selected(const std::string& area, const char* areas) {
     return false;
 }
 
+inline bool matches_list(const char* name, const char* list) {
+    if (!list || !*list) return false;
+    std::string_view l(list);
+    size_t pos = 0;
+    while (pos <= l.size()) {
+        const size_t comma = l.find(',', pos);
+        const size_t end = comma == std::string_view::npos ? l.size() : comma;
+        if (end > pos) {
+            const std::string needle(l.substr(pos, end - pos));
+            if (std::strstr(name, needle.c_str()) != nullptr) return true;
+        }
+        if (comma == std::string_view::npos) break;
+        pos = comma + 1;
+    }
+    return false;
+}
+
 inline int run_all() {
     int passed = 0, failed = 0, selected = 0;
     const char* filter = std::getenv("SLOP_TEST_FILTER");
+    const char* exclude = std::getenv("SLOP_TEST_EXCLUDE");
     const char* areas = std::getenv("SLOP_TEST_AREA");
     const unsigned fallback_timeout = default_timeout_sec();
 #if defined(SLOP_ASAN)
@@ -253,6 +273,7 @@ inline int run_all() {
     watchdog_t watchdog;
     for (auto& tc : registry()) {
         if (filter && *filter && std::strstr(tc.name, filter) == nullptr) continue;
+        if (matches_list(tc.name, exclude)) continue;
         if (!area_selected(tc.area, areas)) continue;
         ++selected;
         g_current_test = tc.name;

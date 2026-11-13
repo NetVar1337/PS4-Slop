@@ -3,6 +3,9 @@
 
 #include "core/mcp/tools_common.hpp"
 
+#include <filesystem>
+
+#include "core/infra/paths.hpp"
 #include "core/memory/console_scan.hpp"
 #include "core/memory/session_reader.hpp"
 
@@ -11,6 +14,19 @@ namespace slop::core::mcp::detail {
 namespace {
 
 using memory::session_reader_t;
+
+// Saved scans live under the engine data dir; the name is a plain stem so a
+// caller cannot escape the folder with separators or dots.
+std::filesystem::path scan_file_path(const std::string& name, bool& ok) {
+    ok = !name.empty() && name.size() <= 64 && name != "." && name != ".." &&
+         name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+             == std::string::npos;
+    if (!ok) return {};
+    const auto dir = std::filesystem::path(infra::paths::app_data()) / "scans";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / (name + ".json");
+}
 
 // optional numeric argument through the shared parser, so "0x1000" strings
 // work everywhere and bad input fails with a readable message
@@ -206,18 +222,19 @@ json tool_memory(const json& args) {
     {
         static const char* kKnown[] = {
             "read", "write", "scan", "rescan", "scan_state", "scan_reset",
+            "scan_save", "scan_load",
             "aob", "pointerscan", "pointerscan_verify", "snapshot", "snapshots", "diff",
             "snapshot_free", "protect", "alloc", "free", "siggen",
             "live_crypto", "watch_list", "watch_add", "watch_remove",
-            "watch_clear", "watch_set",
+            "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
         if (!known)
             fail("memory: unknown action (read|write|scan|rescan|scan_state|scan_reset|"
-                 "aob|pointerscan|pointerscan_verify|snapshot|snapshots|diff|snapshot_free|"
-                 "protect|alloc|free|siggen|live_crypto|watch_list|watch_add|watch_remove|"
-                 "watch_clear|watch_set)");
+                 "scan_save|scan_load|aob|pointerscan|pointerscan_verify|snapshot|snapshots|"
+                 "diff|snapshot_free|protect|alloc|free|siggen|live_crypto|watch_list|"
+                 "watch_add|watch_remove|watch_clear|watch_set|watch_undo|watch_freeze_once)");
     }
 
     // watchlist
@@ -261,8 +278,11 @@ json tool_memory(const json& args) {
             const bool freeze = opt_bool(args, "freeze", false);
             const uint64_t id = memory::watch::add(addr, width, std::move(label));
             if (id == 0) fail("memory.watch_add: watch list is full");
-            if (freeze) memory::watch::set_freeze(id, true);
-            return {{"id", id}, {"addr_hex", addr_hex_str(addr)}, {"entries", entries_json()}};
+            // A fresh entry latches the live value, so a freeze needs a target;
+            // report whether it actually armed instead of silently doing nothing.
+            const bool freeze_armed = freeze && memory::watch::set_freeze(id, true);
+            return {{"id", id}, {"addr_hex", addr_hex_str(addr)},
+                    {"freeze_armed", freeze_armed}, {"entries", entries_json()}};
         }
 
         if (action == "watch_remove") {
@@ -283,7 +303,8 @@ json tool_memory(const json& args) {
             bool touched = false;
             if (args.contains("freeze") && args.at("freeze").is_boolean()) {
                 if (!memory::watch::set_freeze(id, args.at("freeze").get<bool>()))
-                    fail("memory.watch_set: no such id");
+                    fail("memory.watch_set: no such id, or the live read needed to "
+                         "latch a fresh entry failed");
                 touched = true;
             }
             if (args.contains("width")) {
@@ -322,6 +343,21 @@ json tool_memory(const json& args) {
                 touched = true;
             }
             if (!touched) fail("memory.watch_set: nothing to change");
+            return {{"ok", true}, {"entries", entries_json()}};
+        }
+
+        if (action == "watch_freeze_once") {
+            if (!args.contains("id")) fail("memory.watch_freeze_once: missing id");
+            if (!memory::watch::set_freeze_once(parse_addr(args, "id")))
+                fail("memory.watch_freeze_once: no such id or the live read failed");
+            return {{"ok", true}, {"entries", entries_json()}};
+        }
+
+        if (action == "watch_undo") {
+            if (!args.contains("id")) fail("memory.watch_undo: missing id");
+            std::string err;
+            if (!memory::watch::undo_freeze(parse_addr(args, "id"), &err))
+                fail("memory.watch_undo: " + err);
             return {{"ok", true}, {"entries", entries_json()}};
         }
 
@@ -436,6 +472,76 @@ json tool_memory(const json& args) {
 
     const auto s_hold = need_session();
     auto& s = *s_hold;
+
+    if (action == "scan_save") {
+        const std::string name = opt_str(args, "name", "default");
+        bool ok = false;
+        const auto path = scan_file_path(name, ok);
+        if (!ok) fail("scan_save: name must be 1..64 chars of [A-Za-z0-9._-]");
+        std::vector<memory::scan_result_t> rows;
+        memory::value_width_t width = memory::value_width_t::u32;
+        if (!g_scan.engine.export_results(rows, width) || rows.empty())
+            fail("scan_save: no scan results to save (run memory.scan first)");
+        constexpr size_t kMaxPersist = 500000;
+        const size_t n = std::min(rows.size(), kMaxPersist);
+        json arr = json::array();
+        for (size_t i = 0; i < n; ++i)
+            arr.push_back({{"a", rows[i].address}, {"b", rows[i].bits},
+                           {"w", static_cast<int>(rows[i].matched)}});
+        json doc = {{"version", 1},
+                    {"pid", g_scan.pid},
+                    {"width", static_cast<int>(width)},
+                    {"width_label", g_scan.width},
+                    {"kind", g_scan.kind},
+                    {"total", rows.size()},
+                    {"saved", n},
+                    {"results", std::move(arr)}};
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) fail("scan_save: cannot write " + path.string());
+        f << doc.dump();
+        if (!f) fail("scan_save: write failed");
+        return {{"saved", true}, {"name", name}, {"path", path.string()},
+                {"rows", n}, {"truncated", rows.size() > n}};
+    }
+
+    if (action == "scan_load") {
+        const std::string name = opt_str(args, "name", "default");
+        bool ok = false;
+        const auto path = scan_file_path(name, ok);
+        if (!ok) fail("scan_load: name must be 1..64 chars of [A-Za-z0-9._-]");
+        std::ifstream f(path, std::ios::binary);
+        if (!f) fail("scan_load: no saved scan named '" + name + "'");
+        json doc = json::parse(f, nullptr, false);
+        if (doc.is_discarded() || !doc.is_object() || doc.value("version", 0) != 1)
+            fail("scan_load: not a scan file");
+        const uint32_t pid = doc.value("pid", 0u);
+        if (!args.value("force", false) && pid != 0 && s.pid() != pid)
+            fail("scan_load: saved scan belongs to pid " + std::to_string(pid) +
+                 " (pass force:true to load anyway; addresses may be stale)");
+        std::vector<memory::scan_result_t> rows;
+        for (const auto& r : doc.value("results", json::array())) {
+            if (!r.is_object()) continue;
+            memory::scan_result_t row;
+            row.address = static_cast<uintptr_t>(r.value("a", uint64_t{0}));
+            row.bits    = r.value("b", uint64_t{0});
+            const int w = r.value("w", 0);
+            if (w < 0 || w > 9) continue;
+            row.matched = static_cast<memory::value_width_t>(w);
+            rows.push_back(row);
+        }
+        const int width = doc.value("width", 0);
+        if (width < 0 || width > 9 ||
+            !g_scan.engine.import_results(std::move(rows),
+                                          static_cast<memory::value_width_t>(width)))
+            fail("scan_load: file has no result rows");
+        g_scan.used  = true;
+        g_scan.pid   = s.pid();
+        g_scan.kind  = doc.value("kind", std::string{"exact"});
+        g_scan.width = doc.value("width_label", std::string{"i32"});
+        return {{"loaded", true}, {"name", name},
+                {"total", g_scan.engine.results().size()}, {"pid", g_scan.pid},
+                {"note", "rescan continues from these rows"}};
+    }
 
     if (action == "write") {
         const uint64_t addr = parse_addr(args, "addr");

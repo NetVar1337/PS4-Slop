@@ -555,6 +555,11 @@ int l_analyze_packer(lua_State* L) {
 int l_image_status(lua_State* L);
 
 int l_image_load(lua_State* L) {
+    // Host file access is the script_unsafe boundary; the sandbox must not
+    // read arbitrary paths through the image loader.
+    if (!ctx_of(L)->unsafe)
+        return lua_fail(L, "slop.image.load reads a host file; it needs the "
+                           "script_unsafe setting");
     size_t plen = 0;
     const char* path = luaL_checklstring(L, 1, &plen);
     const uint64_t base = lua_gettop(L) >= 2 ? to_addr(L, 2) : 0;

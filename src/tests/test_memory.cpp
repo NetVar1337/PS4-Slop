@@ -1521,3 +1521,28 @@ TEST_CASE(memory_mcp_pointerscan_verify_live_process) {
     slop::core::process::target_detach();
     VirtualFree(base, 0, MEM_RELEASE);
 }
+
+TEST_CASE(memory_scan_export_import_roundtrip) {
+    // scan persistence: rows survive an engine restart as an address-list scan
+    memscan_t engine;
+    std::vector<scan_result_t> rows = {
+        {0x1000, 0x41, value_width_t::u32},
+        {0x2000, 0x42, value_width_t::u32},
+        {0x3000, 0x43, value_width_t::u8},
+    };
+    REQUIRE(engine.import_results(rows, value_width_t::u32));
+    REQUIRE(engine.has_results());
+    REQUIRE_EQ(engine.results().size(), rows.size());
+
+    std::vector<scan_result_t> out;
+    value_width_t width = value_width_t::i8;
+    REQUIRE(engine.export_results(out, width));
+    REQUIRE_EQ(width, value_width_t::u32);
+    REQUIRE_EQ(out.size(), rows.size());
+    REQUIRE_EQ(out[0].address, 0x1000u);
+    REQUIRE_EQ(out[0].bits, 0x41u);
+    REQUIRE_EQ(out[2].matched, value_width_t::u8);
+
+    // an empty row set is not a usable scan state
+    REQUIRE(!engine.import_results({}, value_width_t::u32));
+}

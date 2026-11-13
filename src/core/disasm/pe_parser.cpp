@@ -37,7 +37,9 @@ std::string read_cstring_at(const uint8_t* d, size_t len, size_t off) {
 std::optional<size_t> pe_image_t::rva_to_offset(uint32_t rva) const {
     for (const auto& s : sections) {
         if (!s.contains_rva(rva)) continue;
-        if (rva - s.rva >= s.raw_size) break; // BSS-like tail: no file backing
+        // BSS-like tail: no file backing. `continue`, not `break`: a later
+        // section can still map this RVA (overlapping/zero-raw-size entries).
+        if (rva - s.rva >= s.raw_size) continue;
         return static_cast<size_t>(s.raw_offset) + (rva - s.rva);
     }
     // Headers region
@@ -54,8 +56,12 @@ std::optional<size_t> pe_image_t::va_to_offset(uint64_t va) const {
 
 std::optional<uintptr_t> pe_image_t::offset_to_va(size_t off) const {
     for (const auto& s : sections) {
-        if (off < s.raw_offset || off >= s.raw_offset + s.raw_size) continue;
-        return image_base + s.rva + static_cast<uint32_t>(off - s.raw_offset);
+        // widen before adding: raw_offset + raw_size wraps in u32 on a
+        // crafted section table and would accept an out-of-section offset
+        const uint64_t begin = s.raw_offset;
+        const uint64_t end   = begin + s.raw_size;
+        if (off < begin || off >= end) continue;
+        return image_base + s.rva + static_cast<uint32_t>(off - begin);
     }
     return std::nullopt;
 }
@@ -81,8 +87,10 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
     if (coff + 20 > len) return img;
     img.machine = rd16(d + coff);
 
-    const uint16_t num_sections   = rd16(d + coff + 2);
-    const uint16_t opt_header_off = static_cast<uint16_t>(e_lfanew + 24);
+    const uint16_t num_sections = rd16(d + coff + 2);
+    // size_t: e_lfanew + 24 used to be truncated to uint16_t, so a file with
+    // e_lfanew > 0xFFE8 parsed the optional header at the wrong offset
+    const size_t   opt_header_off = static_cast<size_t>(e_lfanew) + 24;
     const uint16_t opt_size       = rd16(d + coff + 16);
     if (opt_size == 0 || opt_header_off + opt_size > len) return img;
 
@@ -104,7 +112,7 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
     img.size_of_image = rd32(d + opt_header_off + 56);
 
     // Data directories: PE32+ at offset 112, PE32 at 96
-    const uint16_t dd_off = opt_header_off + (img.pe32plus ? 112 : 96);
+    const size_t dd_off = opt_header_off + (img.pe32plus ? 112 : 96);
     if (opt_size >= (img.pe32plus ? 120 : 104)) {
         for (int i = 0; i < 16; ++i) {
             const size_t o = dd_off + static_cast<size_t>(i) * 8;
@@ -147,8 +155,10 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
                     if (oft_rva == 0 && name_rva == 0) break;
 
                     pe_import_dll_t dll;
-                    dll.dll = read_cstring_at(d, len,
-                        img.rva_to_offset(name_rva).value_or(0));
+                    // An unmapped name RVA used to fall back to offset 0 and
+                    // read the DLL name out of the DOS header.
+                    if (auto name_off = img.rva_to_offset(name_rva))
+                        dll.dll = read_cstring_at(d, len, *name_off);
 
                     const uint32_t thunk_rva = oft_rva ? oft_rva : rd32(d + desc + 16);
                     const uint32_t iat_rva  = rd32(d + desc + 16);   // FirstThunk

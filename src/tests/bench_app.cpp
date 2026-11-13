@@ -126,7 +126,8 @@ int main(int argc, char** argv) {
     for (const auto* action : {"output", "diag"}) {
         rows.push_back(bench(action, 10, [&] {
             bool error = false;
-            auto result = mcp::call_tool("app", {{"action", action}, {"since", 4096}, {"limit", 32}}, error);
+            auto result = mcp::call_tool("app", {{"action", action}, {"since", 4096}, {"limit", 32}},
+                                         error, /*cancel=*/{}, /*allow_app=*/true);
             if (error) throw std::runtime_error(result.dump());
             return result.dump().size();
         }));

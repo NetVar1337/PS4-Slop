@@ -172,7 +172,7 @@ private:
     u32 read_col(u32 table, u32 rid, u32 col) const;
 
     // Signature element reader shared by method/field/local parsers.
-    std::string read_type(const u8*& p, const u8* end) const;
+    std::string read_type(const u8*& p, const u8* end, int depth = 0) const;
 
     bool valid_ = false;
     std::string version_;

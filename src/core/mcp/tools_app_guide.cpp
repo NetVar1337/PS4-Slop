@@ -139,7 +139,9 @@ json tool_app(const json& args) {
     if (action == "rotate_token") {
         // the in-flight request already passed auth, so its response still arrives;
         // every later request needs the new token (the per-launch SLOP_MCP_TOKEN
-        // supervisor token is unaffected)
+        // supervisor token is unaffected). The Tauri supervisor and the UI use a
+        // per-launch extra token, so rotation must stay available to it; the new
+        // bearer is returned only in this response and never via settings_get.
         const bool caller_primary = request_used_primary_token();
         const std::string tok = infra::settings::generate_token();
         if (tok.empty()) fail("app.rotate_token: random generator failed");

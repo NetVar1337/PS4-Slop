@@ -122,17 +122,94 @@ void clear() {
 
 bool set_freeze(uint64_t id, bool on) {
     state_t& s = st();
+    uint64_t addr = 0;
+    size_t   n    = 0;
+    {
+        std::lock_guard lk(s.mu);
+        entry_t* e = find(s, id);
+        if (!e) return false;
+        if (on && !e->freeze) {
+            // Latch whatever the last sample saw, exactly like ticking the
+            // ImGui checkbox did. A fresh entry has no sample yet, so read the
+            // live value below instead of leaving frozen_bits at 0 (which made
+            // the next pass write zero over the target).
+            auto it = std::find_if(s.last.begin(), s.last.end(),
+                                   [id](const value_t& v) { return v.id == id; });
+            if (it != s.last.end() && it->ok) {
+                e->frozen_bits = it->bits;
+                e->pre_freeze_bits = it->bits;
+                e->pre_freeze_valid = true;
+            } else {
+                addr = e->addr;
+                n = value_size(e->width);
+            }
+        }
+        e->freeze = on;
+        publish_list_locked(s);
+    }
+    if (on && n != 0) {
+        auto session = process::active_session();
+        if (!session || !session->valid()) {
+            std::lock_guard lk(s.mu);
+            if (entry_t* e = find(s, id)) e->freeze = false;
+            publish_list_locked(s);
+            return false;
+        }
+        uint64_t live = 0;
+        const auto res = session->read(static_cast<uintptr_t>(addr), &live, n);
+        std::lock_guard lk(s.mu);
+        entry_t* e = find(s, id);
+        if (!e || !e->freeze) return false;
+        if (!res.ok) {
+            e->freeze = false;   // never leave a freeze armed with a zero hold
+            publish_list_locked(s);
+            return false;
+        }
+        e->frozen_bits = live & (n >= 8 ? ~uint64_t{0} : ((uint64_t{1} << (n * 8)) - 1));
+        e->pre_freeze_bits = e->frozen_bits;
+        e->pre_freeze_valid = true;
+        publish_list_locked(s);
+    }
+    return true;
+}
+
+bool set_freeze_once(uint64_t id) {
+    if (!set_freeze(id, true)) return false;
+    state_t& s = st();
     std::lock_guard lk(s.mu);
     entry_t* e = find(s, id);
     if (!e) return false;
-    if (on && !e->freeze) {
-        // Latch whatever the last sample saw, exactly like ticking the ImGui
-        // checkbox did, freezing must hold the value on screen, not zero
-        auto it = std::find_if(s.last.begin(), s.last.end(),
-                               [id](const value_t& v) { return v.id == id; });
-        if (it != s.last.end() && it->ok) e->frozen_bits = it->bits;
+    e->freeze_once = true;
+    publish_list_locked(s);
+    return true;
+}
+
+bool undo_freeze(uint64_t id, std::string* err) {
+    state_t& s = st();
+    uint64_t addr = 0, bits = 0;
+    size_t   n = 0;
+    {
+        std::lock_guard lk(s.mu);
+        entry_t* e = find(s, id);
+        if (!e) { if (err) *err = "no such watch entry"; return false; }
+        if (!e->freeze && !e->pre_freeze_valid) {
+            if (err) *err = "this entry has no freeze to undo";
+            return false;
+        }
+        addr = e->addr;
+        bits = e->pre_freeze_bits;
+        n    = value_size(e->width);
     }
-    e->freeze = on;
+    auto session = process::active_session();
+    if (!session || !session->valid()) { if (err) *err = "no target attached"; return false; }
+    const auto res = session->write(static_cast<uintptr_t>(addr), &bits, n);
+    if (!res.ok) { if (err) *err = "restore write failed"; return false; }
+    std::lock_guard lk(s.mu);
+    if (entry_t* e = find(s, id)) {
+        e->freeze = false;
+        e->freeze_once = false;
+        e->pre_freeze_valid = false;
+    }
     publish_list_locked(s);
     return true;
 }
@@ -275,6 +352,7 @@ std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
                 // dirty check: the target already holds the value
                 ++st.clean_holds;
                 v.ok = true;
+                v.wrote = true;
                 v.bits = hold;
             } else if (st.writes >= lim.max_writes) {
                 // drifted but the write budget is spent: next pass starts here
@@ -285,6 +363,7 @@ std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
                 uint64_t buf = hold;
                 if (io.write(e.addr, &buf, n)) {
                     v.ok = true;
+                    v.wrote = true;
                     v.bits = hold;
                 } else {
                     // the console rejected the hold (read-only page, detached
@@ -369,7 +448,14 @@ void tick() {
         s.cursor = cursor;
         for (const auto& v : sampled) {
             entry_t* e = find(s, v.id);
-            if (e && !e->freeze && v.ok) e->frozen_bits = v.bits;
+            if (!e) continue;
+            if (!e->freeze && v.ok) e->frozen_bits = v.bits;
+            // freeze-once: release as soon as the hold actually landed
+            if (e->freeze && e->freeze_once && v.wrote) {
+                e->freeze = false;
+                e->freeze_once = false;
+                e->pre_freeze_valid = false;
+            }
         }
         changed = s.last.size() != sampled.size();
         if (!changed) {

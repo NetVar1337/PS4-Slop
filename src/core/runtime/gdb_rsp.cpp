@@ -299,6 +299,31 @@ struct gdb_rsp_server_t::impl_t {
         return c.thread_id;
     }
 
+    // r8..r15 are separate fields. Both the read and the write path used to
+    // add the register index to the value, so r9 read as r8+1 and a write to
+    // any of r8..r15 landed in the wrong register with a corrupted value.
+    uint64_t* gpr_slot(thread_context_t& ctx, const std::string& name) {
+        if (name == "rax") return &ctx.rax;
+        if (name == "rbx") return &ctx.rbx;
+        if (name == "rcx") return &ctx.rcx;
+        if (name == "rdx") return &ctx.rdx;
+        if (name == "rsi") return &ctx.rsi;
+        if (name == "rdi") return &ctx.rdi;
+        if (name == "rbp") return &ctx.rbp;
+        if (name == "rsp") return &ctx.rsp;
+        if (name == "rip") return &ctx.rip;
+        if (name == "eflags") return &ctx.flags;
+        if (name == "r8")  return &ctx.r8;
+        if (name == "r9")  return &ctx.r9;
+        if (name == "r10") return &ctx.r10;
+        if (name == "r11") return &ctx.r11;
+        if (name == "r12") return &ctx.r12;
+        if (name == "r13") return &ctx.r13;
+        if (name == "r14") return &ctx.r14;
+        if (name == "r15") return &ctx.r15;
+        return nullptr;
+    }
+
     // full 'g' register block as hex (LE per register)
     std::string register_block(uint64_t tid) {
         auto* p = backend();
@@ -314,22 +339,7 @@ struct gdb_rsp_server_t::impl_t {
             const std::string name = r.name;
             uint64_t v = 0;
             bool have = false;
-            if (name == "rax") { v = ctx.rax; have = true; }
-            else if (name == "rbx") { v = ctx.rbx; have = true; }
-            else if (name == "rcx") { v = ctx.rcx; have = true; }
-            else if (name == "rdx") { v = ctx.rdx; have = true; }
-            else if (name == "rsi") { v = ctx.rsi; have = true; }
-            else if (name == "rdi") { v = ctx.rdi; have = true; }
-            else if (name == "rbp") { v = ctx.rbp; have = true; }
-            else if (name == "rsp") { v = ctx.rsp; have = true; }
-            else if (name == "rip") { v = ctx.rip; have = true; }
-            else if (name == "eflags") { v = ctx.flags; have = true; }
-            else if (name.size() == 2 && name[0] == 'r' && name[1] >= '8' && name[1] <= '9') {
-                v = ctx.r8 + (name[1] - '8'); have = true;
-            } else if (name.size() == 3 && name[0] == 'r' && name[1] == '1' &&
-                       name[2] >= '0' && name[2] <= '5') {
-                v = ctx.r10 + (name[2] - '0'); have = true;
-            }
+            if (uint64_t* slot = gpr_slot(ctx, name)) { v = *slot; have = true; }
             if (have) {
                 out += u64_le_hex(v, bytes);
                 continue;
@@ -642,19 +652,7 @@ struct gdb_rsp_server_t::impl_t {
                 if (!p->get_thread_context(static_cast<uint32_t>(tid), ctx).ok)
                     return reply("E01");
                 const std::string name = kRegs[idx].name;
-                if (name == "rax") ctx.rax = v;
-                else if (name == "rbx") ctx.rbx = v;
-                else if (name == "rcx") ctx.rcx = v;
-                else if (name == "rdx") ctx.rdx = v;
-                else if (name == "rsi") ctx.rsi = v;
-                else if (name == "rdi") ctx.rdi = v;
-                else if (name == "rbp") ctx.rbp = v;
-                else if (name == "rsp") ctx.rsp = v;
-                else if (name == "rip") ctx.rip = v;
-                else if (name == "eflags") ctx.flags = v;
-                else if (name.size() == 2 && name[0] == 'r') ctx.r8 = v + (name[1] - '8');
-                else if (name.size() == 3 && name[0] == 'r' && name[1] == '1')
-                    ctx.r10 = v + (name[2] - '0');
+                if (uint64_t* slot = gpr_slot(ctx, name)) *slot = v;
                 if (!p->set_thread_context(static_cast<uint32_t>(tid), ctx).ok)
                     return reply("E01");
                 return reply("OK");
@@ -678,19 +676,7 @@ struct gdb_rsp_server_t::impl_t {
                     uint64_t v = 0;
                     std::memcpy(&v, raw.data(), std::min<size_t>(raw.size(), 8));
                     const std::string name = kRegs[i].name;
-                    if (name == "rax") ctx.rax = v;
-                    else if (name == "rbx") ctx.rbx = v;
-                    else if (name == "rcx") ctx.rcx = v;
-                    else if (name == "rdx") ctx.rdx = v;
-                    else if (name == "rsi") ctx.rsi = v;
-                    else if (name == "rdi") ctx.rdi = v;
-                    else if (name == "rbp") ctx.rbp = v;
-                    else if (name == "rsp") ctx.rsp = v;
-                    else if (name == "rip") ctx.rip = v;
-                    else if (name == "eflags") ctx.flags = v;
-                    else if (name.size() == 2 && name[0] == 'r') ctx.r8 = v + (name[1] - '8');
-                    else if (name.size() == 3 && name[0] == 'r' && name[1] == '1')
-                        ctx.r10 = v + (name[2] - '0');
+                    if (uint64_t* slot = gpr_slot(ctx, name)) *slot = v;
                     any = true;
                 }
                 if (any && !p->set_thread_context(static_cast<uint32_t>(tid), ctx).ok)

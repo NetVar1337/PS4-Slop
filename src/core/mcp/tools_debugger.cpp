@@ -38,6 +38,87 @@ json ps4_event_json(const runtime::ps4_event_t& e) {
     return o;
 }
 
+// ---- conditional breakpoints (client-side) ----
+// The payload has no condition support: the engine keeps "<reg> <op> <value>"
+// per breakpoint address and ps4_wait auto-resumes while the condition is false.
+
+struct bp_condition_t {
+    std::string reg;
+    std::string op;
+    uint64_t    value = 0;
+};
+
+std::unordered_map<uint64_t, bp_condition_t> g_bp_conditions;
+
+bool parse_bp_condition(const std::string& text, bp_condition_t& out, std::string& err) {
+    std::string s;
+    for (char c : text)
+        if (!std::isspace(static_cast<unsigned char>(c))) s.push_back(c);
+    if (s.empty()) { err = "empty condition"; return false; }
+    size_t i = 0;
+    while (i < s.size() &&
+           (std::isalnum(static_cast<unsigned char>(s[i])) || s[i] == '_')) ++i;
+    out.reg = s.substr(0, i);
+    for (char& c : out.reg) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    static const char* kRegs[] = {
+        "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip", "eflags"
+    };
+    if (std::find(std::begin(kRegs), std::end(kRegs), out.reg) == std::end(kRegs)) {
+        err = "unknown register '" + out.reg + "'";
+        return false;
+    }
+    if (i >= s.size()) { err = "missing operator"; return false; }
+    if (s.compare(i, 2, "==") == 0)      { out.op = "=="; i += 2; }
+    else if (s.compare(i, 2, "!=") == 0) { out.op = "!="; i += 2; }
+    else if (s.compare(i, 2, ">=") == 0) { out.op = ">="; i += 2; }
+    else if (s.compare(i, 2, "<=") == 0) { out.op = "<="; i += 2; }
+    else if (s[i] == '>')                { out.op = ">";  ++i; }
+    else if (s[i] == '<')                { out.op = "<";  ++i; }
+    else if (s[i] == '&')                { out.op = "&";  ++i; }
+    else { err = "expected ==, !=, >, <, >=, <= or &"; return false; }
+    const std::string v = s.substr(i);
+    if (v.empty()) { err = "missing value"; return false; }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(v.c_str(), &end, 0);
+    if (!end || *end != '\0') { err = "bad value '" + v + "'"; return false; }
+    out.value = parsed;
+    return true;
+}
+
+uint64_t bp_reg_value(const runtime::thread_context_t& c, const std::string& r) {
+    if (r == "rax") return c.rax;
+    if (r == "rbx") return c.rbx;
+    if (r == "rcx") return c.rcx;
+    if (r == "rdx") return c.rdx;
+    if (r == "rsi") return c.rsi;
+    if (r == "rdi") return c.rdi;
+    if (r == "rbp") return c.rbp;
+    if (r == "rsp") return c.rsp;
+    if (r == "r8")  return c.r8;
+    if (r == "r9")  return c.r9;
+    if (r == "r10") return c.r10;
+    if (r == "r11") return c.r11;
+    if (r == "r12") return c.r12;
+    if (r == "r13") return c.r13;
+    if (r == "r14") return c.r14;
+    if (r == "r15") return c.r15;
+    if (r == "rip") return c.rip;
+    return c.flags;
+}
+
+bool eval_bp_condition(const bp_condition_t& c, const runtime::thread_context_t& ctx) {
+    const uint64_t v = bp_reg_value(ctx, c.reg);
+    if (c.op == "==") return v == c.value;
+    if (c.op == "!=") return v != c.value;
+    if (c.op == ">")  return v > c.value;
+    if (c.op == "<")  return v < c.value;
+    if (c.op == ">=") return v >= c.value;
+    if (c.op == "<=") return v <= c.value;
+    if (c.op == "&")  return (v & c.value) != 0;
+    return true;
+}
+
 // a generic stop (console or local) in the same shape as ps4_event_json
 json stop_json(const dbg::stop_event_t& e) {
     json o = {{"lwpid", e.tid}, {"signal", e.signal}, {"status", e.status},
@@ -546,6 +627,21 @@ json slots_json(const std::vector<runtime::backend_ps4_t::ps4_slot_t>& slots, bo
 
 json ps4_status_json(runtime::backend_ps4_t& p) {
     const int ext = p.ps4_fork_extensions();
+    const bool fork = ext == 1;
+    // What this exact payload can do. Agents and the UI read this before
+    // issuing a command so an upstream payload fails with a capability
+    // answer instead of a protocol drop.
+    json caps = {
+        {"native_scan", p.ps4_authed()},
+        {"turbo_scan", fork},
+        {"write_multi", fork},
+        {"proc_modules", fork},
+        {"proc_snapshot", fork},
+        {"assemble", fork},
+        {"elf_rpc", true},
+        {"gdb_bridge", true},
+        {"debugger", true},
+    };
     return {{"attached", p.ps4_debug_attached()},
             {"pid", p.ps4_debug_pid()},
             {"connected", p.connected()},
@@ -564,6 +660,13 @@ json ps4_status_json(runtime::backend_ps4_t& p) {
             {"branding", p.branding()},
             {"capability_level", p.ps4_capability_level()},
             {"fork_extensions", ext == 1 ? "yes" : ext == 0 ? "no (upstream payload)" : "not probed yet"},
+            {"capabilities", std::move(caps)},
+            {"payload_note", ext == 0
+                ? "upstream ps4debug-NG: turbo scan, write_multi, proc_modules and "
+                  "proc_snapshot are unavailable; target.modules falls back to the "
+                  "map-grouping path"
+                : ext < 0 ? "fork extensions not probed yet (attach or ps4_auth first)"
+                          : "NetVar1337 ps4debug-NG fork extensions available"},
             {"reconnects", p.ps4_connection_generation()},
             {"backend", "PS4"}};
 }
@@ -1035,6 +1138,7 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
     if (action == "ps4_detach") {
         const bool clean = p.ps4_debug_detach();
+        g_bp_conditions.clear();   // conditions belong to the dead debug session
         return {{"attached", false}, {"detach_acknowledged", clean}};
     }
     if (action == "ps4_console_info") {
@@ -1068,8 +1172,23 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         if (!io.ok) io_fail("ps4_bp_set failed (slot " +
                             (want == runtime::backend_ps4_t::kAutoSlot ? std::string("auto")
                                                                        : std::to_string(want)) + ")", io);
+        bool has_condition = false;
+        if (args.contains("condition") && args.at("condition").is_string()) {
+            const std::string text = args.at("condition").get<std::string>();
+            if (text.empty()) {
+                g_bp_conditions.erase(addr);
+            } else {
+                bp_condition_t cond;
+                std::string err;
+                if (!parse_bp_condition(text, cond, err))
+                    fail("ps4_bp_set: bad condition: " + err);
+                g_bp_conditions[addr] = std::move(cond);
+                has_condition = true;
+            }
+        }
         return {{"set", true}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
-                {"index", index}, {"hw", false}, {"already_armed", reused}};
+                {"index", index}, {"hw", false}, {"already_armed", reused},
+                {"condition", has_condition ? args.at("condition") : json(nullptr)}};
     }
     if (action == "ps4_bp_clear") {
         uint64_t addr = 0;
@@ -1085,6 +1204,7 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
             fail("ps4_bp_clear requires addr or index");
         }
         if (!io.ok) io_fail("ps4_bp_clear failed", io);
+        g_bp_conditions.erase(addr);
         return {{"cleared", true}, {"addr", addr}, {"index", index}};
     }
     if (action == "ps4_watch_set") {
@@ -1191,15 +1311,39 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
     if (action == "ps4_wait") {
         const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
-        runtime::ps4_event_t ev{};
-        if (!p.ps4_wait_event(ev, timeout_ms))
-            return {{"halted", false}, {"timeout_ms", timeout_ms},
-                    {"pending", p.ps4_pending_events()},
-                    {"events_dropped", p.ps4_events_dropped()}};
-        json o = ps4_event_json(ev);
-        o["halted"] = true;
-        o["pending"] = p.ps4_pending_events();
-        return o;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        int skipped = 0;
+        for (;;) {
+            runtime::ps4_event_t ev{};
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0 || !p.ps4_wait_event(ev, static_cast<int>(left)))
+                return {{"halted", false}, {"timeout_ms", timeout_ms},
+                        {"pending", p.ps4_pending_events()},
+                        {"events_dropped", p.ps4_events_dropped()},
+                        {"condition_skipped", skipped}};
+            // INT3 leaves RIP one past the trap on some payloads; accept both
+            auto it = g_bp_conditions.find(ev.ctx.rip);
+            if (it == g_bp_conditions.end() && ev.ctx.rip > 0)
+                it = g_bp_conditions.find(ev.ctx.rip - 1);
+            if (it != g_bp_conditions.end() && !eval_bp_condition(it->second, ev.ctx)) {
+                // condition false: resume and keep waiting, bounded so a
+                // hot breakpoint cannot spin forever
+                if (++skipped > 64)
+                    return {{"halted", false}, {"reason", "condition_skip_limit"},
+                            {"condition_skipped", skipped}};
+                if (!p.ps4_continue(runtime::ps4::kStopResume).ok)
+                    return {{"halted", false}, {"reason", "resume_failed"},
+                            {"condition_skipped", skipped}};
+                continue;
+            }
+            json o = ps4_event_json(ev);
+            o["halted"] = true;
+            o["pending"] = p.ps4_pending_events();
+            o["condition_skipped"] = skipped;
+            return o;
+        }
     }
     if (action == "ps4_events") {
         const size_t max = std::min<size_t>(args.value("max", 64u), 4096u);
@@ -1586,6 +1730,10 @@ json tool_debugger(const json& args) {
     fail("debugger: use ps4_* actions (see guide get ps4_setup); the composite flows "
          "ps4_until/ps4_find_write/ps4_trace_calls/ps4_trace_steps also run on a local "
          "test-lab process");
+}
+
+void clear_breakpoint_conditions() {
+    g_bp_conditions.clear();
 }
 
 } // namespace slop::core::mcp::detail
