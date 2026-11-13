@@ -17,6 +17,8 @@ param(
     # Regex of CTest entries to exclude (ctest -E); used to skip areas that
     # cannot run under a given preset (e.g. the Unicorn emulator under ASan)
     [string]$TestExclude = '',
+    # CTest parallelism (-j); areas are separate processes with ephemeral ports
+    [int]$TestJobs = 1,
     # Visual Studio install root; defaults to $env:SLOP_VS_ROOT, then vswhere
     [string]$VsRoot = $env:SLOP_VS_ROOT
 )
@@ -172,6 +174,7 @@ if ($Test) {
     Write-Host "==> running tests (label '$TestLabel'$(if ($TestExclude) { ", excluding /$TestExclude/" }))"
     $ctestArgs = @('--test-dir', $binaryDir, '--output-on-failure', '--no-tests=error', '-L', $TestLabel)
     if ($TestExclude) { $ctestArgs += @('-E', $TestExclude) }
+    if ($TestJobs -gt 1) { $ctestArgs += @('-j', $TestJobs) }
     & $vsCTest @ctestArgs
     # slop_tests_ps4 has a known intermittent watchdog hang that lands on a
     # different test each run (the debug-event listener and the fake payload's

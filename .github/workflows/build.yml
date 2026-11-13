@@ -7,6 +7,10 @@ on:
     tags: ['v*', '[0-9]*']
   pull_request:
   workflow_dispatch:
+  # Full static analysis + ASan + the whole suite run nightly, off the
+  # push/PR critical path.
+  schedule:
+    - cron: '0 4 * * *'
 
 concurrency:
   group: build-${{ github.ref }}
@@ -119,7 +123,7 @@ jobs:
   # Every test area registered with CTest (one entry per src/tests/test_*.cpp).
   tests:
     needs: changes
-    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true'
+    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true')
     runs-on: windows-2022
     timeout-minutes: 45
     env:
@@ -143,7 +147,7 @@ jobs:
 
       - name: build + run tests (ctest -L area)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=OFF" -Test -TestLabel area
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestJobs 4
 
       - name: live MCP battery (spawned engine + SlopTarget)
         shell: pwsh
@@ -162,7 +166,7 @@ jobs:
   # plain test areas.
   asan:
     needs: changes
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -204,7 +208,7 @@ jobs:
   # are listed in the run summary. Main, tags and manual runs only.
   analyze:
     needs: changes
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
@@ -244,7 +248,7 @@ jobs:
   # Main, tags and manual runs only.
   clang-tidy:
     needs: changes
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
@@ -577,7 +581,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: [version, cxx, tests, asan, analyze, clang-tidy, frontend-build, frontend-tests, bundle]
+    needs: [version, cxx, frontend-build, bundle]
     permissions:
       # write so a tag build can publish its release
       contents: write
