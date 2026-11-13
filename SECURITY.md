@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/NetVar1337/PS4-Slop/security/advisories/new)
+[private vulnerability reporting](https://github.com/NetVar1337/SlopStation/security/advisories/new)
 (Security tab -> "Report a vulnerability"). Do not open a public issue for an
 unfixed vulnerability.
 
