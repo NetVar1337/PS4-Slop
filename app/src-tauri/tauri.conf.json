@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "reverse-slop",
+  "productName": "SlopStation",
   "version": "0.2.0",
-  "identifier": "dev.reverse-slop.ui",
+  "identifier": "dev.slopstation.ui",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "reverse-slop",
+        "title": "SlopStation",
         "width": 1680,
         "height": 980,
         "minWidth": 1100,
@@ -34,7 +34,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://github.com/NetVar1337/PS4-Slop/releases/latest/download/latest.json"
+        "https://github.com/NetVar1337/SlopStation/releases/latest/download/latest.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJEMTZERTk0NEExQTcyN0YKUldSL2NocEtsTjRXdmNKbENBY0dEMXZKRVlCSC9WaU0vVTdlMEVHVSsxTjNxMnBvYzh4em02dFYK",
       "windows": {
@@ -44,13 +44,19 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
-    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.png",
+      "icons/icon.ico"
+    ],
     "licenseFile": "../../LICENSE",
     "resources": {
       "../../build/src/engine/reverse-slop-engine.exe": "engine/reverse-slop-engine.exe",
       "../../LICENSE": "LICENSE.txt",
-      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md"
+      "../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../../build/ps4debug-ng": "payloads/ps4debug-ng"
     },
     "windows": {
       "nsis": {

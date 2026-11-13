@@ -6,9 +6,13 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Gamepad2, RefreshCw, Search, ShieldAlert, Unplug } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import ProcessIcon from "@/components/ProcessIcon";
+import { isTauri } from "@/lib/endpoint";
+import { payloadDownload, payloadLatest, payloadSave, payloadStatus } from "@/lib/ps4debug";
+import type { PayloadInfo, PayloadStatus } from "@/lib/ps4debug";
 import { matchesFilter, useTargets, type ProcessRow } from "@/store/targets";
 import { useEngine } from "@/store/engine";
 
@@ -61,6 +65,103 @@ function ConnectForm({ compact }: { compact: boolean }) {
         {busy ? "Connecting…" : "Connect"}
       </button>
     </form>
+  );
+}
+
+function PayloadCard() {
+  const [status, setStatus] = useState<PayloadStatus | null>(null);
+  const [latest, setLatest] = useState<PayloadInfo | null>(null);
+  const [busy, setBusy] = useState<"check" | "download" | "save" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    void payloadStatus().then(setStatus);
+  }, []);
+  if (!isTauri()) return null;
+  const installed = status?.local ?? status?.bundled ?? null;
+  const newer = latest !== null && installed !== null && latest.tag !== installed.tag;
+  const check = async () => {
+    setBusy("check");
+    setError(null);
+    try {
+      setLatest(await payloadLatest());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const download = async () => {
+    setBusy("download");
+    setError(null);
+    try {
+      const info = await payloadDownload();
+      setStatus((s) => (s === null ? s : { ...s, local: info }));
+      setLatest(info);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  const save = async () => {
+    if (installed === null) return;
+    setBusy("save");
+    setError(null);
+    try {
+      const dest = await saveDialog({
+        defaultPath: "ps4debug-ng.bin",
+        filters: [{ name: "Payload", extensions: ["bin"] }],
+      });
+      if (dest !== null) await payloadSave(installed.path, dest);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+  return (
+    <div className="payload-card">
+      <div className="payload-head">
+        <span className="payload-title">ps4debug-NG payload</span>
+        <span className="faint">{installed === null ? "not bundled" : `v${installed.tag}`}</span>
+      </div>
+      <div className="payload-hint">
+        {installed === null
+          ? "Download the latest release, then send it with your console loader."
+          : `Bundled from ${installed.source}. Send it with BinLoader/FTP.`}
+        {latest !== null ? ` · latest v${latest.tag}` : ""}
+      </div>
+      <div className="payload-actions">
+        <button type="button" className="row-action" disabled={busy !== null} onClick={() => void check()}>
+          {busy === "check" ? "Checking…" : "Check latest"}
+        </button>
+        {newer && (
+          <button
+            type="button"
+            className="row-action"
+            disabled={busy !== null}
+            onClick={() => void download()}
+          >
+            {busy === "download" ? "Downloading…" : `Download v${latest?.tag ?? ""}`}
+          </button>
+        )}
+        {installed !== null && (
+          <button
+            type="button"
+            className="row-action"
+            disabled={busy !== null}
+            onClick={() => void save()}
+          >
+            {busy === "save" ? "Saving…" : "Save payload…"}
+          </button>
+        )}
+      </div>
+      {error !== null && (
+        <div className="empty-hint error-text" role="alert">
+          {error}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -175,6 +276,7 @@ export default function TargetsPanel() {
             debugger then come from the console.
           </div>
           <ConnectForm compact={false} />
+          <PayloadCard />
           {error !== null && (
             <div className="empty-hint error-text" role="alert">
               {error}

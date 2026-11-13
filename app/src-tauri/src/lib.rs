@@ -6,6 +6,7 @@
 // crash isolation, the supervisor (supervisor.rs) respawns it when it dies
 
 mod engine_log;
+mod payload;
 mod supervisor;
 
 use engine_log::EngineLog;
@@ -195,7 +196,11 @@ pub fn run() {
             engine_endpoint,
             startup_deadline_ms,
             engine_status,
-            restart_engine
+            restart_engine,
+            payload::ps4debug_payload,
+            payload::ps4debug_payload_latest,
+            payload::ps4debug_payload_download,
+            payload::ps4debug_payload_save
         ])
         .setup(|app| {
             // the devtools toggle permission exists only in debug builds, release

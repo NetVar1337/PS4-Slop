@@ -1586,6 +1586,40 @@ html[data-motion="off"] *::after {
   text-align: center;
 }
 
+.payload-card {
+  display: grid;
+  gap: var(--pad-xs);
+  width: min(420px, 100%);
+  margin: 0 auto;
+  padding: var(--pad-sm) var(--pad-md);
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-1);
+}
+
+.payload-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--pad-sm);
+}
+
+.payload-title {
+  font-size: var(--type-small);
+  color: var(--text);
+}
+
+.payload-hint {
+  font-size: var(--type-small);
+  color: var(--text-faint);
+}
+
+.payload-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pad-xs);
+}
+
 .targets-list {
   display: grid;
   grid-template-rows: auto auto minmax(0, 1fr);

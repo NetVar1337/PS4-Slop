@@ -416,6 +416,10 @@ jobs:
           Copy-Item -LiteralPath $f[0].FullName -Destination build/src/engine/reverse-slop-engine.exe -Force
           Get-ChildItem build/src/engine
 
+      - name: fetch the latest ps4debug-NG payload
+        shell: pwsh
+        run: ./tools/fetch_ps4debug.ps1
+
       - name: sign engine
         if: env.SIGNING_ENABLED == 'true'
         uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
@@ -515,7 +519,7 @@ jobs:
         if: env.SIGNING_ENABLED == 'true'
         shell: pwsh
         run: |
-          foreach ($f in @('dist/reverse-slop/reverse-slop.exe', 'build/src/engine/reverse-slop-engine.exe', '${{ steps.setup.outputs.path }}')) {
+          foreach ($f in @('dist/reverse-slop/SlopStation.exe', 'build/src/engine/reverse-slop-engine.exe', '${{ steps.setup.outputs.path }}')) {
             $sig = Get-AuthenticodeSignature -LiteralPath $f
             if ($sig.Status -ne 'Valid') { throw "$f signature status: $($sig.Status)" }
             Write-Host "signed: $f ($($sig.SignerCertificate.Subject))"
@@ -526,7 +530,7 @@ jobs:
         run: |
           $out = New-Item -ItemType Directory -Force -Path _release
           $ref = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "$((Get-Content VERSION -TotalCount 1).Trim())-$($env:GITHUB_SHA.Substring(0, 8))" }
-          Compress-Archive -Path dist/reverse-slop -DestinationPath (Join-Path $out "reverse-slop-portable-$ref.zip")
+          Compress-Archive -Path dist/reverse-slop -DestinationPath (Join-Path $out "SlopStation-portable-$ref.zip")
           Copy-Item -LiteralPath '${{ steps.setup.outputs.path }}' -Destination $out
           if ('${{ steps.setup.outputs.sig }}' -ne '') {
             Copy-Item -LiteralPath '${{ steps.setup.outputs.sig }}' -Destination $out
@@ -544,7 +548,7 @@ jobs:
           name: reverse-slop-portable
           compression-level: 0
           path: |
-            dist/reverse-slop/reverse-slop.exe
+            dist/reverse-slop/SlopStation.exe
             dist/reverse-slop/LICENSE.txt
             dist/reverse-slop/THIRD_PARTY_NOTICES.md
           if-no-files-found: error
