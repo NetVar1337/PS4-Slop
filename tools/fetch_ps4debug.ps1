@@ -14,6 +14,8 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $OutDir) { $OutDir = Join-Path $repoRoot 'build/ps4debug-ng' }
 $api = 'https://api.github.com/repos/Pharaoh2k/ps4debug-NG/releases/latest'
 $headers = @{ 'User-Agent' = 'SlopStation-build'; 'Accept' = 'application/vnd.github+json' }
+# CI passes the workflow token: unauthenticated runner IPs share a 60/h limit.
+if ($env:GITHUB_TOKEN) { $headers['Authorization'] = "Bearer $env:GITHUB_TOKEN" }
 
 Write-Host "==> ps4debug-NG: querying $api"
 $release = Invoke-RestMethod -Uri $api -Headers $headers
