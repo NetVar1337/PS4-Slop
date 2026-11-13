@@ -503,6 +503,14 @@ jobs:
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
 
+      # Authenticode signing rewrites the installer after tauri bundle
+      # generated the updater .sig, so sign the final bytes again.
+      - name: re-sign the installer for the updater
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        shell: pwsh
+        working-directory: app
+        run: node node_modules/@tauri-apps/cli/tauri.js signer sign "${{ steps.setup.outputs.path }}"
+
       - name: verify signatures
         if: env.SIGNING_ENABLED == 'true'
         shell: pwsh
