@@ -1,9 +1,16 @@
 # Changelog
 
-All notable changes to reverse-slop are documented here. The format follows
+All notable changes to SlopStation are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/). The release job publishes the
 section matching the pushed tag as the GitHub release notes.
+
+## [0.2.1] - 2026-11-14
+
+### Fixed
+
+- The portable zip now unpacks into `SlopStation/` (the dist folder was still
+  named `reverse-slop`).
 
 ## [0.2.0] - 2026-11-13
 
