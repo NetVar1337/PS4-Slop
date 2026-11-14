@@ -1,5 +1,5 @@
 // app/src/lib/rpc.ts
-// thin transport over the engines /api surface, the ui and an ai agent drive
+// thin transport over the engines /api/v1 surface, the ui and an ai agent drive
 // exactly the same tool actions
 
 export type Endpoint = { port: number; token: string };
@@ -68,7 +68,7 @@ async function post(body: unknown, what: string, timeoutMs: number): Promise<unk
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(`${baseUrl()}/api`, {
+    const res = await fetch(`${baseUrl()}/api/v1`, {
       method: "POST",
       headers: headers(),
       body: JSON.stringify(body),

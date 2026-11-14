@@ -48,6 +48,11 @@ if(TARGET slop_target)
     add_dependencies(slop_tests slop_target)
 endif()
 
+# the --port / ready-announce test spawns the real engine binary
+if(TARGET reverse-slop-engine)
+    add_dependencies(slop_tests reverse-slop-engine)
+endif()
+
 if(MSVC)
     target_compile_options(slop_tests PRIVATE /W4 /WX /EHsc)
 endif()

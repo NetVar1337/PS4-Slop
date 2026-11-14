@@ -14,6 +14,8 @@
 #include <string_view>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 namespace slop::core::mcp {
 
 struct server_config_t {
@@ -22,7 +24,7 @@ struct server_config_t {
     std::vector<std::string> extra_tokens;    // also accepted, e.g. the supervisor's per-launch token
     bool        insecure_dev = false;         // --insecure-dev only: accept tokenless loopback requests
     size_t      worker_threads = 48;          // http workers; sse streams are capped well below this
-    size_t      max_streams    = 16;          // concurrent GET /mcp + GET /events streams
+    size_t      max_streams    = 64;          // concurrent GET /mcp + GET /events streams
 };
 
 // starts the server, false if the port would not bind
@@ -54,5 +56,21 @@ bool origin_allowed(std::string_view origin);
 
 // active sse streams right now
 size_t active_streams();
+
+// ---- per-tool rate limiting (agent transport only; /api is exempt) ----
+// token bucket per tool, configured by the mcp_rate_limits setting
+// ({tool: {rate, burst}}, rate = tokens per second); heavy tools ship defaults
+struct rate_limit_t {
+    bool    allowed        = true;
+    int64_t retry_after_ms = 0;   // 0 when allowed
+    double  rate           = 0;   // tokens per second
+    double  burst          = 0;
+};
+rate_limit_t rate_limit_take(const std::string& tool);
+
+// ---- server -> client notifications on the GET /mcp stream ----
+// session "" (or the legacy session) reaches a stream opened without
+// Mcp-Session-Id; used for notifications/progress
+void push_notification(const std::string& session, const nlohmann::json& msg);
 
 } // namespace slop::core::mcp

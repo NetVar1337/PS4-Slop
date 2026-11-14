@@ -159,4 +159,11 @@ std::string mcp_audit_path() {
 
 bool mcp_require_confirm() { return get<bool>("mcp_require_confirm", false); }
 
+size_t events_max_streams() {
+    const int64_t n = get<int64_t>("events_max_streams", 64);
+    if (n < 1) return 1;
+    if (n > 1024) return 1024;
+    return static_cast<size_t>(n);
+}
+
 } // namespace slop::core::infra::settings

@@ -307,4 +307,37 @@ json app_state_unlocked() {
     return out;
 }
 
+std::optional<progress_sample_t> sample_progress(const std::string& tool,
+                                                 const std::string& action,
+                                                 int64_t elapsed_ms) {
+    // memory scans expose a live byte/hit counter
+    if (tool == "memory" && (action == "scan" || action == "rescan")) {
+        const auto& p = g_scan.engine.progress();
+        const uint64_t bytes = p.bytes.load(std::memory_order_relaxed);
+        const uint64_t found = p.found.load(std::memory_order_relaxed);
+        return progress_sample_t{static_cast<double>(bytes), std::nullopt,
+                                 "scanned " + std::to_string(bytes) + " bytes, " +
+                                     std::to_string(found) + " hits"};
+    }
+    // hyperion analysis has a 0..1 fraction
+    if (tool == "disasm" && action == "loaded") {
+        const double pct = static_cast<double>(ds::hype_progress()) * 100.0;
+        return progress_sample_t{pct, 100.0,
+                                 "hyperion analysis " + std::to_string(static_cast<int>(pct)) + "%"};
+    }
+    // no live counter: report elapsed time so a long call still proves liveness
+    static const std::unordered_set<std::string> kLong = {
+        "memory.pointerscan",   "memory.pointerscan_verify", "emulate.run",
+        "devirt.themida_start", "devirt.themida_job",        "analyze.diff",
+        "analyze.diff_start",   "disasm.load",               "script.run",
+        "patch.full_pass",      "re.rtti_scan",              "fs.grep_in_files",
+        "fs.search_files",      "network.reassemble_stream",
+    };
+    if (kLong.count(tool + "." + action) == 0) return std::nullopt;
+    const double secs = static_cast<double>(elapsed_ms) / 1000.0;
+    return progress_sample_t{static_cast<double>(elapsed_ms), std::nullopt,
+                             tool + "." + action + " running (" +
+                                 std::to_string(static_cast<int>(secs)) + "s)"};
+}
+
 } // namespace slop::core::mcp::detail

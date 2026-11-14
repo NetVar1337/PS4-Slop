@@ -173,9 +173,7 @@ describe("debugger", () => {
     expect(useDebugger.getState().regs?.rip).toBe(0x400500);
     expect(useDebugger.getState().regsLwpid).toBe(101);
     expect(useDebugger.getState().waitNote).toContain("stopped lwp 101");
-    await vi.waitFor(() =>
-      expect(useDebugger.getState().frames).toEqual([{ ret_addr: 0x401000 }]),
-    );
+    await vi.waitFor(() => expect(useDebugger.getState().frames).toEqual([{ ret_addr: 0x401000 }]));
 
     stream?.emit("debugger.log", {
       lwpid: 101,

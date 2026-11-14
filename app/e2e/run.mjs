@@ -46,7 +46,7 @@ const fail = (what, detail = "") => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function api(tool, action, params = {}) {
-  const r = await fetch(`${healthUrl}/api`, {
+  const r = await fetch(`${healthUrl}/api/v1`, {
     method: "POST",
     headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
     body: JSON.stringify({ tool, action, params }),

@@ -34,15 +34,28 @@ void validate_setting(const std::string& key, const json& v) {
         fail("app.settings_set: mcp_token is not settable, use app.rotate_token");
     if (v.is_null()) return;   // erase
     if (key == "mcp_enabled" || key == "mcp_onboarded" || key == "script_unsafe" ||
-        key == "web_allow_private" || key == "mcp_token_in_configs") {
+        key == "web_allow_private") {
         if (!v.is_boolean()) fail("app.settings_set: " + key + " must be a boolean");
     } else if (key == "mcp_port") {
         if (!v.is_number_integer() || v.get<int64_t>() < 1 || v.get<int64_t>() > 65535)
             fail("app.settings_set: mcp_port must be an integer in 1..65535");
-    } else if (key == "web_allowlist" || key == "mcp_onboard_clients") {
-        if (!v.is_array()) fail("app.settings_set: " + key + " must be an array of strings");
+    } else if (key == "web_allowlist") {
+        if (!v.is_array()) fail("app.settings_set: web_allowlist must be an array of strings");
         for (const auto& e : v)
-            if (!e.is_string()) fail("app.settings_set: " + key + " must be an array of strings");
+            if (!e.is_string()) fail("app.settings_set: web_allowlist must be an array of strings");
+    } else if (key == "events_max_streams") {
+        if (!v.is_number_integer() || v.get<int64_t>() < 1 || v.get<int64_t>() > 1024)
+            fail("app.settings_set: events_max_streams must be an integer in 1..1024");
+    } else if (key == "mcp_rate_limits") {
+        if (!v.is_object())
+            fail("app.settings_set: mcp_rate_limits must be an object of {tool: {rate, burst}}");
+        for (const auto& [tool, lim] : v.items()) {
+            if (!lim.is_object() || !lim.contains("rate") || !lim.contains("burst") ||
+                !lim.at("rate").is_number() || !lim.at("burst").is_number() ||
+                lim.at("rate").get<double>() <= 0.0 || lim.at("burst").get<double>() < 1.0)
+                fail("app.settings_set: mcp_rate_limits." + tool +
+                     " must be {rate: >0, burst: >=1}");
+        }
     } else if (key == "proxy_token") {
         if (!v.is_string()) fail("app.settings_set: proxy_token must be a string");
     }
@@ -54,8 +67,6 @@ json redacted_settings() {
     s["mcp_token"] = tok.empty() ? "unset" : "set";
     if (s.contains("proxy_token") && s.at("proxy_token").is_string())
         s["proxy_token"] = s.at("proxy_token").get_ref<const std::string&>().empty() ? "unset" : "set";
-    // audit 72: the UI warns when a client config still carries a literal token
-    s["mcp_plaintext_configs"] = infra::mcp_onboard::plaintext_token_clients();
     return s;
 }
 
@@ -199,8 +210,7 @@ json tool_app(const json& args) {
         if (!infra::settings::set(key, value))
             fail("app.settings_set: could not write " + infra::settings::file());
         json out = {{"ok", true}, {"key", key}, {"value", value}};
-        if (key == "mcp_port" || key == "mcp_enabled" || key == "mcp_onboard_clients" ||
-            key == "mcp_token_in_configs")
+        if (key == "mcp_port" || key == "mcp_enabled" || key == "events_max_streams")
             out["restart_required"] = true;
         if (key == "proxy_token" && value.is_string()) out["value"] = "set";
         return out;
@@ -246,13 +256,17 @@ json tool_app(const json& args) {
 // tool: guide — task-oriented recipes so an agent (or user) can drive whole
 // game-RE workflows instead of discovering tool combinations one by one
 
-json tool_guide(const json& args) {
-    struct step_t { const char* tool; const char* action; const char* params; const char* why; };
-    struct topic_t {
-        const char* id; const char* title; const char* summary;
-        std::vector<step_t> steps;
-    };
-    static const std::vector<topic_t> kTopics = {
+namespace {
+
+struct guide_step_t { const char* tool; const char* action; const char* params; const char* why; };
+struct guide_topic_t {
+    const char* id; const char* title; const char* summary;
+    std::vector<guide_step_t> steps;
+};
+
+// one table drives the guide tool, the slop://guide resources and the prompts
+const std::vector<guide_topic_t>& guide_table() {
+    static const std::vector<guide_topic_t> kTopics = {
         {"ps4_setup", "Connect to a PS4 and start debugging the game in one call",
          "ps4_auto connects, finds the game process (the one with /app0/ modules), attaches a session and the ps4debug debugger, and returns modules+threads. Everything else (memory, disasm, debugger ps4_*) then works against the console.",
          {{"target", "ps4_auto", R"({"host":"192.168.1.50"})", "one-call console setup: connect + pick game + attach + debug attach"},
@@ -395,12 +409,41 @@ json tool_guide(const json& args) {
           {"debugger", "ps4_assemble", R"({"asm":"mov rax, 1; ret"})", "assemble a patch on-console (Keystone)"},
           {"memory", "write", R"({"addr":<va>,"hex":"<assembled bytes>"})", "apply the patch live"}}},
     };
+    return kTopics;
+}
 
+json topic_json(const guide_topic_t& t) {
+    json steps = json::array();
+    for (const auto& s : t.steps) {
+        json st;
+        st["tool"] = s.tool;
+        st["action"] = s.action;
+        st["params"] = json::parse(s.params, nullptr, false);
+        st["why"] = s.why;
+        steps.push_back(std::move(st));
+    }
+    return {{"topic", t.id}, {"title", t.title}, {"summary", t.summary}, {"steps", steps}};
+}
+
+} // namespace
+
+json guide_topics() {
+    json arr = json::array();
+    for (const auto& t : guide_table())
+        arr.push_back({{"topic", t.id}, {"title", t.title}, {"summary", t.summary}});
+    return arr;
+}
+
+json guide_topic(const std::string& id) {
+    for (const auto& t : guide_table())
+        if (id == t.id) return topic_json(t);
+    return nullptr;
+}
+
+json tool_guide(const json& args) {
     const std::string action = require_action(args);
     if (action == "list") {
-        json arr = json::array();
-        for (const auto& t : kTopics)
-            arr.push_back({{"topic", t.id}, {"title", t.title}, {"summary", t.summary}});
+        json arr = guide_topics();
         return {{"topics", arr}, {"count", arr.size()},
                 {"note", "call guide get {topic:<id>} for the exact tool-call sequence"}};
     }
@@ -408,23 +451,9 @@ json tool_guide(const json& args) {
         if (!args.contains("topic") || !args.at("topic").is_string())
             fail("guide get requires 'topic' (see guide list)");
         const std::string want = args.at("topic").get<std::string>();
-        for (const auto& t : kTopics) {
-            if (want == t.id) {
-                json steps = json::array();
-                for (const auto& s : t.steps) {
-                    json st;
-                    st["tool"] = s.tool;
-                    st["action"] = s.action;
-                    st["params"] = json::parse(s.params, nullptr, false);
-                    st["why"] = s.why;
-                    steps.push_back(std::move(st));
-                }
-                return {{"topic", t.id}, {"title", t.title},
-                        {"summary", t.summary}, {"steps", steps}};
-            }
-        }
+        if (json out = guide_topic(want); !out.is_null()) return out;
         json ids = json::array();
-        for (const auto& t : kTopics) ids.push_back(t.id);
+        for (const auto& t : guide_topics()) ids.push_back(t.at("topic"));
         fail("unknown guide topic '" + want + "' (available: " + ids.dump() + ")");
     }
     fail("guide: unknown action (list|get)");

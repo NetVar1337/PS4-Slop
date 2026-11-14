@@ -5,6 +5,9 @@
 #include <windows.h>
 #include <dpapi.h>
 
+#include <httplib.h>
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -59,7 +62,10 @@ state_t& st() {
     return s;
 }
 
+std::string g_endpoint_override;   // tests: scratch registration file
+
 std::string endpoint_file() {
+    if (!g_endpoint_override.empty()) return g_endpoint_override;
     const std::string& dir = paths::app_data();
     if (dir.empty()) return {};
     return dir + "\\engine.json";
@@ -154,21 +160,14 @@ void start_mcp() {
     state_t& s = st();
     if (!settings::mcp_enabled()) return;
 
-    bool onboard = false, insecure_dev = false;
+    mcp::server_config_t cfg;
+    cfg.token = settings::mcp_token();
     {
         std::lock_guard lk(s.mu);
-        onboard      = s.cfg.mcp_onboarding;
-        insecure_dev = s.cfg.insecure_dev;
+        cfg.port = resolve_mcp_port(s.cfg.mcp_port, std::getenv("SLOP_MCP_PORT"),
+                                    settings::mcp_port());
     }
-
-    mcp::server_config_t cfg;
-    cfg.port  = settings::mcp_port();
-    cfg.token = settings::mcp_token();
-    cfg.insecure_dev = insecure_dev;
-    if (const char* env_port = std::getenv("SLOP_MCP_PORT")) {
-        const int p = std::atoi(env_port);
-        if (p > 0 && p < 65536) cfg.port = static_cast<uint16_t>(p);
-    }
+    cfg.max_streams = settings::events_max_streams();
     // a spawner (tauri supervisor, test harness) brings its own per-launch token
     // so the persisted one never has to travel over stdout
     if (const char* env_tok = std::getenv("SLOP_MCP_TOKEN"); env_tok && *env_tok)
@@ -209,6 +208,11 @@ void start_mcp() {
                 std::to_string(mcp::port()) + "/mcp");
     write_endpoint(mcp::port(), cfg.token);
 
+    bool onboard = false;
+    {
+        std::lock_guard lk(s.mu);
+        onboard = s.cfg.mcp_onboarding;
+    }
     if (!onboard || ephemeral) return;
 
     // first run registers everywhere; later runs only refresh entries we already
@@ -225,11 +229,8 @@ void start_mcp() {
     }
     if (first) {
         settings::set_mcp_onboarded(true);
-        bus::output(settings::mcp_token_in_configs()
-                        ? "note: client configs now hold the mcp bearer token; do not sync "
-                          "them to public dotfile repos"
-                        : "note: client configs reference ${SLOP_MCP_TOKEN}; set that user "
-                          "env var to the token shown in Settings");
+        bus::output("note: client configs now hold the mcp bearer token; do not sync them "
+                    "to public dotfile repos");
     }
 }
 
@@ -449,6 +450,47 @@ bool read_endpoint(endpoint_t& out) {
     out = std::move(ep);
     return true;
 }
+
+uint16_t resolve_mcp_port(uint16_t cli_port, const char* env_port, uint16_t settings_port) {
+    uint16_t port = settings_port;
+    if (env_port != nullptr) {
+        const int p = std::atoi(env_port);
+        if (p > 0 && p < 65536) port = static_cast<uint16_t>(p);
+    }
+    if (cli_port != 0) port = cli_port;
+    return port;
+}
+
+bool endpoint_serving(const endpoint_t& ep, int timeout_ms) {
+    if (ep.port == 0) return false;
+    httplib::Client cli("127.0.0.1", ep.port);
+    cli.set_connection_timeout(std::chrono::milliseconds(timeout_ms));
+    cli.set_read_timeout(std::chrono::milliseconds(timeout_ms));
+    cli.set_write_timeout(std::chrono::milliseconds(timeout_ms));
+    httplib::Headers h;
+    if (ep.token.empty()) {
+        // no usable token blob (other user, missing): liveness is all we can check
+        const auto health = cli.Get("/health");
+        return health && health->status == 200;
+    }
+    h.emplace("Authorization", "Bearer " + ep.token);
+    const json body = {{"tool", "app"}, {"action", "status"}};
+    const auto res = cli.Post("/api", h, body.dump(), "application/json");
+    if (!res || res->status != 200) return false;
+    const json reply = json::parse(res->body, nullptr, false);
+    return reply.is_object() && reply.value("ok", false);
+}
+
+bool drop_stale_endpoint() {
+    const std::string path = endpoint_file();
+    if (path.empty()) return false;
+    endpoint_t ep;
+    if (read_endpoint(ep) && endpoint_serving(ep)) return false;
+    std::error_code ec;
+    return std::filesystem::remove(path, ec);
+}
+
+void set_endpoint_path_for_testing(std::string path) { g_endpoint_override = std::move(path); }
 
 } // namespace slop::core::infra::lifecycle
 

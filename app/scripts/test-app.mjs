@@ -210,7 +210,7 @@ try {
     events.connect();
     await until(() => FakeSource.current !== before);
     assert.equal(auth, "Bearer secret-token");
-    assert.equal(FakeSource.current.url, "http://127.0.0.1:43123/events?ticket=t-123");
+    assert.equal(FakeSource.current.url, "http://127.0.0.1:43123/api/v1/events?ticket=t-123");
     assert.ok(!FakeSource.current.url.includes("secret-token"));
     events.disconnect();
     setEndpoint({ port: 8765, token: "" });

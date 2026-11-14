@@ -193,7 +193,9 @@ export default function ScriptsPanel() {
   const loadSnippet = (name: string) => {
     void call<{ code: string }>("script", "load", { name })
       .then((r) => setCode(r.code ?? ""))
-      .catch((e) => setRuns((r) => [...r.slice(-19), { ok: false, output: "", error: errorText(e), ms: 0 }]));
+      .catch((e) =>
+        setRuns((r) => [...r.slice(-19), { ok: false, output: "", error: errorText(e), ms: 0 }]),
+      );
   };
 
   const saveSnippet = () => {
@@ -204,13 +206,17 @@ export default function ScriptsPanel() {
         setSnippetName("");
         refreshSnippets();
       })
-      .catch((e) => setRuns((r) => [...r.slice(-19), { ok: false, output: "", error: errorText(e), ms: 0 }]));
+      .catch((e) =>
+        setRuns((r) => [...r.slice(-19), { ok: false, output: "", error: errorText(e), ms: 0 }]),
+      );
   };
 
   const deleteSnippet = (name: string) => {
     void call<{ ok: boolean }>("script", "delete", { name })
       .then(refreshSnippets)
-      .catch((e) => setRuns((r) => [...r.slice(-19), { ok: false, output: "", error: errorText(e), ms: 0 }]));
+      .catch((e) =>
+        setRuns((r) => [...r.slice(-19), { ok: false, output: "", error: errorText(e), ms: 0 }]),
+      );
   };
 
   return (
@@ -276,7 +282,12 @@ export default function ScriptsPanel() {
                 <button
                   type="button"
                   className="row-action"
-                  style={{ flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis" }}
+                  style={{
+                    flex: 1,
+                    textAlign: "left",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}
                   onClick={() => loadSnippet(s.name)}
                 >
                   {s.name}

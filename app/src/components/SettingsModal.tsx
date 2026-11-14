@@ -261,7 +261,7 @@ export default function SettingsModal({ onClose }: Props) {
         <fieldset className="settings-group">
           <legend className="settings-label">Engine</legend>
           <div className="settings-rows mono">
-            <div>api: http://127.0.0.1:{endpoint.port}/api</div>
+            <div>api: http://127.0.0.1:{endpoint.port}/api/v1</div>
             <div className="settings-copy-row">
               <span className="settings-copy-text">mcp: {mcpUrl}</span>
               <CopyButton text={mcpUrl} tip="Copy MCP URL" />

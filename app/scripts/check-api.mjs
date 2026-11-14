@@ -35,13 +35,14 @@ const kAppActions = {
   events_ticket: [],
 };
 
+const auth = process.env.SLOP_MCP_TOKEN
+  ? { Authorization: `Bearer ${process.env.SLOP_MCP_TOKEN}` }
+  : {};
+
 async function schemas() {
   const res = await fetch(`${base}/mcp`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(process.env.SLOP_MCP_TOKEN && { Authorization: `Bearer ${process.env.SLOP_MCP_TOKEN}` }),
-    },
+    headers: { "Content-Type": "application/json", ...auth },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
   if (!res.ok) throw new Error(`tools/list failed: HTTP ${res.status}`);
@@ -55,6 +56,16 @@ async function schemas() {
     });
   }
   return out;
+}
+
+/**
+ * /api/v1/openapi.json is generated from the same tool schemas, so a tool
+ * missing there means the two surfaces drifted apart.
+ */
+async function openapi() {
+  const res = await fetch(`${base}/api/v1/openapi.json`, { headers: auth });
+  if (!res.ok) throw new Error(`openapi.json failed: HTTP ${res.status}`);
+  return res.json();
 }
 
 /** Pull `call("tool", "action", { a, b })` triples out of the sources. */
@@ -140,6 +151,19 @@ for (const s of sites) {
       bad++;
     }
   }
+}
+
+const doc = await openapi();
+const openapiSchemas = doc.components?.schemas ?? {};
+for (const name of known.keys()) {
+  if (!(name in openapiSchemas)) {
+    console.log(`  MISSING OPENAPI SCHEMA ${name}`);
+    bad++;
+  }
+}
+if (!doc.paths?.["/api/v1"]) {
+  console.log("  MISSING OPENAPI PATH /api/v1");
+  bad++;
 }
 
 console.log(

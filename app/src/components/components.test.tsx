@@ -288,7 +288,13 @@ describe("scanner and watchlist exports (item 84)", () => {
       return { entries: 1 };
     });
     useEngine.setState({ target: attached });
-    const prompt = vi.spyOn(window, "prompt").mockReturnValue("C:/tmp/out.csv");
+    // the panel saves through the native dialog inside Tauri (pinned above), so
+    // the dialog mock supplies the two paths this test exports to
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    const saveMock = vi.mocked(dialog.save);
+    saveMock.mockResolvedValueOnce("C:/tmp/out.csv");
+    saveMock.mockResolvedValueOnce("C:/tmp/watch.CT");
+    const prompt = vi.spyOn(window, "prompt");
     render(<ScannerPanel />);
 
     await userEvent.click(screen.getByRole("button", { name: "Export results as CSV" }));
@@ -297,7 +303,6 @@ describe("scanner and watchlist exports (item 84)", () => {
       path: "C:/tmp/out.csv",
     });
 
-    prompt.mockReturnValue("C:/tmp/watch.CT");
     await userEvent.click(
       screen.getByRole("button", { name: "Export the watchlist as a .CT table" }),
     );

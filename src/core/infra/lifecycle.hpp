@@ -29,8 +29,8 @@ const char* stage_status(stage_t row) noexcept;
 struct config_t {
     // register the mcp endpoint into ai clients on first run
     bool mcp_onboarding = true;
-    // --insecure-dev: accept tokenless loopback requests (browser dev mode)
-    bool insecure_dev = false;
+    // --port <n>: wins over SLOP_MCP_PORT and the persisted mcp_port setting
+    uint16_t mcp_port = 0;
 };
 
 struct boot_result_t {
@@ -71,6 +71,21 @@ const std::string& endpoint_path();
 
 // false when the file is missing, the pid is dead or now runs another image
 bool read_endpoint(endpoint_t& out);
+
+// authenticated app.status round trip against the advertised endpoint; false
+// when nothing answers (alive-but-not-serving pid, reused port, stale token).
+// Probes /api on purpose: the deprecated alias also answers on engines that
+// predate /api/v1, so a handover to an older build still verifies.
+bool endpoint_serving(const endpoint_t& ep, int timeout_ms = 1500);
+
+// removes engine.json when it does not serve; true when the file was removed
+bool drop_stale_endpoint();
+
+// --port beats SLOP_MCP_PORT beats the settings port (0 = unset)
+uint16_t resolve_mcp_port(uint16_t cli_port, const char* env_port, uint16_t settings_port);
+
+// tests point the registration at a scratch file
+void set_endpoint_path_for_testing(std::string path);
 
 // rewrites engine.json with the current port and settings token (token rotation)
 void refresh_endpoint();

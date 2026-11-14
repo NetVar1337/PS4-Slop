@@ -217,6 +217,22 @@ json tool_gdb(const json& args);
 // must drop them so stale addresses never re-arm in a new session
 void clear_breakpoint_conditions();
 
+// live progress for a running call (notifications/progress). value must be
+// monotonic; total is set only when the operation knows its size
+struct progress_sample_t {
+    double              value = 0;
+    std::optional<double> total;
+    std::string         message;
+};
+// samples the hooks the running tool exposes; nullopt when it has none
+std::optional<progress_sample_t> sample_progress(const std::string& tool,
+                                                 const std::string& action,
+                                                 int64_t elapsed_ms);
+
+// guide playbooks, shared by the guide tool, the resources and the prompts
+json guide_topics();                       // [{topic, title, summary}]
+json guide_topic(const std::string& id);   // full playbook, null when unknown
+
 } // namespace detail
 
 } // namespace slop::core::mcp

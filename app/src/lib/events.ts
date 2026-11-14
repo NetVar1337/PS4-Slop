@@ -223,14 +223,14 @@ export function connect(): void {
   const gen = ++generation;
   const { token } = getEndpoint();
   if (token === "") {
-    open(gen, `${baseUrl()}/events`);
+    open(gen, `${baseUrl()}/api/v1/events`);
     return;
   }
   call<{ ticket?: string }>("app", "events_ticket", {}, { timeoutMs: 10_000 })
     .then((res) => {
       if (gen !== generation) return;
       if (typeof res.ticket !== "string" || res.ticket === "") throw new Error("no ticket");
-      open(gen, `${baseUrl()}/events?ticket=${encodeURIComponent(res.ticket)}`);
+      open(gen, `${baseUrl()}/api/v1/events?ticket=${encodeURIComponent(res.ticket)}`);
     })
     .catch(() => scheduleRetry(gen));
 }

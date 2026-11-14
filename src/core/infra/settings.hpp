@@ -6,6 +6,7 @@
 // every setter persists immediately through an atomic replace so a crash never
 // loses a change and never leaves a half written file behind
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -70,5 +71,9 @@ bool mcp_token_in_configs();
 bool        mcp_audit_enabled();      // default true
 std::string mcp_audit_path();         // default <app_data>\mcp_audit.jsonl, "" disables
 bool        mcp_require_confirm();    // default false (opt-in)
+
+// concurrent GET /events + GET /mcp streams the server accepts (default 64,
+// clamped to 1..1024); read once at boot
+size_t      events_max_streams();
 
 } // namespace slop::core::infra::settings

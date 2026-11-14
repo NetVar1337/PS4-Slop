@@ -3,6 +3,10 @@
 
 #include "harness.hpp"
 
+// winsock before windows.h so the socket calls below do not fight winsock.h
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
 #include "core/infra/cancel.hpp"
 #include "core/infra/published.hpp"
 #include "core/infra/work_queue.hpp"
@@ -14,14 +18,20 @@
 #include "core/infra/capability.hpp"
 #include "core/infra/deferred.hpp"
 #include "core/infra/mcp_onboard.hpp"
+#include "core/infra/lifecycle.hpp"
 #include "core/infra/paths.hpp"
 #include "core/infra/settings.hpp"
+#include "core/mcp/mcp_server.hpp"
 #include "core/util/fs_tools.hpp"
 
 #include <windows.h>
 
+#include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -838,4 +848,177 @@ TEST_CASE(infra_format_hex_packed) {
     const uint8_t b[] = {0xDE, 0xAD, 0x00, 0x0F};
     REQUIRE_STR_EQ(slop::core::infra::fmt::format_hex_packed(b).c_str(), "dead000f");
     REQUIRE_STR_EQ(slop::core::infra::fmt::format_hex_packed(b, true).c_str(), "DEAD000F");
+}
+
+// === mcp transport settings + engine registration ===
+
+TEST_CASE(infra_settings_events_max_streams_default_and_clamp) {
+    namespace settings = slop::core::infra::settings;
+    scratch_dir_t tmp;
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+    REQUIRE_EQ(settings::events_max_streams(), 64u);   // raised default
+    REQUIRE(settings::set("events_max_streams", 3));
+    REQUIRE_EQ(settings::events_max_streams(), 3u);
+    REQUIRE(settings::set("events_max_streams", 0));
+    REQUIRE_EQ(settings::events_max_streams(), 1u);
+    REQUIRE(settings::set("events_max_streams", 99999));
+    REQUIRE_EQ(settings::events_max_streams(), 1024u);
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(infra_resolve_mcp_port_precedence) {
+    namespace lifecycle = slop::core::infra::lifecycle;
+    // --port beats SLOP_MCP_PORT, which beats the persisted setting
+    REQUIRE_EQ(lifecycle::resolve_mcp_port(9101, "9102", 9103), 9101);
+    REQUIRE_EQ(lifecycle::resolve_mcp_port(0, "9102", 9103), 9102);
+    REQUIRE_EQ(lifecycle::resolve_mcp_port(0, nullptr, 9103), 9103);
+    // garbage env and an unset cli port fall back to the setting
+    REQUIRE_EQ(lifecycle::resolve_mcp_port(0, "nope", 9103), 9103);
+    REQUIRE_EQ(lifecycle::resolve_mcp_port(0, "70000", 9103), 9103);
+}
+
+TEST_CASE(infra_endpoint_probe_and_stale_registration_reap) {
+    namespace lifecycle = slop::core::infra::lifecycle;
+    namespace mcp = slop::core::mcp;
+    scratch_dir_t tmp;
+    // reset the override even when an assertion throws
+    struct override_guard_t {
+        explicit override_guard_t(std::string p) {
+            lifecycle::set_endpoint_path_for_testing(std::move(p));
+        }
+        ~override_guard_t() { lifecycle::set_endpoint_path_for_testing({}); }
+    } guard(tmp.str("engine.json"));
+    const std::string reg = tmp.str("engine.json");
+
+    // a live server answers the authenticated round trip
+    mcp::server_config_t cfg;
+    cfg.token = std::string(64, 'a');
+    REQUIRE(mcp::start(cfg));
+    const uint16_t port = mcp::port();
+    const lifecycle::endpoint_t live{static_cast<uint32_t>(::GetCurrentProcessId()), port,
+                                     cfg.token};
+    REQUIRE(lifecycle::endpoint_serving(live, 3000));
+    // wrong token: not our endpoint, even though the port answers
+    REQUIRE(!lifecycle::endpoint_serving(
+        {static_cast<uint32_t>(::GetCurrentProcessId()), port, std::string(64, 'b')}, 3000));
+
+    // a registration whose pid is alive but whose port no longer serves is stale
+    const std::wstring exe = [&] {
+        wchar_t buf[MAX_PATH * 2]{};
+        const DWORD n = ::GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+        return std::wstring(buf, n);
+    }();
+    std::string exe_utf8;
+    {
+        const int n = ::WideCharToMultiByte(CP_UTF8, 0, exe.data(), static_cast<int>(exe.size()),
+                                           nullptr, 0, nullptr, nullptr);
+        exe_utf8.resize(static_cast<size_t>(n));
+        ::WideCharToMultiByte(CP_UTF8, 0, exe.data(), static_cast<int>(exe.size()),
+                              exe_utf8.data(), n, nullptr, nullptr);
+    }
+    // a port nothing holds right now
+    uint16_t dead = 0;
+    SOCKET s = ::socket(AF_INET, SOCK_STREAM, 0);
+    REQUIRE(s != INVALID_SOCKET);
+    sockaddr_in a{};
+    a.sin_family      = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port        = 0;
+    if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+        int len = sizeof(a);
+        if (::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) == 0) dead = ntohs(a.sin_port);
+    }
+    ::closesocket(s);
+    REQUIRE_GT(dead, 0);
+
+    spit(reg, njson{{"pid", static_cast<uint32_t>(::GetCurrentProcessId())},
+                    {"port", dead},
+                    {"exe", exe_utf8}}
+                 .dump());
+    REQUIRE(lifecycle::drop_stale_endpoint());   // nothing serves that port
+    REQUIRE(!fs::exists(reg));
+
+    // a live server with a token-less registration counts as serving (health probe)
+    spit(reg, njson{{"pid", static_cast<uint32_t>(::GetCurrentProcessId())},
+                    {"port", port},
+                    {"exe", exe_utf8}}
+                 .dump());
+    REQUIRE(!lifecycle::drop_stale_endpoint());
+    REQUIRE(fs::exists(reg));
+    mcp::stop();
+}
+
+TEST_CASE(infra_engine_honors_port_flag) {
+    namespace lifecycle = slop::core::infra::lifecycle;
+    scratch_dir_t tmp;
+    // the child must never touch the real profile
+    char old_local[MAX_PATH]{};
+    const DWORD old_local_n = ::GetEnvironmentVariableA("LOCALAPPDATA", old_local, MAX_PATH);
+    ::SetEnvironmentVariableA("LOCALAPPDATA", tmp.str().c_str());
+    const std::string token = std::string(64, 'e');
+    char old_tok[128]{};
+    const DWORD old_tok_n = ::GetEnvironmentVariableA("SLOP_MCP_TOKEN", old_tok, sizeof(old_tok));
+    ::SetEnvironmentVariableA("SLOP_MCP_TOKEN", token.c_str());
+
+    // a port nothing holds right now
+    uint16_t want = 0;
+    for (int attempt = 0; attempt < 5 && want == 0; ++attempt) {
+        SOCKET s = ::socket(AF_INET, SOCK_STREAM, 0);
+        REQUIRE(s != INVALID_SOCKET);
+        sockaddr_in a{};
+        a.sin_family      = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port        = 0;
+        if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+            int len = sizeof(a);
+            if (::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) == 0)
+                want = ntohs(a.sin_port);
+        }
+        ::closesocket(s);
+    }
+    REQUIRE_GT(want, 0);
+
+    wchar_t buf[MAX_PATH * 2]{};
+    const DWORD n = ::GetModuleFileNameW(nullptr, buf, static_cast<DWORD>(std::size(buf)));
+    const fs::path engine = fs::path(std::wstring(buf, n)).parent_path().parent_path() /
+                            "src" / "engine" / "reverse-slop-engine.exe";
+    REQUIRE(fs::exists(engine));
+
+    const std::string cmd = "\"" + engine.string() + "\" --port " + std::to_string(want) +
+                            " --no-onboard --quiet";
+    FILE* pipe = _popen(cmd.c_str(), "r");
+    REQUIRE(pipe != nullptr);
+    std::string line;
+    char buf_line[512];
+    bool ready = false;
+    while (std::fgets(buf_line, sizeof(buf_line), pipe)) {
+        line = buf_line;
+        if (line.rfind("SLOP_ENGINE_READY", 0) == 0) {
+            ready = true;
+            break;
+        }
+    }
+    REQUIRE(ready);
+    const uint16_t announced =
+        static_cast<uint16_t>(std::strtoul(line.c_str() + std::strlen("SLOP_ENGINE_READY"), nullptr, 10));
+    REQUIRE_EQ(announced, want);   // --port reached the bind, not the settings port
+
+    // and the announced endpoint really serves
+    REQUIRE(lifecycle::endpoint_serving(
+        {static_cast<uint32_t>(::GetCurrentProcessId()), announced, token}, 5000));
+
+    httplib::Client cli("127.0.0.1", announced);
+    cli.set_read_timeout(std::chrono::seconds(15));
+    const njson body = {{"tool", "app"}, {"action", "shutdown"}};
+    auto res = cli.Post("/api/v1", {{"Authorization", "Bearer " + token}}, body.dump(),
+                        "application/json");
+    REQUIRE(res);
+    REQUIRE_EQ(res->status, 200);
+    while (std::fgets(buf_line, sizeof(buf_line), pipe)) {
+    }
+    REQUIRE_EQ(_pclose(pipe), 0);
+
+    ::SetEnvironmentVariableA("LOCALAPPDATA", old_local_n ? old_local : nullptr);
+    ::SetEnvironmentVariableA("SLOP_MCP_TOKEN", old_tok_n ? old_tok : nullptr);
 }

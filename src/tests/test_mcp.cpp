@@ -2775,3 +2775,263 @@ TEST_CASE(mcp_gdb_tool_and_broker_status) {
     REQUIRE(!res.at("running").get<bool>());
     settings::set_file_for_testing({});
 }
+
+// === versioned api surface, openapi, rate limits, progress, resources/prompts ===
+
+TEST_CASE(mcp_api_v1_prefix_and_deprecated_alias) {
+    server_fixture_t fx;
+    // guide.list is pure static data, so both paths must answer byte-identically
+    const json req = {{"tool", "guide"}, {"action", "list"}};
+
+    auto v1 = fx.cli_->Post("/api/v1", req.dump(), "application/json");
+    REQUIRE(v1);
+    REQUIRE_EQ(v1->status, 200);
+    REQUIRE(json::parse(v1->body).value("ok", false));
+    REQUIRE(v1->get_header_value("Deprecation").empty());
+
+    // the old path answers the same body, flagged deprecated
+    auto alias = fx.cli_->Post("/api", req.dump(), "application/json");
+    REQUIRE(alias);
+    REQUIRE_EQ(alias->status, 200);
+    REQUIRE_STR_EQ(alias->get_header_value("Deprecation").c_str(), "true");
+    REQUIRE(alias->body == v1->body);
+
+    // the event stream moved with it; both paths deliver the hello event
+    const auto ticket = [&] {
+        const json t = {{"tool", "app"}, {"action", "events_ticket"}};
+        auto res = fx.cli_->Post("/api/v1", t.dump(), "application/json");
+        REQUIRE(res);
+        return json::parse(res->body).at("data").at("ticket").get<std::string>();
+    };
+    const auto hello_seen = [&](const std::string& path) {
+        std::string got;
+        httplib::Client cli("127.0.0.1", fx.port());
+        cli.set_read_timeout(std::chrono::seconds(5));
+        // the receiver cancels once hello lands, so the result carries no response
+        cli.Get(path, [&](const char* data, size_t len) {
+            got.append(data, len);
+            return got.find("event: hello") == std::string::npos;
+        });
+        return got.find("event: hello") != std::string::npos;
+    };
+    REQUIRE(hello_seen("/api/v1/events?ticket=" + ticket()));
+    REQUIRE(hello_seen("/events?ticket=" + ticket()));
+}
+
+TEST_CASE(mcp_openapi_descriptor_matches_tools_list) {
+    server_fixture_t fx;
+    auto res = fx.cli_->Get("/api/v1/openapi.json");
+    REQUIRE(res);
+    REQUIRE_EQ(res->status, 200);
+    const json doc = json::parse(res->body);
+    REQUIRE_STR_EQ(doc.at("openapi").get<std::string>().c_str(), "3.1.0");
+    REQUIRE(doc.at("paths").contains("/api/v1"));
+    REQUIRE(doc.at("components").at("schemas").contains("ApiCall"));
+
+    const json tools = fx.rpc("tools/list").at("result").at("tools");
+    REQUIRE_EQ(tools.size(), 22u);
+    for (const auto& t : tools) {
+        const std::string n = t.at("name").get<std::string>();
+        REQUIRE(doc.at("components").at("schemas").contains(n));
+        // the descriptor carries the exact input schema the mcp clients see
+        REQUIRE(doc.at("components").at("schemas").at(n) == t.at("inputSchema"));
+        const auto& tool_enum = doc.at("components").at("schemas").at("ApiCall")
+                                    .at("properties").at("tool").at("enum");
+        REQUIRE(std::find(tool_enum.begin(), tool_enum.end(), n) != tool_enum.end());
+    }
+}
+
+TEST_CASE(mcp_rate_limit_trips_with_retry_after) {
+    scratch_settings_t scratch;
+    REQUIRE(slop::core::infra::settings::set(
+        "mcp_rate_limits", {{"guide", {{"rate", 0.5}, {"burst", 2}}}}));
+    server_fixture_t fx;
+    const json call = {{"jsonrpc", "2.0"},
+                       {"id", 9},
+                       {"method", "tools/call"},
+                       {"params", {{"name", "guide"}, {"arguments", {{"action", "list"}}}}}};
+
+    for (int i = 0; i < 2; ++i) {
+        auto ok = fx.cli_->Post("/mcp", call.dump(), "application/json");
+        REQUIRE(ok);
+        REQUIRE_EQ(ok->status, 200);
+        REQUIRE(!json::parse(ok->body).at("result").value("isError", true));
+    }
+
+    auto limited = fx.cli_->Post("/mcp", call.dump(), "application/json");
+    REQUIRE(limited);
+    REQUIRE_EQ(limited->status, 429);
+    REQUIRE(!limited->get_header_value("Retry-After").empty());
+    const json err = json::parse(limited->body).at("error");
+    REQUIRE_EQ(err.at("code").get<int>(), -32002);
+    REQUIRE_GT(err.at("data").at("retry_after_ms").get<int64_t>(), 0);
+    REQUIRE(err.at("message").get<std::string>().find("rate limit") != std::string::npos);
+
+    // the ui channel is exempt: opening a view must never spend the agent budget
+    for (int i = 0; i < 5; ++i) REQUIRE(fx.api("guide", "list").value("ok", false));
+}
+
+TEST_CASE(mcp_progress_notifications_reach_the_stream) {
+    server_fixture_t fx;
+    std::mutex mu;
+    std::string got;
+    std::atomic<bool> open{false};
+    std::thread reader([&] {
+        httplib::Client cli("127.0.0.1", fx.port());
+        cli.set_read_timeout(std::chrono::seconds(10));
+        cli.Get("/mcp", [&](const char* data, size_t len) {
+            std::lock_guard lk(mu);
+            got.append(data, len);
+            if (got.find("event: endpoint") != std::string::npos) open = true;
+            return got.find("guide.list done") == std::string::npos;
+        });
+    });
+    for (int i = 0; i < 300 && !open.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    REQUIRE(open.load());
+
+    const json req = {{"jsonrpc", "2.0"},
+                      {"id", 11},
+                      {"method", "tools/call"},
+                      {"params",
+                       {{"name", "guide"},
+                        {"arguments", {{"action", "list"}}},
+                        {"_meta", {{"progressToken", "tok-1"}}}}}};
+    auto res = fx.cli_->Post("/mcp", req.dump(), "application/json");
+    REQUIRE(res);
+    REQUIRE_EQ(res->status, 200);
+    reader.join();
+
+    std::vector<double> seen;
+    {
+        std::lock_guard lk(mu);
+        REQUIRE(got.find("notifications/progress") != std::string::npos);
+        REQUIRE(got.find("\"progressToken\":\"tok-1\"") != std::string::npos);
+        size_t at = 0;
+        while ((at = got.find("data: ", at)) != std::string::npos) {
+            at += 6;
+            const size_t end = got.find('\n', at);
+            const json msg = json::parse(got.substr(at, end - at), nullptr, false);
+            if (msg.is_discarded() || !msg.is_object()) continue;
+            if (msg.value("method", std::string{}) != "notifications/progress") continue;
+            const auto& p = msg.at("params");
+            REQUIRE_STR_EQ(p.at("progressToken").get<std::string>().c_str(), "tok-1");
+            REQUIRE(p.contains("message"));
+            seen.push_back(p.at("progress").get<double>());
+        }
+    }
+    REQUIRE_GE(seen.size(), 2u);
+    REQUIRE_EQ(seen.front(), 0.0);
+    REQUIRE_EQ(seen.back(), 1.0);
+    for (size_t i = 1; i < seen.size(); ++i) REQUIRE_GE(seen[i], seen[i - 1]);
+}
+
+TEST_CASE(mcp_resources_and_prompts_roundtrip) {
+    server_fixture_t fx;
+
+    const json init = fx.rpc("initialize", {{"protocolVersion", "2025-06-18"},
+                                            {"capabilities", json::object()}});
+    const auto& caps = init.at("result").at("capabilities");
+    REQUIRE(caps.contains("tools"));
+    REQUIRE(caps.contains("resources"));
+    REQUIRE(caps.contains("prompts"));
+
+    const json resources = fx.rpc("resources/list").at("result").at("resources");
+    REQUIRE_GE(resources.size(), 3u);
+    bool has_target = false, has_image = false, has_guide = false;
+    for (const auto& r : resources) {
+        REQUIRE(r.contains("uri"));
+        REQUIRE(r.contains("mimeType"));
+        const std::string uri = r.at("uri").get<std::string>();
+        if (uri == "slop://state/target") has_target = true;
+        if (uri == "slop://state/image") has_image = true;
+        if (uri.rfind("slop://guide/", 0) == 0) has_guide = true;
+    }
+    REQUIRE(has_target);
+    REQUIRE(has_image);
+    REQUIRE(has_guide);
+
+    const auto text_of = [](const json& read) {
+        return json::parse(read.at("result").at("contents").at(0).at("text").get<std::string>());
+    };
+    const json playbook = text_of(fx.rpc("resources/read", {{"uri", "slop://guide/ps4_setup"}}));
+    REQUIRE_STR_EQ(playbook.at("topic").get<std::string>().c_str(), "ps4_setup");
+    REQUIRE(!playbook.at("steps").empty());
+    const json target = text_of(fx.rpc("resources/read", {{"uri", "slop://state/target"}}));
+    REQUIRE(target.contains("target"));
+    const json image = text_of(fx.rpc("resources/read", {{"uri", "slop://state/image"}}));
+    REQUIRE(image.contains("image"));
+    REQUIRE(fx.rpc("resources/read", {{"uri", "slop://nope"}}).contains("error"));
+
+    const json prompts = fx.rpc("prompts/list").at("result").at("prompts");
+    REQUIRE_GE(prompts.size(), 5u);
+    bool named = false;
+    for (const auto& p : prompts) {
+        REQUIRE(p.contains("name"));
+        REQUIRE(p.contains("description"));
+        if (p.at("name") == "ps4_setup") named = true;
+    }
+    REQUIRE(named);
+    const json got = fx.rpc("prompts/get", {{"name", "ps4_setup"}}).at("result");
+    REQUIRE_STR_EQ(got.at("messages").at(0).at("role").get<std::string>().c_str(), "user");
+    const std::string prompt_text =
+        got.at("messages").at(0).at("content").at("text").get<std::string>();
+    REQUIRE(prompt_text.find("ps4_auto") != std::string::npos);
+    REQUIRE(fx.rpc("prompts/get", {{"name", "nope"}}).contains("error"));
+}
+
+TEST_CASE(mcp_annotations_match_mutating_classification) {
+    server_fixture_t fx;
+    const json tools = fx.rpc("tools/list").at("result").at("tools");
+    REQUIRE_GE(tools.size(), 20u);
+    for (const auto& t : tools) {
+        const std::string name = t.at("name").get<std::string>();
+        REQUIRE(t.contains("annotations"));
+        const auto& a = t.at("annotations");
+        for (const char* k : {"readOnlyHint", "destructiveHint", "idempotentHint", "openWorldHint"})
+            REQUIRE(a.at(k).is_boolean());
+        REQUIRE(a.at("title").is_string());
+
+        bool mutating = false;
+        for (const auto& act : t.at("inputSchema").at("properties").at("action").at("enum"))
+            mutating = mutating ||
+                       slop::core::mcp::action_mutating(name, act.get<std::string>());
+        if (mutating) REQUIRE_FALSE(a.at("readOnlyHint").get<bool>());
+        // a destructive tool is never advertised as read-only
+        if (a.at("destructiveHint").get<bool>()) REQUIRE_FALSE(a.at("readOnlyHint").get<bool>());
+        // read-only tools are idempotent; writers make no such promise
+        if (a.at("readOnlyHint").get<bool>()) REQUIRE(a.at("idempotentHint").get<bool>());
+    }
+}
+
+TEST_CASE(mcp_explicit_port_is_honored) {
+    // --port reaches the bind: ask for a known free port and get exactly it
+    const auto free_port = [] {
+        uint16_t p = 0;
+        SOCKET s = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET) return p;
+        sockaddr_in a{};
+        a.sin_family      = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        a.sin_port        = 0;
+        if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+            int len = sizeof(a);
+            if (::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) == 0)
+                p = ntohs(a.sin_port);
+        }
+        ::closesocket(s);
+        return p;
+    };
+    uint16_t want = 0;
+    bool started  = false;
+    for (int attempt = 0; attempt < 5 && !started; ++attempt) {
+        want = free_port();
+        REQUIRE_GT(want, 0);
+        slop::core::mcp::server_config_t cfg;
+        cfg.port = want;
+        started  = slop::core::mcp::start(cfg);
+    }
+    REQUIRE(started);
+    REQUIRE_EQ(slop::core::mcp::port(), want);
+    slop::core::mcp::stop();
+}

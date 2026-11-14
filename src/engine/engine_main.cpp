@@ -13,10 +13,6 @@
 // stdin line is POSTed to the engine's own /mcp (or the running engine's) with
 // a per-process token; each reply is one stdout line. Everything else that
 // would reach stdout (handshake, logs) is moved to stderr.
-//
-// --insecure-dev: accept tokenless loopback requests so `npm run dev` in the
-// browser can talk to this engine. Off by default: without it every request
-// needs the bearer token, loopback included (audit 103).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -29,6 +25,7 @@
 #include <cstring>
 #include <io.h>
 #include <iostream>
+#include <random>
 #include <string>
 #include <thread>
 
@@ -51,7 +48,7 @@ struct options_t {
     bool     quiet          = false;   // quiet the mirrored output
     uint32_t parent_pid     = 0;       // watch this pid and exit when it dies
     bool     stdio          = false;   // MCP over stdin/stdout
-    bool     insecure_dev   = false;   // accept tokenless loopback requests (browser dev mode)
+    uint16_t port           = 0;       // --port <n>, 0 = settings / SLOP_MCP_PORT
 };
 
 FILE* g_rpc_out = nullptr;   // the real stdout in --stdio mode, nullptr otherwise
@@ -94,8 +91,14 @@ void claim_stdout_for_rpc() {
 }
 
 std::string random_token() {
-    // same BCryptGenRandom source as the persisted token (audit 107)
-    return slop::core::infra::settings::generate_token();
+    std::random_device rd;   // MSVC: rand_s, a CSPRNG
+    std::string t;
+    for (int i = 0; i < 4; ++i) {
+        char b[9];
+        std::snprintf(b, sizeof(b), "%08x", rd());
+        t += b;
+    }
+    return t;
 }
 
 // one JSON-RPC message per stdin line -> POST /mcp -> one reply line (none
@@ -134,9 +137,12 @@ options_t parse_args(int argc, char** argv) {
         const char* a = argv[i];
         if (std::strcmp(a, "--no-onboard") == 0)  o.mcp_onboarding = false;
         else if (std::strcmp(a, "--quiet") == 0)       o.quiet = true;
-        else if (std::strcmp(a, "--insecure-dev") == 0) o.insecure_dev = true;
-        else if (std::strcmp(a, "--port") == 0 && i + 1 < argc)
-            ::_putenv_s("SLOP_MCP_PORT", argv[++i]); // CRT getenv() does not see SetEnvironmentVariable
+        else if (std::strcmp(a, "--port") == 0 && i + 1 < argc) {
+            // carried in the boot config, not the environment: an env var would
+            // leak into child processes and lose to nothing
+            const unsigned long p = std::strtoul(argv[++i], nullptr, 10);
+            if (p > 0 && p < 65536) o.port = static_cast<uint16_t>(p);
+        }
         else if (std::strcmp(a, "--parent-pid") == 0 && i + 1 < argc)
             o.parent_pid = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (std::strcmp(a, "--stdio") == 0) {
@@ -157,9 +163,12 @@ int main(int argc, char** argv) {
         if (env_token().empty()) ::_putenv_s("SLOP_MCP_TOKEN", random_token().c_str());
     }
 
-    // already served, hand the caller that endpoint and get out of the way
+    // already served, hand the caller that endpoint and get out of the way.
+    // engine.json can name a pid that is alive but not serving (or a reused
+    // port), so the registration only counts after an authenticated round trip
     const std::string own_token = env_token();
-    if (lifecycle::endpoint_t live; lifecycle::read_endpoint(live)) {
+    lifecycle::endpoint_t live;
+    if (lifecycle::read_endpoint(live) && lifecycle::endpoint_serving(live)) {
         if (own_token.empty()) {
             emit(("SLOP_ENGINE_READY " + std::to_string(live.port) + " " + live.token).c_str());
         } else {
@@ -185,6 +194,8 @@ int main(int argc, char** argv) {
         if (opts.stdio) run_stdio_bridge(live.port, own_token);
         return 0;
     }
+    if (lifecycle::drop_stale_endpoint())
+        std::fprintf(stderr, "stale engine registration dropped (endpoint did not answer)\n");
 
     ::SetConsoleCtrlHandler(ctrl_handler, TRUE);
 
@@ -199,7 +210,7 @@ int main(int argc, char** argv) {
 
     lifecycle::config_t cfg;
     cfg.mcp_onboarding = opts.mcp_onboarding;
-    cfg.insecure_dev   = opts.insecure_dev;
+    cfg.mcp_port       = opts.port;
     lifecycle::begin(std::move(cfg));
 
     // mirror the boot story to stderr so it never collides with the stdout handshake
@@ -223,18 +234,28 @@ int main(int argc, char** argv) {
         if (!announced) {
             const auto boot = lifecycle::result();
             if (boot.mcp_ok) {
-                if (own_token.empty())
-                    emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port) + " " +
-                          slop::core::infra::settings::mcp_token())
-                             .c_str());
-                else
-                    emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port)).c_str());
+                // never announce an endpoint that does not answer: a spawner
+                // trusts this line and would hand its client a dead port
+                const lifecycle::endpoint_t self{static_cast<uint32_t>(::GetCurrentProcessId()),
+                                                 boot.mcp_port,
+                                                 slop::core::infra::settings::mcp_token()};
                 announced = true;
-                if (opts.stdio)
-                    bridge = std::thread([port = boot.mcp_port, own_token] {
-                        run_stdio_bridge(static_cast<uint16_t>(port), own_token);
-                        control::request_quit("stdin closed");
-                    });
+                if (!lifecycle::endpoint_serving(self, 3000)) {
+                    emit("SLOP_ENGINE_FAILED mcp endpoint did not answer after boot");
+                    control::request_quit("mcp endpoint probe failed");
+                } else {
+                    if (own_token.empty())
+                        emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port) + " " +
+                              slop::core::infra::settings::mcp_token())
+                                 .c_str());
+                    else
+                        emit(("SLOP_ENGINE_READY " + std::to_string(boot.mcp_port)).c_str());
+                    if (opts.stdio)
+                        bridge = std::thread([port = boot.mcp_port, own_token] {
+                            run_stdio_bridge(static_cast<uint16_t>(port), own_token);
+                            control::request_quit("stdin closed");
+                        });
+                }
             } else if (lifecycle::booted()) {
                 emit("SLOP_ENGINE_FAILED mcp server did not bind");
                 announced = true;

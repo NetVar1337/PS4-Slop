@@ -40,6 +40,8 @@ bool ps5_action_readonly(const std::string& a) {
     return ro.count(a) != 0;
 }
 
+} // namespace
+
 bool action_mutating(const std::string& tool, const std::string& action) {
     if (tool == "debugger") {
         if (action.rfind("ps4_", 0) == 0) return !ps4_action_readonly(action);
@@ -90,6 +92,8 @@ bool action_mutating(const std::string& tool, const std::string& action) {
                action != "stream_data";
     return false;
 }
+
+namespace {
 
 std::mutex g_audit_mu;
 
@@ -845,10 +849,12 @@ void finalize_tool_entry(json& t) {
     std::string title = name;
     if (!title.empty()) title[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(title[0])));
     t["title"] = title;
+    // readOnly tools are idempotent by construction; anything that can write is
+    // neither read-only nor (necessarily) idempotent, and may destroy state
     t["annotations"] = {{"title", title},
                         {"readOnlyHint", ro},
                         {"destructiveHint", !ro},
-                        {"idempotentHint", false},
+                        {"idempotentHint", ro},
                         {"openWorldHint", open_world}};
 
     json& schema = t["inputSchema"];
@@ -1120,7 +1126,7 @@ static nlohmann::json call_tool_inner(const std::string& name,
 
 nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
                          bool& is_error, infra::cancel_token_t cancel,
-                         bool allow_app) {
+                         bool allow_app, const progress_ctx_t* progress) {
     // ps4debug-mcp safety model: when mcp_require_confirm is on, mutating
     // console/target actions need "confirm": true; every call (allowed or
     // refused) is appended to the JSONL audit log
@@ -1143,6 +1149,43 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
         return err;
     }
     json out;
+    // notifications/progress: a pump samples the tool's own hooks while it runs
+    // and queues each sample on the caller's GET /mcp stream
+    struct progress_pump_t {
+        std::thread       thread;
+        std::atomic<bool> done{false};
+        ~progress_pump_t() {
+            done = true;
+            if (thread.joinable()) thread.join();
+        }
+    };
+    std::optional<progress_pump_t> pump;
+    if (progress != nullptr) {
+        // captured by value: the pump thread outlives this block
+        auto emit = [session = progress->session, token = progress->token](
+                        double value, const std::optional<double>& total,
+                        const std::string& message) {
+            json params = {{"progressToken", token}, {"progress", value}, {"message", message}};
+            if (total) params["total"] = *total;
+            push_notification(session, {{"jsonrpc", "2.0"},
+                                        {"method", "notifications/progress"},
+                                        {"params", std::move(params)}});
+        };
+        pump.emplace();
+        std::atomic<bool>* done = &pump->done;
+        pump->thread = std::thread([done, name, action, emit] {
+            const int64_t started = infra::steady_ms();
+            emit(0.0, 1.0, name + "." + action + " started");
+            while (!done->load()) {
+                for (int i = 0; i < 20 && !done->load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                if (done->load()) break;
+                if (auto s = sample_progress(name, action, infra::steady_ms() - started))
+                    emit(s->value, s->total, s->message);
+            }
+            emit(1.0, 1.0, name + "." + action + " done");
+        });
+    }
     // broker gate: console-session actions serialize with every other console
     // client (UI, the GDB-RSP bridge) on the one console connection; purely
     // local tools (emulate/analyze/...) stay concurrent with a running call
@@ -1201,6 +1244,72 @@ json session_state() {
             {"target", attached_target_json()},
             {"busy", true},
             {"note", "another tool call is running; call disasm.loaded for image state"}};
+}
+
+// ---- resources: live state + the guide playbooks ----
+
+json list_resources() {
+    json out = json::array();
+    out.push_back({{"uri", "slop://state/target"},
+                   {"name", "target status"},
+                   {"description", "active backend and attached target (pid, name, arch)"},
+                   {"mimeType", "application/json"}});
+    out.push_back({{"uri", "slop://state/image"},
+                   {"name", "loaded image"},
+                   {"description", "shared binary session: path, format, arch, analysis state"},
+                   {"mimeType", "application/json"}});
+    for (const auto& t : guide_topics())
+        out.push_back({{"uri", "slop://guide/" + t.at("topic").get<std::string>()},
+                       {"name", t.at("title")},
+                       {"description", t.at("summary")},
+                       {"mimeType", "application/json"}});
+    return out;
+}
+
+json read_resource(const std::string& uri) {
+    auto contents = [&uri](const json& body) {
+        return json{{"contents", json::array({{{"uri", uri},
+                                              {"mimeType", "application/json"},
+                                              {"text", body.dump(2)}}})}};
+    };
+    if (uri == "slop://state/target" || uri == "slop://state/image") {
+        const json st = session_state();
+        json body;
+        const bool target = uri == "slop://state/target";
+        if (target && st.contains("backend")) body["backend"] = st.at("backend");
+        const char* key = target ? "target" : "image";
+        if (st.contains(key)) body[key] = st.at(key);
+        if (st.contains("busy")) body["busy"] = st.at("busy");
+        return contents(body);
+    }
+    constexpr std::string_view kGuide = "slop://guide/";
+    if (uri.size() > kGuide.size() && uri.compare(0, kGuide.size(), kGuide) == 0) {
+        json playbook = guide_topic(uri.substr(kGuide.size()));
+        if (playbook.is_null()) return nullptr;
+        return contents(playbook);
+    }
+    return nullptr;
+}
+
+// ---- prompts: the same playbooks as prompt templates ----
+
+json list_prompts() {
+    json out = json::array();
+    for (const auto& t : guide_topics())
+        out.push_back({{"name", t.at("topic")},
+                       {"title", t.at("title")},
+                       {"description", t.at("summary")},
+                       {"arguments", json::array()}});
+    return out;
+}
+
+json get_prompt(const std::string& name) {
+    json playbook = guide_topic(name);
+    if (playbook.is_null()) return nullptr;
+    return {{"description", playbook.value("summary", std::string{})},
+            {"messages", json::array({{{"role", "user"},
+                                       {"content", {{"type", "text"},
+                                                    {"text", playbook.dump(2)}}}}})}};
 }
 
 } // namespace slop::core::mcp

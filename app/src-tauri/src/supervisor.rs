@@ -673,7 +673,7 @@ fn watch_external(engine: &Engine, pid: Option<u32>, port: u16) {
     }
 }
 
-/// POST /api {tool: app, action: shutdown}, the same request File > Exit sends
+/// POST /api/v1 {tool: app, action: shutdown}, the same request File > Exit sends
 fn request_quit(port: u16, token: &str, reason: &str) -> Result<(), String> {
     let body = serde_json::json!({
         "tool": "app",
@@ -688,7 +688,7 @@ fn request_quit(port: u16, token: &str, reason: &str) -> Result<(), String> {
     let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
     let auth = if token.is_empty() { String::new() } else { format!("Authorization: Bearer {token}\r\n") };
     let request = format!(
-        "POST /api HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /api/v1 HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).map_err(|e| format!("send: {e}"))?;
@@ -915,7 +915,7 @@ mod tests {
         });
         request_quit(port, "secret", "bye").unwrap();
         let req = server.join().unwrap();
-        assert!(req.starts_with("POST /api HTTP/1.1\r\n"));
+        assert!(req.starts_with("POST /api/v1 HTTP/1.1\r\n"));
         assert!(req.contains("Authorization: Bearer secret\r\n"));
         let body: serde_json::Value = serde_json::from_str(req.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(body["tool"], "app");
