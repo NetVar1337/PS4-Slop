@@ -22,6 +22,12 @@ nlohmann::json call_tool(const std::string& name, const nlohmann::json& args,
 // drop tool state on shutdown
 void shutdown_tools();
 
+// identity of the client whose tool call runs on this thread: an MCP
+// Mcp-Session-Id, "ui" for /api, "" when unknown. Set by the server around
+// each call; used for breakpoint slot ownership.
+void set_client_id(std::string id);
+std::string client_id();
+
 // session snapshot for the agent, rides the initialize result
 nlohmann::json session_state();
 

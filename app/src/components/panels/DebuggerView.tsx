@@ -27,6 +27,8 @@ const kCompares = [
   "unknown",
 ];
 const kWaitMs = 5000;
+/** Fallback poll while attached; the push stream is the primary source. */
+const kFallbackPollMs = 15_000;
 
 export default function DebuggerView() {
   const target = useEngine((s) => s.target);
@@ -44,7 +46,9 @@ export default function DebuggerView() {
     app,
     error,
     waitNote,
+    logs,
     busy,
+    connectStream,
     refresh,
     attach,
     detach,
@@ -80,7 +84,18 @@ export default function DebuggerView() {
 
   useEffect(() => {
     void refresh();
-  }, [refresh, target.pid, backend.ps4]);
+    // stop events arrive over /events; the poll below is only a fallback for
+    // a dropped stream (and catches state the engine does not push)
+    const off = connectStream();
+    const id = setInterval(() => {
+      const s = useDebugger.getState().status;
+      if (s.ps4_connected) void refresh();
+    }, kFallbackPollMs);
+    return () => {
+      off();
+      clearInterval(id);
+    };
+  }, [connectStream, refresh, target.pid, backend.ps4]);
 
   const pid = target.pid ?? status.debug_pid;
 
@@ -127,7 +142,9 @@ export default function DebuggerView() {
       setWpAddr("");
     }
   };
-  const lwpNum = parseAddress(lwp) ?? 0;
+  // an empty box steps the thread that last stopped (the engine's lwpid 0
+  // means all threads, which is rarely what the panel wants)
+  const lwpNum = lwp.trim() === "" ? regsLwpid : (parseAddress(lwp) ?? 0);
 
   const pickDumpPath = async () => {
     if (!isTauri()) return;
@@ -180,7 +197,7 @@ export default function DebuggerView() {
               <Play size={11} />
             </IconButton>
             <IconButton
-              tip="Step one lwp (0 = all threads)"
+              tip="Step one lwp (empty = the thread that last stopped)"
               variant="row"
               disabled={busy}
               onClick={() => void step(lwpNum)}
@@ -331,6 +348,25 @@ export default function DebuggerView() {
                     slot {b.index}
                   </span>
                   <span className="fn-name mono">{hex(b.addr)}</span>
+                  {(b.count ?? 0) > 0 && (
+                    <span
+                      className="faint mono"
+                      style={{ fontSize: 10 }}
+                      data-tip={
+                        b.hits !== undefined && b.hits > 0
+                          ? `stops on hit ${b.hits} (${b.hit_mode ?? "eq"})`
+                          : "stops on every hit"
+                      }
+                    >
+                      {b.count}
+                      {b.hits !== undefined && b.hits > 0 ? `/${b.hits}` : ""}
+                    </span>
+                  )}
+                  {b.owner !== undefined && b.owner !== "" && (
+                    <span className="faint" style={{ fontSize: 10 }} data-tip="owning client">
+                      {b.owner}
+                    </span>
+                  )}
                   <IconButton
                     tip={`Clear breakpoint ${hex(b.addr, 1)}`}
                     onClick={() => void bpClear(b.addr)}
@@ -617,6 +653,19 @@ export default function DebuggerView() {
         <div className="dbg-col">
           <div className="dbg-head">Events</div>
           <div className="panel-body">
+            {logs.length > 0 && (
+              <ol className="plain-list" aria-label="Log breakpoint lines, newest first">
+                {logs.slice(0, 20).map((line, i) => (
+                  <li
+                    className="log-row mono"
+                    key={`log-${i}`}
+                    style={{ padding: "1px var(--pad-md)", fontSize: 11 }}
+                  >
+                    {line}
+                  </li>
+                ))}
+              </ol>
+            )}
             {events.length === 0 ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
                 no stop events yet - arm a bp, continue, wait.

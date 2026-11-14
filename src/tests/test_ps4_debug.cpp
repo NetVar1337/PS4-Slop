@@ -4,6 +4,9 @@
 
 #include "ps4_fixture.hpp"
 
+#include "core/infra/event_bus.hpp"
+#include "core/infra/clock.hpp"
+
 TEST_CASE(ps4_debug_control_and_events) {
     server_guard_t g;
     backend_ps4_t b;
@@ -607,4 +610,246 @@ TEST_CASE(ps4_mcp_console_side_tooling) {
         json d = dbg({{"action", "ps4_detach"}}, e);
         CHECK(!e);
     }
+}
+
+// === breakpoint rules, continuous trace, thread stepping, SSE push ==========
+
+TEST_CASE(ps4_breakpoint_hits_log_and_owner) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}});
+    REQUIRE(!e);
+
+    // hits: stop on the 2nd hit, the 1st is auto-resumed by ps4_wait
+    slop::core::mcp::set_client_id("client-a");
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400500}, {"hits", 2}});
+    CHECK(!e);
+    if (e) std::printf("  bp_set hits err: %s\n", r.dump().c_str());
+    CHECK(r.value("hits", 0) == 2);
+    CHECK(r.value("owner", std::string{}) == "client-a");
+    r = dbg({{"action", "ps4_continue"}, {"stop", 0}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 3000}});
+    CHECK(!e);
+    if (e) std::printf("  wait hits err: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("condition_skipped", 0) == 1);
+    CHECK(r.value("rip", 0ull) == 0x400500ull);
+
+    r = dbg({{"action", "ps4_bp_list"}});
+    CHECK(!e);
+    REQUIRE(r["breakpoints"].size() == 1);
+    CHECK(r["breakpoints"][0].value("count", 0) == 2);
+    CHECK(r["breakpoints"][0].value("hits", 0) == 2);
+    CHECK(r["breakpoints"][0].value("hit_mode", std::string{}) == "eq");
+    CHECK(r["breakpoints"][0].value("owner", std::string{}) == "client-a");
+
+    // another client cannot clobber or clear the slot without force
+    slop::core::mcp::set_client_id("client-b");
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400500}});
+    CHECK(e);
+    CHECK(r.dump().find("owned by client 'client-a'") != std::string::npos);
+    e = false;
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400500}, {"force", true}});
+    CHECK(!e);
+    CHECK(r.value("owner", std::string{}) == "client-b");
+    slop::core::mcp::set_client_id("client-a");
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", 0x400500}});
+    CHECK(e);
+    e = false;
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", 0x400500}, {"force", true}});
+    CHECK(!e);
+
+    // log breakpoint: the formatted line reaches the output ring
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400600},
+             {"log", "rax={rax} rip={rip} slot={[rsp]:u64}"}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_continue"}, {"stop", 0}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 3000}});
+    CHECK(!e);
+    CHECK(r.value("halted", false) == true);
+    bool saw = false;
+    for (const auto& l : slop::core::infra::event_bus::output_since(0))
+        if (l.text.find("rax=0x2a") != std::string::npos &&
+            l.text.find("rip=0x400600") != std::string::npos)
+            saw = true;
+    CHECK(saw);
+
+    // log + continue: records and auto-resumes instead of stopping
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", 0x400600}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400600},
+             {"log", "logonly rcx={rcx}"}, {"continue", true}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_continue"}, {"stop", 0}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 500}});
+    CHECK(!e);
+    CHECK(r.value("halted", true) == false);
+    CHECK(r.value("condition_skipped", 0) > 0);
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", 0x400600}});
+    CHECK(!e);
+
+    slop::core::mcp::set_client_id("");
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
+}
+
+TEST_CASE(ps4_continuous_trace_to_file) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}});
+    REQUIRE(!e);
+
+    // steps: 4 records through a 2-entry ring -> 2 dropped, newest 2 flushed
+    const char* path = "ps4_trace_steps_test.jsonl";
+    std::remove(path);
+    r = dbg({{"action", "ps4_trace_start"}, {"mode", "steps"}, {"path", path},
+             {"ring_size", 2}, {"count", 4}, {"lwpid", 101}});
+    CHECK(!e);
+    if (e) std::printf("  trace_start err: %s\n", r.dump().c_str());
+    CHECK(r.value("started", false) == true);
+    CHECK(r.value("ring_size", 0) == 2u);
+    for (int i = 0; i < 200; ++i) {
+        r = dbg({{"action", "ps4_trace_status"}});
+        CHECK(!e);
+        if (!r.value("running", true)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    CHECK(r.value("running", true) == false);
+    if (r.value("records", 0) != 4)
+        std::printf("  trace status: %s\n", r.dump().c_str());
+    CHECK(r.value("records", 0) == 4u);
+    CHECK(r.value("dropped", 0) == 2u);
+    CHECK(r.value("stop_reason", std::string{}) == "count_reached");
+    CHECK(r.value("flushed", false) == true);
+    {
+        std::ifstream f(path);
+        REQUIRE(f.good());
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(f, line))
+            if (!line.empty()) lines.push_back(line);
+        REQUIRE(lines.size() == 2u);
+        const json first = json::parse(lines[0]);
+        const json last = json::parse(lines[1]);
+        CHECK(last.value("rip", 0ull) == first.value("rip", 0ull) + 1);
+        CHECK(last.value("lwpid", 0) == 101u);
+    }
+    std::remove(path);
+
+    // calls: two hits of the breakpoint, each with the argument registers
+    const char* cpath = "ps4_trace_calls_test.jsonl";
+    std::remove(cpath);
+    r = dbg({{"action", "ps4_trace_start"}, {"mode", "calls"}, {"addr", 0x400600},
+             {"path", cpath}, {"count", 2}});
+    CHECK(!e);
+    for (int i = 0; i < 200; ++i) {
+        r = dbg({{"action", "ps4_trace_status"}});
+        CHECK(!e);
+        if (!r.value("running", true)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    CHECK(r.value("running", true) == false);
+    CHECK(r.value("records", 0) == 2u);
+    CHECK(r.value("stop_reason", std::string{}) == "count_reached");
+    {
+        std::ifstream f(cpath);
+        REQUIRE(f.good());
+        std::vector<std::string> lines;
+        std::string line;
+        while (std::getline(f, line))
+            if (!line.empty()) lines.push_back(line);
+        REQUIRE(lines.size() == 2u);
+        const json rec = json::parse(lines[0]);
+        CHECK(rec.value("rip", 0ull) == 0x400600ull);
+        CHECK(rec.contains("rdi") && rec.contains("r9"));
+    }
+    std::remove(cpath);
+
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
+}
+
+TEST_CASE(ps4_step_steps_only_the_named_thread) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}});
+    REQUIRE(!e);
+
+    json main_before = dbg({{"action", "ps4_regs"}, {"lwpid", 101}});
+    json worker_before = dbg({{"action", "ps4_regs"}, {"lwpid", 102}});
+    CHECK(!e);
+    CHECK(main_before.value("rip", 0ull) == 0x400123ull);
+    CHECK(worker_before.value("rip", 0ull) == 0x400123ull);
+
+    r = dbg({{"action", "ps4_step"}, {"lwpid", 102}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 3000}});
+    CHECK(!e);
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("lwpid", 0) == 102u);
+
+    const json main_after = dbg({{"action", "ps4_regs"}, {"lwpid", 101}});
+    const json worker_after = dbg({{"action", "ps4_regs"}, {"lwpid", 102}});
+    CHECK(!e);
+    CHECK(main_after.value("rip", 0ull) == 0x400123ull);     // untouched
+    CHECK(worker_after.value("rip", 0ull) == 0x400124ull);   // stepped
+
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
+}
+
+TEST_CASE(ps4_debugger_events_pushed_over_event_bus) {
+    server_guard_t g;
+    ps4_disconnect_guard_t guard;
+    std::string err;
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
+    auto sub = slop::core::infra::event_bus::subscribe();
+    REQUIRE(sub != nullptr);
+
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    json r = dbg({{"action", "ps4_attach"}, {"pid", kFakePid}});
+    REQUIRE(!e);
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", 0x400500}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_continue"}, {"stop", 0}});
+    CHECK(!e);
+
+    bool saw_state = false, saw_stop = false;
+    std::string stop_frame;
+    const int64_t deadline = slop::core::infra::steady_ms() + 5000;
+    while (slop::core::infra::steady_ms() < deadline && (!saw_state || !saw_stop)) {
+        std::string frame;
+        if (!sub->wait(frame, 500)) break;
+        if (frame.find("event: debugger.state") != std::string::npos &&
+            frame.find("\"attached\":true") != std::string::npos)
+            saw_state = true;
+        if (frame.find("event: debugger.stop") != std::string::npos) {
+            saw_stop = true;
+            stop_frame = frame;
+        }
+    }
+    CHECK(saw_state);
+    CHECK(saw_stop);
+    CHECK(stop_frame.find("\"lwpid\":101") != std::string::npos);
+    CHECK(stop_frame.find("\"rip\":4195584") != std::string::npos);   // 0x400500
+
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
 }

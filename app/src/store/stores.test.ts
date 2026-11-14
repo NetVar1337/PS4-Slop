@@ -125,6 +125,73 @@ describe("debugger", () => {
     expect(useDebugger.getState().regs).toBeNull();
   });
 
+  it("takes debugger stops and state from the push stream (item 28)", async () => {
+    const regs = Object.fromEntries(
+      [
+        "rip",
+        "rsp",
+        "rbp",
+        "rax",
+        "rbx",
+        "rcx",
+        "rdx",
+        "rsi",
+        "rdi",
+        "r8",
+        "r9",
+        "r10",
+        "r11",
+        "r12",
+        "r13",
+        "r14",
+        "r15",
+        "flags",
+      ].map((r, i) => [r, 0x1000 + i]),
+    );
+    mockApi(({ action }) => {
+      if (action === "ps4_callstack") return { frames: [{ ret_addr: 0x401000 }] };
+      return {};
+    });
+    const off = useDebugger.getState().connectStream();
+    events.connect();
+    const stream = EventSourceStub.instances.at(-1);
+    stream?.onopen?.();
+    stream?.emit("debugger.stop", {
+      ...regs,
+      lwpid: 101,
+      signal: 5,
+      thread: "main",
+      rip: 0x400500,
+    });
+    await vi.waitFor(() =>
+      expect(useDebugger.getState().events[0]).toMatchObject({
+        lwpid: 101,
+        signal: 5,
+        rip: 0x400500,
+      }),
+    );
+    expect(useDebugger.getState().regs?.rip).toBe(0x400500);
+    expect(useDebugger.getState().regsLwpid).toBe(101);
+    expect(useDebugger.getState().waitNote).toContain("stopped lwp 101");
+    await vi.waitFor(() =>
+      expect(useDebugger.getState().frames).toEqual([{ ret_addr: 0x401000 }]),
+    );
+
+    stream?.emit("debugger.log", {
+      lwpid: 101,
+      rip: 0x400500,
+      rip_hex: "0x400500",
+      text: "rax=0x2a rip=0x400500",
+    });
+    expect(useDebugger.getState().logs[0]).toBe("rax=0x2a rip=0x400500");
+
+    stream?.emit("debugger.state", { attached: false, pid: 0 });
+    expect(useDebugger.getState().status.debug_attached).toBe(false);
+    expect(useDebugger.getState().regs).toBeNull();
+    off();
+    events.disconnect();
+  });
+
   it("refreshes the whole view in one batched round trip (item 106)", async () => {
     const { fetch } = mockApi(({ action }) => {
       if (action === "status")

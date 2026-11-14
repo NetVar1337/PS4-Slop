@@ -1751,7 +1751,16 @@ int l_dbg_attach(lua_State* L) {
 int l_dbg_bp_set(lua_State* L) {
     return mcp_action(L, "debugger", "ps4_bp_set", [](arg_reader_t& a, json& j) {
         j["addr"] = a.u64(1, "addr");
-        if (a.has(2)) j["index"] = a.u64(2, "index");
+        if (!a.has(2)) return;
+        // second argument: a slot index, or a table of rule fields
+        // {index, condition, hits, hit_mode, log, ["continue"], force}
+        if (lua_type(a.L, 2) == LUA_TTABLE) {
+            json opts = lua_to_json(a.L, 2, 0, a.err);
+            if (!a.err.empty()) return;
+            if (opts.is_object()) j.update(opts);
+        } else {
+            j["index"] = a.u64(2, "index");
+        }
     });
 }
 
@@ -1881,9 +1890,40 @@ int l_dbg_trace_calls(lua_State* L) {
     });
 }
 
+// trace_start(mode, path, opts?): continuous trace flushed as JSONL
+int l_dbg_trace_start(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_trace_start", [](arg_reader_t& a, json& j) {
+        // writes the JSONL trace file: host access needs script_unsafe
+        if (!ctx_of(a.L)->unsafe) {
+            if (a.err.empty())
+                a.err = "debugger.trace_start writes a host file; it needs the script_unsafe setting";
+            return;
+        }
+        j["mode"] = a.str(1, "mode");
+        j["path"] = a.str(2, "path");
+        if (!a.has(3)) return;
+        if (lua_type(a.L, 3) != LUA_TTABLE) {
+            if (a.err.empty()) a.err = "debugger.trace_start: opts must be a table";
+            return;
+        }
+        json opts = lua_to_json(a.L, 3, 0, a.err);
+        if (!a.err.empty()) return;
+        if (opts.is_object()) j.update(opts);   // {addr, lwpid, ring_size, count, timeout_ms}
+    });
+}
+
+int l_dbg_trace_stop(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_trace_stop");
+}
+
+int l_dbg_trace_status(lua_State* L) {
+    return mcp_action(L, "debugger", "ps4_trace_status");
+}
+
 // actions that read host files are host access, not console access
 bool host_file_action(const std::string& action) {
-    return action == "ps4_elf_rpc" || action == "ps4_elf_load";
+    return action == "ps4_elf_rpc" || action == "ps4_elf_load" ||
+           action == "ps4_trace_start";   // writes the JSONL trace file
 }
 
 // slop.debugger.action(name, params): any debugger ps4_* action by name
@@ -2092,10 +2132,13 @@ int open_env(lua_State* L) {
         {"run_until",   l_dbg_run_until},
         {"find_write",  l_dbg_find_write},
         {"trace_calls", l_dbg_trace_calls},
+        {"trace_start", l_dbg_trace_start},
+        {"trace_stop",  l_dbg_trace_stop},
+        {"trace_status", l_dbg_trace_status},
         {"action",      l_dbg_action},
         {nullptr, nullptr},
     };
-    lua_createtable(L, 0, 23);
+    lua_createtable(L, 0, 26);
     set_funcs(L, kDebugger);
     lua_setfield(L, -2, "debugger");
 

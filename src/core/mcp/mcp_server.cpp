@@ -65,6 +65,17 @@ std::unordered_map<std::string, int64_t> g_tickets;
 
 thread_local bool t_used_primary = false;
 
+// tells tools which client is calling (breakpoint slot ownership)
+struct client_scope_t {
+    std::string prev;
+    explicit client_scope_t(std::string id) : prev(client_id()) {
+        set_client_id(std::move(id));
+    }
+    ~client_scope_t() { set_client_id(std::move(prev)); }
+    client_scope_t(const client_scope_t&) = delete;
+    client_scope_t& operator=(const client_scope_t&) = delete;
+};
+
 constexpr const char* kLatestProtocol = "2025-06-18";
 constexpr const char* kSupportedProtocols[] = {"2025-06-18", "2025-03-26", "2024-11-05"};
 constexpr const char* kServerName      = "slopstation";
@@ -305,6 +316,7 @@ json handle_request(const json& req, const std::string& session) {
                 if (it != g_active.end() && it->second == source) g_active.erase(it);
             }
         } registration{key, source};
+        client_scope_t client(session);
         json payload = call_tool(name, args, is_error, source->token());
         // memory reads can hand back junk bytes so swap bad utf8 instead of 500ing
         std::string text = payload.dump(2, ' ', true, json::error_handler_t::replace);
@@ -344,6 +356,7 @@ json handle_api(const json& req, infra::cancel_token_t cancel) {
 
     bool is_error = false;
     // /api is the UI channel and is the only caller allowed to reach `app`
+    client_scope_t client("ui");
     json payload = call_tool(tool, args, is_error, cancel, /*allow_app=*/true);
     json out{{"ok", !is_error}, {"data", std::move(payload)}};
     if (req.contains("id")) out["id"] = req.at("id");

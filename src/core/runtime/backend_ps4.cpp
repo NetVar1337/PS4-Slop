@@ -20,6 +20,7 @@
 
 #include "core/infra/clock.hpp"
 #include "core/infra/diag.hpp"
+#include "core/infra/event_bus.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1007,8 +1008,13 @@ struct backend_ps4_t::impl_t {
             wipe_slots();
         }
         // last: "detached" must never be observable with the old slots still listed
-        if (dbg_pid.exchange(0) != 0 && !why.empty())
-            infra::diag::info("ps4", "debug session ended: " + why);
+        const uint32_t was_pid = dbg_pid.exchange(0);
+        if (was_pid != 0) {
+            if (!why.empty()) infra::diag::info("ps4", "debug session ended: " + why);
+            infra::event_bus::publish("debugger.state",
+                nlohmann::json{{"attached", false}, {"pid", 0}, {"held", false},
+                               {"reason", why}});
+        }
     }
 
     // ---- events -------------------------------------------------------
@@ -1030,6 +1036,20 @@ struct backend_ps4_t::impl_t {
             evq.push_back(std::move(e));
         }
         ev_cv.notify_all();
+        // push the stop to the UI/agents over /events; polling ps4_wait stays
+        // available for callers that need the stop synchronously
+        infra::event_bus::publish("debugger.stop",
+            nlohmann::json{{"lwpid", e.lwpid}, {"signal", e.signal}, {"status", e.status},
+                           {"thread", std::string(e.thread_name)},
+                           {"rip", e.ctx.rip}, {"rsp", e.ctx.rsp}, {"rbp", e.ctx.rbp},
+                           {"rax", e.ctx.rax}, {"rbx", e.ctx.rbx},
+                           {"rcx", e.ctx.rcx}, {"rdx", e.ctx.rdx},
+                           {"rsi", e.ctx.rsi}, {"rdi", e.ctx.rdi},
+                           {"r8", e.ctx.r8}, {"r9", e.ctx.r9},
+                           {"r10", e.ctx.r10}, {"r11", e.ctx.r11},
+                           {"r12", e.ctx.r12}, {"r13", e.ctx.r13},
+                           {"r14", e.ctx.r14}, {"r15", e.ctx.r15},
+                           {"flags", e.ctx.flags}});
         if (killed) {
             std::lock_guard lk(dbg_mu);
             end_debug_session_locked("debuggee received SIGKILL");
@@ -1314,6 +1334,8 @@ struct backend_ps4_t::impl_t {
             // CMD_DEBUG_CONTINUE (unlike the local Win32 attach, which runs)
             dbg_held.store(true);
             if (!keep_slots) wipe_slots();
+            infra::event_bus::publish("debugger.state",
+                nlohmann::json{{"attached", true}, {"pid", pid}, {"held", true}});
         }
         clear_events();   // fresh debug session: drop stale events
         return 0;
@@ -2452,6 +2474,11 @@ io_result_t backend_ps4_t::ps4_continue(uint32_t stop) {
     auto r = simple_debug_cmd(*m_impl->conn, m_impl->cmd_budget_ms, ps4::CMD_DEBUG_CONTINUE,
                               &pkt, sizeof(pkt));
     if (!r.ok && was_held) m_impl->dbg_held.store(true);
+    if (r.ok) {
+        infra::event_bus::publish("debugger.state",
+            nlohmann::json{{"attached", true}, {"pid", m_impl->dbg_pid.load()},
+                           {"held", m_impl->dbg_held.load()}, {"stop", stop}});
+    }
     return r;
 }
 

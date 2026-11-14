@@ -64,6 +64,12 @@ struct local_debugger_t::impl_t {
     std::condition_variable ev_cv;
     std::deque<stop_event_t> evq;
 
+    // newest stop context, for callstacks taken while the process is held
+    mutable std::mutex last_mu;
+    runtime::thread_context_t last_ctx;
+    uint32_t last_tid = 0;
+    bool last_valid = false;
+
     // slots (read by callers, written on the debug thread)
     struct bp_t { bool used = false; uint64_t addr = 0; uint8_t orig = 0; };
     struct wp_t { bool used = false; uint64_t addr = 0; uint32_t len = 0, type = 0; };
@@ -160,6 +166,10 @@ struct local_debugger_t::impl_t {
                 runtime::context_from_win(ev.ctx, c);
                 ev.dr[0] = c.Dr0; ev.dr[1] = c.Dr1; ev.dr[2] = c.Dr2; ev.dr[3] = c.Dr3;
                 ev.dr[6] = c.Dr6; ev.dr[7] = c.Dr7;
+                std::lock_guard lk(last_mu);
+                last_ctx = ev.ctx;
+                last_tid = tid;
+                last_valid = true;
             }
         }
         return ev;
@@ -541,6 +551,11 @@ bool local_debugger_t::attach(uint32_t pid, std::string& err) {
         std::lock_guard lk(m_->ev_mu);
         m_->evq.clear();
     }
+    {
+        std::lock_guard lk(m_->last_mu);
+        m_->last_valid = false;
+        m_->last_tid = 0;
+    }
     HANDLE h = OpenProcess(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
                            PROCESS_QUERY_INFORMATION, FALSE, pid);
     if (!h) {
@@ -577,6 +592,13 @@ uint32_t local_debugger_t::pid() const noexcept {
 
 bool local_debugger_t::stopped() const noexcept {
     return m_->held.load();
+}
+
+bool local_debugger_t::last_stop_context(uint32_t tid, runtime::thread_context_t& out) const {
+    std::lock_guard lk(m_->last_mu);
+    if (!m_->last_valid || (tid != 0 && tid != m_->last_tid)) return false;
+    out = m_->last_ctx;
+    return true;
 }
 
 bool local_debugger_t::attached() const {

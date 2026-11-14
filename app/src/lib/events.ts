@@ -34,8 +34,33 @@ export type EngineEvent =
   | { type: "image.changed"; data: { loaded: boolean; name?: string; format?: ImageFormat } }
   | { type: "watch.list"; data: { entries: WatchEntry[] } }
   | { type: "watch.values"; data: { attached: boolean; values: WatchValue[] } }
+  | { type: "debugger.stop"; data: DebuggerStop }
+  | { type: "debugger.state"; data: DebuggerState }
+  | { type: "debugger.log"; data: DebuggerLog }
   | { type: "app.quitting"; data: { reason: string } }
   | { type: "server.stopping"; data: Record<string, never> };
+
+/** Pushed when the console debugger stops (breakpoint, watchpoint, step, signal). */
+export type DebuggerStop = {
+  lwpid: number;
+  signal: number;
+  status?: number;
+  thread?: string;
+  rip?: number;
+  rsp?: number;
+  rbp?: number;
+  [reg: string]: number | string | undefined;
+};
+
+export type DebuggerState = {
+  attached: boolean;
+  pid: number;
+  held?: boolean;
+  reason?: string;
+};
+
+/** One log-breakpoint line (also appended to the output panel). */
+export type DebuggerLog = { lwpid: number; rip: number; rip_hex: string; text: string };
 
 export type WatchEntry = {
   id: number;
@@ -72,6 +97,9 @@ const kEventNames: EventName[] = [
   "image.changed",
   "watch.list",
   "watch.values",
+  "debugger.stop",
+  "debugger.state",
+  "debugger.log",
   "app.quitting",
   "server.stopping",
 ];

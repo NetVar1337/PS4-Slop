@@ -4,6 +4,7 @@
 // Every call maps to a debugger ps4_* MCP action
 
 import { create } from "zustand";
+import * as events from "@/lib/events";
 import { batch, batchData, call, errorText } from "@/lib/rpc";
 
 export type Ps4Status = {
@@ -40,7 +41,21 @@ export type Ps4Event = {
 export type WaitResult = Partial<Ps4Event> &
   Partial<Regs> & { halted: boolean; pending?: number; timeout_ms?: number };
 
-export type SlotEntry = { addr: number; index: number };
+/** A breakpoint/watchpoint slot; the engine adds the rule it keeps for it. */
+export type SlotEntry = {
+  addr: number;
+  index: number;
+  armed?: boolean;
+  /** MCP session (or "ui") that armed the slot. */
+  owner?: string;
+  /** Stop only on the Nth hit (0 = every hit). */
+  hits?: number;
+  hit_mode?: string;
+  /** Hits the engine has seen since the rule was armed. */
+  count?: number;
+  log?: string;
+  condition?: string;
+};
 
 export type ScanHit = { addr: number; addr_hex?: string; value_hex?: string };
 
@@ -118,8 +133,12 @@ type DebuggerStore = {
   error: string | null;
   /** Result line of the last wait ("halted lwp 101 sig 5" / "no stop in 5s"). */
   waitNote: string | null;
+  /** Log-breakpoint lines pushed over /events, newest first. */
+  logs: string[];
   busy: boolean;
 
+  /** Subscribe to the pushed debugger events; returns the unsubscribe. */
+  connectStream: () => () => void;
   refresh: () => Promise<void>;
   attach: (pid: number) => Promise<void>;
   detach: () => Promise<void>;
@@ -180,7 +199,46 @@ export const useDebugger = create<DebuggerStore>((set, get) => {
     app: null,
     error: null,
     waitNote: null,
+    logs: [],
     busy: false,
+
+    connectStream: () => {
+      // the engine pushes every console stop over /events; the slow poll in
+      // the view is only a fallback for a dropped stream
+      const offStop = events.on("debugger.stop", (e) => {
+        const ev: Ps4Event = {
+          lwpid: e.lwpid,
+          signal: e.signal,
+          ...(e.status !== undefined ? { status: e.status } : {}),
+          ...(e.thread !== undefined ? { thread: e.thread } : {}),
+          ...(e.rip !== undefined ? { rip: e.rip } : {}),
+        };
+        const regs = regsFrom(e as unknown as Record<string, unknown>);
+        set((s) => ({
+          events: [ev, ...s.events].slice(0, kMaxEvents),
+          ...(regs !== null ? { regs, regsLwpid: ev.lwpid } : {}),
+          waitNote: `stopped lwp ${ev.lwpid}${ev.thread ? ` (${ev.thread})` : ""} · signal ${ev.signal}`,
+        }));
+        if (regs === null) void get().readRegs(ev.lwpid);
+        void get().readStack(ev.lwpid);
+      });
+      const offState = events.on("debugger.state", (e) => {
+        set((s) => ({
+          status: { ...s.status, debug_attached: e.attached, debug_pid: e.pid },
+          ...(e.attached
+            ? {}
+            : { regs: null, frames: [], breakpoints: [], watchpoints: [], waitNote: null }),
+        }));
+      });
+      const offLog = events.on("debugger.log", (e) => {
+        set((s) => ({ logs: [e.text, ...s.logs].slice(0, 50) }));
+      });
+      return () => {
+        offStop();
+        offState();
+        offLog();
+      };
+    },
 
     refresh: async () => {
       // One round trip for the whole view instead of six stacked ones;
@@ -422,6 +480,7 @@ export const useDebugger = create<DebuggerStore>((set, get) => {
         scan: null,
         app: null,
         waitNote: null,
+        logs: [],
         error: null,
       }),
   };

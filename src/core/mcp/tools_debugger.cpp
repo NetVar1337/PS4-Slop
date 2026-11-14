@@ -8,6 +8,7 @@
 #include "core/debugger/local_debugger.hpp"
 #include "core/debugger/ps4_debug_target.hpp"
 #include "core/memory/console_scan.hpp"
+#include "core/runtime/broker.hpp"
 
 namespace slop::core::mcp::detail {
 
@@ -48,7 +49,21 @@ struct bp_condition_t {
     uint64_t    value = 0;
 };
 
-std::unordered_map<uint64_t, bp_condition_t> g_bp_conditions;
+// one rule per breakpoint address: condition, hit count, log format and the
+// client that armed it (slots are shared by the UI, MCP sessions and scripts)
+struct bp_rule_t {
+    bool           has_condition = false;
+    bp_condition_t condition;
+    std::string    condition_text;
+    uint64_t       hits = 0;          // 0 = stop on every hit
+    std::string    hit_mode = "eq";   // eq | ge | every
+    std::string    log;               // empty = no log line
+    bool           log_continue = false;   // log and auto-resume
+    uint64_t       count = 0;         // hits the engine has seen
+    std::string    owner;             // client id that armed the slot
+};
+
+std::unordered_map<uint64_t, bp_rule_t> g_bp_rules;
 
 bool parse_bp_condition(const std::string& text, bp_condition_t& out, std::string& err) {
     std::string s;
@@ -117,6 +132,189 @@ bool eval_bp_condition(const bp_condition_t& c, const runtime::thread_context_t&
     if (c.op == "<=") return v <= c.value;
     if (c.op == "&")  return (v & c.value) != 0;
     return true;
+}
+
+bool bp_reg_by_name(const runtime::thread_context_t& c, const std::string& r, uint64_t& v) {
+    if (r == "rax") { v = c.rax; return true; }
+    if (r == "rbx") { v = c.rbx; return true; }
+    if (r == "rcx") { v = c.rcx; return true; }
+    if (r == "rdx") { v = c.rdx; return true; }
+    if (r == "rsi") { v = c.rsi; return true; }
+    if (r == "rdi") { v = c.rdi; return true; }
+    if (r == "rbp") { v = c.rbp; return true; }
+    if (r == "rsp") { v = c.rsp; return true; }
+    if (r == "r8")  { v = c.r8;  return true; }
+    if (r == "r9")  { v = c.r9;  return true; }
+    if (r == "r10") { v = c.r10; return true; }
+    if (r == "r11") { v = c.r11; return true; }
+    if (r == "r12") { v = c.r12; return true; }
+    if (r == "r13") { v = c.r13; return true; }
+    if (r == "r14") { v = c.r14; return true; }
+    if (r == "r15") { v = c.r15; return true; }
+    if (r == "rip") { v = c.rip; return true; }
+    if (r == "flags" || r == "eflags") { v = c.flags; return true; }
+    return false;
+}
+
+std::string hex64(uint64_t v) {
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "0x%llx", static_cast<unsigned long long>(v));
+    return buf;
+}
+
+std::string lower_ascii(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// "[rsp+8]" / "[rax]" / "[rbp-0x10]:u32" -> base register, displacement, width
+bool parse_mem_token(const std::string& t, std::string& reg, int64_t& disp, uint32_t& width) {
+    if (t.size() < 3 || t.front() != '[') return false;
+    const size_t close = t.find(']');
+    if (close == std::string::npos) return false;
+    std::string inner;
+    for (char c : t.substr(1, close - 1))
+        if (!std::isspace(static_cast<unsigned char>(c))) inner.push_back(c);
+    size_t i = 0;
+    while (i < inner.size() &&
+           (std::isalnum(static_cast<unsigned char>(inner[i])) || inner[i] == '_')) ++i;
+    reg = lower_ascii(inner.substr(0, i));
+    disp = 0;
+    if (i < inner.size()) {
+        if (inner[i] != '+' && inner[i] != '-') return false;
+        const bool neg = inner[i] == '-';
+        char* end = nullptr;
+        const unsigned long long d = std::strtoull(inner.c_str() + i + 1, &end, 0);
+        if (!end || *end != '\0') return false;
+        disp = neg ? -static_cast<int64_t>(d) : static_cast<int64_t>(d);
+    }
+    width = 8;
+    if (close + 1 < t.size()) {
+        if (t[close + 1] != ':') return false;
+        const std::string w = lower_ascii(t.substr(close + 2));
+        if (w == "u8") width = 1;
+        else if (w == "u16") width = 2;
+        else if (w == "u32") width = 4;
+        else if (w == "u64") width = 8;
+        else return false;
+    }
+    return !reg.empty();
+}
+
+using bp_read_fn = std::function<bool(uint64_t, void*, size_t)>;
+
+// log breakpoint format: {rax} {rip} {[rsp+8]:u64}; unknown tokens stay literal
+std::string format_bp_log(const std::string& fmt, const runtime::thread_context_t& ctx,
+                          const bp_read_fn& read) {
+    std::string out;
+    out.reserve(fmt.size() + 32);
+    for (size_t i = 0; i < fmt.size();) {
+        if (fmt[i] != '{') { out.push_back(fmt[i++]); continue; }
+        const size_t end = fmt.find('}', i + 1);
+        if (end == std::string::npos) { out.append(fmt.substr(i)); break; }
+        const std::string token = fmt.substr(i + 1, end - i - 1);
+        bool done = false;
+        if (!token.empty() && token[0] != '[') {
+            uint64_t v = 0;
+            if (bp_reg_by_name(ctx, lower_ascii(token), v)) {
+                out += hex64(v);
+                done = true;
+            }
+        } else {
+            std::string reg;
+            int64_t disp = 0;
+            uint32_t width = 8;
+            uint64_t base = 0;
+            if (parse_mem_token(token, reg, disp, width) &&
+                bp_reg_by_name(ctx, reg, base)) {
+                uint8_t buf[8]{};
+                if (read(base + static_cast<uint64_t>(disp), buf, width)) {
+                    uint64_t v = 0;
+                    std::memcpy(&v, buf, width);
+                    out += hex64(v);
+                } else {
+                    out += "<unreadable>";
+                }
+                done = true;
+            }
+        }
+        if (!done) out.append(fmt, i, end - i + 1);
+        i = end + 1;
+    }
+    return out;
+}
+
+// count this hit and decide whether the debugger stops (false = auto-resume).
+// log_line is filled when the rule has a log format.
+bool bp_rule_hit(bp_rule_t& r, const runtime::thread_context_t& ctx, const bp_read_fn& read,
+                 std::string& log_line) {
+    if (r.has_condition && !eval_bp_condition(r.condition, ctx)) return false;
+    ++r.count;
+    if (!r.log.empty()) log_line = format_bp_log(r.log, ctx, read);
+    if (r.log_continue) return false;   // log-only breakpoint
+    if (r.hits == 0) return true;
+    if (r.hit_mode == "ge") return r.count >= r.hits;
+    if (r.hit_mode == "every") return r.count % r.hits == 0;
+    return r.count == r.hits;           // eq
+}
+
+void emit_bp_log(const std::string& text, uint32_t lwpid, uint64_t rip) {
+    if (text.empty()) return;
+    infra::event_bus::output(text);
+    infra::event_bus::publish("debugger.log", json{{"lwpid", lwpid}, {"rip", rip},
+                                                   {"rip_hex", addr_hex_str(rip)},
+                                                   {"text", text}});
+}
+
+// rule fields merged into ps4_bp_list entries
+json bp_rule_json(uint64_t addr) {
+    const auto it = g_bp_rules.find(addr);
+    if (it == g_bp_rules.end()) return json::object();
+    const auto& r = it->second;
+    json o = {{"hits", r.hits}, {"hit_mode", r.hit_mode}, {"count", r.count},
+              {"log", r.log}, {"log_continue", r.log_continue}};
+    if (r.has_condition) o["condition"] = r.condition_text;
+    if (!r.owner.empty()) o["owner"] = r.owner;
+    return o;
+}
+
+// parse the rule arguments shared by the console and local ps4_bp_set paths
+bp_rule_t parse_bp_rule_args(const json& args) {
+    bp_rule_t r;
+    if (args.contains("condition") && args.at("condition").is_string()) {
+        const std::string text = args.at("condition").get<std::string>();
+        if (!text.empty()) {
+            std::string err;
+            if (!parse_bp_condition(text, r.condition, err))
+                fail("ps4_bp_set: bad condition: " + err);
+            r.has_condition = true;
+            r.condition_text = text;
+        }
+    }
+    if (args.contains("hits")) {
+        r.hits = parse_addr(args, "hits");
+        if (r.hits == 0) fail("ps4_bp_set: hits must be greater than 0");
+    }
+    r.hit_mode = args.value("hit_mode", std::string{"eq"});
+    if (r.hit_mode != "eq" && r.hit_mode != "ge" && r.hit_mode != "every")
+        fail("ps4_bp_set: hit_mode must be eq|ge|every");
+    if (args.contains("log") && args.at("log").is_string())
+        r.log = args.at("log").get<std::string>();
+    r.log_continue = args.value("continue", false);
+    if (r.log_continue && r.log.empty())
+        fail("ps4_bp_set: continue:true needs a log format");
+    r.owner = mcp::client_id();
+    return r;
+}
+
+// a slot armed by another client is not silently clobbered
+void require_bp_owner(uint64_t addr, bool force, const char* what) {
+    const auto it = g_bp_rules.find(addr);
+    if (it == g_bp_rules.end() || it->second.owner.empty() || force) return;
+    const std::string me = mcp::client_id();
+    if (it->second.owner == me) return;
+    fail(std::string(what) + ": " + addr_hex_str(addr) + " is owned by client '" +
+         it->second.owner + "'; pass force:true to take it over");
 }
 
 // a generic stop (console or local) in the same shape as ps4_event_json
@@ -319,6 +517,452 @@ json tool_debugger_composite(const std::string& action, const json& args) {
     return {{"lwpid", tid}, {"steps", steps}, {"steps_count", steps.size()},
             {"stop_reason", r.stop_reason}, {"debugger", t.kind()}};
 }
+
+// ---- local (usermode test-lab) debugger actions ---------------------------
+// The same engine-side breakpoint rules apply to a local test-lab process, so
+// conditions, hit counts and log breakpoints are testable without a console.
+
+bool local_debug_session() {
+    if (runtime::registry_ps4()) return false;
+    auto s = process::active_session();
+    return s && s->valid() && s->backend()->kind() == runtime::backend_kind_t::user_mode;
+}
+
+dbg::local_debugger_t& need_local() {
+    auto s = process::active_session();
+    if (!s || !s->valid())
+        fail("debugger: no local target attached (target.attach {pid})");
+    auto& d = local_debugger();
+    if (!d.attached() || d.pid() != s->pid()) {
+        std::string err;
+        if (!d.attach(s->pid(), err)) fail("debugger: local debugger attach failed: " + err);
+    }
+    return d;
+}
+
+json tool_ps4_trace(const std::string& action, const json& args);
+
+json local_bp_list_json(const dbg::local_debugger_t& d) {
+    json arr = json::array();
+    for (const auto& s : d.breakpoints()) {
+        json o = {{"addr", s.addr}, {"addr_hex", addr_hex_str(s.addr)},
+                  {"index", s.index}, {"armed", true}};
+        if (auto r = bp_rule_json(s.addr); r.is_object())
+            for (auto& kv : r.items()) o[kv.key()] = kv.value();
+        arr.push_back(std::move(o));
+    }
+    return arr;
+}
+
+// .pdata callstack over the local debugger's newest stop context
+json local_callstack(const json& args) {
+    auto& d = need_local();
+    const uint32_t lwpid = args.contains("lwpid")
+        ? static_cast<uint32_t>(parse_addr(args, "lwpid")) : 0;
+    const size_t depth = std::min<size_t>(args.value("depth", 32u), 64u);
+    runtime::thread_context_t ctx{};
+    if (!d.last_stop_context(lwpid, ctx))
+        fail("ps4_callstack: the local debuggee has no stop context yet (arm a breakpoint and wait)");
+
+    auto s = process::active_session();
+    std::vector<runtime::module_info_t> mods;
+    if (s && s->valid()) {
+        auto r = s->backend()->enum_modules(s->handle());
+        if (r.ok) mods = std::move(r.items);
+    }
+    const auto module_of = [&mods](uint64_t addr, unwind::module_span_t& out) {
+        for (const auto& m : mods) {
+            const uint64_t base = static_cast<uint64_t>(m.base);
+            if (addr >= base && addr < base + m.size) {
+                out.base = base;
+                out.size = m.size;
+                return true;
+            }
+        }
+        return false;
+    };
+    struct local_reader_t final : unwind::reader_t {
+        dbg::local_debugger_t& d;
+        explicit local_reader_t(dbg::local_debugger_t& x) : d(x) {}
+        bool read(uint64_t addr, void* dst, size_t len) override {
+            return d.read(addr, dst, len);
+        }
+    } rdr(d);
+
+    std::vector<unwind::frame_t> frames;
+    std::string note;
+    const bool pdata = unwind::pe_unwind(rdr, ctx, depth, module_of, frames, &note);
+    if (!pdata) {
+        // no .pdata for the paused module: rbp chain, the old behaviour
+        frames.clear();
+        for (const auto& f : dbg::rbp_frames(d, ctx, depth)) {
+            unwind::frame_t uf;
+            uf.ret_addr = f.ret_addr;
+            uf.frame_ptr = f.frame_ptr;
+            frames.push_back(uf);
+        }
+    }
+    json arr = json::array();
+    for (size_t i = 0; i < frames.size(); ++i)
+        arr.push_back({{"index", i}, {"ret_addr", frames[i].ret_addr},
+                       {"ret_addr_hex", addr_hex_str(frames[i].ret_addr)},
+                       {"frame_ptr", frames[i].frame_ptr}});
+    json o = {{"lwpid", lwpid}, {"frames", arr}, {"count", arr.size()},
+              {"debugger", "user"}, {"unwind", pdata ? "pdata" : "rbp"}};
+    if (!pdata) o["note"] = note;
+    return o;
+}
+
+json tool_debugger_local(const std::string& action, const json& args) {
+    auto& d = need_local();
+    if (action == "ps4_bp_set") {
+        const uint64_t addr = parse_addr(args, "addr");
+        if (addr == 0) fail("ps4_bp_set: addr required");
+        require_bp_owner(addr, args.value("force", false), "ps4_bp_set");
+        uint32_t index = 0;
+        bool reused = false;
+        auto io = d.bp_arm(addr, index, reused);
+        if (!io.ok) io_fail("ps4_bp_set failed", io);
+        bp_rule_t rule = parse_bp_rule_args(args);
+        g_bp_rules[addr] = rule;
+        return {{"set", true}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                {"index", index}, {"hw", false}, {"already_armed", reused},
+                {"condition", rule.has_condition ? json(rule.condition_text) : json(nullptr)},
+                {"hits", rule.hits}, {"hit_mode", rule.hit_mode},
+                {"log", rule.log}, {"log_continue", rule.log_continue},
+                {"owner", rule.owner}, {"count", 0}, {"debugger", "user"}};
+    }
+    if (action == "ps4_bp_clear") {
+        uint64_t addr = 0;
+        uint32_t index = 0;
+        runtime::io_result_t io;
+        if (args.contains("addr")) {
+            addr = parse_addr(args, "addr");
+            require_bp_owner(addr, args.value("force", false), "ps4_bp_clear");
+            io = d.bp_disarm(addr);
+        } else if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+            for (const auto& s : d.breakpoints())
+                if (s.index == index) addr = s.addr;
+            if (addr == 0)
+                fail("ps4_bp_clear: no local breakpoint in slot " + std::to_string(index));
+            require_bp_owner(addr, args.value("force", false), "ps4_bp_clear");
+            io = d.bp_disarm(addr);
+        } else {
+            fail("ps4_bp_clear requires addr or index");
+        }
+        if (!io.ok) io_fail("ps4_bp_clear failed", io);
+        g_bp_rules.erase(addr);
+        return {{"cleared", true}, {"addr", addr}, {"index", index}, {"debugger", "user"}};
+    }
+    if (action == "ps4_bp_list") {
+        json arr = local_bp_list_json(d);
+        return {{"breakpoints", arr}, {"count", arr.size()}, {"debugger", "user"},
+                {"note", "client-side record; owner is the MCP session (or \"ui\") that "
+                         "armed the slot"}};
+    }
+    if (action == "ps4_continue") {
+        auto io = d.resume();
+        if (!io.ok) io_fail("ps4_continue failed", io);
+        return {{"continued", true}, {"stop", 0}, {"debugger", "user"}};
+    }
+    if (action == "ps4_step") {
+        const uint32_t lwpid = args.contains("lwpid")
+            ? static_cast<uint32_t>(parse_addr(args, "lwpid")) : 0;   // 0 = the held thread
+        auto io = d.step(lwpid);
+        if (!io.ok) io_fail("ps4_step failed", io);
+        return {{"stepped", true}, {"lwpid", lwpid}, {"debugger", "user"}};
+    }
+    if (action == "ps4_wait") {
+        const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        const bp_read_fn read = [&d](uint64_t a, void* dst, size_t n) {
+            return d.read(a, dst, n);
+        };
+        int skipped = 0;
+        for (;;) {
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now()).count();
+            if (left <= 0)
+                return {{"halted", false}, {"timeout_ms", timeout_ms},
+                        {"condition_skipped", skipped}, {"debugger", "user"}};
+            dbg::stop_event_t ev;
+            if (!d.wait_event(ev, static_cast<int>(left)))
+                return {{"halted", false}, {"timeout_ms", timeout_ms},
+                        {"condition_skipped", skipped}, {"debugger", "user"}};
+            if (ev.reason == "exit") {
+                json o = stop_json(ev);
+                o["halted"] = true;
+                o["process_exited"] = true;
+                o["debugger"] = "user";
+                return o;
+            }
+            const auto it = g_bp_rules.find(ev.ctx.rip);
+            if (it != g_bp_rules.end()) {
+                std::string line;
+                const bool stop = bp_rule_hit(it->second, ev.ctx, read, line);
+                emit_bp_log(line, ev.tid, ev.ctx.rip);
+                if (!stop) {
+                    if (++skipped > 64)
+                        return {{"halted", false}, {"reason", "condition_skip_limit"},
+                                {"condition_skipped", skipped}, {"debugger", "user"}};
+                    if (!d.resume().ok)
+                        return {{"halted", false}, {"reason", "resume_failed"},
+                                {"condition_skipped", skipped}, {"debugger", "user"}};
+                    continue;
+                }
+            }
+            json o = stop_json(ev);
+            o["halted"] = true;
+            o["condition_skipped"] = skipped;
+            o["debugger"] = "user";
+            return o;
+        }
+    }
+    if (action == "ps4_callstack") return local_callstack(args);
+    if (action == "ps4_trace_start" || action == "ps4_trace_stop" ||
+        action == "ps4_trace_status")
+        return tool_ps4_trace(action, args);
+    fail("debugger: " + action + " needs a connected console (target.ps4_connect)");
+}
+
+bool is_local_action(const std::string& action) {
+    return action == "ps4_bp_set" || action == "ps4_bp_clear" || action == "ps4_bp_list" ||
+           action == "ps4_continue" || action == "ps4_step" || action == "ps4_wait" ||
+           action == "ps4_callstack" || action == "ps4_trace_start" ||
+           action == "ps4_trace_stop" || action == "ps4_trace_status";
+}
+
+// ---- continuous trace (ring buffer in memory, flushed as JSONL) -----------
+
+struct trace_session_t {
+    std::mutex mu;
+    std::thread th;
+    std::atomic<bool> running{false};
+    std::atomic<bool> stop{false};
+    std::string mode, path, stop_reason, error;
+    size_t ring_size = 4096;
+    std::deque<json> ring;
+    uint64_t total = 0, dropped = 0;
+    int64_t started_ms = 0;
+    uint32_t lwpid = 0;
+    uint64_t addr = 0;
+    size_t limit = 0;
+    bool flushed = false;
+};
+
+struct trace_holder_t {
+    trace_session_t s;
+    ~trace_holder_t() {
+        s.stop = true;
+        if (s.th.joinable()) s.th.join();
+    }
+};
+
+trace_session_t& trace_sess() {
+    static trace_holder_t h;
+    return h.s;
+}
+
+void trace_record(trace_session_t& ts, json rec) {
+    std::lock_guard lk(ts.mu);
+    if (ts.ring.size() >= ts.ring_size) {
+        ts.ring.pop_front();
+        ++ts.dropped;
+    }
+    ts.ring.push_back(std::move(rec));
+    ++ts.total;
+}
+
+bool trace_flush(trace_session_t& ts) {
+    std::deque<json> recs;
+    std::string path;
+    {
+        std::lock_guard lk(ts.mu);
+        recs = ts.ring;
+        path = ts.path;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::lock_guard lk(ts.mu);
+        ts.error = "cannot create " + path;
+        return false;
+    }
+    for (const auto& r : recs) out << r.dump() << '\n';
+    if (!out) {
+        std::lock_guard lk(ts.mu);
+        ts.error = "write failed: " + path;
+        return false;
+    }
+    std::lock_guard lk(ts.mu);
+    ts.flushed = true;
+    return true;
+}
+
+void trace_run(trace_session_t& ts, std::unique_ptr<picked_target_t> pk, std::string mode,
+               uint32_t lwpid, uint64_t addr, size_t limit, int timeout_ms) {
+    auto& t = *pk->t;
+    const int64_t started = infra::steady_ms();
+    std::string reason = "stopped";
+    std::string err;
+    size_t produced = 0;
+    // short waits keep ps4_trace_stop responsive (it joins this thread)
+    const int poll_ms = std::min(timeout_ms, 1000);
+    const auto gate = [] { return std::lock_guard<std::recursive_mutex>(runtime::broker_gate()); };
+    try {
+        if (mode == "steps") {
+            while (!ts.stop.load()) {
+                if (limit != 0 && produced >= limit) { reason = "count_reached"; break; }
+                runtime::io_result_t io;
+                { auto g = gate(); io = t.step(lwpid); }
+                if (!io.ok) {
+                    reason = "step_failed";
+                    err = runtime::ps4::io_error_str(io.error);
+                    break;
+                }
+                dbg::stop_event_t ev;
+                bool got = false;
+                { auto g = gate(); got = t.wait_event(ev, poll_ms); }
+                if (!got) { reason = "timeout"; break; }
+                if (ev.reason == "exit") { reason = "process_exited"; break; }
+                if (lwpid == 0) lwpid = ev.tid;
+                trace_record(ts, {{"seq", produced},
+                                  {"ms", infra::steady_ms() - started},
+                                  {"lwpid", ev.tid},
+                                  {"rip", ev.ctx.rip},
+                                  {"rip_hex", addr_hex_str(ev.ctx.rip)},
+                                  {"reason", ev.reason}});
+                ++produced;
+            }
+        } else {
+            uint32_t index = 0;
+            bool reused = false;
+            runtime::io_result_t io;
+            { auto g = gate(); io = t.bp_arm(addr, index, reused); }
+            if (!io.ok) {
+                reason = "arm_failed";
+                err = runtime::ps4::io_error_str(io.error);
+            } else {
+                { auto g = gate(); if (t.stopped()) t.resume(); }
+                while (!ts.stop.load()) {
+                    if (limit != 0 && produced >= limit) { reason = "count_reached"; break; }
+                    dbg::stop_event_t ev;
+                    bool got = false;
+                    { auto g = gate(); got = t.wait_event(ev, poll_ms); }
+                    if (!got) { reason = "timeout"; break; }
+                    if (ev.reason == "exit") { reason = "process_exited"; break; }
+                    if (dbg::stop_at(ev, addr)) {
+                        trace_record(ts, {{"seq", produced},
+                                          {"ms", infra::steady_ms() - started},
+                                          {"lwpid", ev.tid},
+                                          {"rip", ev.ctx.rip},
+                                          {"rip_hex", addr_hex_str(ev.ctx.rip)},
+                                          {"rdi", ev.ctx.rdi}, {"rsi", ev.ctx.rsi},
+                                          {"rdx", ev.ctx.rdx}, {"rcx", ev.ctx.rcx},
+                                          {"r8", ev.ctx.r8}, {"r9", ev.ctx.r9}});
+                        ++produced;
+                    }
+                    runtime::io_result_t rio;
+                    { auto g = gate(); rio = t.resume(); }
+                    if (!rio.ok) { reason = "resume_failed"; break; }
+                }
+                if (!reused) { auto g = gate(); t.bp_disarm(addr); }
+            }
+        }
+    } catch (const std::exception& ex) {
+        reason = "error";
+        err = ex.what();
+    }
+    {
+        std::lock_guard lk(ts.mu);
+        ts.stop_reason = reason;
+        if (!err.empty()) ts.error = err;
+    }
+    trace_flush(ts);
+    ts.running = false;
+}
+
+// stop and join a trace (detach, shutdown); safe when none runs
+void trace_stop_join() {
+    auto& ts = trace_sess();
+    ts.stop = true;
+    if (ts.th.joinable()) ts.th.join();
+}
+
+json tool_ps4_trace(const std::string& action, const json& args) {
+    auto& ts = trace_sess();
+    if (action == "ps4_trace_status") {
+        std::lock_guard lk(ts.mu);
+        json last = json::array();
+        const size_t take = std::min<size_t>(ts.ring.size(), 8);
+        for (size_t i = ts.ring.size() - take; i < ts.ring.size(); ++i)
+            last.push_back(ts.ring[i]);
+        return {{"running", ts.running.load()}, {"mode", ts.mode}, {"path", ts.path},
+                {"records", ts.total}, {"buffered", ts.ring.size()},
+                {"ring_size", ts.ring_size}, {"dropped", ts.dropped},
+                {"stop_reason", ts.stop_reason}, {"error", ts.error},
+                {"flushed", ts.flushed}, {"started_ms", ts.started_ms},
+                {"last", last}};
+    }
+    if (action == "ps4_trace_stop") {
+        if (!ts.running.load() && !ts.th.joinable())
+            fail("ps4_trace_stop: no trace session");
+        trace_stop_join();
+        std::lock_guard lk(ts.mu);
+        return {{"stopped", true}, {"path", ts.path}, {"records", ts.total},
+                {"dropped", ts.dropped}, {"stop_reason", ts.stop_reason},
+                {"flushed", ts.flushed}, {"error", ts.error}};
+    }
+    // ps4_trace_start
+    if (ts.running.load())
+        fail("ps4_trace_start: a trace is already running (ps4_trace_stop first)");
+    if (ts.th.joinable()) ts.th.join();   // reap a trace that finished on its own
+    const std::string mode = args.value("mode", std::string{"steps"});
+    if (mode != "steps" && mode != "calls")
+        fail("ps4_trace_start: mode must be steps|calls");
+    if (!args.contains("path") || !args.at("path").is_string())
+        fail("ps4_trace_start requires 'path' (JSONL output)");
+    const std::string path = args.at("path").get<std::string>();
+    const size_t ring = std::min<size_t>(args.value("ring_size", 4096u), 1u << 20);
+    if (ring == 0) fail("ps4_trace_start: ring_size must be greater than 0");
+    const size_t limit = args.contains("count") ? args.value("count", 0u) : 0;
+    const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
+    uint32_t lwpid = 0;
+    uint64_t addr = 0;
+    if (mode == "calls") addr = parse_addr(args, "addr");
+    else if (args.contains("lwpid")) lwpid = static_cast<uint32_t>(parse_addr(args, "lwpid"));
+
+    auto pk = std::make_unique<picked_target_t>(pick_debug_target(action));
+    const std::string kind = pk->t->kind();
+    {
+        std::lock_guard lk(ts.mu);
+        ts.mode = mode;
+        ts.path = path;
+        ts.ring_size = ring;
+        ts.ring.clear();
+        ts.total = 0;
+        ts.dropped = 0;
+        ts.stop_reason.clear();
+        ts.error.clear();
+        ts.started_ms = infra::wall_ms();
+        ts.lwpid = lwpid;
+        ts.addr = addr;
+        ts.limit = limit;
+        ts.flushed = false;
+    }
+    ts.stop = false;
+    ts.running = true;
+    ts.th = std::thread([&ts, pk = std::move(pk), mode, lwpid, addr, limit, timeout_ms]() mutable {
+        trace_run(ts, std::move(pk), mode, lwpid, addr, limit, timeout_ms);
+    });
+    return {{"started", true}, {"mode", mode}, {"path", path}, {"ring_size", ring},
+            {"count", limit}, {"lwpid", lwpid}, {"addr", addr},
+            {"debugger", kind},
+            {"note", "records stay in the ring until ps4_trace_stop (or count) flushes "
+                     "them to path as JSONL; ps4_trace_status previews the newest"}};
+}
+
 
 // native ps4debug-NG scan session (one per console connection); mirrors the
 // host-side memory.scan state but runs the scan on the console itself
@@ -1083,6 +1727,10 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
     auto& p = need_ps4();
 
+    if (action == "ps4_trace_start" || action == "ps4_trace_stop" ||
+        action == "ps4_trace_status")
+        return tool_ps4_trace(action, args);
+
     if (action.rfind("ps4_turbo_", 0) == 0 || action == "ps4_write_multi")
         return tool_ps4_turbo(action, args, p);
 
@@ -1137,8 +1785,9 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
                 {"branding", p.branding()}};
     }
     if (action == "ps4_detach") {
+        trace_stop_join();
         const bool clean = p.ps4_debug_detach();
-        g_bp_conditions.clear();   // conditions belong to the dead debug session
+        g_bp_rules.clear();   // rules belong to the dead debug session
         return {{"attached", false}, {"detach_acknowledged", clean}};
     }
     if (action == "ps4_console_info") {
@@ -1163,6 +1812,7 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         const uint64_t addr = parse_addr(args, "addr");
         if (!p.ps4_debug_attached())
             fail("ps4_bp_set requires ps4_attach first");
+        require_bp_owner(addr, args.value("force", false), "ps4_bp_set");
         const uint32_t want = args.contains("index")
             ? static_cast<uint32_t>(parse_addr(args, "index"))
             : runtime::backend_ps4_t::kAutoSlot;
@@ -1172,23 +1822,14 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         if (!io.ok) io_fail("ps4_bp_set failed (slot " +
                             (want == runtime::backend_ps4_t::kAutoSlot ? std::string("auto")
                                                                        : std::to_string(want)) + ")", io);
-        bool has_condition = false;
-        if (args.contains("condition") && args.at("condition").is_string()) {
-            const std::string text = args.at("condition").get<std::string>();
-            if (text.empty()) {
-                g_bp_conditions.erase(addr);
-            } else {
-                bp_condition_t cond;
-                std::string err;
-                if (!parse_bp_condition(text, cond, err))
-                    fail("ps4_bp_set: bad condition: " + err);
-                g_bp_conditions[addr] = std::move(cond);
-                has_condition = true;
-            }
-        }
+        bp_rule_t rule = parse_bp_rule_args(args);
+        g_bp_rules[addr] = rule;
         return {{"set", true}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
                 {"index", index}, {"hw", false}, {"already_armed", reused},
-                {"condition", has_condition ? args.at("condition") : json(nullptr)}};
+                {"condition", rule.has_condition ? json(rule.condition_text) : json(nullptr)},
+                {"hits", rule.hits}, {"hit_mode", rule.hit_mode},
+                {"log", rule.log}, {"log_continue", rule.log_continue},
+                {"owner", rule.owner}, {"count", 0}};
     }
     if (action == "ps4_bp_clear") {
         uint64_t addr = 0;
@@ -1196,15 +1837,20 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         runtime::io_result_t io;
         if (args.contains("addr")) {
             addr = parse_addr(args, "addr");
+            require_bp_owner(addr, args.value("force", false), "ps4_bp_clear");
             io = p.ps4_bp_disarm_addr(addr, &index);
         } else if (args.contains("index")) {
             index = static_cast<uint32_t>(parse_addr(args, "index"));
+            // find the address first so the owner check can run
+            for (const auto& s : p.ps4_breakpoints())
+                if (s.index == index) addr = s.addr;
+            if (addr != 0) require_bp_owner(addr, args.value("force", false), "ps4_bp_clear");
             io = p.ps4_bp_disarm(index, &addr);
         } else {
             fail("ps4_bp_clear requires addr or index");
         }
         if (!io.ok) io_fail("ps4_bp_clear failed", io);
-        g_bp_conditions.erase(addr);
+        g_bp_rules.erase(addr);
         return {{"cleared", true}, {"addr", addr}, {"index", index}};
     }
     if (action == "ps4_watch_set") {
@@ -1313,6 +1959,10 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
         const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(timeout_ms);
+        const auto s_hold = process::active_session();
+        const bp_read_fn read = [&s_hold](uint64_t a, void* dst, size_t n) {
+            return s_hold && s_hold->valid() && s_hold->read(a, dst, n).ok;
+        };
         int skipped = 0;
         for (;;) {
             runtime::ps4_event_t ev{};
@@ -1324,19 +1974,24 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
                         {"events_dropped", p.ps4_events_dropped()},
                         {"condition_skipped", skipped}};
             // INT3 leaves RIP one past the trap on some payloads; accept both
-            auto it = g_bp_conditions.find(ev.ctx.rip);
-            if (it == g_bp_conditions.end() && ev.ctx.rip > 0)
-                it = g_bp_conditions.find(ev.ctx.rip - 1);
-            if (it != g_bp_conditions.end() && !eval_bp_condition(it->second, ev.ctx)) {
-                // condition false: resume and keep waiting, bounded so a
-                // hot breakpoint cannot spin forever
-                if (++skipped > 64)
-                    return {{"halted", false}, {"reason", "condition_skip_limit"},
-                            {"condition_skipped", skipped}};
-                if (!p.ps4_continue(runtime::ps4::kStopResume).ok)
-                    return {{"halted", false}, {"reason", "resume_failed"},
-                            {"condition_skipped", skipped}};
-                continue;
+            auto it = g_bp_rules.find(ev.ctx.rip);
+            if (it == g_bp_rules.end() && ev.ctx.rip > 0)
+                it = g_bp_rules.find(ev.ctx.rip - 1);
+            if (it != g_bp_rules.end()) {
+                std::string line;
+                const bool stop = bp_rule_hit(it->second, ev.ctx, read, line);
+                emit_bp_log(line, ev.lwpid, ev.ctx.rip);
+                if (!stop) {
+                    // condition/hit count/log-only: resume and keep waiting,
+                    // bounded so a hot breakpoint cannot spin forever
+                    if (++skipped > 64)
+                        return {{"halted", false}, {"reason", "condition_skip_limit"},
+                                {"condition_skipped", skipped}};
+                    if (!p.ps4_continue(runtime::ps4::kStopResume).ok)
+                        return {{"halted", false}, {"reason", "resume_failed"},
+                                {"condition_skipped", skipped}};
+                    continue;
+                }
             }
             json o = ps4_event_json(ev);
             o["halted"] = true;
@@ -1368,12 +2023,27 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
     }
     if (action == "ps4_bp_list" || action == "ps4_watch_list") {
         const bool bp = action == "ps4_bp_list";
-        json arr = bp ? slots_json(p.ps4_breakpoints(), false) : slots_json(p.ps4_watchpoints(), true);
+        json arr;
+        if (bp) {
+            // the backend lists the slots; the engine adds the rule (owner,
+            // hit count, log format) it keeps for each address
+            arr = json::array();
+            for (const auto& s : p.ps4_breakpoints()) {
+                json o = {{"addr", s.addr}, {"addr_hex", addr_hex_str(s.addr)},
+                          {"index", s.index}, {"armed", s.armed}};
+                if (auto r = bp_rule_json(s.addr); r.is_object())
+                    for (auto& kv : r.items()) o[kv.key()] = kv.value();
+                arr.push_back(std::move(o));
+            }
+        } else {
+            arr = slots_json(p.ps4_watchpoints(), true);
+        }
         return {{bp ? "breakpoints" : "watchpoints", arr},
                 {"count", arr.size()},
                 {"note", "client-side record of slots armed through this backend (the payload "
                          "has no query command); cleared when the debug session ends, armed="
-                         "false while the connection is down (ps4_reconnect re-arms them)"}};
+                         "false while the connection is down (ps4_reconnect re-arms them); "
+                         "owner is the MCP session (or \"ui\") that armed the slot"}};
     }
     if (action == "ps4_call") {
         const uint64_t addr = parse_addr(args, "addr");
@@ -1676,11 +2346,16 @@ json tool_debugger(const json& args) {
     // the composite flows run on the console debugger, or on the local
     // Win32 debugger when the attached session is a local test-lab process
     if (is_composite(action)) return tool_debugger_composite(action, args);
+    // local test-lab process: the breakpoint rules, wait path and .pdata
+    // callstack work the same way as on the console
+    if (local_debug_session() && is_local_action(action))
+        return tool_debugger_local(action, args);
     if (action == "ps4_detach" && !runtime::registry_ps4()) {
         // local debugger session (composites on a test-lab process)
         auto& d = local_debugger();
         const bool was = d.attached();
         d.detach();
+        g_bp_rules.clear();
         return {{"attached", false}, {"debugger", "user"}, {"was_attached", was}};
     }
     if (action.rfind("ps4_", 0) == 0) {
@@ -1733,7 +2408,8 @@ json tool_debugger(const json& args) {
 }
 
 void clear_breakpoint_conditions() {
-    g_bp_conditions.clear();
+    trace_stop_join();
+    g_bp_rules.clear();
 }
 
 } // namespace slop::core::mcp::detail

@@ -6,10 +6,12 @@
 // synthetic stacks
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 #include "core/disasm/engine.hpp"
+#include "core/runtime/backend.hpp"
 
 namespace slop::core::debugger::unwind {
 
@@ -29,6 +31,26 @@ struct frame_t {
 std::vector<frame_t> walk_stack(disasm::engine_t& eng, reader_t& rdr,
                                 uint64_t rip, uint64_t rsp, uint64_t rbp,
                                 size_t max_frames = 32);
+
+// ---- PE x64 unwind info (.pdata) ------------------------------------------
+// The local usermode backend is Windows x64: every non-leaf function carries a
+// RUNTIME_FUNCTION in the module's .pdata, so the callstack does not need a
+// frame pointer. The tables are read from target memory, no OS unwind helper.
+
+struct module_span_t {
+    uint64_t base = 0;
+    uint64_t size = 0;
+};
+
+// true when addr belongs to a module (fills its load base and size)
+using module_of_fn = std::function<bool(uint64_t addr, module_span_t& out)>;
+
+// Frame 0 is ctx.rip itself (same shape as rbp_frames), then every caller
+// resolved through RUNTIME_FUNCTION/UNWIND_INFO. Returns false when the first
+// frame's module has no usable .pdata (caller falls back to walk_stack).
+bool pe_unwind(reader_t& rdr, const runtime::thread_context_t& ctx, size_t max_frames,
+               const module_of_fn& module_of, std::vector<frame_t>& out,
+               std::string* note = nullptr);
 
 struct seh_entry_t {
     uint64_t handler = 0;

@@ -126,7 +126,8 @@ TEST_CASE(lua_slop_table_exists_with_expected_surface) {
                              "bp_list", "watch_set", "watch_clear", "watch_list",
                              "continue", "step", "suspend", "resume", "wait",
                              "events", "regs", "set_reg", "callstack", "call",
-                             "run_until", "find_write", "trace_calls", "action"}) do
+                             "run_until", "find_write", "trace_calls",
+                             "trace_start", "trace_stop", "trace_status", "action"}) do
             assert(type(slop.debugger[fn]) == "function", "slop.debugger." .. fn)
         end
     )");
@@ -719,6 +720,14 @@ TEST_CASE(lua_debugger_bindings_route_through_mcp_actions) {
         assert(not ok and tostring(err):find("connected console"), tostring(err))
         ok, err = pcall(slop.debugger.bp_set)
         assert(not ok and tostring(err):find("addr required"), tostring(err))
+        -- the second bp_set argument is a rule table (hits/log/condition)
+        ok, err = pcall(slop.debugger.bp_set, 0x401000, {hits = 2, log = "rax={rax}"})
+        assert(not ok and tostring(err):find("connected console"), tostring(err))
+        ok, err = pcall(slop.debugger.trace_status)
+        assert(not ok and tostring(err):find("connected console"), tostring(err))
+        -- trace_start writes a host file: sandboxed scripts cannot reach it
+        ok, err = pcall(slop.debugger.trace_start, "steps", "C:/trace.jsonl")
+        assert(not ok and tostring(err):find("script_unsafe"), tostring(err))
         ok, err = pcall(slop.debugger.call, 0x1000, {1, 2, 3, 4, 5, 6, 7})
         assert(not ok and tostring(err):find("at most 6"), tostring(err))
         ok, err = pcall(slop.debugger.action, "bp_list", {})

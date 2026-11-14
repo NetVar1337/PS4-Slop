@@ -4,6 +4,10 @@
 
 #include "ps4_fixture.hpp"
 
+#include "core/infra/event_bus.hpp"
+
+#include <tlhelp32.h>
+
 TEST_CASE(ps4_status_console_info_and_mcp_reconnect) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
@@ -987,4 +991,176 @@ TEST_CASE(ps4_gdb_rsp_bridge) {
     CHECK(!rsp.running());
     REQUIRE(b.ps4_debug_detach());
     b.disconnect();
+}
+
+// === local debugger: rules, .pdata callstacks ===============================
+
+namespace {
+
+// entry point RVA of a PE32+ file (0 when unreadable)
+uint32_t pe_entry_rva(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return 0;
+    std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (b.size() < 0x40) return 0;
+    uint32_t lfanew = 0;
+    std::memcpy(&lfanew, b.data() + 0x3C, 4);
+    if (b.size() < static_cast<size_t>(lfanew) + 24 + 20 + 4) return 0;
+    uint32_t sig = 0;
+    std::memcpy(&sig, b.data() + lfanew, 4);
+    if (sig != 0x4550) return 0;
+    uint16_t magic = 0;
+    std::memcpy(&magic, b.data() + lfanew + 24, 2);
+    if (magic != 0x20B) return 0;
+    uint32_t entry = 0;
+    std::memcpy(&entry, b.data() + lfanew + 24 + 16, 4);
+    return entry;
+}
+
+// a CREATE_SUSPENDED process has no module list yet: read PEB.ImageBaseAddress
+uint64_t suspended_image_base(HANDLE proc) {
+    using ntqip_t = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static auto ntqip = reinterpret_cast<ntqip_t>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (!ntqip) return 0;
+    struct pbi_t {
+        PVOID reserved1;
+        PVOID peb;
+        PVOID reserved2[2];
+        ULONG_PTR unique_pid;
+        PVOID reserved3;
+    } pbi{};
+    ULONG len = 0;
+    if (ntqip(proc, 0 /*ProcessBasicInformation*/, &pbi, sizeof(pbi), &len) != 0) return 0;
+    uint64_t base = 0;
+    SIZE_T n = 0;
+    // PEB.ImageBaseAddress is at offset 0x10 on x64
+    if (!ReadProcessMemory(proc, static_cast<const uint8_t*>(pbi.peb) + 0x10, &base,
+                           sizeof(base), &n) ||
+        n != sizeof(base))
+        return 0;
+    return base;
+}
+
+} // namespace
+
+TEST_CASE_TIMEOUT(ps4_local_breakpoint_rules, 180) {
+    // the engine-side rules (hit counts, log breakpoints) also drive the local
+    // Win32 debugger, so they are testable without a console
+    slop::core::process::target_disconnect_ps4();
+    loop_target_t t;
+    REQUIRE(t.ok);
+    const uint64_t func = t.base + 0x40;
+    REQUIRE(slop::core::process::target_attach(t.pi.dwProcessId));
+
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+
+    json r = dbg({{"action", "ps4_bp_set"}, {"addr", func}, {"hits", 2}});
+    CHECK(!e);
+    if (e) std::printf("  local bp_set err: %s\n", r.dump().c_str());
+    CHECK(r.value("debugger", std::string{}) == "user");
+    CHECK(r.value("hits", 0) == 2);
+    r = dbg({{"action", "ps4_continue"}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 10000}});
+    CHECK(!e);
+    if (e) std::printf("  local wait err: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("rip", 0ull) == func);
+    CHECK(r.value("condition_skipped", 0) == 1);
+    r = dbg({{"action", "ps4_bp_list"}});
+    CHECK(!e);
+    CHECK(r.value("count", 0) == 1u);
+    CHECK(r["breakpoints"][0].value("count", 0) == 2u);
+    CHECK(r["breakpoints"][0].value("hits", 0) == 2u);
+
+    // log-only breakpoint: records and auto-resumes (bounded skip limit)
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", func}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_bp_set"}, {"addr", func},
+             {"log", "call rcx={rcx}"}, {"continue", true}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_continue"}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 1500}});
+    CHECK(!e);
+    CHECK(r.value("halted", true) == false);
+    CHECK(r.value("condition_skipped", 0) > 0);
+    bool saw = false;
+    for (const auto& l : slop::core::infra::event_bus::output_since(0))
+        if (l.text.find("call rcx=0x") != std::string::npos) saw = true;
+    CHECK(saw);
+
+    r = dbg({{"action", "ps4_bp_clear"}, {"addr", func}});
+    CHECK(!e);
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
+    slop::core::process::target_detach();
+}
+
+TEST_CASE_TIMEOUT(ps4_local_callstack_unwinds_pdata, 180) {
+#ifdef SLOP_TARGET_EXE_PATH
+    slop::core::process::target_disconnect_ps4();
+    const uint32_t entry_rva = pe_entry_rva(SLOP_TARGET_EXE_PATH);
+    REQUIRE(entry_rva != 0);
+
+    // start suspended so the breakpoint lands on the entry point itself
+    std::string cmd = std::string("\"") + SLOP_TARGET_EXE_PATH + "\" --auto 50";
+    std::vector<char> cmdline(cmd.begin(), cmd.end());
+    cmdline.push_back('\0');
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+    si.hStdInput = si.hStdOutput = si.hStdError = nul;
+    PROCESS_INFORMATION pi{};
+    REQUIRE(CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
+                           CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi));
+    CloseHandle(nul);
+    struct target_guard_t {
+        PROCESS_INFORMATION& pi;
+        ~target_guard_t() {
+            TerminateProcess(pi.hProcess, 0);
+            WaitForSingleObject(pi.hProcess, 5000);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+        }
+    } tguard{pi};
+
+    const uint64_t base = suspended_image_base(pi.hProcess);
+    REQUIRE(base != 0);
+    REQUIRE(slop::core::process::target_attach(pi.dwProcessId));
+
+    bool e = false;
+    auto dbg = [&](const json& a) { return slop::core::mcp::call_tool("debugger", a, e); };
+    json r = dbg({{"action", "ps4_bp_set"}, {"addr", base + entry_rva}});
+    CHECK(!e);
+    if (e) std::printf("  local entry bp err: %s\n", r.dump().c_str());
+    ResumeThread(pi.hThread);
+
+    r = dbg({{"action", "ps4_wait"}, {"timeout_ms", 15000}});
+    CHECK(!e);
+    if (e) std::printf("  local entry wait err: %s\n", r.dump().c_str());
+    CHECK(r.value("halted", false) == true);
+    CHECK(r.value("rip", 0ull) == base + entry_rva);
+
+    // .pdata (RUNTIME_FUNCTION/UNWIND_INFO) walks past the entry point into
+    // the loader frames; an rbp chain would stop at one frame
+    r = dbg({{"action", "ps4_callstack"}, {"depth", 16}});
+    CHECK(!e);
+    if (e) std::printf("  local callstack err: %s\n", r.dump().c_str());
+    CHECK(r.value("unwind", std::string{}) == "pdata");
+    CHECK(r.value("count", 0) >= 2u);
+    REQUIRE(r.contains("frames"));
+    REQUIRE(r["frames"].size() >= 2);
+    CHECK(r["frames"][0].value("ret_addr", 0ull) == base + entry_rva);
+    CHECK(r["frames"][1].value("ret_addr", 0ull) != 0ull);
+
+    r = dbg({{"action", "ps4_detach"}});
+    CHECK(!e);
+    slop::core::process::target_detach();
+#endif
 }

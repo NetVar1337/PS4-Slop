@@ -32,6 +32,10 @@ public:
     uint32_t pid() const noexcept;
     bool     stopped() const noexcept;   // a stop event is holding the process
 
+    // register context of the newest stop (tid 0 = any thread); false when no
+    // stop was seen yet. Used by the callstack (.pdata unwind) path.
+    bool     last_stop_context(uint32_t tid, runtime::thread_context_t& out) const;
+
     static constexpr uint32_t kMaxBreakpoints = 30;
     static constexpr uint32_t kMaxWatchpoints = 4;
     struct slot_t {
