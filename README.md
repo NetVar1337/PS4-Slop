@@ -292,10 +292,13 @@ The listener binds `127.0.0.1` only.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /health` | Liveness and version |
-| `POST /mcp` | MCP JSON-RPC 2.0: `initialize`, `ping`, `tools/list`, `tools/call` (protocol `2025-06-18`) |
-| `GET /mcp` | MCP SSE endpoint / keepalive |
-| `POST /api` | Direct frontend RPC; one request or an array |
-| `GET /events` | Frontend SSE stream: `hello`, `output`, `boot.stage`, `target.changed`, `backend.changed`, `hype.progress`, `watch.list`, `watch.values`, `app.quitting` |
+| `POST /mcp` | MCP JSON-RPC 2.0: `initialize`, `ping`, `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get` (protocol `2025-06-18`) |
+| `GET /mcp` | MCP SSE endpoint: keepalive plus `notifications/progress` for a `tools/call` that carried `_meta.progressToken` |
+| `POST /api/v1` | Direct frontend RPC; one request or an array |
+| `POST /api` | Deprecated alias of `/api/v1` (answers with a `Deprecation` header) |
+| `GET /api/v1/events` | Frontend SSE stream: `hello`, `output`, `boot.stage`, `target.changed`, `backend.changed`, `hype.progress`, `watch.list`, `watch.values`, `debugger.stop`, `debugger.state`, `debugger.log`, `types.changed`, `disasm.index_updated`, `app.quitting` |
+| `GET /events` | Deprecated alias of `/api/v1/events` |
+| `GET /api/v1/openapi.json` | OpenAPI 3.1 descriptor generated from the MCP tool schemas |
 
 `initialize` also returns `instructions` (a usage preamble) and `state` (backend badge,
 attached target, debugger state, loaded image, analysis readiness). The same context is
@@ -305,7 +308,7 @@ available through `target.status` and `disasm.loaded`.
 Invoke-RestMethod http://127.0.0.1:8765/health
 
 $body = @{ tool = 'target'; action = 'ps4_auto'; params = @{ host = '192.168.1.50' } } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/api -ContentType 'application/json' -Body $body
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/api/v1 -ContentType 'application/json' -Body $body
 
 $body = @{ jsonrpc = '2.0'; id = 1; method = 'tools/call'
            params = @{ name = 'target'; arguments = @{ action = 'list' } } } | ConvertTo-Json -Depth 8
@@ -323,20 +326,32 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/mcp -ContentType 'appl
   "mcp_token": "<auto>",
   "mcp_onboarded": false,
   "script_unsafe": false,
-  "web_allow_private": false
+  "web_allow_private": false,
+  "mcp_onboard_clients": [],
+  "mcp_token_in_configs": false,
+  "mcp_rate_limits": {},
+  "events_max_streams": 64,
+  "proxy_redact_secrets": true,
+  "fs_root": []
 }
 ```
 
-- **A bearer token is generated automatically on first start**; every `/mcp` and `/api`
-  call needs `Authorization: Bearer <token>`. Regenerate it from Settings
-  (`app.rotate_token`) — client configs and `engine.json` are updated in place.
-  `SLOP_MCP_TOKEN` adds a per-process token without persisting anything.
-- `SLOP_MCP_PORT` or `--port` overrides the port. If the port is busy the engine takes an
-  ephemeral port and skips onboarding.
-- The event stream (`/events`) authenticates with a **single-use ticket** from
+- **A bearer token is generated automatically on first start** (`BCryptGenRandom`, 32
+  bytes); every `/mcp` and `/api/v1` call needs `Authorization: Bearer <token>`, loopback
+  included. Regenerate it from Settings (`app.rotate_token`) — client configs and
+  `engine.json` are updated in place. `SLOP_MCP_TOKEN` adds a per-process token without
+  persisting anything. `--insecure-dev` accepts tokenless loopback requests for
+  `npm run dev`; it is the only way to turn the check off.
+- `--port <n>` overrides the port (it beats `SLOP_MCP_PORT` and the settings port). If the
+  port is busy the engine takes an ephemeral port and skips onboarding, and a stale
+  `engine.json` registration is probed and dropped instead of announced.
+- The event stream (`/api/v1/events`) authenticates with a **single-use ticket** from
   `app.events_ticket` — no token in URLs.
 - Other settings: `script_unsafe` (full Lua `io`/`os`), `web_allow_private` /
-  `web_allowlist` (deny loopback/LAN by default), `proxy_token`.
+  `web_allowlist` (deny loopback/LAN by default), `proxy_token`,
+  `proxy_redact_secrets` (default on), `fs_root` (jails every `fs` action),
+  `mcp_onboard_clients` (empty = Tern when installed, else every known client),
+  `mcp_token_in_configs` (default off), `mcp_rate_limits`, `events_max_streams`.
 - Request bodies are capped at 32 MiB. Every route validates `Host` and browser `Origin`
   (DNS-rebinding and cross-site JSON-RPC get 403).
 - Treat `script.run` as code execution regardless of the sandbox — the `slop.*` surface
@@ -348,30 +363,30 @@ Every tool takes an `action`; `tools/list` returns the exact schemas.
 
 | Tool | Actions |
 | --- | --- |
-| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_discover`, `ps4_send_payload`, `ps4_dump_module` |
-| `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `scan_save`, `scan_load`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `watch_undo`, `watch_freeze_once`, `pointerscan_verify`, `offsets_verify` |
-| `debugger` | `status` plus every `ps4_*` action above |
-| `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed` |
+| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_discover`, `ps4_send_payload`, `ps4_dump_module`, `ps5_connect`, `ps5_disconnect`, `ps5_reconnect`, `ps5_auto`, `ps5_notify`, `consoles_list`, `consoles_save`, `consoles_remove`, `consoles_switch` |
+| `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `scan_save`, `scan_load`, `scan_export`, `aob`, `pointerscan`, `pointerscan_verify`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `watch_undo`, `watch_freeze_once`, `watch_export_ct`, `watch_import_ct`, `offsets_verify`, `dissect` |
+| `debugger` | `status` plus every `ps4_*` and `ps5_*` action above |
+| `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings` (`decode:true` for XOR/ROT/base64 previews), `symbols`, `symbol_set`, `blocks` (`graph`), `globals`, `vtables`, `load`, `load_self`, `unload`, `analyze_stop`, `managed` |
 | `decomp` | `function` |
 | `xray` | `cfg`, `complexity`, `cff`, `obfuscation`, `strings_recon`, `indirect_calls`, `anti_analysis`, `hooks`, `syscalls`, `apihash`, `entropy`, `pages`, `crypto_range`, `gadgets` |
 | `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |
 | `devirt` | `themida_status`, `themida_start`, `themida_job`, `themida_cancel`, `identify`, `handlers`, `opcode_map`, `trace`, `lift`, `pseudocode`, `recover_cfg`, `prove_predicates`, `invariants`, `iat_audit` |
-| `emulate` | `run` |
+| `emulate` | `run`, `slice`, `session_create`, `session_step`, `session_run`, `session_destroy`, `snapshot`, `restore` — `arch:"arm64"` for Mach-O/iOS, `orbis_syscalls:true` for PS4 syscalls |
 | `analyze` | `packer`, `signatures`, `diff` |
-| `re` | `rtti_scan`, `vftable`, `danger`, `libsig` |
+| `re` | `rtti_scan`, `vftable`, `danger`, `libsig` (JSON sigsets or an IDA FLIRT `.sig`) |
 | `types` | `declare`, `create_struct`, `get_struct`, `list_structs`, `add_member`, `remove_member`, `create_enum`, `get_enum`, `list_enums`, `remove_enum`, `read_field`, `format_at` |
-| `notes` | `set_comment`, `get_comment`, `comments`, `bookmark_toggle`, `bookmarks` |
-| `network` | `status`, `capture_start`, `capture_stop`, `packets`, `dns`, `stats`, `export_pcap`, `streams`, `stream_data`, `reassemble_stream`, `connections`, `deep_inspect` |
-| `proxy` | `start`, `stop`, `status`, `entries`, `entry`, `replay`, `mitm_enable`, `mitm_disable` |
+| `notes` | `set_comment`, `get_comment`, `comments`, `bookmark_toggle`, `bookmarks`, `export`, `import` |
+| `network` | `status`, `capture_start`, `capture_stop`, `packets`, `dns`, `stats`, `export_pcap` (`pcap`/`pcapng`), `import_pcap`, `annotate`, `streams`, `stream_data`, `reassemble_stream`, `connections`, `deep_inspect`, `clear` |
+| `proxy` | `start`, `stop`, `status`, `entries`, `entry`, `replay`, `mitm_enable`, `mitm_disable`, `mitm_status`, `mitm_uninstall` |
 | `persist` | `save`, `list`, `load`, `delete`, `kv_set`, `kv_get`, `hype_save`, `hype_load` |
 | `fs` | `read_file`, `write_file`, `list_directory`, `create_directory`, `delete_path`, `search_files`, `grep_in_files` |
 | `web` | `fetch`, `post` |
-| `script` | `run` |
+| `script` | `run`, `api`, `list`, `save`, `load`, `delete` |
 | `gdb` | `start` (loopback-only, `allow_writes` opt-in), `stop`, `status` — GDB Remote bridge sharing the console session |
 | `host` | `start`, `stop`, `status`, `put` — HTTP payload host with sha256 `manifest.json`, token on non-loopback binds |
 | `guide` | `list`, `get` |
 
-`app` (`status`, `ping`, `output`, `output_clear`, `log`, `diag`, `shutdown`) is frontend
+`app` (`status`, `ping`, `output`, `output_clear`, `log`, `diag`, `diag_bundle`, `settings_get`, `settings_set`, `rotate_token`, `events_ticket`, `shutdown`) is frontend
 plumbing, reachable through `/api` only and hidden from `tools/list`.
 
 ### Automatic MCP client registration
@@ -398,17 +413,22 @@ desktop app), the stdio process bridges to it instead of starting a second one.
     "args": ["--stdio"] } } }
 ```
 
-Unparseable config files are left untouched. When a token is set, it is
-written into these files — **do not sync them publicly**. Run the engine with
-`--no-onboard` to skip registration; set `mcp_onboarded` to `false` to request another pass.
+Unparseable config files are left untouched. **Tern** (`%APPDATA%\tern\settings.json`,
+`agents.mcp`) is registered first when it is installed, and it is the only client written
+when it exists; agents running inside Tern then receive the server over ACP. Configs get
+`${SLOP_MCP_TOKEN}` by default (`mcp_token_in_configs` writes the literal token instead) —
+**do not sync them publicly**. Run the engine with `--no-onboard` to skip registration;
+set `mcp_onboarded` to `false` to request another pass.
 
 ## Lua scripting
 
 Scripts run from the **Scripts** panel, the `script` MCP tool (`action=run`, `code`,
 `timeout_ms`) or `/api`, against the same session as the UI — renames and comments made
 in one surface show up in all of them. Returned values are appended as `return: <value>`.
-Scripts are sandboxed by default (no `io`/`os` execution, memory and instruction caps);
-set `script_unsafe` in Settings for the full standard library.
+Scripts are sandboxed by default (no `io`/`os` execution, memory and instruction caps, and
+a wall-clock deadline that also covers a script stuck in native code); set `script_unsafe`
+in Settings for the full standard library, or pass `unsafe:true, confirm:true` to one
+`script.run` call. `slop.api()` lists every binding with its signature.
 
 ```lua
 -- read the player struct on the console, then rank the dump's functions
@@ -419,9 +439,9 @@ local hp, ammo, lives = string.unpack("<i4i4i4", raw)
 print("player: hp=" .. hp .. " ammo=" .. ammo .. " lives=" .. lives)
 
 -- the debugger surface is scriptable too
-slop.ps4.attach(st.pid)
-slop.ps4.bp_set(0x484490)
-local ev = slop.ps4.wait(5000)
+slop.debugger.attach(st.pid)
+slop.debugger.bp_set(0x484490, { hits = 2, log = "hit {rip}" })   -- or just (addr)
+local ev = slop.debugger.wait(5000)
 print(("stop: rip=0x%X thread=%s"):format(ev.rip, ev.thread))
 
 local fns = slop.disasm.functions(4000)
@@ -433,7 +453,7 @@ end
 
 | Group | Functions |
 | --- | --- |
-| Core | `slop.version()`, `slop.log(msg)` |
+| Core | `slop.version()`, `slop.api()`, `slop.log(msg)`, `slop.log(level, msg)`, `slop.log.debug/info/warn/error(msg)` |
 | Target | `slop.target.list()`, `attach(pid)`, `status()` |
 | Memory | `slop.mem.read_hex(addr, len)`, `write_hex(addr, data)`, `scan(...)` |
 | Image session | `slop.image.load(path[, base])`, `load_from_target`, `unload`, `status`, `wait_ready([ms])` |
@@ -443,13 +463,15 @@ end
 | Annotation | `slop.disasm.name/set_name/comment/set_comment`, `bookmark_toggle`, `bookmarks` |
 | Decompiler | `slop.decomp.decompile(va)`, `blocks(va)`, `vtables()`, `globals()`, `rtti()` |
 | Analysis | `slop.analyze.packer()` |
+| Console | `slop.ps4.connect(host[, port])`, `auto(host[, port])`, `disconnect()`, `status()` |
+| Debugger | `slop.debugger.status()`, `attach(pid)`, `detach()`, `bp_set(addr[, index\|opts])`, `bp_clear(addr)`, `bp_list()`, `watch_set(addr[, len[, type]])`, `watch_clear(addr)`, `watch_list()`, `continue([stop])`, `step([lwpid])`, `suspend(lwpid)`, `resume(lwpid)`, `wait([ms])`, `events([max])`, `regs([lwpid])`, `set_reg(lwpid, name, value)`, `callstack([lwpid[, depth]])`, `call(addr[, args[, pid]])`, `run_until(addr[, ms])`, `find_write(addr[, len[, ms]])`, `trace_calls(addr[, count[, ms]])`, `trace_start(mode, path[, opts])`, `trace_stop()`, `trace_status()`, `action(name, params)` |
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   subgraph PC["Analysis PC (Windows)"]
-    UI["Tauri v2 + React<br/>app/"] -- "/api, /events (HTTP + SSE)" --> ENG
+    UI["Tauri v2 + React<br/>app/"] -- "/api/v1, /api/v1/events (HTTP + SSE)" --> ENG
     AG["AI agent / MCP client"] -- "/mcp (JSON-RPC)" --> ENG
     IMGUI["ImGui / DX11 shell<br/>src/app + src/ui"] -- in-process --> CORE
     subgraph ENG["reverse-slop-engine.exe (src/engine)"]
@@ -516,7 +538,7 @@ powershell -File tools/build.ps1 -NoFrontend   # C++ only, fastest loop
 | `-NoFrontend` | C++ targets only |
 | `-FullClean` | Delete `build/` before configuring |
 | `-PlanOnly` | Configure without compiling |
-| `-Preset <name>` | `ninja-msvc-debug`, `ninja-msvc-asan`, `ninja-msvc-analyze` |
+| `-Preset <name>` | `ninja-msvc-debug`, `ninja-msvc-asan`, `ninja-msvc-analyze`, `ninja-msvc-fuzz` |
 | `-Full` | Self-contained installer: embeds WebView2 and Magicmida |
 
 The bundled payload is fetched from the latest ps4debug-NG release before packaging:
@@ -527,12 +549,14 @@ powershell -File tools/fetch_ps4debug.ps1 -Force   # re-download
 ```
 
 First-party targets compile with `/W4 /WX`. The legacy ImGui shell is optional
-(`SLOP_BUILD_UI=ON` in a local build); CI builds the engine and the Tauri app.
+(`SLOP_BUILD_UI=ON` in a local build, see [`docs/imgui-shell.md`](docs/imgui-shell.md) for what
+it covers); CI builds the engine and the Tauri app.
 
 | CMake option | Default | Builds |
 | --- | ---: | --- |
 | `SLOP_BUILD_ENGINE` | `ON` | headless engine |
 | `SLOP_BUILD_UI` | `ON` | legacy ImGui shell |
+| `SLOP_BUILD_FUZZ` | `OFF` | libFuzzer targets (`src/fuzz`, preset `ninja-msvc-fuzz`) |
 | `SLOP_BUILD_TEST_TARGET` | `ON` | `SlopTarget.exe` fixture |
 | `SLOP_BUILD_TESTS` | `ON` | `slop_tests.exe` |
 

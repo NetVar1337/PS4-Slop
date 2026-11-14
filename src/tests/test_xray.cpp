@@ -267,6 +267,9 @@ TEST_CASE(xray_crypto_range_finds_sha_constants) {
 TEST_CASE(imgpatch_write_journal_and_revert) {
     REQUIRE(disasm::binary_state::load_file(SLOP_TARGET_EXE_PATH));
     auto& bin = disasm::binary_state::get();
+    // the journal persists per image hash, so a patch an earlier test in this
+    // run left behind is replayed on load; start from the on-disk image
+    if (!bin.patches.empty()) REQUIRE(analysis::imgpatch::revert_all(bin).ok);
 
     const uint64_t va = bin.base + bin.pe.entry_rva;
     auto off = bin.offset_of(va);

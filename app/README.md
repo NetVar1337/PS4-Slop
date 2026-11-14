@@ -11,7 +11,7 @@ MCP, so whatever the UI does an agent can do, and vice versa.
 │ it, hands the UI {port, token} via IPC           │
 └───────────────┬──────────────────────────────────┘
                 │ engine_endpoint / engine-crashed / engine-restarted
-┌───────────────▼──────────────┐   POST /api  (bearer token)   ┌─────────────────────┐
+┌───────────────▼──────────────┐   POST /api/v1 (bearer token)   ┌─────────────────────┐
 │ React UI (this directory)    │ ─────────────────────────────▶│ reverse-slop-engine │
 │ zustand stores ◀── events ───│ ◀──── GET /events?ticket=… ───│ 127.0.0.1:<port>    │
 └──────────────────────────────┘        (server-sent events)   └─────────────────────┘
@@ -20,7 +20,7 @@ MCP, so whatever the UI does an agent can do, and vice versa.
 ## Architecture
 
 - **Transport** (`src/lib/rpc.ts`): `call(tool, action, params)` posts
-  `{tool, action, params}` to `/api` and returns `data` or throws `ToolError`.
+  `{tool, action, params}` to `/api/v1` and returns `data` or throws `ToolError`.
   Every request has a deadline (30 s default, longer for scans/dumps) so a
   wedged engine surfaces as a `TimeoutError` instead of a stuck spinner.
   `batch()` sends several actions in one round trip (the debugger view
@@ -129,7 +129,7 @@ VITE_SLOP_TOKEN=<the engine's mcp_token>
   function-list refresh on analysis completion, the native endpoint
   handshake, the ticketed event stream and startup/reconnect recovery.
 - `src/**/*.test.ts(x)` (vitest, jsdom): component and store tests with a fake
-  `/api` (`src/test/api.ts`). Each fixed UI bug has a regression test there.
+  `/api/v1` (`src/test/api.ts`). Each fixed UI bug has a regression test there.
 
 ## Conventions
 
