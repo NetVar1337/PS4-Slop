@@ -29,7 +29,8 @@
 //   slop.decomp.vtables() / globals() / rtti()   rich analysis DB views
 //
 // live target surface:
-//   slop.version() / slop.log(msg)
+//   slop.version() / slop.api() / slop.log(msg)
+//   slop.log(level, msg) / slop.log.debug|info|warn|error(msg)
 //   slop.target.list() / attach(pid) / status()
 //   slop.mem.read_hex(addr,len)       lowercase hex string of the bytes read
 //   slop.mem.read_bytes(addr,len)     raw bytes (binary lua string)
@@ -60,12 +61,20 @@
 // checks every kHookInstructions vm instructions), an allocation cap and an
 // output cap; print output is captured and the return value lands in the
 // output as return: ...
+//
+// wall-clock backstop: the hook only counts vm instructions, so a loop of
+// cheap C calls (slop.mem.read_bytes) or one long native call would outrun
+// it. every slop.* binding re-checks the deadline on entry, the allocator
+// refuses growth past the deadline, and blocking bindings clamp their wait
+// to the remaining budget. the run therefore ends within one binding call
+// of timeout_ms even when the vm never executes another instruction.
 
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "core/infra/cancel.hpp"
 
@@ -104,5 +113,36 @@ struct lua_run_result_t {
 
 lua_run_result_t lua_run(const std::string& code, const lua_run_options_t& opt);
 lua_run_result_t lua_run(const std::string& code, int timeout_ms = kDefaultTimeoutMs);
+
+// ---- script.api: the slop.* surface, generated from the registration tables
+//
+// one row per registered binding plus the top-level functions; the Scripts
+// panel builds its completion list from this and the MCP script.api action
+// returns it, so the docs cannot drift from what open_env() actually binds
+struct api_entry_t {
+    std::string group;     // "" for slop.version / slop.log / slop.api
+    std::string name;      // "read_hex"
+    std::string signature; // "(addr, len) -> hex string"
+    std::string doc;       // one line
+    bool        callable = true;   // false: a table with __call (slop.log)
+};
+const std::vector<api_entry_t>& api_entries();
+
+// ---- snippets: named scripts persisted under <app_data>\scripts
+//
+// names are 1..64 chars of [A-Za-z0-9._-], never "." or "..", so a snippet
+// name can never escape the folder
+
+struct snippet_t {
+    std::string name;
+    std::string code;
+    int64_t     updated_ms = 0;
+};
+
+bool snippet_name_valid(const std::string& name);
+bool snippet_save(const std::string& name, const std::string& code, std::string& err);
+std::vector<snippet_t> snippet_list(std::string& err);
+bool snippet_load(const std::string& name, snippet_t& out, std::string& err);
+bool snippet_delete(const std::string& name, std::string& err);
 
 } // namespace slop::core::script

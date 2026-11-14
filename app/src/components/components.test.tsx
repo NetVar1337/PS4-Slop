@@ -511,3 +511,76 @@ describe("command palette (item 123)", () => {
     await waitFor(() => expect(useDisasm.getState().selected).toBe(0x4dda48));
   });
 });
+
+describe("scripts panel: snippets, completion, unsafe consent (68, 69, 70)", () => {
+  const apiList = {
+    functions: [
+      { name: "slop.mem.read_hex", signature: "(addr, len) -> hex string", doc: "read" },
+      { name: "slop.mem.read_bytes", signature: "(addr, len) -> string", doc: "raw" },
+      { name: "slop.target.status", signature: "() -> status", doc: "target" },
+    ],
+  };
+
+  it("offers the built-in examples and loads one into the editor", async () => {
+    mockApi(({ action }) => (action === "list" ? { snippets: [] } : apiList));
+    render(<ScriptsPanel />);
+    const area = screen.getByRole("textbox", { name: "Lua script" }) as HTMLTextAreaElement;
+    await userEvent.click(screen.getByRole("button", { name: "bp + wait" }));
+    expect(area.value).toContain("slop.debugger.bp_set");
+    await userEvent.click(screen.getByRole("button", { name: "find value" }));
+    expect(area.value).toContain("slop.mem.scan");
+  });
+
+  it("completes slop.* names from script.api", async () => {
+    mockApi(({ action }) => (action === "list" ? { snippets: [] } : apiList));
+    render(<ScriptsPanel />);
+    const area = screen.getByRole("textbox", { name: "Lua script" }) as HTMLTextAreaElement;
+    await waitFor(() => expect(screen.queryByRole("listbox")).toBeNull());
+    await userEvent.clear(area);
+    await userEvent.type(area, "slop.me");
+    const list = await screen.findByRole("listbox", { name: "slop completions" });
+    expect(within(list).getByText("slop.mem.read_hex")).toBeInTheDocument();
+    await userEvent.keyboard("{Enter}");
+    expect(area.value).toBe("slop.mem.read_hex");
+  });
+
+  it("sends unsafe consent for one run only", async () => {
+    const { calls } = mockApi(({ action, params }) =>
+      action === "list"
+        ? { snippets: [] }
+        : action === "api"
+          ? apiList
+          : { ok: true, output: "", params },
+    );
+    render(<ScriptsPanel />);
+    const consent = screen.getByRole("checkbox", { name: "Allow unsafe for this run" });
+    await userEvent.click(consent);
+    expect(consent).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Run (Ctrl+Enter)" }));
+    await waitFor(() => expect(calls.some((c) => c.action === "run")).toBe(true));
+    const run = calls.find((c) => c.action === "run");
+    expect(run?.params.unsafe).toBe(true);
+    expect(run?.params.confirm).toBe(true);
+    // consent does not stick: the next run is sandboxed again
+    await waitFor(() => expect(consent).not.toBeChecked());
+  });
+
+  it("lists saved snippets and loads one into the editor", async () => {
+    const { calls } = mockApi(({ action, params }) => {
+      if (action === "api") return apiList;
+      if (action === "list") return { snippets: [{ name: "mine" }] };
+      if (action === "load") return { name: params.name, code: "return 7" };
+      return { ok: true };
+    });
+    render(<ScriptsPanel />);
+    const item = await screen.findByRole("button", { name: "mine" });
+    await userEvent.click(item);
+    const area = screen.getByRole("textbox", { name: "Lua script" }) as HTMLTextAreaElement;
+    await waitFor(() => expect(area.value).toBe("return 7"));
+
+    await userEvent.type(screen.getByRole("textbox", { name: "Snippet name" }), "saved-one");
+    await userEvent.click(screen.getByRole("button", { name: "Save snippet" }));
+    await waitFor(() => expect(calls.some((c) => c.action === "save")).toBe(true));
+    expect(calls.find((c) => c.action === "save")?.params.name).toBe("saved-one");
+  });
+});

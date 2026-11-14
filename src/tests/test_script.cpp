@@ -6,6 +6,8 @@
 #include "harness.hpp"
 
 #include "core/disasm/binary_state.hpp"
+#include "core/infra/diag.hpp"
+#include "core/infra/paths.hpp"
 #include "core/infra/settings.hpp"
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
@@ -623,16 +625,30 @@ TEST_CASE(lua_tool_mutex_is_per_binding_not_per_script) {
     REQUIRE(grabbed.load());
     REQUIRE(busy.output.find("return: true") != std::string::npos);
 
-    // a binding waiting for a held mutex gives up at the script deadline
-    // instead of hanging, and plain lua keeps running meanwhile
-    std::unique_lock held(mu);
+    // a binding waiting for a mutex held by another thread gives up at the
+    // script deadline instead of hanging (a same-thread try_lock is UB)
+    std::atomic<bool> locked{false};
+    std::atomic<bool> release{false};
+    std::thread holder([&] {
+        mu.lock();
+        locked = true;
+        while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        mu.unlock();
+    });
+    while (!locked.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     opt.timeout_ms = 300;
     const auto t0 = std::chrono::steady_clock::now();
     auto blocked = lua_run("local x = 1 + 1 return slop.target.status()", opt);
-    held.unlock();
+    const int64_t blocked_ms = elapsed_ms(t0);
+    release = true;
+    holder.join();
     REQUIRE_FALSE(blocked.ok);
-    REQUIRE(blocked.error.find("tool lock") != std::string::npos);
-    REQUIRE(elapsed_ms(t0) < 3000);
+    // the deadline is reported by the lock wait or by the binding entry; the
+    // contract is that the run ends at the budget, not the exact wording
+    if (blocked.error.find("timed out") == std::string::npos)
+        std::printf("  detail: %s\n", blocked.error.c_str());
+    REQUIRE(blocked.error.find("timed out") != std::string::npos);
+    REQUIRE(blocked_ms < 3000);
 
     // errors raised inside a locked binding release the mutex
     opt.timeout_ms = 5000;
@@ -743,4 +759,184 @@ TEST_CASE(lua_debugger_bindings_route_through_mcp_actions) {
     )");
     dump_on_fail(r);
     REQUIRE(r.ok);
+}
+
+// === wall-clock backstop (67, 106) ==========================================
+//
+// the instruction hook only counts vm instructions: a loop of cheap C calls
+// runs one native call per instruction, and one long native call runs none.
+// both are bounded by the binding-entry check and the allocator cap
+
+TEST_CASE(lua_runaway_c_call_loop_is_bounded) {
+    using namespace slop::core;
+    if (runtime::active_kind() != runtime::backend_kind_t::user_mode) {
+        std::printf("  [skip] needs the user-mode backend\n");
+        return;
+    }
+    REQUIRE(process::target_attach(GetCurrentProcessId()));
+    char addr[32];
+    std::snprintf(addr, sizeof(addr), "0x%llX",
+                  static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(&g_lua_probe[0])));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = lua_run(std::string(R"(
+        local a = )") + addr + R"(
+        local n = 0
+        for i = 1, 100000000 do n = n + #slop.mem.read_bytes(a, 1) end
+        return n
+    )", 300);
+    const int64_t took = elapsed_ms(t0);
+    process::target_detach();
+    dump_on_fail(r);
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.error.find("timed out") != std::string::npos);
+    REQUIRE(took < 3000);
+}
+
+TEST_CASE(lua_single_long_native_call_is_bounded) {
+    // one string.rep fills a 384 MiB buffer in C with no vm instructions in
+    // between, so the instruction hook cannot fire; the second allocation
+    // lands past the 10 ms deadline and the allocator refuses it
+    lua_run_options_t opt;
+    opt.timeout_ms = 10;
+    opt.mem_limit  = size_t{1024} << 20;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = lua_run(R"(
+        local a = string.rep("x", 384 * 1024 * 1024)
+        local b = string.rep("y", 384 * 1024 * 1024)
+        return #a + #b
+    )", opt);
+    const int64_t took = elapsed_ms(t0);
+    dump_on_fail(r);
+    REQUIRE_FALSE(r.ok);
+    REQUIRE(r.error.find("timed out") != std::string::npos);
+    // bounded by one native call, not by the whole script budget
+    REQUIRE(took < 30000);
+}
+
+// === structured logging (71) ================================================
+
+TEST_CASE(lua_log_levels_are_tagged_and_routed) {
+    slop::core::infra::diag::init();
+    auto r = lua_run(R"(
+        slop.log("plain", 1)
+        slop.log("warn", "disk full")
+        slop.log.info("hello")
+        slop.log.debug("detail")
+        slop.log.error("bad")
+        print("warn", "not a level")
+    )");
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+    REQUIRE(r.output.find("plain\t1") != std::string::npos);
+    REQUIRE(r.output.find("[warn] disk full") != std::string::npos);
+    REQUIRE(r.output.find("[info] hello") != std::string::npos);
+    REQUIRE(r.output.find("[debug] detail") != std::string::npos);
+    REQUIRE(r.output.find("[error] bad") != std::string::npos);
+    // print() keeps the legacy shape: no level detection there
+    REQUIRE(r.output.find("warn\tnot a level") != std::string::npos);
+
+    bool saw_warn = false, saw_error = false;
+    for (const auto& e : slop::core::infra::diag::snapshot().entries) {
+        if (e.tag != "script") continue;
+        if (e.level == slop::core::infra::diag::level_t::warn &&
+            e.message == "disk full")
+            saw_warn = true;
+        if (e.level == slop::core::infra::diag::level_t::error && e.message == "bad")
+            saw_error = true;
+    }
+    REQUIRE(saw_warn);
+    REQUIRE(saw_error);
+}
+
+// === script.api (69) ========================================================
+
+TEST_CASE(lua_api_lists_every_registered_binding) {
+    const auto& entries = api_entries();
+    REQUIRE(entries.size() > 50);
+
+    std::string code;
+    std::string want = "local want = {";
+    for (const auto& e : entries) {
+        REQUIRE(!e.name.empty());
+        REQUIRE(!e.signature.empty());
+        REQUIRE(!e.doc.empty());
+        const std::string full = e.group.empty() ? "slop." + e.name
+                                                 : "slop." + e.group + "." + e.name;
+        // every listed row resolves to a real binding of the right kind
+        code += "assert(type(" + full + ") == \"" +
+                (e.callable ? "function" : "table") + "\", \"" + full + "\")\n";
+        want += "\"" + full + "\",";
+    }
+    want += "}\n";
+    code += want + R"(
+        local got = {}
+        for _, e in ipairs(slop.api()) do
+            assert(type(e.signature) == "string" and #e.signature > 0, e.name)
+            assert(type(e.doc) == "string" and #e.doc > 0, e.name)
+            got[#got + 1] = e.name
+        end
+        assert(#got == #want, "count " .. #got .. " ~= " .. #want)
+        for i = 1, #want do
+            assert(got[i] == want[i], got[i] .. " ~= " .. want[i])
+        end
+        return #got
+    )";
+    auto r = lua_run(code);
+    dump_on_fail(r);
+    REQUIRE(r.ok);
+    REQUIRE(r.output.find("return: " + std::to_string(entries.size())) !=
+            std::string::npos);
+}
+
+// === snippets (68) ==========================================================
+
+TEST_CASE(lua_snippets_crud_and_name_validation) {
+    namespace fs = std::filesystem;
+    namespace paths = slop::core::infra::paths;
+    const auto dir = fs::temp_directory_path() /
+                     ("slop_lua_snippets_" + std::to_string(GetCurrentProcessId()));
+    fs::remove_all(dir);
+    paths::set_app_data_for_testing(dir.string());
+
+    std::string err;
+    REQUIRE(snippet_list(err).empty());
+    REQUIRE(err.empty());
+
+    REQUIRE(snippet_save("find-value", "return 1", err));
+    REQUIRE(snippet_save("dump.module_2", "return 2", err));
+    REQUIRE(err.empty());
+
+    auto list = snippet_list(err);
+    REQUIRE_EQ(list.size(), size_t{2});
+    REQUIRE_EQ(list[0].name, std::string("dump.module_2"));
+    REQUIRE_EQ(list[1].name, std::string("find-value"));
+    REQUIRE(list[1].updated_ms > 0);
+
+    snippet_t s;
+    REQUIRE(snippet_load("find-value", s, err));
+    REQUIRE_EQ(s.code, std::string("return 1"));
+
+    REQUIRE(snippet_save("find-value", "return 3", err));
+    REQUIRE(snippet_load("find-value", s, err));
+    REQUIRE_EQ(s.code, std::string("return 3"));
+
+    REQUIRE(snippet_delete("find-value", err));
+    REQUIRE_FALSE(snippet_load("find-value", s, err));
+    REQUIRE(err.find("no snippet") != std::string::npos);
+    REQUIRE_FALSE(snippet_delete("find-value", err));
+
+    // names are the only path component: traversal and separators are refused
+    for (const std::string bad : {std::string{}, std::string("."), std::string(".."),
+                                  std::string("../escape"), std::string("a/b"),
+                                  std::string("a\\b"), std::string("x:y"),
+                                  std::string("a b"), std::string(65, 'a')}) {
+        REQUIRE_FALSE(snippet_name_valid(bad));
+        err.clear();
+        REQUIRE_FALSE(snippet_save(bad, "return 1", err));
+        REQUIRE(!err.empty());
+    }
+    REQUIRE_FALSE(fs::exists(dir.parent_path() / "escape.lua"));
+
+    paths::init();
+    fs::remove_all(dir);
 }

@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <utility>
 
 namespace slop::core::infra::paths {
 
@@ -40,6 +41,15 @@ const std::string& app_data()      { return g_app_data; }
 const std::string& settings_file() { return g_settings_file; }
 const std::string& sessions_dir()  { return g_sessions_dir; }
 const std::string& crashes_dir()   { return g_crashes_dir; }
+
+void set_app_data_for_testing(std::string dir) {
+    g_app_data = std::move(dir);
+    g_settings_file = g_app_data + "\\settings.json";
+    g_sessions_dir  = g_app_data + "\\sessions";
+    g_crashes_dir   = g_app_data + "\\crashes";
+    std::error_code ec;
+    std::filesystem::create_directories(g_app_data, ec);
+}
 
 bool write_file_atomic(const std::string& path, std::string_view data) {
     namespace fs = std::filesystem;

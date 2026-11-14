@@ -6,6 +6,8 @@
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/hyperion_session.hpp"
+#include "core/infra/diag.hpp"
+#include "core/infra/paths.hpp"
 #include "core/infra/settings.hpp"
 #include "core/mcp/mcp_tools.hpp"
 #include "core/memory/memscan.hpp"
@@ -28,6 +30,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
 #include <map>
 #include <optional>
 #include <thread>
@@ -58,6 +64,7 @@ struct script_ctx_t {
     size_t                mem_used  = 0;
     size_t                mem_peak  = 0;
     size_t                mem_limit = kDefaultMemLimit;
+    bool                  alloc_timed_out = false;   // allocator refused past the deadline
 };
 
 int64_t now_ms() {
@@ -88,6 +95,12 @@ void* capped_alloc(void* ud, void* ptr, size_t osize, size_t nsize) {
         return nullptr;
     }
     if (nsize > old && c->mem_used - old + nsize > c->mem_limit) return nullptr;
+    // wall-clock backstop for one long native call (string.rep): a growth
+    // request past the deadline fails and the run reports a timeout
+    if (nsize > old && now_ms() > c->deadline_ms) {
+        c->alloc_timed_out = true;
+        return nullptr;
+    }
     void* p = std::realloc(ptr, nsize);
     if (!p) return nullptr;
     c->mem_used = c->mem_used - old + nsize;
@@ -115,6 +128,7 @@ uint64_t to_addr(lua_State* L, int idx) {
     return static_cast<uint64_t>(lua_tointegerx(L, idx, nullptr));
 }
 
+// print(): the legacy capture, no level, output only
 int l_log(lua_State* L) {
     const int n = lua_gettop(L);
     for (int i = 1; i <= n; ++i) {
@@ -127,6 +141,72 @@ int l_log(lua_State* L) {
     out_append(L, "\n");
     return 0;
 }
+
+// "debug"/"info"/"warn"/"error" (trace and warning accepted) as a level name
+bool log_level_of(const char* s, infra::diag::level_t& out) {
+    if (!s) return false;
+    if (std::strcmp(s, "debug") == 0 || std::strcmp(s, "trace") == 0) {
+        out = infra::diag::level_t::trace;
+        return true;
+    }
+    if (std::strcmp(s, "info") == 0) {
+        out = infra::diag::level_t::info;
+        return true;
+    }
+    if (std::strcmp(s, "warn") == 0 || std::strcmp(s, "warning") == 0) {
+        out = infra::diag::level_t::warn;
+        return true;
+    }
+    if (std::strcmp(s, "error") == 0) {
+        out = infra::diag::level_t::error;
+        return true;
+    }
+    return false;
+}
+
+// one slop.log line: "[level] " prefix in the captured output (the Scripts
+// panel renders it) and the same text in the engine diag ring
+int log_line(lua_State* L, const char* level, infra::diag::level_t dl, int first) {
+    script_ctx_t* c = ctx_of(L);
+    if (level) {
+        out_append(L, "[");
+        out_append(L, level);
+        out_append(L, "] ");
+    }
+    const size_t text_start = c->output.size();
+    const int n = lua_gettop(L);
+    for (int i = first; i <= n; ++i) {
+        size_t len = 0;
+        const char* s = luaL_tolstring(L, i, &len);
+        out_append(L, s ? std::string(s, len) : std::string("nil"));
+        lua_pop(L, 1);
+        if (i < n) out_append(L, "\t");
+    }
+    out_append(L, "\n");
+    // the diag entry carries the level itself, so its message is the raw text
+    if (!c->output_truncated && c->output.size() > text_start)
+        infra::diag::log(dl, "script",
+                         c->output.substr(text_start, c->output.size() - text_start - 1));
+    return 0;
+}
+
+// slop.log is called through its __call metamethod, so the table itself is
+// argument 1; slop.log(msg...) keeps the old tab-joined shape and
+// slop.log(level, msg...) tags the line when the first real argument names a
+// level
+int l_slop_log(lua_State* L) {
+    const int base = lua_gettop(L) >= 1 && lua_type(L, 1) == LUA_TTABLE ? 2 : 1;
+    infra::diag::level_t lvl = infra::diag::level_t::info;
+    if (lua_gettop(L) >= base + 1 && lua_type(L, base) == LUA_TSTRING &&
+        log_level_of(lua_tostring(L, base), lvl))
+        return log_line(L, lua_tostring(L, base), lvl, base + 1);
+    return log_line(L, nullptr, lvl, base);
+}
+
+int l_log_debug(lua_State* L) { return log_line(L, "debug", infra::diag::level_t::trace, 1); }
+int l_log_info(lua_State* L)  { return log_line(L, "info",  infra::diag::level_t::info,  1); }
+int l_log_warn(lua_State* L)  { return log_line(L, "warn",  infra::diag::level_t::warn,  1); }
+int l_log_error(lua_State* L) { return log_line(L, "error", infra::diag::level_t::error, 1); }
 
 int l_version(lua_State* L) {
     lua_pushstring(L, ctx_of(L)->unsafe
@@ -142,6 +222,16 @@ int l_version(lua_State* L) {
 // the message goes through %s so dynamic content is never a format string
 __declspec(noinline) int lua_fail(lua_State* L, const char* msg) {
     return luaL_error(L, "%s", msg);
+}
+
+// wall-clock backstop: the instruction hook cannot fire inside a C call, so
+// every binding entry re-checks the budget. a tight slop.mem.read_bytes loop
+// runs one native call per vm instruction and would otherwise outrun the
+// deadline. called before any lock is taken, so longjmp is safe here
+__declspec(noinline) void check_deadline(lua_State* L) {
+    const script_ctx_t* c = ctx_of(L);
+    if (c->cancel.cancelled()) lua_fail(L, "script cancelled");
+    if (now_ms() > c->deadline_ms) lua_fail(L, "script execution timed out");
 }
 
 // Push a table of strings (array part)
@@ -652,6 +742,7 @@ int l_image_status(lua_State* L) {
 
 int l_image_wait_ready(lua_State* L) {
     // never past the script budget: the hook cannot fire while we sleep here
+    check_deadline(L);
     const uint64_t timeout_req = lua_gettop(L) >= 1 ? to_addr(L, 1) : 30000;
     const int64_t budget = std::min<int64_t>(
         static_cast<int64_t>(std::min<uint64_t>(timeout_req, 300000)), remaining_ms(L));
@@ -1529,6 +1620,13 @@ int locked_call(lua_State* L, lua_CFunction f) {
         return lua_fail(L, c->cancel.cancelled()
                                ? "script cancelled while waiting for the tool lock"
                                : "script execution timed out while waiting for the tool lock");
+    // the lock is ours: a spent budget stops the run before the binding runs,
+    // so a loop of cheap C calls still ends at the deadline
+    if (c->cancel.cancelled() || now_ms() > c->deadline_ms) {
+        if (c->tool_mu) c->tool_mu->unlock();
+        return lua_fail(L, c->cancel.cancelled() ? "script cancelled"
+                                                 : "script execution timed out");
+    }
     const int st = lua_pcall(L, nargs, LUA_MULTRET, 0);
     if (c->tool_mu) c->tool_mu->unlock();
     if (st != LUA_OK) return lua_error(L);
@@ -1694,6 +1792,7 @@ using fill_fn = void (*)(arg_reader_t&, json&);
 // mutex itself, so these bindings are never wrapped in locked<>) and leaves
 // either the result table (true) or the error message (false) on the stack
 bool mcp_action_impl(lua_State* L, const char* tool, const char* action, fill_fn fill) {
+    check_deadline(L);
     std::string err;
     json args = {{"action", action}};
     arg_reader_t rd{L, err};
@@ -2003,6 +2102,258 @@ void set_funcs(lua_State* L, const luaL_Reg* regs) {
     }
 }
 
+// ---- the slop.* surface, one registration table per group ------------------
+// open_env binds exactly these and api_entries() documents exactly these, so
+// slop.api() / script.api cannot drift from what the engine really binds
+
+const luaL_Reg kTargetRegs[] = {
+    {"list",   locked<l_target_list>},
+    {"attach", locked<l_target_attach>},
+    {"status", locked<l_target_status>},
+    {nullptr, nullptr},
+};
+
+const luaL_Reg kMemRegs[] = {
+    {"read_hex",   locked<l_mem_read_hex>},
+    {"read_bytes", locked<l_mem_read_bytes>},
+    {"write_hex",  locked<l_mem_write>},
+    {"scan",       locked<l_mem_scan>},
+    {nullptr, nullptr},
+};
+
+const luaL_Reg kDisasmRegs[] = {
+    // live-target disassembly (attached process memory)
+    {"disassemble",     locked<l_disasm_disassemble>},
+    // static analysis over the loaded image, the IDA-style surface
+    {"decode",          locked<l_disasm_decode>},
+    {"functions",       locked<l_disasm_functions>},
+    {"function_at",     locked<l_disasm_function_at>},
+    {"xrefs_to",        locked<l_disasm_xrefs_to>},
+    {"strings",         locked<l_disasm_strings>},
+    {"pe",              locked<l_disasm_pe>},
+    {"bytes",           locked<l_image_bytes>},
+    // names/comments/bookmarks, persisted per binary hash, shared with the
+    // UI and the MCP tools
+    {"name",            locked<l_name_get>},
+    {"set_name",        locked<l_name_set>},
+    {"comment",         locked<l_comment_get>},
+    {"set_comment",     locked<l_comment_set>},
+    {"bookmark_toggle", locked<l_bookmark_toggle>},
+    {"bookmarks",       locked<l_bookmarks>},
+    {nullptr, nullptr},
+};
+
+const luaL_Reg kAnalyzeRegs[] = {
+    {"packer", locked<l_analyze_packer>},
+    {nullptr, nullptr},
+};
+
+// wait_ready only polls under the binary lock, holding the tool mutex while
+// it sleeps would stall every other tool
+const luaL_Reg kImageRegs[] = {
+    {"load",             locked<l_image_load>},
+    {"load_from_target", locked<l_image_load_from_target>},
+    {"unload",           locked<l_image_unload>},
+    {"status",           locked<l_image_status>},
+    {"wait_ready",       l_image_wait_ready},
+    {nullptr, nullptr},
+};
+
+// decompiler + hyperion-rich analysis (requires analysis-ready session)
+const luaL_Reg kDecompRegs[] = {
+    {"decompile", locked<l_decomp_function>},
+    {"blocks",    locked<l_decomp_blocks>},
+    {"vtables",   locked<l_decomp_vtables>},
+    {"globals",   locked<l_decomp_globals>},
+    {"rtti",      locked<l_decomp_rtti>},
+    {nullptr, nullptr},
+};
+
+// console connection; each call is one mcp action (call_tool locks)
+const luaL_Reg kPs4Regs[] = {
+    {"connect",    l_ps4_connect},
+    {"disconnect", l_ps4_disconnect},
+    {"auto",       l_ps4_auto},
+    {"status",     l_ps4_status},
+    {nullptr, nullptr},
+};
+
+const luaL_Reg kDebuggerRegs[] = {
+    {"status",      l_dbg_status},
+    {"attach",      l_dbg_attach},
+    {"detach",      l_dbg_detach},
+    {"bp_set",      l_dbg_bp_set},
+    {"bp_clear",    l_dbg_bp_clear},
+    {"bp_list",     l_dbg_bp_list},
+    {"watch_set",   l_dbg_watch_set},
+    {"watch_clear", l_dbg_watch_clear},
+    {"watch_list",  l_dbg_watch_list},
+    {"continue",    l_dbg_continue},
+    {"step",        l_dbg_step},
+    {"suspend",     l_dbg_suspend},
+    {"resume",      l_dbg_resume},
+    {"wait",        l_dbg_wait},
+    {"events",      l_dbg_events},
+    {"regs",        l_dbg_regs},
+    {"set_reg",     l_dbg_set_reg},
+    {"callstack",   l_dbg_callstack},
+    {"call",        l_dbg_call},
+    {"run_until",   l_dbg_run_until},
+    {"find_write",  l_dbg_find_write},
+    {"trace_calls", l_dbg_trace_calls},
+    {"trace_start", l_dbg_trace_start},
+    {"trace_stop",  l_dbg_trace_stop},
+    {"trace_status", l_dbg_trace_status},
+    {"action",      l_dbg_action},
+    {nullptr, nullptr},
+};
+
+struct api_group_t {
+    const char*     group;
+    const luaL_Reg* regs;
+};
+
+const api_group_t kApiGroups[] = {
+    {"target",   kTargetRegs},
+    {"mem",      kMemRegs},
+    {"disasm",   kDisasmRegs},
+    {"analyze",  kAnalyzeRegs},
+    {"image",    kImageRegs},
+    {"decomp",   kDecompRegs},
+    {"ps4",      kPs4Regs},
+    {"debugger", kDebuggerRegs},
+};
+
+// one line per binding; keyed "group.name" (top-level entries use "name")
+struct api_doc_t {
+    const char* key;
+    const char* signature;
+    const char* doc;
+    bool        callable = true;
+};
+
+const api_doc_t kTopDocs[] = {
+    {"version", "() -> string", "engine name plus the sandbox state", true},
+    {"log", "(msg...) | (level, msg...)",
+     "write a line to the output panel; level is debug|info|warn|error", false},
+    {"api", "() -> {name,signature,doc,callable}[]", "this surface, for completion", true},
+};
+
+const api_doc_t kApiDocs[] = {
+    {"target.list", "() -> {pid,name,arch,path}[]", "processes of the active backend"},
+    {"target.attach", "(pid) -> status", "attach the shared target session"},
+    {"target.status", "() -> {backend,attached,pid,name,...}", "current target state"},
+
+    {"mem.read_hex", "(addr, len) -> hex string", "read target memory as lowercase hex"},
+    {"mem.read_bytes", "(addr, len) -> string", "read target memory as raw bytes"},
+    {"mem.write_hex", "(addr, hex) -> bytes written", "write hex bytes to target memory"},
+    {"mem.scan", "(cfg) -> addr[]", "first scan; cfg={kind,width,begin,end,value,...}"},
+
+    {"disasm.disassemble", "(addr[, count]) -> string[]", "live-process disassembly text"},
+    {"disasm.decode", "(addr[, count]) -> {addr,len,text,bytes,target}[]", "static decode from the image"},
+    {"disasm.functions", "([limit]) -> {va,size,name,...}[]", "indexed functions of the image"},
+    {"disasm.function_at", "(va) -> row | nil", "owning function of an address"},
+    {"disasm.xrefs_to", "(va) -> {from,kind}[]", "references to an address"},
+    {"disasm.strings", "([min[, limit]]) -> {va,text,utf16}[]", "indexed strings"},
+    {"disasm.pe", "() -> {sections,imports,exports,...}", "PE headers, sections, imports"},
+    {"disasm.bytes", "(addr[, len]) -> string", "raw file-image bytes"},
+    {"disasm.name", "(va) -> string", "persisted name, or sub_<VA>"},
+    {"disasm.set_name", "(va, name) -> ok", "persisted rename (empty clears)"},
+    {"disasm.comment", "(va) -> string", "persisted comment"},
+    {"disasm.set_comment", "(va, text) -> ok", "persisted comment (empty clears)"},
+    {"disasm.bookmark_toggle", "(va) -> bool", "toggle a bookmark"},
+    {"disasm.bookmarks", "() -> va[]", "bookmarked addresses"},
+
+    {"analyze.packer", "([path]) -> {packed,family,confidence,...}", "packer heuristics"},
+
+    {"image.load", "(path[, base]) -> ok", "load a binary into the shared session"},
+    {"image.load_from_target", "() -> ok", "load the attached target's main module"},
+    {"image.unload", "() -> ok", "tear the session down"},
+    {"image.status", "() -> {ready,name,base,entry,hype,...}", "session state"},
+    {"image.wait_ready", "([ms]) -> bool", "block until hyperion analysis lands"},
+
+    {"decomp.decompile", "(va) -> {lines,signature,...}", "pseudo-C for one function"},
+    {"decomp.blocks", "(va) -> {blocks,loops}", "CFG blocks and loops"},
+    {"decomp.vtables", "() -> row[]", "recovered vtables"},
+    {"decomp.globals", "() -> row[]", "recovered globals"},
+    {"decomp.rtti", "() -> row[]", "RTTI classes"},
+
+    {"ps4.connect", "(host[, port]) -> status", "connect ps4debug-NG"},
+    {"ps4.disconnect", "() -> status", "drop the console connection"},
+    {"ps4.auto", "(host[, port]) -> status", "connect, pick the game, attach"},
+    {"ps4.status", "() -> status", "console + debug state"},
+
+    {"debugger.status", "() -> status", "debug session state"},
+    {"debugger.attach", "(pid) -> status", "debug-attach the payload"},
+    {"debugger.detach", "() -> status", "debug-detach"},
+    {"debugger.bp_set", "(addr[, index|opts]) -> {index}",
+     "arm a breakpoint; opts: {condition, hits, hit_mode, log, continue, force}"},
+    {"debugger.trace_start", "(mode, path[, opts]) -> {started}",
+     "continuous trace to a JSONL file (needs script_unsafe)"},
+    {"debugger.trace_stop", "() -> {stopped, lines}", "stop the continuous trace"},
+    {"debugger.trace_status", "() -> {running, lines, dropped}", "continuous trace state"},
+    {"debugger.bp_clear", "(addr) -> ok", "clear a breakpoint"},
+    {"debugger.bp_list", "() -> row[]", "armed breakpoints"},
+    {"debugger.watch_set", "(addr[, len[, type]]) -> {index}", "arm a hardware watchpoint"},
+    {"debugger.watch_clear", "(addr) -> ok", "clear a watchpoint"},
+    {"debugger.watch_list", "() -> row[]", "armed watchpoints"},
+    {"debugger.continue", "([stop]) -> status", "resume the debuggee"},
+    {"debugger.step", "([lwpid]) -> status", "single-step"},
+    {"debugger.suspend", "(lwpid) -> status", "suspend one thread"},
+    {"debugger.resume", "(lwpid) -> status", "resume one thread"},
+    {"debugger.wait", "([ms]) -> event", "wait for the next stop"},
+    {"debugger.events", "([max]) -> event[]", "drain queued stop events"},
+    {"debugger.regs", "([lwpid]) -> {reg:value}", "thread registers"},
+    {"debugger.set_reg", "(lwpid, name, value) -> ok", "write one register"},
+    {"debugger.callstack", "([lwpid[, depth]]) -> frame[]", "thread call stack"},
+    {"debugger.call", "(addr[, args[, pid]]) -> result", "remote call in the debuggee"},
+    {"debugger.run_until", "(addr[, ms]) -> event", "resume until an address"},
+    {"debugger.find_write", "(addr[, len[, ms]]) -> event", "catch the next write"},
+    {"debugger.trace_calls", "(addr[, count[, ms]]) -> event[]", "trace calls from an address"},
+    {"debugger.action", "(name, params) -> result", "any other debugger ps4_* action"},
+};
+
+const api_doc_t* find_doc(const std::string& key) {
+    for (const auto& d : kApiDocs)
+        if (key == d.key) return &d;
+    return nullptr;
+}
+
+// slop.log is callable (legacy slop.log(msg)) and carries the level helpers
+void push_log_table(lua_State* L) {
+    lua_createtable(L, 0, 4);
+    lua_pushcfunction(L, l_log_debug); lua_setfield(L, -2, "debug");
+    lua_pushcfunction(L, l_log_info);  lua_setfield(L, -2, "info");
+    lua_pushcfunction(L, l_log_warn);  lua_setfield(L, -2, "warn");
+    lua_pushcfunction(L, l_log_error); lua_setfield(L, -2, "error");
+    lua_createtable(L, 0, 1);
+    lua_pushcfunction(L, l_slop_log);
+    lua_setfield(L, -2, "__call");
+    lua_setmetatable(L, -2);
+}
+
+int l_api(lua_State* L) {
+    const auto& entries = api_entries();
+    lua_createtable(L, static_cast<int>(entries.size()), 0);
+    int i = 1;
+    for (const auto& e : entries) {
+        lua_createtable(L, 0, 4);
+        if (e.group.empty())
+            lua_pushfstring(L, "slop.%s", e.name.c_str());
+        else
+            lua_pushfstring(L, "slop.%s.%s", e.group.c_str(), e.name.c_str());
+        lua_setfield(L, -2, "name");
+        lua_pushlstring(L, e.signature.data(), e.signature.size());
+        lua_setfield(L, -2, "signature");
+        lua_pushlstring(L, e.doc.data(), e.doc.size());
+        lua_setfield(L, -2, "doc");
+        lua_pushboolean(L, e.callable);
+        lua_setfield(L, -2, "callable");
+        lua_rawseti(L, -2, i++);
+    }
+    return 1;
+}
+
 // opens the libraries and builds the slop table; runs under lua_pcall so a
 // memory-limit failure during setup is an error, not a panic
 int open_env(lua_State* L) {
@@ -2012,135 +2363,17 @@ int open_env(lua_State* L) {
     lua_pushcfunction(L, l_log);
     lua_setglobal(L, "print");
 
-    lua_createtable(L, 0, 12);
+    lua_createtable(L, 0, 16);
     lua_pushcfunction(L, l_version); lua_setfield(L, -2, "version");
-    lua_pushcfunction(L, l_log);     lua_setfield(L, -2, "log");
+    lua_pushcfunction(L, l_api);     lua_setfield(L, -2, "api");
+    push_log_table(L);
+    lua_setfield(L, -2, "log");
 
-    static const luaL_Reg kTarget[] = {
-        {"list",   locked<l_target_list>},
-        {"attach", locked<l_target_attach>},
-        {"status", locked<l_target_status>},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 3);
-    set_funcs(L, kTarget);
-    lua_setfield(L, -2, "target");
-
-    static const luaL_Reg kMem[] = {
-        {"read_hex",   locked<l_mem_read_hex>},
-        {"read_bytes", locked<l_mem_read_bytes>},
-        {"write_hex",  locked<l_mem_write>},
-        {"scan",       locked<l_mem_scan>},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 4);
-    set_funcs(L, kMem);
-    lua_setfield(L, -2, "mem");
-
-    static const luaL_Reg kDisasm[] = {
-        // live-target disassembly (attached process memory)
-        {"disassemble",     locked<l_disasm_disassemble>},
-        // static analysis over the loaded image, the IDA-style surface
-        {"decode",          locked<l_disasm_decode>},
-        {"functions",       locked<l_disasm_functions>},
-        {"function_at",     locked<l_disasm_function_at>},
-        {"xrefs_to",        locked<l_disasm_xrefs_to>},
-        {"strings",         locked<l_disasm_strings>},
-        {"pe",              locked<l_disasm_pe>},
-        {"bytes",           locked<l_image_bytes>},
-        // names/comments/bookmarks, persisted per binary hash, shared with
-        // the UI and the MCP tools
-        {"name",            locked<l_name_get>},
-        {"set_name",        locked<l_name_set>},
-        {"comment",         locked<l_comment_get>},
-        {"set_comment",     locked<l_comment_set>},
-        {"bookmark_toggle", locked<l_bookmark_toggle>},
-        {"bookmarks",       locked<l_bookmarks>},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 14);
-    set_funcs(L, kDisasm);
-    lua_setfield(L, -2, "disasm");
-
-    static const luaL_Reg kAnalyze[] = {
-        {"packer", locked<l_analyze_packer>},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 1);
-    set_funcs(L, kAnalyze);
-    lua_setfield(L, -2, "analyze");
-
-    // wait_ready only polls under the binary lock, holding the tool mutex
-    // while it sleeps would stall every other tool
-    static const luaL_Reg kImage[] = {
-        {"load",             locked<l_image_load>},
-        {"load_from_target", locked<l_image_load_from_target>},
-        {"unload",           locked<l_image_unload>},
-        {"status",           locked<l_image_status>},
-        {"wait_ready",       l_image_wait_ready},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 5);
-    set_funcs(L, kImage);
-    lua_setfield(L, -2, "image");
-
-    // decompiler + hyperion-rich analysis (requires analysis-ready session)
-    static const luaL_Reg kDecomp[] = {
-        {"decompile", locked<l_decomp_function>},
-        {"blocks",    locked<l_decomp_blocks>},
-        {"vtables",   locked<l_decomp_vtables>},
-        {"globals",   locked<l_decomp_globals>},
-        {"rtti",      locked<l_decomp_rtti>},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 5);
-    set_funcs(L, kDecomp);
-    lua_setfield(L, -2, "decomp");
-
-    // console connection; each call is one mcp action (call_tool locks)
-    static const luaL_Reg kPs4[] = {
-        {"connect",    l_ps4_connect},
-        {"disconnect", l_ps4_disconnect},
-        {"auto",       l_ps4_auto},
-        {"status",     l_ps4_status},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 4);
-    set_funcs(L, kPs4);
-    lua_setfield(L, -2, "ps4");
-
-    static const luaL_Reg kDebugger[] = {
-        {"status",      l_dbg_status},
-        {"attach",      l_dbg_attach},
-        {"detach",      l_dbg_detach},
-        {"bp_set",      l_dbg_bp_set},
-        {"bp_clear",    l_dbg_bp_clear},
-        {"bp_list",     l_dbg_bp_list},
-        {"watch_set",   l_dbg_watch_set},
-        {"watch_clear", l_dbg_watch_clear},
-        {"watch_list",  l_dbg_watch_list},
-        {"continue",    l_dbg_continue},
-        {"step",        l_dbg_step},
-        {"suspend",     l_dbg_suspend},
-        {"resume",      l_dbg_resume},
-        {"wait",        l_dbg_wait},
-        {"events",      l_dbg_events},
-        {"regs",        l_dbg_regs},
-        {"set_reg",     l_dbg_set_reg},
-        {"callstack",   l_dbg_callstack},
-        {"call",        l_dbg_call},
-        {"run_until",   l_dbg_run_until},
-        {"find_write",  l_dbg_find_write},
-        {"trace_calls", l_dbg_trace_calls},
-        {"trace_start", l_dbg_trace_start},
-        {"trace_stop",  l_dbg_trace_stop},
-        {"trace_status", l_dbg_trace_status},
-        {"action",      l_dbg_action},
-        {nullptr, nullptr},
-    };
-    lua_createtable(L, 0, 26);
-    set_funcs(L, kDebugger);
-    lua_setfield(L, -2, "debugger");
+    for (const auto& g : kApiGroups) {
+        lua_createtable(L, 0, 8);
+        set_funcs(L, g.regs);
+        lua_setfield(L, -2, g.group);
+    }
 
     lua_setglobal(L, "slop");
     return 0;
@@ -2157,14 +2390,149 @@ int serialize_return(lua_State* L) {
 
 std::string lua_error_text(lua_State* L, int status, const script_ctx_t& ctx,
                            const char* fallback) {
-    if (status == LUA_ERRMEM)
+    if (status == LUA_ERRMEM) {
+        if (ctx.alloc_timed_out) return "script execution timed out";
         return "script exceeded the memory limit (" +
                std::to_string(ctx.mem_limit >> 20) + " MiB)";
+    }
     const char* msg = lua_tostring(L, -1);
     return msg ? msg : fallback;
 }
 
 } // namespace
+
+// the api list is built from the registration tables above plus kApiDocs;
+// a binding without a doc row still shows up with an empty doc
+const std::vector<api_entry_t>& api_entries() {
+    static const std::vector<api_entry_t> entries = [] {
+        std::vector<api_entry_t> out;
+        for (const auto& d : kTopDocs) {
+            api_entry_t e;
+            e.name      = d.key;
+            e.signature = d.signature;
+            e.doc       = d.doc;
+            e.callable  = d.callable;
+            out.push_back(std::move(e));
+        }
+        for (const auto& g : kApiGroups) {
+            for (const luaL_Reg* r = g.regs; r->name; ++r) {
+                api_entry_t e;
+                e.group = g.group;
+                e.name  = r->name;
+                if (const api_doc_t* d = find_doc(e.group + "." + e.name)) {
+                    e.signature = d->signature;
+                    e.doc       = d->doc;
+                }
+                out.push_back(std::move(e));
+            }
+        }
+        return out;
+    }();
+    return entries;
+}
+
+// ---- snippets --------------------------------------------------------------
+
+namespace {
+
+std::filesystem::path snippets_dir() {
+    return std::filesystem::path(infra::paths::app_data()) / "scripts";
+}
+
+std::filesystem::path snippet_path(const std::string& name) {
+    return snippets_dir() / (name + ".lua");
+}
+
+int64_t file_ms(const std::filesystem::path& p) {
+    std::error_code ec;
+    const auto ft = std::filesystem::last_write_time(p, ec);
+    if (ec) return 0;
+    // file_clock has no fixed epoch in the standard: anchor it to now
+    const auto sys = std::chrono::system_clock::now() +
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            ft - std::filesystem::file_time_type::clock::now());
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               sys.time_since_epoch()).count();
+}
+
+} // namespace
+
+bool snippet_name_valid(const std::string& name) {
+    if (name.empty() || name.size() > 64) return false;
+    if (name == "." || name == "..") return false;
+    return std::all_of(name.begin(), name.end(), [](char c) {
+        return std::isalnum(static_cast<unsigned char>(c)) != 0 ||
+               c == '_' || c == '-' || c == '.';
+    });
+}
+
+bool snippet_save(const std::string& name, const std::string& code, std::string& err) {
+    if (!snippet_name_valid(name)) {
+        err = "snippet name must be 1..64 chars of A-Z a-z 0-9 . _ -";
+        return false;
+    }
+    const auto path = snippet_path(name);
+    if (!infra::paths::write_file_atomic(path.string(), code)) {
+        err = "cannot write " + path.string();
+        return false;
+    }
+    return true;
+}
+
+std::vector<snippet_t> snippet_list(std::string& err) {
+    std::vector<snippet_t> out;
+    std::error_code ec;
+    const auto dir = snippets_dir();
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        err = "cannot create " + dir.string() + ": " + ec.message();
+        return out;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec) || entry.path().extension() != ".lua") continue;
+        snippet_t s;
+        s.name = entry.path().stem().string();
+        if (!snippet_name_valid(s.name)) continue;
+        s.updated_ms = file_ms(entry.path());
+        out.push_back(std::move(s));
+    }
+    std::sort(out.begin(), out.end(),
+              [](const snippet_t& a, const snippet_t& b) { return a.name < b.name; });
+    return out;
+}
+
+bool snippet_load(const std::string& name, snippet_t& out, std::string& err) {
+    if (!snippet_name_valid(name)) {
+        err = "snippet name must be 1..64 chars of A-Z a-z 0-9 . _ -";
+        return false;
+    }
+    const auto path = snippet_path(name);
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        err = "no snippet named " + name;
+        return false;
+    }
+    out.name = name;
+    out.code.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    out.updated_ms = file_ms(path);
+    return true;
+}
+
+bool snippet_delete(const std::string& name, std::string& err) {
+    if (!snippet_name_valid(name)) {
+        err = "snippet name must be 1..64 chars of A-Z a-z 0-9 . _ -";
+        return false;
+    }
+    std::error_code ec;
+    const auto path = snippet_path(name);
+    if (!std::filesystem::remove(path, ec) || ec) {
+        err = ec ? "cannot delete " + path.string() + ": " + ec.message()
+                 : "no snippet named " + name;
+        return false;
+    }
+    return true;
+}
 
 int clamp_timeout_ms(int64_t ms) noexcept {
     return static_cast<int>(std::clamp<int64_t>(ms, kMinTimeoutMs, kMaxTimeoutMs));
@@ -2213,6 +2581,9 @@ lua_run_result_t lua_run(const std::string& code, const lua_run_options_t& opt) 
             // output so return x is not lost
             res.error = lua_error_text(L, st, ctx, "runtime error");
         } else {
+            // the body is done: the deadline no longer applies, so result
+            // serialization cannot trip the hook or the allocator
+            ctx.deadline_ms = std::numeric_limits<int64_t>::max();
             res.ok = true;
             lua_pushcfunction(L, serialize_return);
             lua_insert(L, -2);

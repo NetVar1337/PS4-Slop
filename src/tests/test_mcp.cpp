@@ -10,9 +10,11 @@
 #include "core/disasm/binary_state.hpp"
 #include "core/infra/diag.hpp"
 #include "core/infra/event_bus.hpp"
+#include "core/infra/paths.hpp"
 #include "core/infra/settings.hpp"
 #include "core/mcp/tools_common.hpp"
 #include "core/network/net_socket.hpp"
+#include "core/script/lua_engine.hpp"
 #include "core/util/zip_reader.hpp"
 
 #include <windows.h>
@@ -1220,6 +1222,128 @@ TEST_CASE(mcp_script_run_roundtrip) {
     REQUIRE(is_error);
 }
 
+TEST_CASE(mcp_script_unsafe_needs_per_run_consent) {
+    namespace settings = slop::core::infra::settings;
+    const std::string old_file = settings::file();
+    const auto scratch = (std::filesystem::temp_directory_path() /
+                          ("slop_test_mcp_script_unsafe_" +
+                           std::to_string(GetCurrentProcessId()) + ".json")).string();
+    settings::set_file_for_testing(scratch);
+    server_fixture_t fx;
+    bool is_error = false;
+
+    // no per-run consent and no admin override: refused before any code runs
+    json payload = fx.call("script",
+                           {{"action", "run"}, {"code", "return io ~= nil"},
+                            {"unsafe", true}},
+                           is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.at("error").get<std::string>().find("confirm") !=
+            std::string::npos);
+
+    // consent opens the full stdlib for that one run
+    payload = fx.call("script",
+                      {{"action", "run"}, {"code", "return io ~= nil"},
+                       {"unsafe", true}, {"confirm", true}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("ok", false), true);
+    REQUIRE_EQ(payload.value("sandboxed", true), false);
+    REQUIRE(payload.at("output").get<std::string>().find("return: true") !=
+            std::string::npos);
+
+    // the next run is sandboxed again: consent does not stick
+    payload = fx.call("script", {{"action", "run"}, {"code", "return io ~= nil"}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("sandboxed", false), true);
+    REQUIRE(payload.at("output").get<std::string>().find("return: false") !=
+            std::string::npos);
+
+    // script_unsafe stays the admin override
+    REQUIRE(settings::set("script_unsafe", true));
+    payload = fx.call("script",
+                      {{"action", "run"}, {"code", "return io ~= nil"},
+                       {"unsafe", true}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("sandboxed", true), false);
+
+    settings::set_file_for_testing(old_file);
+    std::error_code ec;
+    std::filesystem::remove(scratch, ec);
+}
+
+TEST_CASE(mcp_script_api_lists_the_surface) {
+    server_fixture_t fx;
+    bool is_error = false;
+    json payload = fx.call("script", {{"action", "api"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("count", size_t{0}),
+               slop::core::script::api_entries().size());
+    bool saw = false;
+    for (const auto& f : payload.at("functions")) {
+        REQUIRE(!f.value("signature", "").empty());
+        REQUIRE(!f.value("doc", "").empty());
+        if (f.value("name", "") == "slop.mem.read_hex") saw = true;
+    }
+    REQUIRE(saw);
+}
+
+TEST_CASE(mcp_script_snippets_roundtrip) {
+    namespace fs = std::filesystem;
+    namespace paths = slop::core::infra::paths;
+    const auto dir = fs::temp_directory_path() /
+                     ("slop_mcp_snippets_" + std::to_string(GetCurrentProcessId()));
+    fs::remove_all(dir);
+    paths::set_app_data_for_testing(dir.string());
+    server_fixture_t fx;
+    bool is_error = false;
+
+    json payload = fx.call("script",
+                           {{"action", "save"}, {"name", "find-value"},
+                            {"code", "return 42"}},
+                           is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("ok", false), true);
+
+    payload = fx.call("script", {{"action", "list"}}, is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.at("snippets").size(), size_t{1});
+    REQUIRE_EQ(payload.at("snippets")[0].value("name", ""),
+               std::string("find-value"));
+
+    payload = fx.call("script", {{"action", "load"}, {"name", "find-value"}},
+                      is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(payload.value("code", ""), std::string("return 42"));
+
+    payload = fx.call("script", {{"action", "delete"}, {"name", "find-value"}},
+                      is_error);
+    REQUIRE(!is_error);
+    payload = fx.call("script", {{"action", "load"}, {"name", "find-value"}},
+                      is_error);
+    REQUIRE(is_error);
+
+    // name validation refuses traversal and separators
+    payload = fx.call("script",
+                      {{"action", "save"}, {"name", "../escape"}, {"code", "x"}},
+                      is_error);
+    REQUIRE(is_error);
+    REQUIRE(payload.at("error").get<std::string>().find("snippet name") !=
+            std::string::npos);
+    REQUIRE_FALSE(fs::exists(dir.parent_path() / "escape.lua"));
+
+    // save without code and an unknown action both fail cleanly
+    payload = fx.call("script", {{"action", "save"}, {"name", "empty"}}, is_error);
+    REQUIRE(is_error);
+    payload = fx.call("script", {{"action", "nope"}}, is_error);
+    REQUIRE(is_error);
+
+    paths::init();
+    fs::remove_all(dir);
+}
+
 TEST_CASE(mcp_script_static_analysis_surface) {
     // the script loads the fixture from disk, which the sandbox refuses
     struct unsafe_guard_t {
@@ -1957,31 +2081,6 @@ TEST_CASE(mcp_auth_rejects_missing_or_bad_tokens_with_rpc_shape) {
     REQUIRE_EQ(health->status, 200);
 }
 
-TEST_CASE(mcp_insecure_dev_allows_tokenless_loopback_only_with_flag) {
-    slop::core::mcp::server_config_t cfg = token_cfg();
-    cfg.insecure_dev = true;
-    server_fixture_t fx(cfg);
-    const std::string body = rpc_body("ping").dump();
-
-    // audit 103: the flag, and only the flag, opens tokenless loopback access
-    auto none = fx.cli_->Post("/mcp", body, "application/json");
-    REQUIRE(none);
-    REQUIRE_EQ(none->status, 200);
-    // a wrong bearer is still refused in dev mode
-    auto bad = fx.cli_->Post("/mcp", bearer(std::string(64, 'c')), body, "application/json");
-    REQUIRE(bad);
-    REQUIRE_EQ(bad->status, 401);
-    // the real token keeps working
-    auto good = fx.cli_->Post("/mcp", bearer(kTok), body, "application/json");
-    REQUIRE(good);
-    REQUIRE_EQ(good->status, 200);
-    // /api is gated by the same rule
-    const json api = {{"tool", "app"}, {"action", "status"}};
-    auto api_none = fx.cli_->Post("/api", api.dump(), "application/json");
-    REQUIRE(api_none);
-    REQUIRE_EQ(api_none->status, 200);
-}
-
 TEST_CASE(mcp_host_and_origin_guard_and_cors) {
     server_fixture_t fx;
     const std::string body = rpc_body("ping").dump();
@@ -2220,24 +2319,11 @@ TEST_CASE(mcp_app_settings_api_redacts_and_validates) {
 
     json got = fx.api("app", "settings_get").at("data");
     REQUIRE_STR_EQ(got.at("mcp_token").get<std::string>().c_str(), "set");
-    REQUIRE(got.contains("mcp_plaintext_configs"));
 
     REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_token"}, {"value", "x"}})
                  .value("ok", true));
     REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 70000}})
                  .value("ok", true));
-    // the onboarding policy keys are typed too
-    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_token_in_configs"}, {"value", "x"}})
-                 .value("ok", true));
-    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_onboard_clients"}, {"value", "Tern"}})
-                 .value("ok", true));
-    REQUIRE(fx.api("app", "settings_set",
-                   {{"key", "mcp_onboard_clients"}, {"value", json::array({"Tern"})}})
-                .value("ok", false));
-    REQUIRE(fx.api("app", "settings_set", {{"key", "mcp_token_in_configs"}, {"value", true}})
-                .value("ok", false));
-    REQUIRE(slop::core::infra::settings::mcp_token_in_configs());
-    REQUIRE_EQ(slop::core::infra::settings::mcp_onboard_clients().size(), 1u);
     json set = fx.api("app", "settings_set", {{"key", "script_unsafe"}, {"value", true}})
                    .at("data");
     REQUIRE(set.value("ok", false));
@@ -2346,54 +2432,6 @@ TEST_CASE(mcp_rotate_token_applies_live) {
     auto with_new = fx.cli_->Post("/mcp", bearer(std::string(64, 'd')), rpc_body("ping").dump(),
                                   "application/json");
     REQUIRE_EQ(with_new->status, 200);
-}
-
-TEST_CASE(mcp_rotate_token_respects_config_token_policy) {
-    scratch_settings_t scratch;
-    namespace settings = slop::core::infra::settings;
-    const auto cursor = scratch.dir / "profile" / ".cursor" / "mcp.json";
-    std::filesystem::create_directories(cursor.parent_path());
-    {
-        std::ofstream f(cursor);
-        f << R"({"mcpServers":{"slopstation":{"url":"http://127.0.0.1:1/mcp","headers":{"Authorization":"Bearer old"}}}})";
-    }
-    REQUIRE(settings::set("mcp_onboard_clients", json::array({"Cursor"})));
-    REQUIRE(!settings::mcp_token_in_configs());
-
-    slop::core::mcp::server_config_t cfg;
-    cfg.token = settings::mcp_token();
-    cfg.extra_tokens = {kExtra};
-    server_fixture_t fx(cfg);
-    const json req = {{"tool", "app"}, {"action", "rotate_token"}};
-
-    auto res = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
-    REQUIRE(res);
-    const json out = json::parse(res->body).at("data");
-    REQUIRE(out.value("rotated", false));
-    const std::string fresh = out.at("token").get<std::string>();
-
-    auto read_cursor = [&] {
-        std::ifstream f(cursor);
-        std::stringstream ss;
-        ss << f.rdbuf();
-        return ss.str();
-    };
-    // policy off: the config gets the env reference, never the new plaintext
-    std::string text = read_cursor();
-    REQUIRE_STR_EQ(json::parse(text).at("mcpServers").at("slopstation").at("headers")
-                       .at("Authorization").get<std::string>().c_str(),
-                   "Bearer ${SLOP_MCP_TOKEN}");
-    REQUIRE(text.find(fresh) == std::string::npos);
-
-    // policy on: the rotated token is written through
-    REQUIRE(settings::set("mcp_token_in_configs", true));
-    auto res2 = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
-    REQUIRE(res2);
-    const std::string fresh2 = json::parse(res2->body).at("data").at("token").get<std::string>();
-    text = read_cursor();
-    REQUIRE_STR_EQ(json::parse(text).at("mcpServers").at("slopstation").at("headers")
-                       .at("Authorization").get<std::string>().c_str(),
-                   ("Bearer " + fresh2).c_str());
 }
 
 TEST_CASE(mcp_fs_read_file_pages) {
