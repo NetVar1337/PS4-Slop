@@ -146,6 +146,9 @@ add_library(slop_core STATIC
     runtime/ps4_protocol.hpp
     runtime/backend_ps4.hpp
     runtime/backend_ps4.cpp
+    runtime/ps5_protocol.hpp
+    runtime/backend_ps5.hpp
+    runtime/backend_ps5.cpp
     runtime/scan_bridge.hpp
     runtime/scan_bridge.cpp
     runtime/session.hpp

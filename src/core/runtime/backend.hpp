@@ -13,7 +13,8 @@ namespace slop::core::runtime {
 
 enum class backend_kind_t : uint8_t {
     user_mode,   // local process (internal test lab only)
-    ps4          // remote console over ps4debug-NG
+    ps4,         // remote console over ps4debug-NG
+    ps5          // remote console over ps5debug-NG
 };
 
 enum class arch_t : uint8_t {

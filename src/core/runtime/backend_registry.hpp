@@ -10,6 +10,7 @@
 
 #include "core/runtime/backend.hpp"
 #include "core/runtime/backend_ps4.hpp"
+#include "core/runtime/backend_ps5.hpp"
 
 namespace slop::core::runtime {
 
@@ -37,5 +38,20 @@ bool        registry_ps4_lost() noexcept;     // selected but the connection dro
 std::string registry_ps4_endpoint();   // "host:port" or ""
 std::string registry_ps4_branding();   // server branding string or ""
 backend_ps4_t* registry_ps4() noexcept;  // the console backend while selected, else null
+
+// remote PS5 (ps5debug-NG) backend control. Only one console is selected at a
+// time: connecting a PS5 drops a selected PS4 and vice versa
+bool        registry_connect_ps5(const std::string& host, uint16_t port, std::string& err);
+void        registry_disconnect_ps5();
+// re-open the last PS5 after a dropped connection (handshake, debug re-attach,
+// slot re-arm); sessions on it stay valid
+bool        registry_ps5_reconnect(std::string& err,
+                                   backend_ps5_t::reconnect_report_t* report = nullptr);
+bool        registry_ps5_active() noexcept;   // selected and the socket is alive
+bool        registry_ps5_selected() noexcept; // selected, maybe with a dropped socket
+bool        registry_ps5_lost() noexcept;     // selected but the connection dropped
+std::string registry_ps5_endpoint();   // "host:port" or ""
+std::string registry_ps5_branding();   // server branding string or ""
+backend_ps5_t* registry_ps5() noexcept;  // the console backend while selected, else null
 
 } // namespace slop::core::runtime

@@ -58,13 +58,14 @@ std::vector<std::string> discover_ps4(int timeout_ms) {
 }
 
 // host "auto"/"discover": pick the first console answering the broadcast probe
-std::string resolve_host_arg(const std::string& host, int timeout_ms = 2000) {
+std::string resolve_host_arg(const std::string& host, const char* console = "PS4",
+                             int timeout_ms = 2000) {
     if (host != "auto" && host != "discover") return host;
     const auto found = discover_ps4(timeout_ms);
     if (found.empty())
         fail("discovery found no console (UDP broadcast 255.255.255.255:" +
              std::to_string(runtime::ps4::kBroadcastPort) +
-             ", magic 0xFFFFAAAA); pass an explicit PS4 IP as host");
+             ", magic 0xFFFFAAAA); pass an explicit " + console + " IP as host");
     return found.front();
 }
 
@@ -126,6 +127,21 @@ json ps4_status_json(runtime::backend_ps4_t& p4) {
             {"lost_reason", p4.lost_reason()},
             {"drops", p4.drop_count()},
             {"authed", p4.ps4_authed()}};
+}
+
+json ps5_status_json(runtime::backend_ps5_t& p5) {
+    return {{"endpoint", runtime::registry_ps5_endpoint()},
+            {"branding", p5.branding()},
+            {"server_version", p5.server_version()},
+            {"caps", p5.server_caps()},
+            {"fw", p5.fw_string()},
+            {"platform", p5.platform_id()},
+            {"connected", p5.connected()},
+            {"lost", p5.lost()},
+            {"lost_reason", p5.lost_reason()},
+            {"drops", p5.drop_count()},
+            {"debug_attached", p5.ps5_debug_attached()},
+            {"debug_pid", p5.ps5_debug_pid()}};
 }
 
 // ---- saved consoles (multi-console manager) --------------------------------
@@ -717,6 +733,223 @@ json tool_target(const json& args) {
         return out;
     }
 
+    if (action == "ps5_connect") {
+        if (!args.contains("host") || !args.at("host").is_string())
+            fail("ps5_connect requires string 'host' (the PS5 IP, or \"auto\" to "
+                 "discover via UDP broadcast)");
+        const std::string host = resolve_host_arg(args.at("host").get<std::string>(), "PS5");
+        if (host.empty()) fail("ps5_connect: 'host' is empty");
+        const uint64_t port = args.contains("port") ? parse_addr(args, "port")
+                                                    : runtime::ps5::kDefaultPort;
+        if (port == 0 || port > 0xFFFF) fail("ps5_connect: bad port");
+        uint32_t pid = 0;
+        if (args.contains("pid")) {
+            const uint64_t p = parse_addr(args, "pid");
+            if (p == 0 || p > 0xFFFFFFFFull) fail("ps5_connect: bad pid");
+            pid = static_cast<uint32_t>(p);
+        }
+        std::string err;
+        if (!process::target_connect_ps5(host, static_cast<uint16_t>(port), pid, err))
+            fail("ps5_connect failed: " + err);
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid = 0;
+        auto* p5 = runtime::registry_ps5();
+        json out = {{"connected", true},
+                    {"host", host},
+                    {"port", port},
+                    {"endpoint", runtime::registry_ps5_endpoint()},
+                    {"branding", runtime::registry_ps5_branding()},
+                    {"server_version", p5 ? p5->server_version() : std::string{}},
+                    {"fw", p5 ? p5->fw_string() : std::string{}},
+                    {"platform", p5 ? p5->platform_id() : 0},
+                    {"backend", runtime::active_badge()}};
+        auto s = process::active_session();
+        if (pid != 0 && s && s->valid()) {
+            out["attached"] = true;
+            out["pid"]      = s->pid();
+            out["name"]     = s->name();
+            out["arch"]     = arch_name(s->arch());
+            out["hint"]     = "PS5 modules are ELF/SELF, not PE: use target.modules and "
+                              "target.ps5_dump_module to pull the raw memory image over the "
+                              "wire. memory.read/write, memory.scan and disasm.disassemble work "
+                              "on live addresses.";
+        } else {
+            out["attached"] = false;
+            out["hint"]     = "Console connected. Next: target.list to pick a pid, then "
+                              "target.attach {pid} (or ps5_connect again with pid).";
+        }
+        return out;
+    }
+
+    if (action == "ps5_disconnect") {
+        process::target_disconnect_ps5();
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid = 0;
+        return {{"connected", false}, {"backend", runtime::active_badge()}};
+    }
+
+    if (action == "ps5_reconnect") {
+        // after a dropped connection (console reboot, Wi-Fi loss, payload
+        // restart): handshake again, re-attach the debuggee, re-arm every slot
+        // this client had armed; the session survives
+        runtime::backend_ps5_t::reconnect_report_t rep;
+        std::string err;
+        if (!process::target_reconnect_ps5(err, &rep)) fail("ps5_reconnect failed: " + err);
+        auto s = process::active_session();
+        auto* p5 = runtime::registry_ps5();
+        json out = {{"connected", p5 && p5->connected()},
+                    {"endpoint", runtime::registry_ps5_endpoint()},
+                    {"branding", runtime::registry_ps5_branding()},
+                    {"server_version", p5 ? p5->server_version() : std::string{}},
+                    {"fw", p5 ? p5->fw_string() : std::string{}},
+                    {"session_kept", s && s->valid()},
+                    {"debug_pid", rep.debug_pid},
+                    {"debug_restored", rep.debug_restored},
+                    {"breakpoints_rearmed", rep.bp_rearmed},
+                    {"breakpoints_lost", rep.bp_failed},
+                    {"watchpoints_rearmed", rep.wp_rearmed},
+                    {"watchpoints_lost", rep.wp_failed}};
+        if (!rep.debug_error.empty()) out["debug_error"] = rep.debug_error;
+        if (s && s->valid()) out["pid"] = s->pid();
+        return out;
+    }
+
+    if (action == "ps5_auto") {
+        // one-call console setup: connect, find the game process (the one with
+        // /app0/ in its maps), attach a session, debug-attach, summarize
+        if (!args.contains("host") || !args.at("host").is_string())
+            fail("ps5_auto requires string 'host' (the PS5 IP, or \"auto\" to "
+                 "discover via UDP broadcast)");
+        const std::string host = resolve_host_arg(args.at("host").get<std::string>(), "PS5");
+        if (host.empty()) fail("ps5_auto: 'host' is empty");
+        const uint64_t port = args.contains("port") ? parse_addr(args, "port")
+                                                    : runtime::ps5::kDefaultPort;
+        if (port == 0 || port > 0xFFFF) fail("ps5_auto: bad port");
+        std::string err;
+        if (!runtime::registry_ps5_active() &&
+            !process::target_connect_ps5(host, static_cast<uint16_t>(port), 0, err))
+            fail("ps5_auto: connect failed: " + err);
+        auto* p = runtime::registry_ps5();
+        if (!p || !p->connected()) fail("ps5_auto: no PS5 console connected");
+
+        // candidates: processes whose maps live under /app0/
+        auto procs = p->enum_processes();
+        if (!procs.ok) fail("ps5_auto: cannot list console processes: " +
+                            runtime::ps5::io_error_str(procs.error));
+        struct cand_t {
+            uint32_t pid = 0;
+            std::string name, path;
+            size_t image_size = 0;
+            bool game = false;
+        };
+        std::vector<cand_t> cands;
+        uint32_t fallback_pid = 0;
+        size_t fallback_size = 0;
+        for (const auto& pr : procs.items) {
+            auto h = p->attach(pr.pid);
+            if (!h.valid()) continue;
+            cand_t c;
+            c.pid  = pr.pid;
+            c.name = pr.name;
+            auto mods = p->enum_modules(h);
+            for (const auto& m : mods.items) {
+                c.image_size += m.size;
+                if (m.path.find("/app0/") != std::string::npos ||
+                    m.path.find("\\app0\\") != std::string::npos) {
+                    c.game = true;
+                    if (c.path.empty()) c.path = m.path;
+                }
+            }
+            p->detach(h);
+            if (c.image_size > fallback_size) {
+                fallback_size = c.image_size;
+                fallback_pid  = c.pid;
+            }
+            cands.push_back(std::move(c));
+        }
+        uint32_t pick = 0;
+        std::string pick_name;
+        bool heuristic = false;
+        for (const auto& c : cands) {
+            if (!c.game) continue;
+            if (pick == 0 || c.name.find("eboot") != std::string::npos) {
+                pick = c.pid;
+                pick_name = c.name;
+                if (c.name.find("eboot") != std::string::npos) break;
+            }
+        }
+        if (pick == 0) {
+            pick = fallback_pid;
+            heuristic = true;
+            for (const auto& c : cands)
+                if (c.pid == pick) pick_name = c.name;
+        }
+        if (pick == 0) fail("ps5_auto: no processes on the console");
+
+        if (!process::target_attach(pick))
+            fail("ps5_auto: attached console but session attach to pid " +
+                 std::to_string(pick) + " failed");
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid = 0;
+
+        std::string derr;
+        const bool dbg_ok = p->ps5_debug_attach(pick, derr);
+
+        auto s = process::active_session();
+        json out = {{"connected", true},
+                    {"endpoint", runtime::registry_ps5_endpoint()},
+                    {"branding", runtime::registry_ps5_branding()},
+                    {"pid", pick},
+                    {"name", pick_name},
+                    {"debug_attached", dbg_ok},
+                    {"heuristic_pick", heuristic},
+                    {"hint", "Ready: target.modules/threads, memory.*, disasm.disassemble on "
+                             "live addresses, debugger ps5_* for breakpoints/steps/regs. "
+                             "docs/ps5.md documents the payload commands and limits."}};
+        if (!dbg_ok) out["debug_error"] = derr;
+        json cands_json = json::array();
+        for (const auto& c : cands)
+            cands_json.push_back({{"pid", c.pid}, {"name", c.name},
+                                  {"game", c.game}, {"image_size", c.image_size},
+                                  {"path", c.path}});
+        out["candidates"] = cands_json;
+        if (s && s->valid()) {
+            auto mods = p->enum_modules(s->handle());
+            json mods_json = json::array();
+            for (size_t i = 0; i < mods.items.size() && i < 32; ++i)
+                mods_json.push_back({{"base", static_cast<uint64_t>(mods.items[i].base)},
+                                     {"size", mods.items[i].size},
+                                     {"name", mods.items[i].name},
+                                     {"path", mods.items[i].path}});
+            out["modules"] = mods_json;
+            out["module_count"] = mods.items.size();
+            auto thr = p->enum_threads(pick);
+            json thr_json = json::array();
+            for (const auto& t : thr.items)
+                thr_json.push_back({{"lwpid", t.tid}, {"priority", t.priority}, {"name", t.name}});
+            out["threads"] = thr_json;
+            out["thread_count"] = thr.items.size();
+            auto regs = p->enum_regions(s->handle());
+            out["region_count"] = regs.ok ? regs.items.size() : 0;
+        }
+        return out;
+    }
+
+    if (action == "ps5_notify") {
+        // on-screen notification on the console (ps5debug-NG CMD_CONSOLE_NOTIFY)
+        auto* p = runtime::registry_ps5();
+        if (!p) fail("ps5_notify requires a connected console (target.ps5_connect {host})");
+        if (!args.contains("msg") || !args.at("msg").is_string())
+            fail("ps5_notify requires string 'msg'");
+        const std::string text = args.at("msg").get<std::string>();
+        auto io = p->ps5_notify(text);
+        if (!io.ok) fail("ps5_notify failed: " + runtime::ps5::io_error_str(io.error));
+        return {{"sent", true}, {"bytes", io.bytes}, {"text", text}};
+    }
+
     if (action == "status") {
         json out;
         out["backend"]  = runtime::active_badge();
@@ -725,6 +958,8 @@ json tool_target(const json& args) {
         // connection is down (connected=false, lost=true -> ps4_reconnect)
         auto* p4 = runtime::registry_ps4();
         if (p4) out["ps4"] = ps4_status_json(*p4);
+        auto* p5 = runtime::registry_ps5();
+        if (p5) out["ps5"] = ps5_status_json(*p5);
         auto s = process::active_session();
         if (s && s->valid()) {
             out["attached"] = true;

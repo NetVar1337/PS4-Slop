@@ -30,6 +30,7 @@ add_executable(slop_tests
     test_ps4_debug.cpp
     test_ps4_chaos.cpp
     test_ps4_tooling.cpp
+    test_ps5.cpp
     test_harness.cpp
 )
 

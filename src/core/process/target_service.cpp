@@ -102,6 +102,32 @@ bool target_reconnect_ps4(std::string& err, runtime::backend_ps4_t::reconnect_re
     return true;
 }
 
+bool target_connect_ps5(const std::string& host, uint16_t port, uint32_t pid,
+                        std::string& err) {
+    // the registry detaches the current session before swapping (hook)
+    if (!runtime::registry_connect_ps5(host, port, err)) return false;
+    if (pid == 0) return true;
+    if (!target_attach(pid)) {
+        err = "connected to " + host + ":" + std::to_string(port) +
+              " but attach to pid " + std::to_string(pid) + " failed";
+        target_detach();
+        runtime::registry_disconnect_ps5();
+        return false;
+    }
+    return true;
+}
+
+void target_disconnect_ps5() {
+    target_detach();
+    runtime::registry_disconnect_ps5();
+}
+
+bool target_reconnect_ps5(std::string& err, runtime::backend_ps5_t::reconnect_report_t* report) {
+    if (!runtime::registry_ps5_reconnect(err, report)) return false;
+    g_misses = 0;
+    return true;
+}
+
 void target_tick() {
     // Heartbeat: drop the session if the target died. Work on a local copy,
     // the session may be replaced concurrently by an MCP attach
@@ -127,6 +153,13 @@ void target_tick() {
         // channel already reports the process going away (SIGKILL / channel
         // close) and a stopped debuggee must not be second-guessed
         if (!p->connected() || p->ps4_debug_attached()) { g_misses = 0; return; }
+    }
+    if (b.kind() == runtime::backend_kind_t::ps5) {
+        auto* p = static_cast<runtime::backend_ps5_t*>(&b);
+        // same contract as the PS4 branch: keep the session across a dropped
+        // connection (target.ps5_reconnect) and never second-guess a debuggee
+        // the payload is holding
+        if (!p->connected() || p->ps5_debug_attached()) { g_misses = 0; return; }
     }
 
     auto procs = b.enum_processes();

@@ -329,22 +329,29 @@ void tick() {
     // session, breakpoints and slots are restored by reconnect(). Opt out with
     // ps4_auto_reconnect=false. disconnect() clears "lost", so an intentional
     // disconnect is never undone.
+    const auto console_lost = [] {
+        return runtime::registry_ps4_lost() || runtime::registry_ps5_lost();
+    };
     if (!g_auto_thread.joinable() &&
         settings::get<bool>("ps4_auto_reconnect", true) &&
-        runtime::registry_ps4_lost()) {
+        console_lost()) {
         g_auto_stop.store(false);
         g_auto_thread = std::thread([] {
             int backoff_ms = 1000;
-            while (!g_auto_stop.load() && runtime::registry_ps4_lost()) {
+            while (!g_auto_stop.load() &&
+                   (runtime::registry_ps4_lost() || runtime::registry_ps5_lost())) {
                 std::string err;
-                if (runtime::registry_ps4_reconnect(err)) break;
+                const bool back = runtime::registry_ps4_selected()
+                    ? runtime::registry_ps4_reconnect(err)
+                    : runtime::registry_ps5_reconnect(err);
+                if (back) break;
                 for (int waited = 0; waited < backoff_ms && !g_auto_stop.load(); waited += 100)
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 backoff_ms = (std::min)(backoff_ms * 2, 30000);
             }
         });
     }
-    if (g_auto_thread.joinable() && !runtime::registry_ps4_lost()) {
+    if (g_auto_thread.joinable() && !console_lost()) {
         g_auto_stop.store(true);
         g_auto_thread.join();
     }
@@ -364,7 +371,8 @@ void tick() {
 
     bus::publish_changed("backend.changed",
                          json{{"badge", runtime::active_badge()},
-                              {"ps4", runtime::registry_ps4_active()}});
+                              {"ps4", runtime::registry_ps4_active()},
+                              {"ps5", runtime::registry_ps5_active()}});
 
     const auto hs = disasm::binary_state::hype_status();
     bus::publish_changed("hype.progress",

@@ -67,6 +67,7 @@
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/ps4_protocol.hpp"
+#include "core/runtime/ps5_protocol.hpp"
 #include "core/runtime/backend_ps4.hpp"
 #include "core/runtime/scan_bridge.hpp"
 #include "core/runtime/session.hpp"

@@ -2331,6 +2331,276 @@ json tool_debugger_ps4(const std::string& action, const json& args) {
          "ps4_fpregs|ps4_set_fpregs|ps4_set_dbregs|ps4_fsgs|ps4_set_fsgs)");
 }
 
+// ---- PS5 live debugging (ps5debug-NG) --------------------------------------
+
+[[noreturn]] void ps5_io_fail(const std::string& what, const runtime::io_result_t& io) {
+    fail(what + ": " + runtime::ps5::io_error_str(io.error));
+}
+
+runtime::backend_ps5_t& need_ps5() {
+    auto* p = runtime::registry_ps5();
+    if (!p)
+        fail("PS5 debug actions require a connected console (target.ps5_connect {host})");
+    if (!p->connected())
+        fail("the console connection was lost (" + p->lost_reason() +
+             "); target.ps5_reconnect restores it with the debug session and breakpoints");
+    return *p;
+}
+
+uint32_t ps5_pid_arg(const json& args) {
+    if (args.contains("pid"))
+        return static_cast<uint32_t>(parse_addr(args, "pid"));
+    if (auto s = process::active_session(); s && s->valid())
+        return s->pid();
+    fail("missing pid (no PS5 target attached either; use target.attach {pid})");
+}
+
+// lwpid argument, or the first thread of the debuggee when omitted
+uint32_t ps5_lwpid_arg(runtime::backend_ps5_t& p, const json& args) {
+    if (args.contains("lwpid"))
+        return static_cast<uint32_t>(parse_addr(args, "lwpid"));
+    const uint32_t pid = ps5_pid_arg(args);
+    auto thr = p.enum_threads(pid);
+    if (thr.ok && !thr.items.empty()) return thr.items.front().tid;
+    fail("missing lwpid (target.threads lists the debuggee's lwpids)");
+}
+
+json ps5_slots_json(const std::vector<runtime::backend_ps5_t::ps5_slot_t>& slots) {
+    json arr = json::array();
+    for (const auto& s : slots)
+        arr.push_back({{"index", s.index}, {"addr", s.addr},
+                       {"addr_hex", addr_hex_str(s.addr)},
+                       {"len", s.len}, {"type", s.type}, {"armed", s.armed}});
+    return arr;
+}
+
+json tool_debugger_ps5(const std::string& action, const json& args) {
+    if (action == "ps5_status") {
+        // also answers while the connection is down (connected=false)
+        auto* sel = runtime::registry_ps5();
+        if (!sel) fail("ps5_status: no console selected (target.ps5_connect {host})");
+        return {{"endpoint", runtime::registry_ps5_endpoint()},
+                {"branding", sel->branding()},
+                {"server_version", sel->server_version()},
+                {"caps", sel->server_caps()},
+                {"fw", sel->fw_string()},
+                {"platform", sel->platform_id()},
+                {"connected", sel->connected()},
+                {"lost", sel->lost()},
+                {"lost_reason", sel->lost_reason()},
+                {"drops", sel->drop_count()},
+                {"debug_attached", sel->ps5_debug_attached()},
+                {"debug_pid", sel->ps5_debug_pid()},
+                {"pending_events", static_cast<uint64_t>(sel->ps5_pending_events())},
+                {"events_received", sel->ps5_events_received()},
+                {"events_dropped", sel->ps5_events_dropped()}};
+    }
+    auto& p = need_ps5();
+
+    if (action == "ps5_attach") {
+        const uint32_t pid = ps5_pid_arg(args);
+        std::string err;
+        if (!p.ps5_debug_attach(pid, err)) fail("ps5_attach failed: " + err);
+        return {{"attached", true}, {"pid", pid}, {"endpoint", p.endpoint()},
+                {"branding", p.branding()}};
+    }
+    if (action == "ps5_detach") {
+        const bool clean = p.ps5_debug_detach();
+        return {{"attached", false}, {"detach_acknowledged", clean}};
+    }
+    if (action == "ps5_console_info") {
+        runtime::backend_ps5_t::ps5_console_info_t ci;
+        auto io = p.ps5_console_info(ci);
+        if (!io.ok) ps5_io_fail("ps5_console_info failed", io);
+        runtime::backend_ps5_t::ps5_app_info_t app;
+        const bool app_ok = p.ps5_foreground_app(app).ok;
+        json out = {{"alive", ci.alive}, {"endpoint", ci.endpoint},
+                    {"branding", ci.branding}, {"caps", ci.caps},
+                    {"server_version", ci.version}, {"fw", ci.fw}, {"fw_bcd", ci.fw_bcd},
+                    {"platform", ci.platform == 5 ? "PS5" : std::to_string(ci.platform)},
+                    {"debug_pid", ci.debug_pid}, {"connection_drops", ci.drops}};
+        if (app_ok)
+            out["foreground_app"] = {{"pid", app.pid}, {"titleid", app.titleid},
+                                     {"contentid", app.contentid}, {"name", app.name},
+                                     {"app_ver", app.app_ver}, {"running", app.pid != 0}};
+        return out;
+    }
+    if (action == "ps5_notify" || action == "ps5_print") {
+        if (!args.contains("msg") || !args.at("msg").is_string())
+            fail(action + " requires string 'msg'");
+        const std::string text = args.at("msg").get<std::string>();
+        auto io = action == "ps5_notify" ? p.ps5_notify(text) : p.ps5_print(text);
+        if (!io.ok) ps5_io_fail(action + " failed", io);
+        return {{"sent", true}, {"bytes", io.bytes},
+                {"target", action == "ps5_notify" ? "on-screen notification" : "kernel log"}};
+    }
+    if (action == "ps5_app") {
+        runtime::backend_ps5_t::ps5_app_info_t app;
+        auto io = p.ps5_foreground_app(app);
+        if (!io.ok) ps5_io_fail("ps5_app failed", io);
+        return {{"pid", app.pid}, {"titleid", app.titleid}, {"contentid", app.contentid},
+                {"name", app.name}, {"app_ver", app.app_ver}, {"running", app.pid != 0}};
+    }
+    if (action == "ps5_bp_set") {
+        const uint64_t addr = parse_addr(args, "addr");
+        if (!p.ps5_debug_attached()) fail("ps5_bp_set requires ps5_attach first");
+        const uint32_t want = args.contains("index")
+            ? static_cast<uint32_t>(parse_addr(args, "index"))
+            : runtime::backend_ps5_t::kAutoSlot;
+        uint32_t index = 0;
+        bool reused = false;
+        auto io = p.ps5_bp_arm(addr, want, index, &reused);
+        if (!io.ok) ps5_io_fail("ps5_bp_set failed", io);
+        return {{"set", true}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                {"index", index}, {"already_armed", reused}};
+    }
+    if (action == "ps5_bp_clear") {
+        uint64_t addr = 0;
+        uint32_t index = 0;
+        runtime::io_result_t io;
+        if (args.contains("addr")) {
+            addr = parse_addr(args, "addr");
+            io = p.ps5_bp_disarm_addr(addr, &index);
+        } else if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+            io = p.ps5_bp_disarm(index, &addr);
+        } else {
+            fail("ps5_bp_clear requires addr or index");
+        }
+        if (!io.ok) ps5_io_fail("ps5_bp_clear failed", io);
+        return {{"cleared", true}, {"addr", addr}, {"index", index}};
+    }
+    if (action == "ps5_bp_list")
+        return {{"breakpoints", ps5_slots_json(p.ps5_breakpoints())},
+                {"debug_pid", p.ps5_debug_pid()}};
+    if (action == "ps5_watch_set") {
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t len = args.contains("len") ? parse_addr(args, "len") : 8;
+        const uint32_t type = static_cast<uint32_t>(args.value("type", 3u));   // 3 = read/write
+        if (type != 0 && type != 1 && type != 3)
+            fail("ps5_watch_set: type must be 0=exec, 1=write or 3=read_write");
+        if (len != 1 && len != 2 && len != 4 && len != 8)
+            fail("ps5_watch_set: len must be 1, 2, 4 or 8");
+        if (!p.ps5_debug_attached()) fail("ps5_watch_set requires ps5_attach first");
+        const uint32_t want = args.contains("index")
+            ? static_cast<uint32_t>(parse_addr(args, "index"))
+            : runtime::backend_ps5_t::kAutoSlot;
+        uint32_t index = 0;
+        bool reused = false;
+        auto io = p.ps5_wp_arm(addr, static_cast<uint32_t>(len), type, want, index, &reused);
+        if (!io.ok) ps5_io_fail("ps5_watch_set failed", io);
+        return {{"set", true}, {"addr", addr}, {"addr_hex", addr_hex_str(addr)},
+                {"index", index}, {"len", len}, {"type", type}, {"hw", true},
+                {"already_armed", reused}};
+    }
+    if (action == "ps5_watch_clear") {
+        uint64_t addr = 0;
+        uint32_t index = 0;
+        runtime::io_result_t io;
+        if (args.contains("addr")) {
+            addr = parse_addr(args, "addr");
+            io = p.ps5_wp_disarm_addr(addr, &index);
+        } else if (args.contains("index")) {
+            index = static_cast<uint32_t>(parse_addr(args, "index"));
+            io = p.ps5_wp_disarm(index, &addr);
+        } else {
+            fail("ps5_watch_clear requires addr or index");
+        }
+        if (!io.ok) ps5_io_fail("ps5_watch_clear failed", io);
+        return {{"cleared", true}, {"addr", addr}, {"index", index}};
+    }
+    if (action == "ps5_watch_list")
+        return {{"watchpoints", ps5_slots_json(p.ps5_watchpoints())},
+                {"debug_pid", p.ps5_debug_pid()}};
+    if (action == "ps5_continue") {
+        const uint32_t stop = static_cast<uint32_t>(args.value("stop", 0u));
+        if (stop > 2) fail("ps5_continue: stop must be 0=resume, 1=SIGSTOP or 2=SIGKILL");
+        auto io = p.ps5_continue(stop);
+        if (!io.ok) ps5_io_fail("ps5_continue failed", io);
+        return {{"resumed", stop == 0}, {"stop", stop}};
+    }
+    if (action == "ps5_step") {
+        const uint32_t lwpid = args.contains("lwpid")
+            ? static_cast<uint32_t>(parse_addr(args, "lwpid")) : 0;
+        auto io = p.ps5_step(lwpid);
+        if (!io.ok) ps5_io_fail("ps5_step failed", io);
+        return {{"stepped", true}, {"lwpid", lwpid}};
+    }
+    if (action == "ps5_suspend" || action == "ps5_resume") {
+        const uint32_t lwpid = ps5_lwpid_arg(p, args);
+        auto io = action == "ps5_suspend" ? p.ps5_suspend_thread(lwpid)
+                                          : p.ps5_resume_thread(lwpid);
+        if (!io.ok) ps5_io_fail(action + " failed", io);
+        return {{action == "ps5_suspend" ? "suspended" : "resumed", true},
+                {"lwpid", lwpid}};
+    }
+    if (action == "ps5_regs") {
+        const uint32_t lwpid = ps5_lwpid_arg(p, args);
+        runtime::thread_context_t ctx{};
+        auto io = p.ps5_get_regs(lwpid, ctx);
+        if (!io.ok) ps5_io_fail("ps5_regs failed", io);
+        json out = ps4_ctx_json(ctx);
+        out["lwpid"] = lwpid;
+        out["rip_hex"] = addr_hex_str(ctx.rip);
+        return out;
+    }
+    if (action == "ps5_set_reg") {
+        if (!args.contains("name") || !args.at("name").is_string())
+            fail("ps5_set_reg requires string 'name' (rax, rip, ...)");
+        const std::string name = args.at("name").get<std::string>();
+        const uint32_t lwpid = ps5_lwpid_arg(p, args);
+        runtime::thread_context_t ctx{};
+        auto io = p.ps5_get_regs(lwpid, ctx);
+        if (!io.ok) ps5_io_fail("ps5_set_reg: reading the registers failed", io);
+        uint64_t* slot = ps4_reg_ptr(ctx, name);
+        if (!slot) fail("ps5_set_reg: unknown register '" + name + "'");
+        *slot = parse_addr(args, "value");
+        io = p.ps5_set_regs(lwpid, ctx);
+        if (!io.ok) ps5_io_fail("ps5_set_reg failed", io);
+        return {{"ok", true}, {"lwpid", lwpid}, {"name", name}, {"value", *slot}};
+    }
+    if (action == "ps5_threads") {
+        const uint32_t pid = ps5_pid_arg(args);
+        auto thr = p.enum_threads(pid);
+        if (!thr.ok) {
+            runtime::io_result_t io;
+            io.error = thr.error;
+            ps5_io_fail("ps5_threads failed", io);
+        }
+        json arr = json::array();
+        for (const auto& t : thr.items)
+            arr.push_back({{"lwpid", t.tid}, {"priority", t.priority}, {"name", t.name}});
+        return {{"threads", arr}, {"count", arr.size()}};
+    }
+    if (action == "ps5_wait") {
+        const int timeout_ms = std::min(args.value("timeout_ms", 5000), 60000);
+        runtime::ps5_event_t ev{};
+        if (!p.ps5_wait_event(ev, timeout_ms))
+            return {{"halted", false}, {"timeout_ms", timeout_ms},
+                    {"pending", static_cast<uint64_t>(p.ps5_pending_events())},
+                    {"events_dropped", p.ps5_events_dropped()}};
+        json o = ps4_event_json(ev);
+        o["halted"] = true;
+        o["pending"] = static_cast<uint64_t>(p.ps5_pending_events());
+        return o;
+    }
+    if (action == "ps5_events") {
+        const size_t max = std::min<size_t>(args.value("max", 64u), 4096u);
+        const bool clear = args.value("clear", true);
+        auto evs = p.ps5_drain_events(max, clear);
+        json arr = json::array();
+        for (const auto& e : evs) arr.push_back(ps4_event_json(e));
+        return {{"events", arr}, {"count", arr.size()},
+                {"pending", static_cast<uint64_t>(p.ps5_pending_events())},
+                {"events_dropped", p.ps5_events_dropped()}};
+    }
+
+    fail("debugger: unknown ps5 action (ps5_status|ps5_attach|ps5_detach|ps5_console_info|"
+         "ps5_bp_set|ps5_bp_clear|ps5_bp_list|ps5_watch_set|ps5_watch_clear|ps5_watch_list|"
+         "ps5_continue|ps5_step|ps5_suspend|ps5_resume|ps5_regs|ps5_set_reg|ps5_threads|"
+         "ps5_wait|ps5_events|ps5_notify|ps5_print|ps5_app)");
+}
+
 bool is_composite(const std::string& action) {
     return action == "ps4_until" || action == "ps4_find_write" ||
            action == "ps4_trace_calls" || action == "ps4_trace_steps";
@@ -2358,6 +2628,7 @@ json tool_debugger(const json& args) {
         g_bp_rules.clear();
         return {{"attached", false}, {"debugger", "user"}, {"was_attached", was}};
     }
+    if (action.rfind("ps5_", 0) == 0) return tool_debugger_ps5(action, args);
     if (action.rfind("ps4_", 0) == 0) {
         // append the console's own status word (CMD_ERR_* from the
         // NetVar1337 fork, CMD_DATA_NULL, ...) to failures so callers see

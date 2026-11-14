@@ -98,6 +98,8 @@ constexpr const char* kInstructions =
     "image.hype.ready=true -> functions/xrefs/strings -> decomp.function. "
     "Live flow on a PS4: target.ps4_connect {host} (or the one-call "
     "target.ps4_auto {host}) -> memory.scan / debugger ps4_* over the wire. "
+    "Live flow on a PS5: target.ps5_connect {host} (or target.ps5_auto "
+    "{host}) -> memory.* / target.modules / debugger ps5_* over ps5debug-NG. "
     "Actions fail fast with structured errors when a precondition is missing "
     "(console connected, image.ready, image.hype.ready), re-check state "
     "rather than retrying. "
