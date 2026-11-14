@@ -112,6 +112,7 @@ const kRetryMaxMs = 8_000;
 
 const handlers = new Map<EventName, Set<Handler>>();
 let source: EventSource | null = null;
+let socket: WebSocket | null = null;
 let retry: ReturnType<typeof setTimeout> | null = null;
 let retryDelay = kRetryMinMs;
 let isOpen = false;
@@ -120,16 +121,20 @@ let generation = 0;
 let reconnectHook: (() => Promise<void>) | null = null;
 const statusHandlers = new Set<(open: boolean) => void>();
 
-function emit(name: EventName, raw: string): void {
+function emitValue(name: EventName, value: unknown): void {
   const set = handlers.get(name);
   if (!set || set.size === 0) return;
+  for (const fn of set) fn(value);
+}
+
+function emit(name: EventName, raw: string): void {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     return;
   }
-  for (const fn of set) fn(parsed);
+  emitValue(name, parsed);
 }
 
 /** Subscribe to one event name. Returns an unsubscribe function. */
@@ -193,8 +198,14 @@ function scheduleRetry(gen: number): void {
   }, delay);
 }
 
-function open(gen: number, url: string): void {
-  const es = new EventSource(url);
+function streamUrl(ticket: string | null, ws: boolean): string {
+  const base = ws ? baseUrl().replace(/^http/, "ws") : baseUrl();
+  const path = ws ? "/api/v1/events/ws" : "/api/v1/events";
+  return ticket === null ? `${base}${path}` : `${base}${path}?ticket=${encodeURIComponent(ticket)}`;
+}
+
+function openSse(gen: number, ticket: string | null): void {
+  const es = new EventSource(streamUrl(ticket, false));
   source = es;
   es.onopen = () => {
     retryDelay = kRetryMinMs;
@@ -216,23 +227,69 @@ function open(gen: number, url: string): void {
 }
 
 /**
+ * The engine serves the same stream over a websocket, which skips chunked SSE
+ * parsing and gives the server a real close handshake. An engine that predates
+ * the route answers 404 without spending the ticket, so the first failure
+ * silently falls back to SSE.
+ */
+function openWs(gen: number, ticket: string | null): void {
+  const ws = new WebSocket(streamUrl(ticket, true));
+  socket = ws;
+  let opened = false;
+  ws.onopen = () => {
+    opened = true;
+    retryDelay = kRetryMinMs;
+    setOpen(true);
+  };
+  ws.onmessage = (ev) => {
+    let msg: { event?: unknown; data?: unknown };
+    try {
+      msg = JSON.parse(String(ev.data)) as { event?: unknown; data?: unknown };
+    } catch {
+      return;
+    }
+    if (typeof msg.event !== "string") return;
+    if (!kEventNames.includes(msg.event as EventName)) return;
+    emitValue(msg.event as EventName, msg.data);
+  };
+  ws.onclose = () => {
+    if (socket !== ws) return;
+    socket = null;
+    setOpen(false);
+    if (opened) {
+      scheduleRetry(gen);
+      return;
+    }
+    // never opened: no websocket on this engine, take the same stream over SSE
+    fetchTicket()
+      .then((t) => {
+        if (gen === generation) openSse(gen, t);
+      })
+      .catch(() => scheduleRetry(gen));
+  };
+}
+
+/**
  * EventSource cannot send an Authorization header. A token-protected engine
  * hands out a single-use, short-lived ticket over the authenticated /api, and
  * the stream URL carries only that, never the bearer token itself.
  */
+function fetchTicket(): Promise<string | null> {
+  if (getEndpoint().token === "") return Promise.resolve(null);
+  return call<{ ticket?: string }>("app", "events_ticket", {}, { timeoutMs: 10_000 }).then(
+    (res) => {
+      if (typeof res.ticket !== "string" || res.ticket === "") throw new Error("no ticket");
+      return res.ticket;
+    },
+  );
+}
+
 export function connect(): void {
   disconnect();
   const gen = ++generation;
-  const { token } = getEndpoint();
-  if (token === "") {
-    open(gen, `${baseUrl()}/api/v1/events`);
-    return;
-  }
-  call<{ ticket?: string }>("app", "events_ticket", {}, { timeoutMs: 10_000 })
-    .then((res) => {
-      if (gen !== generation) return;
-      if (typeof res.ticket !== "string" || res.ticket === "") throw new Error("no ticket");
-      open(gen, `${baseUrl()}/api/v1/events?ticket=${encodeURIComponent(res.ticket)}`);
+  fetchTicket()
+    .then((t) => {
+      if (gen === generation) openWs(gen, t);
     })
     .catch(() => scheduleRetry(gen));
 }
@@ -246,6 +303,10 @@ export function disconnect(): void {
   if (source) {
     source.close();
     source = null;
+  }
+  if (socket) {
+    socket.close();
+    socket = null;
   }
   setOpen(false);
 }

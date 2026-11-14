@@ -7,11 +7,15 @@ import Tabs, { panelId, tabId } from "@/components/Tabs";
 import DisassemblyView from "@/components/panels/DisassemblyView";
 import DecompView from "@/components/panels/DecompView";
 import DebuggerView from "@/components/panels/DebuggerView";
+import EmulatorPanel from "@/components/panels/EmulatorPanel";
 import MemoryView from "@/components/panels/MemoryView";
+import NetworkPanel from "@/components/panels/NetworkPanel";
+import PatchPanel from "@/components/panels/PatchPanel";
 import PeView from "@/components/panels/PeView";
 import StringsView from "@/components/panels/StringsView";
 import StructEditor from "@/components/panels/StructEditor";
 import UnpackerView from "@/components/panels/UnpackerView";
+import XrayPanel from "@/components/panels/XrayPanel";
 import { browserLabel, formatLabel } from "@/lib/format";
 import { openBinary } from "@/lib/openBinary";
 import { useEngine } from "@/store/engine";
@@ -31,6 +35,10 @@ const kTabs: readonly { id: WorkspaceTab; label: string; needs: "image" | "targe
   { id: "pe", label: "Image Browser", needs: "image" },
   { id: "structs", label: "Structs", needs: "image" },
   { id: "unpacker", label: "Unpacker", needs: "image" },
+  { id: "xray", label: "X-ray", needs: "image" },
+  { id: "patch", label: "Patches", needs: "image" },
+  { id: "network", label: "Network", needs: "none" },
+  { id: "emulate", label: "Emulator", needs: "none" },
 ];
 
 export default function WorkspacePanel() {
@@ -114,6 +122,14 @@ export default function WorkspacePanel() {
         return <StructEditor />;
       case "unpacker":
         return <UnpackerView />;
+      case "xray":
+        return <XrayPanel />;
+      case "patch":
+        return <PatchPanel />;
+      case "network":
+        return <NetworkPanel />;
+      case "emulate":
+        return <EmulatorPanel />;
     }
   };
 

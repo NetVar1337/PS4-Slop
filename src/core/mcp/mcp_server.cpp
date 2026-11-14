@@ -8,6 +8,7 @@
 #include "core/infra/clock.hpp"
 #include "core/infra/event_bus.hpp"
 #include "core/infra/settings.hpp"
+#include "core/infra/text_format.hpp"
 #include "core/runtime/broker.hpp"
 
 #include <httplib.h>
@@ -714,6 +715,342 @@ void serve_events(const httplib::Request& req, httplib::Response& res, bool depr
         release_stream);
 }
 
+// ---- websocket event stream ------------------------------------------------
+// httplib has no websocket support and a handler never sees the socket, so the
+// upgrade is taken over one level down: the accept loop peeks the request line
+// and only /api/v1/events/ws leaves httplib. Same bus, same single use ticket,
+// text frames instead of sse.
+
+constexpr std::string_view kWsPath   = "/api/v1/events/ws";
+constexpr int64_t          kWsPingMs = 20'000;
+
+// rfc 3174, one 20 byte digest
+std::string sha1_digest(std::string_view data) {
+    uint32_t h[5] = {0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u};
+    std::string msg(data);
+    const uint64_t bits = static_cast<uint64_t>(msg.size()) * 8;
+    msg.push_back(static_cast<char>(0x80));
+    while (msg.size() % 64 != 56) msg.push_back('\0');
+    for (int i = 7; i >= 0; --i) msg.push_back(static_cast<char>((bits >> (8 * i)) & 0xFF));
+    for (size_t chunk = 0; chunk < msg.size(); chunk += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; ++i) {
+            const auto* p = reinterpret_cast<const uint8_t*>(msg.data() + chunk) + i * 4;
+            w[i] = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+        }
+        for (int i = 16; i < 80; ++i) {
+            const uint32_t x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16];
+            w[i] = (x << 1) | (x >> 31);
+        }
+        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; ++i) {
+            uint32_t f = 0, k = 0;
+            if (i < 20) { f = (b & c) | (~b & d); k = 0x5A827999u; }
+            else if (i < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+            else { f = b ^ c ^ d; k = 0xCA62C1D6u; }
+            const uint32_t t = ((a << 5) | (a >> 27)) + f + e + k + w[i];
+            e = d; d = c; c = (b << 30) | (b >> 2); b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    std::string out(20, '\0');
+    for (size_t i = 0; i < 20; ++i)
+        out[i] = static_cast<char>((h[i / 4] >> (24 - 8 * (i % 4))) & 0xFF);
+    return out;
+}
+
+bool ws_send_all(socket_t sock, std::string_view bytes) {
+    size_t off = 0;
+    while (off < bytes.size()) {
+        const int n = ::send(sock, bytes.data() + off,
+                             static_cast<int>(bytes.size() - off), 0);
+        if (n <= 0) return false;
+        off += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// one unmasked server frame: 1 = text, 8 = close, 9 = ping, 10 = pong
+bool ws_send(socket_t sock, uint8_t opcode, std::string_view payload) {
+    std::string f;
+    f.reserve(payload.size() + 10);
+    f.push_back(static_cast<char>(0x80 | opcode));
+    const size_t n = payload.size();
+    if (n < 126) {
+        f.push_back(static_cast<char>(n));
+    } else if (n <= 0xFFFF) {
+        f.push_back(126);
+        f.push_back(static_cast<char>((n >> 8) & 0xFF));
+        f.push_back(static_cast<char>(n & 0xFF));
+    } else {
+        f.push_back(127);
+        for (int i = 7; i >= 0; --i)
+            f.push_back(static_cast<char>((static_cast<uint64_t>(n) >> (8 * i)) & 0xFF));
+    }
+    f.append(payload);
+    return ws_send_all(sock, f);
+}
+
+// buffered client frame reader; every client frame is masked
+struct ws_reader_t {
+    socket_t    sock = 0;
+    std::string buf;
+
+    // 1 = read something, 0 = nothing yet, -1 = the peer is gone
+    int fill(int timeout_ms) {
+        fd_set rd;
+        FD_ZERO(&rd);
+        FD_SET(sock, &rd);
+        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+        if (::select(0, &rd, nullptr, nullptr, &tv) <= 0) return 0;
+        char tmp[4096];
+        const int n = ::recv(sock, tmp, sizeof(tmp), 0);
+        if (n <= 0) return -1;
+        buf.append(tmp, static_cast<size_t>(n));
+        return 1;
+    }
+
+    // 1 = one frame in opcode/payload, 0 = need more bytes, -1 = bogus frame
+    int next(uint8_t& opcode, std::string& payload) {
+        if (buf.size() < 2) return 0;
+        const auto* p = reinterpret_cast<const uint8_t*>(buf.data());
+        opcode = static_cast<uint8_t>(p[0] & 0x0F);
+        const bool masked = (p[1] & 0x80) != 0;
+        uint64_t len = p[1] & 0x7F;
+        size_t head = 2;
+        if (len == 126) {
+            if (buf.size() < 4) return 0;
+            len = (uint64_t(p[2]) << 8) | p[3];
+            head = 4;
+        } else if (len == 127) {
+            if (buf.size() < 10) return 0;
+            len = 0;
+            for (int i = 0; i < 8; ++i) len = (len << 8) | p[2 + i];
+            head = 10;
+        }
+        if (len > (1u << 20)) return -1;   // the client never sends us a megabyte
+        if (masked) head += 4;
+        if (buf.size() < head + len) return 0;
+        payload.assign(buf, head, static_cast<size_t>(len));
+        if (masked) {
+            const uint8_t* key = p + head - 4;
+            for (size_t i = 0; i < payload.size(); ++i)
+                payload[i] = static_cast<char>(payload[i] ^ key[i % 4]);
+        }
+        buf.erase(0, head + static_cast<size_t>(len));
+        return 1;
+    }
+};
+
+// a websocket owns its stream slot for the whole connection
+struct ws_slot_t {
+    bool ok = false;
+    ws_slot_t() {
+        size_t cur = g_streams.load();
+        while (cur < g_max_streams) {
+            if (g_streams.compare_exchange_weak(cur, cur + 1)) {
+                ok = true;
+                return;
+            }
+        }
+    }
+    ~ws_slot_t() {
+        if (ok) g_streams.fetch_sub(1);
+    }
+    ws_slot_t(const ws_slot_t&) = delete;
+    ws_slot_t& operator=(const ws_slot_t&) = delete;
+};
+
+void ws_write_http(socket_t sock, const httplib::Response& res) {
+    std::string out = "HTTP/1.1 " + std::to_string(res.status) + " " +
+                      httplib::status_message(res.status) + "\r\n";
+    for (const auto& [k, v] : res.headers) out += k + ": " + v + "\r\n";
+    out += "Content-Length: " + std::to_string(res.body.size()) + "\r\n";
+    out += "Connection: close\r\n\r\n";
+    out += res.body;
+    ws_send_all(sock, out);
+}
+
+// the bus speaks sse, the client wants {"event": name, "data": payload}
+bool ws_send_events(socket_t sock, const std::string& batch) {
+    size_t pos = 0;
+    for (;;) {
+        const size_t ev = batch.find("event: ", pos);
+        if (ev == std::string::npos) return true;
+        const size_t nl = batch.find('\n', ev);
+        if (nl == std::string::npos) return true;
+        const size_t data = batch.find("data: ", nl);
+        if (data == std::string::npos) return true;
+        const size_t end = batch.find("\n\n", data);
+        const size_t stop = end == std::string::npos ? batch.size() : end;
+        std::string msg = "{\"event\":\"";
+        msg.append(batch, ev + 7, nl - ev - 7);
+        msg += "\",\"data\":";
+        msg.append(batch, data + 6, stop - data - 6);
+        msg += '}';
+        if (!ws_send(sock, 0x1, msg)) return false;
+        pos = stop;
+    }
+}
+
+bool ws_serve(socket_t sock) {
+    // request head, then the upgrade
+    std::string head;
+    const int64_t deadline = infra::steady_ms() + 5000;
+    char tmp[2048];
+    while (head.find("\r\n\r\n") == std::string::npos) {
+        if (infra::steady_ms() > deadline || head.size() > 32 * 1024) return false;
+        const int n = ::recv(sock, tmp, sizeof(tmp), 0);
+        if (n <= 0) return false;
+        head.append(tmp, static_cast<size_t>(n));
+    }
+
+    const size_t eol = head.find("\r\n");
+    const std::string first = head.substr(0, eol);
+    const size_t s1 = first.find(' ');
+    const size_t s2 = first.rfind(' ');
+    if (s1 == std::string::npos || s2 == s1) return false;
+    const std::string method = first.substr(0, s1);
+    const std::string target = first.substr(s1 + 1, s2 - s1 - 1);
+
+    httplib::Request req;
+    req.method = method;
+    req.path   = target.substr(0, target.find('?'));
+    for (size_t pos = eol + 2; pos < head.size();) {
+        const size_t end = head.find("\r\n", pos);
+        if (end == std::string::npos || end == pos) break;
+        const std::string line = head.substr(pos, end - pos);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            size_t v = colon + 1;
+            while (v < line.size() && (line[v] == ' ' || line[v] == '\t')) ++v;
+            req.set_header(lower(line.substr(0, colon)), line.substr(v));
+        }
+        pos = end + 2;
+    }
+    const size_t q = target.find('?');
+    if (q != std::string::npos)
+        httplib::detail::parse_query_text(target.substr(q + 1), req.params);
+
+    httplib::Response res;
+    if (method != "GET" || req.path != kWsPath) {
+        send_json(res, 404, {{"ok", false}, {"error", "not found"}});
+        ws_write_http(sock, res);
+        return false;
+    }
+    if (!guard_request(req, res)) {
+        ws_write_http(sock, res);
+        return false;
+    }
+    if (!consume_ticket(req.get_param_value("ticket")) &&
+        !require_auth(req, res, /*rpc_shape=*/false)) {
+        ws_write_http(sock, res);
+        return false;
+    }
+    const std::string key = req.get_header_value("Sec-WebSocket-Key");
+    if (lower(req.get_header_value("Upgrade")) != "websocket" || key.empty() ||
+        req.get_header_value("Sec-WebSocket-Version") != "13") {
+        send_json(res, 400, {{"ok", false}, {"error", "websocket upgrade required"}});
+        ws_write_http(sock, res);
+        return false;
+    }
+    ws_slot_t slot;
+    if (!slot.ok) {
+        res.set_header("Retry-After", "5");
+        send_json(res, 503, {{"ok", false}, {"error", "too many open event streams"}});
+        ws_write_http(sock, res);
+        return false;
+    }
+
+    if (!ws_send_all(sock, "HTTP/1.1 101 Switching Protocol\r\n"
+                            "Upgrade: websocket\r\n"
+                            "Connection: Upgrade\r\n"
+                            "Sec-WebSocket-Accept: " + ws_accept_key(key) + "\r\n\r\n"))
+        return false;
+
+    auto sub = infra::event_bus::subscribe();
+    // the sse stream opens with hello; the socket client gets the same frame
+    if (!ws_send(sock, 0x1, "{\"event\":\"hello\",\"data\":{\"output_revision\":" +
+                                std::to_string(infra::event_bus::output_revision()) + "}}"))
+        return false;
+
+    ws_reader_t reader;
+    reader.sock = sock;
+    int64_t last_ping = infra::steady_ms();
+    while (g_running.load()) {
+        const int filled = reader.fill(0);
+        if (filled < 0) return true;   // peer closed
+        for (;;) {
+            uint8_t opcode = 0;
+            std::string payload;
+            const int r = reader.next(opcode, payload);
+            if (r < 0) return false;
+            if (r == 0) break;
+            if (opcode == 0x8) {   // close: echo the code back and stop
+                ws_send(sock, 0x8, payload);
+                return true;
+            }
+            if (opcode == 0x9 && !ws_send(sock, 0xA, payload)) return false;   // ping -> pong
+        }
+        std::string batch;
+        if (!sub->wait(batch, 200)) return false;   // bus closed
+        if (batch.empty()) {
+            if (infra::steady_ms() - last_ping >= kWsPingMs) {
+                last_ping = infra::steady_ms();
+                if (!ws_send(sock, 0x9, {})) return false;
+            }
+            continue;
+        }
+        if (!ws_send_events(sock, batch)) return false;
+    }
+    ws_send(sock, 0x8, {});
+    return true;
+}
+
+// httplib's accept loop is the only place the raw socket is visible, so the
+// upgrade is dispatched there. Everything else takes the stock path; the body
+// below mirrors httplib's own process_and_close_socket, which is private.
+class ws_server_t final : public httplib::Server {
+public:
+    bool process_and_close_socket(socket_t sock) override {
+        // the request is tiny and arrives in one packet on loopback, but a
+        // split write must not silently land on the http path
+        std::string head;
+        const int64_t deadline = infra::steady_ms() + 200;
+        for (;;) {
+            char peek[1024];
+            const int n = ::recv(sock, peek, sizeof(peek), MSG_PEEK);
+            if (n <= 0) break;
+            head.assign(peek, static_cast<size_t>(n));
+            if (head.find("\r\n\r\n") != std::string::npos) break;
+            if (infra::steady_ms() > deadline) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (std::string_view(head).find(kWsPath) != std::string_view::npos) {
+            const bool ok = ws_serve(sock);
+            httplib::detail::shutdown_socket(sock);
+            httplib::detail::close_socket(sock);
+            return ok;
+        }
+
+        std::string remote_addr, local_addr;
+        int remote_port = 0, local_port = 0;
+        httplib::detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
+        httplib::detail::get_local_ip_and_port(sock, local_addr, local_port);
+        const bool ret = httplib::detail::process_server_socket(
+            svr_sock_, sock, keep_alive_max_count_, keep_alive_timeout_sec_,
+            read_timeout_sec_, read_timeout_usec_, write_timeout_sec_, write_timeout_usec_,
+            [&](httplib::Stream& strm, bool close_connection, bool& connection_closed) {
+                return process_request(strm, remote_addr, remote_port, local_addr, local_port,
+                                       close_connection, connection_closed, nullptr);
+            });
+        httplib::detail::shutdown_socket(sock);
+        httplib::detail::close_socket(sock);
+        return ret;
+    }
+};
+
 // OpenAPI 3.1 descriptor for /api/v1, generated from the same tool schemas
 // tools/list serves so the two can never drift
 json openapi_doc() {
@@ -776,6 +1113,15 @@ json openapi_doc() {
 
 } // namespace
 
+// rfc 6455 4.2.2: base64(sha1(key + guid)), exposed for the handshake test
+std::string ws_accept_key(std::string_view key) {
+    std::string in(key);
+    in += "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    const std::string digest = sha1_digest(in);
+    return infra::fmt::base64(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(digest.data()), digest.size()));
+}
+
 bool start(const server_config_t& cfg) {
     if (g_running) return true;
 
@@ -787,7 +1133,7 @@ bool start(const server_config_t& cfg) {
             if (!t.empty()) g_extra_tokens.push_back(t);
     }
     g_max_streams = std::max<size_t>(1, cfg.max_streams);
-    auto srv = std::make_unique<httplib::Server>();
+    auto srv = std::make_unique<ws_server_t>();
     // httplib's default SO_REUSEADDR lets a second process bind the same
     // 127.0.0.1 port on Windows and silently take half the connections
     srv->set_socket_options([](socket_t s) {

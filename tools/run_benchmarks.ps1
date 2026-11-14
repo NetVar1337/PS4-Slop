@@ -54,7 +54,8 @@ foreach ($b in $appBase.workloads) {
     Add-Row 'app' $b.name $b.median_ms $n[0].median_ms
 }
 
-# frontend: OutputPanel SSR render of 4096 rows (app\scripts\bench-ui.mjs)
+# frontend: OutputPanel SSR render + the 1M row virtualized list
+# (app\scripts\bench-ui.mjs)
 if (-not $SkipUi) {
     $uiOut = Join-Path $OutDir 'ui.json'
     Push-Location (Join-Path $root 'app')
@@ -64,8 +65,22 @@ if (-not $SkipUi) {
     } finally { Pop-Location }
     $ui = Get-Content -LiteralPath $uiOut -Raw | ConvertFrom-Json
     $uiBase = Get-Content -LiteralPath (Join-Path $docs 'ui-after.json') -Raw | ConvertFrom-Json
-    if ($ui.workload -ne $uiBase.workload) { $failures.Add("ui: workload $($ui.workload) != baseline $($uiBase.workload)") }
-    Add-Row 'ui' $ui.workload ([Math]::Round($uiBase.median_ms, 3)) ([Math]::Round($ui.median_ms, 3))
+    foreach ($b in $uiBase.workloads) {
+        $n = @($ui.workloads | Where-Object workload -EQ $b.workload)
+        if ($n.Count -ne 1) { $failures.Add("ui/$($b.workload): workload missing from this run"); continue }
+        if ($null -ne $b.median_ms) {
+            Add-Row 'ui' $b.workload ([Math]::Round($b.median_ms, 3)) ([Math]::Round($n[0].median_ms, 3))
+        }
+        # the 1M row list's hot path is a scroll frame, and it gets a tighter
+        # budget than the generic slowdown factor
+        if ($null -ne $b.scroll_frame_ms) {
+            $ratio = if ($b.scroll_frame_ms -gt 0) { [Math]::Round($n[0].scroll_frame_ms / $b.scroll_frame_ms, 2) } else { $null }
+            $rows.Add([pscustomobject]@{ Suite = 'ui'; Workload = "$($b.workload)/scroll_frame"; BaselineMs = $b.scroll_frame_ms; Ms = $n[0].scroll_frame_ms; Ratio = $ratio })
+            if ($ratio -and $ratio -gt 1.25) {
+                $failures.Add("ui/$($b.workload): scroll frame $($n[0].scroll_frame_ms) ms is ${ratio}x the baseline $($b.scroll_frame_ms) ms (limit 1.25x)")
+            }
+        }
+    }
 }
 
 $table = $rows | Format-Table -AutoSize | Out-String

@@ -50,6 +50,9 @@ bool request_used_primary_token();
 // single use ticket for GET /events?ticket=..., valid for 60 s
 std::string issue_events_ticket();
 
+// RFC 6455 Sec-WebSocket-Accept for a client key, exposed for the handshake test
+std::string ws_accept_key(std::string_view key);
+
 // guard predicates, exposed for tests
 bool host_allowed(std::string_view host, uint16_t port);
 bool origin_allowed(std::string_view origin);

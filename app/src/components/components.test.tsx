@@ -10,8 +10,13 @@ import StatusBar from "@/components/StatusBar";
 import Tabs from "@/components/Tabs";
 import DebuggerView from "@/components/panels/DebuggerView";
 import DecompView from "@/components/panels/DecompView";
+import DisassemblyView from "@/components/panels/DisassemblyView";
+import EmulatorPanel from "@/components/panels/EmulatorPanel";
 import InspectorPanel from "@/components/panels/InspectorPanel";
 import MemoryView from "@/components/panels/MemoryView";
+import { bucketize, kBuckets } from "@/components/panels/Minimap";
+import NetworkPanel from "@/components/panels/NetworkPanel";
+import PatchPanel from "@/components/panels/PatchPanel";
 import ScannerPanel from "@/components/panels/ScannerPanel";
 import ScriptsPanel from "@/components/panels/ScriptsPanel";
 import StringsView from "@/components/panels/StringsView";
@@ -19,20 +24,24 @@ import StructEditor from "@/components/panels/StructEditor";
 import TargetsPanel from "@/components/panels/TargetsPanel";
 import UnpackerView from "@/components/panels/UnpackerView";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
+import XrayPanel from "@/components/panels/XrayPanel";
 import { hex } from "@/lib/format";
 import { setEndpoint } from "@/lib/rpc";
 import { readLayoutFile, saveLayoutFile } from "@/lib/layoutFile";
 import { useDebugger } from "@/store/debugger";
 import { useDecomp } from "@/store/decomp";
 import { useDisasm } from "@/store/disasm";
+import { useEmulator } from "@/store/emulator";
 import { useEngine } from "@/store/engine";
 import { useMemory } from "@/store/memory";
+import { useNetwork } from "@/store/network";
 import { useSettings } from "@/store/settings";
 import { useTargets } from "@/store/targets";
 import { useTheme } from "@/store/theme";
 import { useTypes } from "@/store/types";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
+import { useXray } from "@/store/xray";
 import { mockApi } from "@/test/api";
 
 // the diagnostics bundle and the payload save both go through the native save
@@ -87,6 +96,9 @@ const initial = {
   decomp: useDecomp.getState(),
   settings: useSettings.getState(),
   types: useTypes.getState(),
+  xray: useXray.getState(),
+  network: useNetwork.getState(),
+  emulator: useEmulator.getState(),
 };
 
 beforeEach(() => {
@@ -100,6 +112,9 @@ beforeEach(() => {
   useDecomp.setState(initial.decomp, true);
   useSettings.setState(initial.settings, true);
   useTypes.setState(initial.types, true);
+  useXray.setState(initial.xray, true);
+  useNetwork.setState(initial.network, true);
+  useEmulator.setState(initial.emulator, true);
   setEndpoint({ port: 8765, token: "" });
 });
 
@@ -260,6 +275,40 @@ describe("strings view (item 87)", () => {
     useDisasm.setState({ image: { ready: true, format: "elf" } });
     render(<StringsView />);
     expect(await screen.findByText("line1\\nline2")).toBeInTheDocument();
+  });
+});
+
+describe("disassembly minimap (audit 88)", () => {
+  const insns = Array.from({ length: 320 }, (_, i) => ({
+    va: 0x1000 + i * 4,
+    len: 4,
+    text: `insn ${i}`,
+    flow: i === 10 ? "cond_jump" : "next",
+    target: i === 10 ? 0x1000 + 300 * 4 : undefined,
+  }));
+
+  it("folds the whole function into fixed buckets and marks branch targets", () => {
+    const buckets = bucketize(insns);
+    expect(buckets).toHaveLength(kBuckets);
+    expect(buckets.reduce((n, b) => n + b.density, 0)).toBe(insns.length);
+    expect(buckets.filter((b) => b.branch)).toHaveLength(1);
+    expect(buckets[Math.floor((300 * kBuckets) / insns.length)].branch).toBe(true);
+    expect(bucketize([])).toEqual([]);
+  });
+
+  it("renders one strip with a viewport marker over the listing", () => {
+    useDisasm.setState({
+      insns,
+      selected: 0x1000,
+      selectedFn: { va: 0x1000, size: 1280 },
+    });
+    render(<DisassemblyView />);
+    const strip = screen.getByRole("scrollbar", { name: "Function overview" });
+    expect(strip.querySelectorAll(".minimap-bar").length).toBeGreaterThan(0);
+    expect(strip.querySelectorAll(".minimap-view")).toHaveLength(1);
+    // a press on the strip jumps without needing layout from jsdom
+    fireEvent.pointerDown(strip, { clientY: 300 });
+    fireEvent.pointerUp(strip, { clientY: 300 });
   });
 });
 
@@ -936,5 +985,174 @@ describe("memory caret inspector (item 83)", () => {
     await screen.findByText("ABCD");
     expect(screen.getByText("u32").closest(".mem-value")?.textContent).toContain("1145258561");
     expect(await screen.findByText("Player { hp: 65 }")).toBeInTheDocument();
+  });
+});
+
+describe("xray panel", () => {
+  it("renders pass rows with severity and jumps to the address", async () => {
+    const { calls } = mockApi(({ action }) =>
+      action === "hooks"
+        ? {
+            hooks: [
+              { address: 0x401000, hook_type: "jmp", target: 0x500000, prologue_bytes: "E9" },
+            ],
+            functions_checked: 12,
+            hooks_found: 1,
+            source: "index",
+          }
+        : {},
+    );
+    useDisasm.setState({ image: { ready: true, name: "eboot.bin", format: "elf" } });
+    render(<XrayPanel />);
+    await userEvent.click(screen.getByRole("button", { name: "Hooks" }));
+    expect(await screen.findByText("jmp")).toBeInTheDocument();
+    expect(screen.getByText(/1 hooks in 12 functions/)).toBeInTheDocument();
+    const row = screen.getByText("jmp").closest("tr");
+    expect(row).toHaveAttribute("data-severity", "bad");
+    await userEvent.click(screen.getByRole("button", { name: "0x401000" }));
+    expect(useUi.getState().workspaceTab).toBe("disassembly");
+    expect(calls.some((c) => c.tool === "xray" && c.action === "hooks")).toBe(true);
+  });
+});
+
+describe("patch panel", () => {
+  it("lists the journal and reverts after a confirm", async () => {
+    const { calls } = mockApi(({ action }) =>
+      action === "journal"
+        ? {
+            patches: [{ va: 0x401000, before: 0x90, after: 0xcc }],
+            total: 1,
+            indexes_dirty: false,
+          }
+        : { ok: true, bytes_changed: 1, journal_total: 0, patches: [] },
+    );
+    render(<PatchPanel />);
+    expect(await screen.findByText("401000")).toBeInTheDocument();
+    expect(screen.getByText("90")).toBeInTheDocument();
+    expect(screen.getByText("CC")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Revert all…" }));
+    expect(screen.getByRole("alertdialog", { name: "Confirm patch" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Confirm Revert all" }));
+    await waitFor(() => expect(calls.some((c) => c.action === "revert_all")).toBe(true));
+  });
+});
+
+describe("network panel", () => {
+  const status = {
+    capture_running: true,
+    capture_filter: { host: "", port: 0, protocol: 0 },
+    store_packets: 1,
+    proxy_running: false,
+    proxy_port: 0,
+    proxy_mitm: false,
+  };
+
+  it("shows captured packets and exports a pcap", async () => {
+    const { calls } = mockApi(({ action }) => {
+      if (action === "status") return status;
+      if (action === "packets")
+        return {
+          packets: [
+            {
+              id: 1,
+              at_ms: 1000,
+              protocol: 6,
+              protocol_str: "tcp",
+              direction: 0,
+              direction_str: "outbound",
+              ip_version: 4,
+              local: "10.0.0.5:1234",
+              remote: "1.2.3.4:80",
+              payload_bytes: 10,
+              wire_bytes: 54,
+            },
+          ],
+          last_id: 1,
+        };
+      if (action === "export_pcap") return { exported: true, packets: 1 };
+      return {};
+    });
+    render(<NetworkPanel />);
+    expect(await screen.findByText("10.0.0.5:1234")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Export PCAP…" }));
+    await waitFor(() => expect(calls.some((c) => c.action === "export_pcap")).toBe(true));
+    expect(await screen.findByText(/1 packets written/)).toBeInTheDocument();
+  });
+
+  it("shows an Administrator error verbatim", async () => {
+    mockApi(({ action }) => {
+      if (action === "status") return { ...status, capture_running: false };
+      if (action === "capture_start")
+        throw new Error("capture needs Administrator: run reverse-slop elevated");
+      return {};
+    });
+    render(<NetworkPanel />);
+    await userEvent.click(screen.getByRole("button", { name: "Start capture" }));
+    expect(await screen.findByText(/capture needs Administrator/)).toBeInTheDocument();
+  });
+});
+
+describe("emulator panel", () => {
+  it("renders a run result and the backward slice", async () => {
+    const { calls } = mockApi(({ action }) => {
+      if (action === "run")
+        return {
+          ok: true,
+          stopped_reason: "count",
+          instructions: 1,
+          arch: "x64",
+          abi: "win64",
+          regs: { rip: 0x1000, rax: 0 },
+          trace: [{ ip: 0x1000, text: "nop" }],
+          trace_id: 3,
+        };
+      if (action === "slice")
+        return { trace_id: 3, count: 1, instructions: [{ ip: 0x1000, text: "nop" }] };
+      return {};
+    });
+    render(<EmulatorPanel />);
+    await userEvent.type(screen.getByLabelText("Code bytes (hex)"), "90");
+    await userEvent.click(screen.getByRole("button", { name: "Run" }));
+    expect(await screen.findByText(/count · 1 instructions/)).toBeInTheDocument();
+    expect(screen.getByText("rip")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Slice" }));
+    await waitFor(() => expect(calls.some((c) => c.action === "slice")).toBe(true));
+    expect(await screen.findByText(/1 instructions for trace 3/)).toBeInTheDocument();
+  });
+});
+
+describe("PS5 connect", () => {
+  it("auto-connects and shows the console firmware", async () => {
+    const { calls } = mockApi(({ action }) => {
+      if (action === "status")
+        return {
+          ps5: {
+            endpoint: "10.0.0.9:744",
+            branding: "ps5debug-NG",
+            server_version: "1.0",
+            caps: "0x3",
+            fw: "3.00",
+            platform: "ps5",
+            connected: true,
+            lost: false,
+            lost_reason: "",
+            drops: 0,
+            debug_attached: false,
+            debug_pid: 0,
+          },
+        };
+      if (action === "ps5_auto")
+        return { connected: true, pid: 5, name: "game.elf", debug_attached: true };
+      return {};
+    });
+    useEngine.setState({ backend: { badge: "user", ps4: false } });
+    render(<TargetsPanel />);
+    expect(await screen.findByText(/fw 3\.00/)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText("PS5 IP address"), "10.0.0.9");
+    await userEvent.click(screen.getByRole("button", { name: "Auto connect" }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.action === "ps5_auto" && c.params.host === "10.0.0.9")).toBe(true),
+    );
+    expect(await screen.findByText(/pid 5 game\.elf/)).toBeInTheDocument();
   });
 });

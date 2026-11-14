@@ -12,7 +12,7 @@ import { searchHelp } from "@/lib/help";
 import { handleShortcut } from "@/lib/shortcuts";
 import { useUi } from "@/store/ui";
 import { mockApi } from "@/test/api";
-import { EventSourceStub } from "@/test/setup";
+import { EventSourceStub, WebSocketStub } from "@/test/setup";
 
 describe("rpc", () => {
   it("times out a wedged engine instead of hanging (item 93)", async () => {
@@ -76,16 +76,40 @@ describe("format", () => {
 });
 
 describe("events", () => {
-  it("disconnect() reports the stream closed (item 98)", () => {
+  it("disconnect() reports the stream closed (item 98)", async () => {
     const seen: boolean[] = [];
     const off = events.onConnectionChange((open) => seen.push(open));
     events.connect();
-    const source = EventSourceStub.instances.at(-1);
-    source?.onopen?.();
+    await Promise.resolve();
+    const ws = WebSocketStub.instances.at(-1);
+    expect(ws?.url).toBe("ws://127.0.0.1:8765/api/v1/events/ws");
+    ws?.onopen?.();
     events.disconnect();
     off();
     expect(seen).toEqual([true, false]);
     expect(events.isConnected()).toBe(false);
+  });
+
+  it("delivers websocket frames to subscribers", async () => {
+    const got: unknown[] = [];
+    const off = events.on("output", (data) => got.push(data));
+    events.connect();
+    await Promise.resolve();
+    WebSocketStub.instances.at(-1)?.emit("output", { seq: 7, ms: 1, text: "ws" });
+    events.disconnect();
+    off();
+    expect(got).toEqual([{ seq: 7, ms: 1, text: "ws" }]);
+  });
+
+  it("falls back to sse when the engine has no websocket route", async () => {
+    events.connect();
+    await Promise.resolve();
+    const ws = WebSocketStub.instances.at(-1);
+    ws?.onclose?.(); // closed before it ever opened
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(EventSourceStub.instances.at(-1)?.url).toBe("http://127.0.0.1:8765/api/v1/events");
+    events.disconnect();
   });
 });
 

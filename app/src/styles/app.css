@@ -757,6 +757,41 @@ input {
   border-bottom: 1px solid var(--border-soft);
 }
 
+/* the scroll body and its overview strip side by side */
+.listing-body {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr);
+  min-height: 0;
+}
+
+.minimap {
+  position: relative;
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+  background: var(--bg-0);
+  cursor: pointer;
+  touch-action: none;
+}
+
+.minimap svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.minimap-bar {
+  fill: var(--text-faint);
+}
+
+.minimap-branch {
+  fill: var(--warning);
+}
+
+.minimap-view {
+  fill: var(--accent);
+  opacity: 0.3;
+}
+
 .insn-row {
   position: absolute;
   left: 0;
@@ -2421,4 +2456,140 @@ fieldset.settings-group {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* --- tool panels: xray / patch / network / emulator ---------------------- */
+
+.tool-body {
+  display: grid;
+  gap: var(--pad-sm);
+  align-content: start;
+  padding: var(--pad-sm) var(--pad-md);
+}
+
+.tool-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--pad-sm);
+  min-width: 0;
+}
+
+.tool-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--type-small);
+}
+
+.tool-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.tool-summary {
+  display: grid;
+  gap: 2px;
+  font-size: var(--type-small);
+}
+
+.tool-steps {
+  margin: 0;
+  padding-left: var(--pad-md);
+  font-size: var(--type-small);
+  user-select: text;
+}
+
+.tool-steps li[data-ok="false"] {
+  color: var(--warning);
+}
+
+.tool-table-wrap {
+  display: grid;
+  gap: var(--pad-xs);
+  min-height: 0;
+}
+
+.tool-table-scroll {
+  height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border-soft);
+}
+
+.tool-hex {
+  width: 100%;
+  padding: var(--pad-sm);
+  font-family: var(--font-mono);
+  font-size: var(--type-mono);
+  color: var(--text);
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+  resize: vertical;
+}
+
+.tool-hex:focus {
+  border-color: var(--accent);
+}
+
+.tool-pre {
+  max-height: 160px;
+  margin: 0;
+  padding: var(--pad-sm);
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--type-mono);
+  white-space: pre-wrap;
+  background: var(--bg-0);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  user-select: text;
+}
+
+.tool-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--pad-sm);
+  padding-top: var(--pad-xs);
+  border-top: 1px solid var(--border-soft);
+}
+
+.confirm-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--pad-sm);
+  padding: var(--pad-sm);
+  font-size: var(--type-small);
+  color: var(--warning);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  border: 1px solid var(--warning);
+  border-radius: var(--radius-sm);
+}
+
+.xray-graph {
+  max-height: 320px;
+  overflow: auto;
+}
+
+.sev-bad {
+  color: var(--danger);
+}
+
+.sev-warn {
+  color: var(--warning);
+}
+
+.sev-ok {
+  color: var(--success);
+}
+
+.table tbody tr[data-severity="bad"] td:first-child {
+  color: var(--danger);
+}
+
+.table tbody tr[data-severity="warn"] td:first-child {
+  color: var(--warning);
 }

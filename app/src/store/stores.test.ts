@@ -12,7 +12,7 @@ import { useWatch } from "@/store/watch";
 import { useTypes } from "@/store/types";
 import * as events from "@/lib/events";
 import { flushPromises, mockApi } from "@/test/api";
-import { EventSourceStub } from "@/test/setup";
+import { lastStream } from "@/test/setup";
 
 const initial = {
   debugger: useDebugger.getState(),
@@ -57,7 +57,7 @@ describe("engine event mirroring (items 83, 84)", () => {
       return {};
     });
     await useEngine.getState().start();
-    const stream = EventSourceStub.instances.at(-1);
+    const stream = await lastStream();
     stream?.onopen?.();
     await vi.waitFor(() => expect(useEngine.getState().boot.done).toBe(true));
 
@@ -158,7 +158,7 @@ describe("debugger", () => {
     });
     const off = useDebugger.getState().connectStream();
     events.connect();
-    const stream = EventSourceStub.instances.at(-1);
+    const stream = await lastStream();
     stream?.onopen?.();
     stream?.emit("debugger.stop", {
       ...regs,
@@ -366,7 +366,7 @@ describe("output batching (item 104)", () => {
   it("commits a burst of streamed lines in one update", async () => {
     vi.useFakeTimers();
     events.connect();
-    const stream = EventSourceStub.instances.at(-1);
+    const stream = await lastStream();
     let commits = 0;
     const stop = useOutput.subscribe(() => commits++);
     const detach = useOutput.getState().attach();
@@ -399,7 +399,7 @@ describe("output batching (item 104)", () => {
       return {};
     });
     events.connect();
-    const stream = EventSourceStub.instances.at(-1);
+    const stream = await lastStream();
     const detach = useOutput.getState().attach();
     stream?.emit("output.cleared", {}); // reset module-level seq cursor from prior tests
     for (let seq = 1; seq <= 4; seq++) stream?.emit("output", { seq, ms: 0, text: `l${seq}` });

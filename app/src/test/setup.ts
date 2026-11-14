@@ -87,6 +87,36 @@ export class EventSourceStub {
 }
 globalThis.EventSource = EventSourceStub as unknown as typeof EventSource;
 
+/** The engine's /events websocket, driven by hand from the tests. */
+export class WebSocketStub {
+  static instances: WebSocketStub[] = [];
+  onopen: (() => void) | null = null;
+  onmessage: ((ev: MessageEvent<string>) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  readyState = 0;
+  constructor(readonly url: string) {
+    WebSocketStub.instances.push(this);
+  }
+  close(): void {
+    this.readyState = 3;
+  }
+  /** Deliver one frame, as the engine would. */
+  emit(name: string, data: unknown): void {
+    this.onmessage?.(new MessageEvent("message", { data: JSON.stringify({ event: name, data }) }));
+  }
+}
+globalThis.WebSocket = WebSocketStub as unknown as typeof WebSocket;
+
+/** The stream the engine just opened: websocket first, sse after a fallback. */
+export function lastStream(): Promise<EventSourceStub | WebSocketStub> {
+  return vi.waitFor(() => {
+    const stream = WebSocketStub.instances.at(-1) ?? EventSourceStub.instances.at(-1);
+    if (stream === undefined) throw new Error("no stream opened");
+    return stream;
+  });
+}
+
 if (window.matchMedia === undefined) {
   window.matchMedia = (query: string) =>
     ({

@@ -2009,6 +2009,103 @@ slop::core::mcp::server_config_t token_cfg() {
     return cfg;
 }
 
+// raw client for GET /api/v1/events/ws: httplib has no websocket side, so the
+// test speaks rfc 6455 itself
+struct ws_client_t {
+    socket_t    sock = INVALID_SOCKET;
+    std::string buf;
+
+    explicit ws_client_t(uint16_t port) {
+        sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        REQUIRE(sock != INVALID_SOCKET);
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port   = htons(port);
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE_EQ(::connect(sock, reinterpret_cast<sockaddr*>(&a), sizeof(a)), 0);
+        DWORD tv = 5000;
+        ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&tv), sizeof(tv));
+    }
+    ~ws_client_t() {
+        if (sock != INVALID_SOCKET) ::closesocket(sock);
+    }
+    ws_client_t(const ws_client_t&) = delete;
+    ws_client_t& operator=(const ws_client_t&) = delete;
+
+    void send(std::string_view bytes) {
+        size_t off = 0;
+        while (off < bytes.size()) {
+            const int n = ::send(sock, bytes.data() + off,
+                                 static_cast<int>(bytes.size() - off), 0);
+            REQUIRE_GT(n, 0);
+            off += static_cast<size_t>(n);
+        }
+    }
+
+    bool fill(size_t need) {
+        while (buf.size() < need) {
+            char tmp[1024];
+            const int n = ::recv(sock, tmp, sizeof(tmp), 0);
+            if (n <= 0) return false;
+            buf.append(tmp, static_cast<size_t>(n));
+        }
+        return true;
+    }
+
+    // http response head, body bytes stay in the buffer for frame()
+    bool http_head(std::string& out) {
+        for (;;) {
+            const size_t end = buf.find("\r\n\r\n");
+            if (end != std::string::npos) {
+                out = buf.substr(0, end + 4);
+                buf.erase(0, end + 4);
+                return true;
+            }
+            char tmp[1024];
+            const int n = ::recv(sock, tmp, sizeof(tmp), 0);
+            if (n <= 0) return false;
+            buf.append(tmp, static_cast<size_t>(n));
+        }
+    }
+
+    // one unmasked server frame
+    bool frame(uint8_t& opcode, std::string& payload) {
+        if (!fill(2)) return false;
+        opcode = static_cast<uint8_t>(buf[0]) & 0x0F;
+        uint64_t len = static_cast<uint8_t>(buf[1]) & 0x7F;
+        size_t head = 2;
+        if (len == 126) {
+            if (!fill(4)) return false;
+            len = (uint64_t(static_cast<uint8_t>(buf[2])) << 8) |
+                  static_cast<uint8_t>(buf[3]);
+            head = 4;
+        } else if (len == 127) {
+            if (!fill(10)) return false;
+            len = 0;
+            for (int i = 0; i < 8; ++i)
+                len = (len << 8) | static_cast<uint8_t>(buf[2 + i]);
+            head = 10;
+        }
+        if (!fill(head + static_cast<size_t>(len))) return false;
+        payload.assign(buf, head, static_cast<size_t>(len));
+        buf.erase(0, head + static_cast<size_t>(len));
+        return true;
+    }
+};
+
+// a masked client frame; the payloads here are all under 126 bytes
+std::string ws_client_frame(uint8_t opcode, std::string_view payload) {
+    std::string f;
+    f.push_back(static_cast<char>(0x80 | opcode));
+    f.push_back(static_cast<char>(0x80 | payload.size()));
+    const char mask[4] = {0x11, 0x22, 0x33, 0x44};
+    f.append(mask, 4);
+    for (size_t i = 0; i < payload.size(); ++i)
+        f.push_back(static_cast<char>(payload[i] ^ mask[i % 4]));
+    return f;
+}
+
 // scratch settings file so app.* settings actions never touch the real profile
 struct scratch_settings_t {
     std::filesystem::path dir;
@@ -2273,6 +2370,66 @@ TEST_CASE(mcp_events_ticket_is_single_use) {
     REQUIRE_EQ(reuse.first, 401);
     const auto legacy = open_stream("/events?token=" + kTok);
     REQUIRE_EQ(legacy.first, 401);   // the query-string token is gone
+}
+
+TEST_CASE(mcp_events_websocket_handshake_and_one_event) {
+    server_fixture_t fx(token_cfg());
+    // the same single use ticket the sse stream takes
+    auto res = fx.cli_->Post("/api", bearer(kTok),
+                             json{{"tool", "app"}, {"action", "events_ticket"}}.dump(),
+                             "application/json");
+    REQUIRE(res);
+    REQUIRE_EQ(res->status, 200);
+    const std::string ticket =
+        json::parse(res->body).at("data").at("ticket").get<std::string>();
+
+    // no ticket: rejected before the upgrade, exactly like sse
+    {
+        ws_client_t anon(fx.port());
+        anon.send("GET /api/v1/events/ws HTTP/1.1\r\nHost: 127.0.0.1:" +
+                  std::to_string(fx.port()) +
+                  "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                  "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                  "Sec-WebSocket-Version: 13\r\n\r\n");
+        std::string head;
+        REQUIRE(anon.http_head(head));
+        REQUIRE(head.rfind("HTTP/1.1 401", 0) == 0);
+    }
+
+    ws_client_t ws(fx.port());
+    // rfc 6455 example key, so the accept value is the published one
+    ws.send("GET /api/v1/events/ws?ticket=" + ticket +
+            " HTTP/1.1\r\nHost: 127.0.0.1:" + std::to_string(fx.port()) +
+            "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n");
+    std::string head;
+    REQUIRE(ws.http_head(head));
+    REQUIRE(head.rfind("HTTP/1.1 101", 0) == 0);
+    REQUIRE(head.find("Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=") !=
+            std::string::npos);
+
+    uint8_t opcode = 0;
+    std::string payload;
+    REQUIRE(ws.frame(opcode, payload));   // hello, same as the sse opener
+    REQUIRE_EQ(static_cast<int>(opcode), 1);
+    REQUIRE(json::parse(payload).at("event") == "hello");
+
+    slop::core::infra::event_bus::publish("test.ws", json{{"n", 1}});
+    REQUIRE(ws.frame(opcode, payload));
+    REQUIRE_EQ(static_cast<int>(opcode), 1);
+    const json msg = json::parse(payload);
+    REQUIRE(msg.at("event") == "test.ws");
+    REQUIRE_EQ(msg.at("data").at("n").get<int>(), 1);
+
+    ws.send(ws_client_frame(0x9, "hi"));   // ping -> pong
+    REQUIRE(ws.frame(opcode, payload));
+    REQUIRE_EQ(static_cast<int>(opcode), 10);
+    REQUIRE_STR_EQ(payload.c_str(), "hi");
+
+    ws.send(ws_client_frame(0x8, {}));   // close -> close
+    REQUIRE(ws.frame(opcode, payload));
+    REQUIRE_EQ(static_cast<int>(opcode), 8);
 }
 
 TEST_CASE(mcp_stream_cap_keeps_workers_free) {

@@ -488,6 +488,204 @@ function elevationLabel(p: ProcessRow): string | null {
   }
 }
 
+type Ps5Status = {
+  endpoint: string;
+  branding: string;
+  server_version: string;
+  caps: string;
+  fw: string;
+  platform: string;
+  connected: boolean;
+  lost: boolean;
+  lost_reason: string;
+  drops: number;
+  debug_attached: boolean;
+  debug_pid: number;
+};
+
+type Ps5AutoReply = {
+  pid?: number;
+  name?: string;
+  debug_attached?: boolean;
+  debug_error?: string;
+  candidates?: { pid: number; name: string; game: boolean }[];
+};
+
+/** PS5 console card: ps5debug-NG connect/auto/reconnect and the console state. */
+function Ps5Card() {
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState(kDefaultPs4Port);
+  const [status, setStatus] = useState<Ps5Status | null>(null);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+
+  const refresh = async () => {
+    try {
+      const res = await call<{ ps5?: Ps5Status }>("target", "status");
+      setStatus(res.ps5 ?? null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  const run = async (label: string, action: string, params: Record<string, unknown>) => {
+    setBusy(label);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await call<Ps5AutoReply & { connected?: boolean }>("target", action, params);
+      if (action === "ps5_auto") {
+        setNotice(
+          `pid ${res.pid ?? "?"} ${res.name ?? ""}${
+            res.debug_attached === true ? " · debug attached" : " · debug not attached"
+          }${res.debug_error !== undefined ? ` (${res.debug_error})` : ""}`,
+        );
+      }
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const send = async () => {
+    if (msg.trim() === "") return;
+    setBusy("notify");
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await call<{ bytes: number }>("target", "ps5_notify", { msg: msg.trim() });
+      setNotice(`Notification sent (${res.bytes} bytes).`);
+      setMsg("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="payload-card ps5-card" aria-label="PS5 console">
+      <div className="payload-head">
+        <span className="payload-title">PS5</span>
+        {status !== null ? (
+          <span className="pill" data-active={status.connected}>
+            {status.connected ? "connected" : status.lost ? "lost" : "idle"}
+          </span>
+        ) : (
+          <span className="faint">not connected</span>
+        )}
+        <div className="spacer" />
+        <button type="button" className="row-action" onClick={() => void refresh()}>
+          Refresh
+        </button>
+      </div>
+
+      {status !== null && (
+        <div className="payload-hint">
+          {status.endpoint !== "" ? `${status.endpoint} · ` : ""}
+          {status.branding !== "" ? `${status.branding} · ` : ""}
+          fw {status.fw !== "" ? status.fw : "unknown"}
+          {status.platform !== "" ? ` · platform ${status.platform}` : ""}
+          {status.server_version !== "" ? ` · server ${status.server_version}` : ""}
+          {status.caps !== "" ? ` · caps ${status.caps}` : ""}
+          {" · "}
+          {status.debug_attached ? `debug pid ${status.debug_pid}` : "debugger idle"}
+          {" · "}
+          drops {status.drops}
+          {status.lost && status.lost_reason !== "" ? ` · lost: ${status.lost_reason}` : ""}
+        </div>
+      )}
+
+      <div className="payload-actions">
+        <input
+          className="addr-input"
+          aria-label="PS5 IP address"
+          placeholder="PS5 IP, e.g. 192.168.1.30"
+          value={host}
+          onChange={(e) => setHost(e.target.value)}
+        />
+        <input
+          className="addr-input"
+          style={{ width: 64 }}
+          aria-label="ps5debug port"
+          type="number"
+          min={1}
+          max={65535}
+          value={port}
+          onChange={(e) => setPort(Number(e.target.value) || kDefaultPs4Port)}
+        />
+        <button
+          type="button"
+          className="row-action"
+          disabled={busy !== null || host.trim() === ""}
+          onClick={() => void run("connect", "ps5_connect", { host: host.trim(), port })}
+        >
+          {busy === "connect" ? "Connecting…" : "Connect"}
+        </button>
+        <button
+          type="button"
+          className="row-action"
+          disabled={busy !== null || host.trim() === ""}
+          data-tip="Connect, pick the game process, attach a session and the debugger"
+          onClick={() => void run("auto", "ps5_auto", { host: host.trim(), port })}
+        >
+          {busy === "auto" ? "Setting up…" : "Auto connect"}
+        </button>
+        <button
+          type="button"
+          className="row-action"
+          disabled={busy !== null || status?.connected !== true}
+          onClick={() => void run("disconnect", "ps5_disconnect", {})}
+        >
+          Disconnect
+        </button>
+        <button
+          type="button"
+          className="row-action"
+          disabled={busy !== null || status?.lost !== true}
+          onClick={() => void run("reconnect", "ps5_reconnect", {})}
+        >
+          Reconnect
+        </button>
+      </div>
+
+      <div className="payload-actions">
+        <input
+          className="addr-input"
+          style={{ flex: 1, minWidth: 120 }}
+          aria-label="PS5 notification message"
+          placeholder="on-screen message"
+          value={msg}
+          onChange={(e) => setMsg(e.target.value)}
+        />
+        <button
+          type="button"
+          className="row-action"
+          disabled={busy !== null || msg.trim() === "" || status?.connected !== true}
+          onClick={() => void send()}
+        >
+          {busy === "notify" ? "Sending…" : "Notify"}
+        </button>
+      </div>
+
+      {notice !== null && <div className="payload-hint">{notice}</div>}
+      {error !== null && (
+        <div className="empty-hint error-text" role="alert">
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function TargetsPanel() {
   const {
     processes,
@@ -585,6 +783,7 @@ export default function TargetsPanel() {
       <div className="banner-slot">
         {banner}
         <ConsolesCard />
+        <Ps5Card />
       </div>
 
       {!listing ? (
