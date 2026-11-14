@@ -53,6 +53,14 @@ section matching the pushed tag as the GitHub release notes.
 - **Persistence**: `sessions.db` schema migrations (`PRAGMA user_version`), `fs_root` jail for every `fs`
   action, `notes.export`/`notes.import` for Git-shareable `symbols/<hash>.json`, and a patch journal that
   survives a restart.
+- **UI**: a Pseudocode tab (highlighted, clickable tokens, `types.changed` re-render) with a
+  dependency-free CFG graph; Structs (ReClass-style catalog editor with live `read_field` values) and
+  Unpacker (packer verdict, patch passes, journal, revert) tabs; X-ray, Patches, Network and Emulator
+  panels; a PS5 card in Targets; a disassembly minimap; snapshot-diff highlighting and a caret
+  inspector in the hex editor; help search over the generated docs index; layout export/import; a
+  typed i18n catalog (English/German) with a language selector; and a theme editor with named custom
+  themes and JSON round-trip.
+- **Notes**: `notes.push` / `notes.pull` share `symbols/<hash>.json` through any HTTP symbol store.
 - **Tooling**: `app.diag_bundle` (support zip) with Settings "Copy diagnostics" and a crash-banner "Open
   log folder"; libFuzzer targets for the ELF/PE/Mach-O/.ipa/ZIP/ps4debug-NG/.NET parsers; coverage and
   `/analyze` ratchets; gitleaks; release-artifact mitigation checks; winget/Scoop/Chocolatey manifests;
@@ -72,6 +80,9 @@ section matching the pushed tag as the GitHub release notes.
   strips credentials unless `with_secrets:true`.
 - Unicorn is built with the aarch64 backend alongside x86.
 - The ps4 test suite uses a per-test ephemeral debug-event port instead of the machine-global 755.
+- The event stream is also served over WebSocket (`/api/v1/events/ws`, RFC 6455); the UI prefers it
+  and falls back to SSE. The weekly bench lane gained a 1,000,000-row virtualized-list case with a
+  scroll-frame budget.
 
 ### Fixed
 

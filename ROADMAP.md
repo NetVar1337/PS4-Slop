@@ -36,23 +36,31 @@ Everything below shipped in one pass; see the `Unreleased` section of
       carries the parity matrix); the Unpacker view stays ImGui-only for now.
 - [x] Tutorials, an mdBook site over `docs/`, a help index generator, winget/Scoop/Chocolatey
       manifests, and a demo-capture script.
+- [x] UI panels for the tools that were MCP/Lua-only: pseudocode + CFG graph, struct editor,
+      unpacker, X-ray, patch journal, network capture/proxy, emulator, PS5 card, disassembly
+      minimap, hex snapshot diff and caret inspector.
+- [x] In-app help search, layout export/import, a typed i18n catalog with a language selector, and a
+      theme editor with custom themes.
+- [x] `/api/v1/events/ws` (WebSocket) alongside SSE, and a 1M-row virtualized-list benchmark with a
+      scroll-frame budget.
+- [x] Self-hosted annotation sharing: `notes.push` / `notes.pull` over any HTTP symbol store.
 
 ## Next (P1)
 
-- [ ] **UI panels for the tools that are still MCP/Lua-only**: decompiler view with syntax
-      highlighting and clickable tokens, an interactive CFG graph canvas, a ReClass-style struct
-      editor, the unpacker view, and Xray / patch-journal / network-capture / emulator panels.
+- [ ] **UI depth on the new panels**: `patch.rebuild`, `network.annotate/stream_data/reassemble_stream`,
+      `proxy.mitm_*` and the analyze diff jobs still have no control; the CFG canvas is a layered
+      view, not a draggable graph.
 - [ ] **Linux engine port**: the portable subset (Hyperion + `dissect`) already configures off
       Windows; next are `backend_usermode`, raw-socket capture, WinHTTP and the Tauri supervisor.
 - [ ] **PS5 depth**: on-console scan engine, module dump, remote call and ELF upload once the
       payload exposes them; real-hardware verification of the current surface.
-- [ ] **Localization** framework (all strings are hardcoded English) and a user theme editor.
+
 - [ ] **Time-travel debugging**: a snapshot ring on the console (research-grade).
 
 ## Later (P3, opportunistic)
 
 - [ ] Nintendo Switch / other targets behind the same backend abstraction.
-- [ ] Shared symbol/comment server (self-hosted) on top of `notes.export`/`import`.
+
 - [ ] FLIRT crc16 tails and referenced-function constraints (import models anchors only today).
 - [ ] `emulate.slice` for ARM64 (x86-64 only today).
 - [ ] `.eh_frame` unwinding for PS4 ELF callstacks (rbp chain today).
