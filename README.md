@@ -43,7 +43,7 @@ through one UI, one Lua surface and one MCP server.
 | --- | --- |
 | **Console connection** | ps4debug-NG over TCP 744 plus the TCP 755 debug-event callback. Auto-discovery, auto-connect, reconnect with backoff, native/turbo scan and bulk writes. |
 | **Live memory** | Regions, modules, threads, read/write/protect/alloc, Cheat Engine-style scans, AOB wildcards, pointer chains, snapshots and diffs, a shared watchlist with freeze/freeze-once/undo. |
-| **Live debugging** | Software breakpoints (conditional, hit counts), DR0–DR3 watchpoints, continue/step/suspend, stop events with registers, callstacks, FP/FS-GS, remote calls, trace/find-write one-shots. |
+| **Live debugging** | Software breakpoints (conditional, hit counts, log-only), DR0–DR3 watchpoints, continue/step/suspend, pushed stop events with registers, `.pdata` callstacks, FP/FS-GS, remote calls, continuous trace to JSONL, trace/find-write one-shots; the same surface on PS5 (ps5debug-NG) minus the on-console scan engine. |
 | **On-console tooling** | Native scan/rescan, Turbo Scan, verified bulk writes, fork module/snapshot commands, Zydis disassembly, xrefs, Keystone assembly, ELF upload. |
 | **Static analysis** | ELF64 with NID→name resolution, SELF, PE, Mach-O/`.ipa`, .NET; function/xref/string indexes; Xray passes; patching with a journal; binary diffing; packer heuristics. |
 | **Decompiler** | Hyperion p-code lifting, SSA, DCE, type inference and structuring to C-like output (SysV AMD64, Win64, AAPCS64). |
@@ -372,9 +372,9 @@ Every tool takes an `action`; `tools/list` returns the exact schemas.
 | `patch` | `nop_junk`, `resolve_opaque`, `patch_antidebug`, `unpack_xor`, `decode_strings`, `write_bytes`, `revert_all`, `journal`, `full_pass`, `rebuild` |
 | `devirt` | `themida_status`, `themida_start`, `themida_job`, `themida_cancel`, `identify`, `handlers`, `opcode_map`, `trace`, `lift`, `pseudocode`, `recover_cfg`, `prove_predicates`, `invariants`, `iat_audit` |
 | `emulate` | `run`, `slice`, `session_create`, `session_step`, `session_run`, `session_destroy`, `snapshot`, `restore` — `arch:"arm64"` for Mach-O/iOS, `orbis_syscalls:true` for PS4 syscalls |
-| `analyze` | `packer`, `signatures`, `diff` |
+| `analyze` | `packer`, `signatures`, `diff`, `diff_start`, `diff_job`, `diff_cancel` |
 | `re` | `rtti_scan`, `vftable`, `danger`, `libsig` (JSON sigsets or an IDA FLIRT `.sig`) |
-| `types` | `declare`, `create_struct`, `get_struct`, `list_structs`, `add_member`, `remove_member`, `create_enum`, `get_enum`, `list_enums`, `remove_enum`, `read_field`, `format_at` |
+| `types` | `declare`, `create_struct`, `get_struct`, `list_structs`, `add_member`, `remove_struct`, `create_enum`, `get_enum`, `list_enums`, `remove_enum`, `read_field`, `format_at` |
 | `notes` | `set_comment`, `get_comment`, `comments`, `bookmark_toggle`, `bookmarks`, `export`, `import` |
 | `network` | `status`, `capture_start`, `capture_stop`, `packets`, `dns`, `stats`, `export_pcap` (`pcap`/`pcapng`), `import_pcap`, `annotate`, `streams`, `stream_data`, `reassemble_stream`, `connections`, `deep_inspect`, `clear` |
 | `proxy` | `start`, `stop`, `status`, `entries`, `entry`, `replay`, `mitm_enable`, `mitm_disable`, `mitm_status`, `mitm_uninstall` |
@@ -383,10 +383,10 @@ Every tool takes an `action`; `tools/list` returns the exact schemas.
 | `web` | `fetch`, `post` |
 | `script` | `run`, `api`, `list`, `save`, `load`, `delete` |
 | `gdb` | `start` (loopback-only, `allow_writes` opt-in), `stop`, `status` — GDB Remote bridge sharing the console session |
-| `host` | `start`, `stop`, `status`, `put` — HTTP payload host with sha256 `manifest.json`, token on non-loopback binds |
+| `host` | `start`, `stop`, `status`, `put`, `files`, `manifest` — HTTP payload host with sha256 `manifest.json`, token on non-loopback binds |
 | `guide` | `list`, `get` |
 
-`app` (`status`, `ping`, `output`, `output_clear`, `log`, `diag`, `diag_bundle`, `settings_get`, `settings_set`, `rotate_token`, `events_ticket`, `shutdown`) is frontend
+`app` (`status`, `ping`, `output`, `output_clear`, `log`, `diag`, `diag_bundle`, `settings_get`, `settings_set`, `rotate_token`, `register_token`, `events_ticket`, `shutdown`) is frontend
 plumbing, reachable through `/api` only and hidden from `tools/list`.
 
 ### Automatic MCP client registration
