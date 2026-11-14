@@ -5,6 +5,23 @@ All notable changes to SlopStation are documented here. The format follows
 [Semantic Versioning](https://semver.org/). The release job publishes the
 section matching the pushed tag as the GitHub release notes.
 
+## [0.2.3] - 2026-11-14
+
+### Added
+
+- `target.ps4_send_payload {host, port=9090, path?}`: stream the bundled (or a
+  given) `.bin`/`.elf` payload to the console's BinLoader over one fresh TCP
+  connection. The Targets payload card has **Send to console** with a loader
+  port, and the connect form has **Discover** (UDP broadcast, PS4 consoles).
+- The payload card can send the latest downloaded payload, not just the
+  bundled one.
+
+### Changed
+
+- CI is lighter: the tests job builds and uploads the engine, so the separate
+  engine job is gone; packaging runs only in the tag release workflow, which
+  reuses the successful main build's artifacts instead of rebuilding.
+
 ## [0.2.2] - 2026-11-14
 
 ### Fixed

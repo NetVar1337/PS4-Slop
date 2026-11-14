@@ -11,6 +11,7 @@ import { Gamepad2, RefreshCw, Search, ShieldAlert, Unplug } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import ProcessIcon from "@/components/ProcessIcon";
 import { isTauri } from "@/lib/endpoint";
+import { call } from "@/lib/rpc";
 import { payloadDownload, payloadLatest, payloadSave, payloadStatus } from "@/lib/ps4debug";
 import type { PayloadInfo, PayloadStatus } from "@/lib/ps4debug";
 import { matchesFilter, useTargets, type ProcessRow } from "@/store/targets";
@@ -19,11 +20,24 @@ import { useEngine } from "@/store/engine";
 const kRowHeight = 22;
 const kDefaultPs4Port = 744;
 
-function ConnectForm({ compact }: { compact: boolean }) {
+function ConnectForm({
+  compact,
+  host,
+  port,
+  onHost,
+  onPort,
+}: {
+  compact: boolean;
+  host: string;
+  port: number;
+  onHost: (v: string) => void;
+  onPort: (v: number) => void;
+}) {
   const connectPs4 = useTargets((s) => s.connectPs4);
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState(kDefaultPs4Port);
   const [busy, setBusy] = useState(false);
+  const [discovering, setDiscovering] = useState(false);
+  const [found, setFound] = useState<string[]>([]);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
 
   const submit = async () => {
     if (host.trim() === "" || busy) return;
@@ -32,6 +46,25 @@ function ConnectForm({ compact }: { compact: boolean }) {
       await connectPs4(host.trim(), port);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const discover = async () => {
+    setDiscovering(true);
+    setDiscoverError(null);
+    setFound([]);
+    try {
+      const res = await call<{ consoles?: { ip: string }[] }>("target", "ps4_discover", {
+        timeout_ms: 2000,
+      });
+      const ips = (res.consoles ?? []).map((c) => c.ip).filter((ip) => ip !== "");
+      setFound(ips);
+      if (ips.length > 0) onHost(ips[0]);
+      else setDiscoverError("No console answered the discovery probe.");
+    } catch (e) {
+      setDiscoverError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiscovering(false);
     }
   };
 
@@ -49,7 +82,7 @@ function ConnectForm({ compact }: { compact: boolean }) {
         aria-label="PS4 IP address"
         placeholder="PS4 IP, e.g. 192.168.1.20"
         value={host}
-        onChange={(e) => setHost(e.target.value)}
+        onChange={(e) => onHost(e.target.value)}
       />
       <input
         className="addr-input"
@@ -59,20 +92,39 @@ function ConnectForm({ compact }: { compact: boolean }) {
         min={1}
         max={65535}
         value={port}
-        onChange={(e) => setPort(Number(e.target.value) || kDefaultPs4Port)}
+        onChange={(e) => onPort(Number(e.target.value) || kDefaultPs4Port)}
       />
       <button type="submit" className="row-action" disabled={host.trim() === "" || busy}>
         {busy ? "Connecting…" : "Connect"}
       </button>
+      <button
+        type="button"
+        className="row-action"
+        disabled={discovering}
+        onClick={() => void discover()}
+      >
+        {discovering ? "Searching…" : "Discover"}
+      </button>
+      {found.length > 1 &&
+        found.map((ip) => (
+          <button type="button" key={ip} className="link-button" onClick={() => onHost(ip)}>
+            {ip}
+          </button>
+        ))}
+      {discoverError !== null && <span className="faint error-text">{discoverError}</span>}
     </form>
   );
 }
 
-function PayloadCard() {
+function PayloadCard({ host }: { host: string }) {
   const [status, setStatus] = useState<PayloadStatus | null>(null);
   const [latest, setLatest] = useState<PayloadInfo | null>(null);
   const [busy, setBusy] = useState<"check" | "download" | "save" | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loaderPort, setLoaderPort] = useState(9090);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState<number | null>(null);
+  const [sendError, setSendError] = useState<string | null>(null);
   useEffect(() => {
     void payloadStatus().then(setStatus);
   }, []);
@@ -119,6 +171,24 @@ function PayloadCard() {
       setBusy(null);
     }
   };
+  const send = async () => {
+    if (installed === null || host.trim() === "") return;
+    setSending(true);
+    setSendError(null);
+    setSent(null);
+    try {
+      const res = await call<{ bytes: number }>("target", "ps4_send_payload", {
+        host: host.trim(),
+        port: loaderPort,
+        path: installed.path,
+      });
+      setSent(res.bytes);
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSending(false);
+    }
+  };
   return (
     <div className="payload-card">
       <div className="payload-head">
@@ -155,7 +225,35 @@ function PayloadCard() {
             {busy === "save" ? "Saving…" : "Save payload…"}
           </button>
         )}
+        <input
+          className="addr-input"
+          style={{ width: 70 }}
+          aria-label="Payload loader port"
+          type="number"
+          min={1}
+          max={65535}
+          value={loaderPort}
+          onChange={(e) => setLoaderPort(Number(e.target.value) || 9090)}
+        />
+        <button
+          type="button"
+          className="row-action"
+          disabled={installed === null || host.trim() === "" || sending}
+          onClick={() => void send()}
+        >
+          {sending ? "Sending…" : "Send to console"}
+        </button>
       </div>
+      {sent !== null && (
+        <div className="payload-hint">
+          Sent {sent} bytes to {host}:{loaderPort}.
+        </div>
+      )}
+      {sendError !== null && (
+        <div className="empty-hint error-text" role="alert">
+          {sendError}
+        </div>
+      )}
       {error !== null && (
         <div className="empty-hint error-text" role="alert">
           {error}
@@ -195,6 +293,8 @@ export default function TargetsPanel() {
   const backend = useEngine((s) => s.backend);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showConnect, setShowConnect] = useState(false);
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState(kDefaultPs4Port);
   const listing = backend.ps4 || showHost;
 
   useEffect(() => {
@@ -225,7 +325,7 @@ export default function TargetsPanel() {
       </button>
     </div>
   ) : showConnect && showHost ? (
-    <ConnectForm compact />
+    <ConnectForm compact host={host} port={port} onHost={setHost} onPort={setPort} />
   ) : null;
 
   return (
@@ -275,8 +375,8 @@ export default function TargetsPanel() {
             Run the ps4debug-NG payload on the PS4 and enter its address. Processes, modules and the
             debugger then come from the console.
           </div>
-          <ConnectForm compact={false} />
-          <PayloadCard />
+          <ConnectForm compact={false} host={host} port={port} onHost={setHost} onPort={setPort} />
+          <PayloadCard host={host} />
           {error !== null && (
             <div className="empty-hint error-text" role="alert">
               {error}

@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml"><img alt="build" src="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml/badge.svg"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.2.2-informational">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.3-informational">
   <img alt="platform" src="https://img.shields.io/badge/host-Windows%2010%2F11%20x64-blue">
   <img alt="target" src="https://img.shields.io/badge/target-PS4%20%2B%20ps4debug--NG-black">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -92,10 +92,11 @@ release on demand.
 1. **Launch SlopStation.** The splash waits for the engine handshake (up to 180 s, which
    covers the UAC prompt on first run).
 2. **Load the payload on the PS4.** In **Targets**, the *ps4debug-NG payload* card shows
-   the bundled release. **Save payload…** writes `ps4debug-ng.bin` wherever you want;
-   send it with BinLoader (port 9090), FTP or your GoldHEN payload loader. **Check
-   latest** compares the bundled build with the newest GitHub release; **Download**
-   fetches a newer one.
+   the bundled release. **Send to console** streams the `.bin` to BinLoader (port 9090)
+   over TCP; **Save payload…** writes it wherever you want for FTP or a GoldHEN loader.
+   **Check latest** compares the bundled build with the newest GitHub release;
+   **Download** fetches a newer one. **Discover** in the connect form finds consoles on
+   the LAN via UDP broadcast.
 3. **Connect.** Enter the console IP (port 744) and press **Connect**, or let an agent do
    it in one call:
 
@@ -343,7 +344,7 @@ Every tool takes an `action`; `tools/list` returns the exact schemas.
 
 | Tool | Actions |
 | --- | --- |
-| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_discover`, `ps4_dump_module` |
+| `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_discover`, `ps4_send_payload`, `ps4_dump_module` |
 | `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `scan_save`, `scan_load`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `watch_undo`, `watch_freeze_once`, `pointerscan_verify` |
 | `debugger` | `status` plus every `ps4_*` action above |
 | `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed` |
@@ -512,7 +513,7 @@ powershell -File tools/fetch_ps4debug.ps1 -Force   # re-download
 ```
 
 First-party targets compile with `/W4 /WX`. The legacy ImGui shell is optional
-(`SLOP_BUILD_UI`), and CI keeps it compiling.
+(`SLOP_BUILD_UI=ON` in a local build); CI builds the engine and the Tauri app.
 
 | CMake option | Default | Builds |
 | --- | ---: | --- |
@@ -539,13 +540,13 @@ frontend/Tauri manifests and the README badge, and CI verifies the tag matches.
 ### CI
 
 - **PRs** run only the lanes their paths touch: C++ build/tests for `src/**`, frontend
-  build/tests for `app/**`. Static analysis, ASan and packaging run on `main` and tags; a
-  PR can opt into packaging with the `ci:package` label.
-- **main/tags** run the full gate: engine + legacy shell, every CTest area, ASan (mcp area
-  minus the Unicorn cases), `/analyze`, clang-tidy, frontend tests, packaging and the
-  updater artifacts.
-- Release tags publish the installer, the single-file portable zip, `SHA256SUMS` and
-  `latest.json`; Authenticode signing is applied when the Azure secrets are present.
+  build/tests for `app/**`.
+- **main** runs the build + test + frontend gate. ASan, `/analyze` and clang-tidy run
+  nightly (and on manual dispatch), off the push critical path.
+- **Tags** use a separate release workflow: it downloads the successful main build's
+  engine and frontend artifacts for the same commit, then packages, signs and publishes
+  the installer, the single-file portable zip, `SHA256SUMS` and `latest.json` — no
+  rebuild on the release path.
 
 ## Tests
 
@@ -575,8 +576,10 @@ payload (GPLv3). The build always fetches the **latest release**:
 - The **Targets → ps4debug-NG payload** card shows the bundled/local tag, checks the
   latest release and downloads a newer payload to
   `%LOCALAPPDATA%\dev.slopstation.ui\payloads\ps4debug-ng\`.
-- **Save payload…** exports the `.bin` for BinLoader (port 9090), FTP or a GoldHEN
-  payload loader.
+- **Send to console** streams the payload to the console's BinLoader over one fresh
+  TCP connection (port 9090); **Save payload…** exports the `.bin` for FTP or a
+  GoldHEN payload loader. The engine action is `target.ps4_send_payload {host, port,
+  path?}`.
 
 ps4debug-NG is a separate GPLv3 program, not linked into the MIT-licensed SlopStation
 code; its source is at <https://github.com/Pharaoh2k/ps4debug-NG>.
