@@ -11,6 +11,10 @@ on:
         description: 'Fail when a median exceeds baseline x this factor'
         default: '3.0'
 
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

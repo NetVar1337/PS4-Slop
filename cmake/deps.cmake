@@ -97,12 +97,21 @@ FetchContent_Declare(nlohmann_json
     SYSTEM
 )
 
-# v4.1.1; git (not an archive) because zycore comes in as a submodule.
-# GIT_SHALLOW cannot fetch an arbitrary commit, so this one is a full clone
+# Zydis v4.1.1 and its zycore submodule (v1.5.2) as two hash-pinned archives
+# instead of a full recursive git clone. Zydis adds zycore itself from
+# ZYAN_ZYCORE_PATH, so zycore is only downloaded here, never added.
+FetchContent_Populate(zycore
+    URL https://github.com/zyantific/zycore-c/archive/0b2432ced0884fd152b471d97ecf0258ff4d859f.zip
+    URL_HASH SHA256=5a3fa3cfe9631ec6aedde911121e2e27f192ec66660b703e354eafa736e4b9a5
+    SOURCE_DIR "${SLOP_DEPS_DIR}/zycore-src"
+    BINARY_DIR "${SLOP_DEPS_DIR}/zycore-unused"
+    SUBBUILD_DIR "${SLOP_DEPS_DIR}/zycore-subbuild"
+)
+set(ZYAN_ZYCORE_PATH "${SLOP_DEPS_DIR}/zycore-src" CACHE PATH "" FORCE)
+
 FetchContent_Declare(zydis
-    GIT_REPOSITORY https://github.com/zyantific/zydis.git
-    GIT_TAG a2278f1d254e492f6a6b39f6cb5d1f5d515659dc
-    GIT_SUBMODULES_RECURSE TRUE
+    URL https://github.com/zyantific/zydis/archive/a2278f1d254e492f6a6b39f6cb5d1f5d515659dc.zip
+    URL_HASH SHA256=8e4a93bfb31cfcc6334510a524505ddbe62b9a502886847b819e701b8d6d4b02
     SYSTEM
 )
 
