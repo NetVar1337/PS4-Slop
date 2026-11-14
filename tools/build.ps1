@@ -116,7 +116,9 @@ if (Test-Path -LiteralPath $vsNinja) {
 
 $binaryDir = $null
 if (-not $FrontendOnly) {
-    $binaryDir = Resolve-PresetBinaryDir $Preset
+    # SLOP_BUILD_DIR moves the binary dir (e.g. off a virtual/overlay drive,
+    # where MSVC precompiled headers cannot be written)
+    $binaryDir = if ($env:SLOP_BUILD_DIR) { [IO.Path]::GetFullPath($env:SLOP_BUILD_DIR) } else { Resolve-PresetBinaryDir $Preset }
     if ($FullClean) {
         Clear-GeneratedTrees $binaryDir '-FullClean'
     } else {
@@ -143,7 +145,7 @@ if ($CmakeExtra -and $CmakeExtra.Trim()) { $configureExtra += $CmakeExtra.Split(
 if ($configureExtra.Count -gt 0) { Write-Host "==> configure extra: $($configureExtra -join ' ')" }
 $prevEap = $ErrorActionPreference
 $ErrorActionPreference = 'Continue'
-& $vsCMake --preset $Preset -S $repoRoot @configureExtra 2>&1 | ForEach-Object { "$_" } | Set-Content -LiteralPath (Join-Path $logDir 'configure.log')
+& $vsCMake --preset $Preset -S $repoRoot -B $binaryDir @configureExtra 2>&1 | ForEach-Object { "$_" } | Set-Content -LiteralPath (Join-Path $logDir 'configure.log')
 Get-Content -LiteralPath (Join-Path $logDir 'configure.log') | Write-Host
 $ErrorActionPreference = $prevEap
 if ($LASTEXITCODE -ne 0) { throw "configure failed (exit $LASTEXITCODE), log: $(Join-Path $logDir 'configure.log')" }
