@@ -13,6 +13,25 @@
 
 namespace slop::core::memory {
 
+// One hop of the chain, in chain order: levels[0] is the hop out of the root
+// (the same order as pointer_chain_result_t::offsets). A wildcard level
+// accepts any offset, which is how CE finds chains whose intermediate offset
+// is unknown
+struct pointer_level_t {
+    int32_t  min_offset = -4096;
+    int32_t  max_offset =  4096;
+    uint32_t alignment  = 0;      // 0 -> pointer_scan_options_t::alignment
+    bool     wildcard   = false;  // accept any 32-bit offset, ignores min/max
+};
+
+// A loaded module, so a root inside one is reported module-relative and
+// survives a restart
+struct pointer_module_t {
+    std::string name;
+    uintptr_t   base = 0;
+    size_t      size = 0;
+};
+
 struct pointer_scan_options_t {
     uintptr_t target     = 0;
     uint32_t  depth      = 3;        // clamped to infra::limits::max_pointer_depth
@@ -21,11 +40,20 @@ struct pointer_scan_options_t {
     uint32_t  alignment  = 4;        // qword holder alignment
     size_t    frontier_cap = 100'000; // per-level expansion guard
     bool      only_module_backed = false; // roots must live in MEM_IMAGE regions
+
+    // Per-level overrides, chain order (levels[0] = root hop). When non-empty
+    // the level count is levels.size() and min_offset/max_offset/alignment
+    // above only supply the defaults for levels that leave them at 0
+    std::vector<pointer_level_t> levels;
+    // Modules to attribute roots to (name + module_offset in the result)
+    std::vector<pointer_module_t> modules;
 };
 
 struct pointer_chain_result_t {
     std::vector<uintptr_t> addresses;  // [root-most holder, ..., final holder]
     std::vector<int64_t>   offsets;    // offsets[i] applies to addresses[i]'s value
+    std::string            module;     // root's module, empty when none matched
+    uint64_t               module_offset = 0;  // root - module base
 
     size_t depth() const noexcept { return addresses.size(); }
 };

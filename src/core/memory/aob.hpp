@@ -38,6 +38,20 @@ std::string aob_to_string(const aob_pattern_t& p);
 // Format raw selection bytes as a copy-paste-ready pattern ("41 42 43")
 std::string aob_from_bytes(const uint8_t* data, size_t len);
 
+// Signature text renderings of the same pattern, one per consumer: IDA
+// ("48 8B ? ?"), x64dbg ("48 8B ?? ??"), Cheat Engine AOB ("48 8B ?? ??")
+// and the C string + mask pair ("\x48\x8B" / "xx??"). A nibble wildcard
+// renders as ? in the byte form and as ? in its mask position
+std::string aob_to_ida(const aob_pattern_t& p);
+std::string aob_to_x64dbg(const aob_pattern_t& p);
+std::string aob_to_ce(const aob_pattern_t& p);
+
+struct aob_code_sig_t {
+    std::string bytes;   // "\x48\x8B\x00"
+    std::string mask;    // "xx??", one char per byte: x = compare, ? = wildcard
+};
+aob_code_sig_t aob_to_code(const aob_pattern_t& p);
+
 struct aob_scan_options_t {
     uint32_t alignment = 1;                    // fastscan: addr % N == 0
     size_t   max_results = 0;                  // 0 -> infra::limits::max_aob_matches

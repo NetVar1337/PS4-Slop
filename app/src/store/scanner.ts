@@ -42,9 +42,13 @@ export const kNextKinds = [
   "bigger",
   "smaller",
   "increased",
+  "increased_by",
   "decreased",
+  "decreased_by",
   "changed",
   "unchanged",
+  "changed_by_more_than",
+  "changed_by_less_than",
 ] as const;
 
 type ScannerStore = {
@@ -61,6 +65,8 @@ type ScannerStore = {
   set: (patch: Partial<Pick<ScannerStore, "width" | "kind" | "value" | "value2">>) => void;
   refreshState: () => Promise<void>;
   scan: (rescan: boolean) => Promise<void>;
+  /** Write the engine's full result set (not just this page) as CSV. */
+  exportCsv: (path: string) => Promise<boolean>;
   reset: () => Promise<void>;
 };
 
@@ -122,5 +128,16 @@ export const useScanner = create<ScannerStore>((set, get) => ({
   reset: async () => {
     await call("memory", "scan_reset").catch(() => undefined);
     set({ hits: [], total: 0, hasState: false, error: null });
+  },
+
+  exportCsv: async (path) => {
+    try {
+      await call("memory", "scan_export", { path });
+      set({ error: null });
+      return true;
+    } catch (e) {
+      set({ error: errorText(e) });
+      return false;
+    }
   },
 }));

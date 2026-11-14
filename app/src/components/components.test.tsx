@@ -265,6 +265,50 @@ describe("scanner watchlist (items 88, 113)", () => {
   });
 });
 
+describe("scanner and watchlist exports (item 84)", () => {
+  it("writes scan results as CSV and the watchlist as a .CT table", async () => {
+    const { calls } = mockApi(({ action }) => {
+      if (action === "scan_state") return { active: true, total: 3 };
+      if (action === "watch_list")
+        return {
+          entries: [
+            {
+              id: 1,
+              addr: 0x10,
+              width: "u32",
+              label: "hp",
+              freeze: false,
+              frozen_bits: 0,
+              frozen_text: "",
+            },
+          ],
+          values: [],
+        };
+      if (action === "scan_export") return { rows: 3 };
+      return { entries: 1 };
+    });
+    useEngine.setState({ target: attached });
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("C:/tmp/out.csv");
+    render(<ScannerPanel />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Export results as CSV" }));
+    await waitFor(() => expect(calls.some((c) => c.action === "scan_export")).toBe(true));
+    expect(calls.find((c) => c.action === "scan_export")?.params).toEqual({
+      path: "C:/tmp/out.csv",
+    });
+
+    prompt.mockReturnValue("C:/tmp/watch.CT");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Export the watchlist as a .CT table" }),
+    );
+    await waitFor(() => expect(calls.some((c) => c.action === "watch_export_ct")).toBe(true));
+    expect(calls.find((c) => c.action === "watch_export_ct")?.params).toEqual({
+      path: "C:/tmp/watch.CT",
+    });
+    prompt.mockRestore();
+  });
+});
+
 describe("memory view (items 89, 90)", () => {
   it("keeps the goto address across tab switches and uses a PS4 placeholder", async () => {
     mockApi(({ action }) =>

@@ -52,18 +52,18 @@ if(MSVC)
         "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:__cplusplus>"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8>"
         "$<$<COMPILE_LANGUAGE:C,CXX>:/GS>"
-        "$<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>"
     )
     add_link_options(
         /DYNAMICBASE
         /HIGHENTROPYVA
         /NXCOMPAT
-        # CFG needs the linker switch as well as the /guard:cf compile flag;
-        # without it the final image carries no guard table at all
-        /GUARD:CF
-        # marks the image CET compatible (shadow-stack aware). tools/check_binaries.ps1
-        # verifies all five on the release artifacts, see SECURITY.md
-        /CETCOMPAT
+        # deliberately NOT /guard:cf + /GUARD:CF (CFG) and NOT /CETCOMPAT: the
+        # Unicorn emulator executes code it generates at runtime, which is in no
+        # CFG target table and does no shadow-stack bookkeeping, so either one
+        # kills the first emulation run with STATUS_STACK_BUFFER_OVERRUN
+        # (__fastfail). ASLR/DEP/stack cookies stay on; tools/check_binaries.ps1
+        # verifies them on the release artifacts, SECURITY.md explains the two
+        # omissions.
     )
 endif()
 

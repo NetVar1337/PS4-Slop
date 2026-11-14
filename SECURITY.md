@@ -48,18 +48,22 @@ rejects an import or section the build does not expect):
 | ASLR | `/DYNAMICBASE` | the image is relocated to a random base |
 | High-entropy ASLR | `/HIGHENTROPYVA` | 64-bit images get the full random range |
 | DEP | `/NXCOMPAT` | no executable data pages |
-| Control Flow Guard | `/guard:cf` + `/GUARD:CF` | indirect calls are checked against a compiler-emitted target table |
-| CET compatibility | `/CETCOMPAT` | the image is marked safe for hardware shadow-stack enforcement |
 | Stack cookies | `/GS` | stack buffer overruns are detected on return |
 
 The mitigations are link-time, so they cover the whole image including the
-vendored static libraries (Zydis, Capstone, Unicorn, spdlog, ...). `/CETCOMPAT`
-only marks the image as compatible: Windows enables user-mode shadow stacks for
-the process when the machine's policy asks for it. The one component that can
-disagree with an enforced shadow stack is the Unicorn emulator's JIT, which
-generates code at runtime without the CET-aware allocation APIs; if a machine
-enforces shadow stacks and the emulator faults there, drop `/CETCOMPAT` for the
-targets that link Unicorn rather than the whole tree.
+vendored static libraries (Zydis, Capstone, Unicorn, spdlog, ...). Two are
+deliberately **not** used, for the same reason: the Unicorn emulator executes
+code it generates at runtime.
+
+- `/guard:cf` + `/GUARD:CF` (Control Flow Guard) validates every indirect call
+  against a compiler-emitted table; the JIT's generated code is not in that
+  table, so the first emulation run dies with `STATUS_STACK_BUFFER_OVERRUN`
+  (`__fastfail(FAST_FAIL_CFG)`).
+- `/CETCOMPAT` marks the image safe for hardware shadow stacks, but the JIT
+  does no shadow-stack bookkeeping, so a CET-enforcing host faults the same way.
+
+ASLR, high-entropy ASLR, DEP and stack cookies stay on for every first-party
+target, and `tools/check_binaries.ps1` verifies them on the release artifacts.
 
 ## Handling untrusted input
 

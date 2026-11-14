@@ -15,10 +15,14 @@ type WatchStore = {
   error: string | null;
   attach: () => () => void;
   load: () => Promise<void>;
-  add: (addr: number, width: string, label?: string) => Promise<boolean>;
+  add: (addr: number, width: string, label?: string, intervalMs?: number) => Promise<boolean>;
   remove: (id: number) => Promise<boolean>;
   setFreeze: (id: number, freeze: boolean) => Promise<boolean>;
   poke: (id: number, value: string) => Promise<boolean>;
+  /** Write the list as a Cheat Engine .CT table. */
+  exportCt: (path: string) => Promise<boolean>;
+  /** Append the entries of a .CT table to the list. */
+  importCt: (path: string) => Promise<boolean>;
   clear: () => Promise<boolean>;
 };
 
@@ -65,8 +69,15 @@ export const useWatch = create<WatchStore>((set) => {
       });
     },
 
-    add: (addr, width, label) =>
-      run(() => call("memory", "watch_add", { addr, width, ...(label ? { label } : {}) })),
+    add: (addr, width, label, intervalMs) =>
+      run(() =>
+        call("memory", "watch_add", {
+          addr,
+          width,
+          ...(label ? { label } : {}),
+          ...(intervalMs !== undefined && intervalMs !== 100 ? { interval_ms: intervalMs } : {}),
+        }),
+      ),
 
     remove: (id) => run(() => call("memory", "watch_remove", { id })),
 
@@ -75,6 +86,10 @@ export const useWatch = create<WatchStore>((set) => {
     // Text form so f32/f64 and signed widths round-trip through the same
     // parse_value_text() the scanner's value box used
     poke: (id, value) => run(() => call("memory", "watch_set", { id, value })),
+
+    exportCt: (path) => run(() => call("memory", "watch_export_ct", { path })),
+
+    importCt: (path) => run(() => call("memory", "watch_import_ct", { path })),
 
     clear: () => run(() => call("memory", "watch_clear")),
   };

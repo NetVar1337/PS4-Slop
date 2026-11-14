@@ -47,7 +47,9 @@ enum class scan_type_t : uint8_t {
     increased_percent, // value1/value2 = pct window (value2 defaults to value1)
     decreased_percent,
     changed,
-    unchanged
+    unchanged,
+    changed_by_more_than, // |curr-prev| > value1 (either direction)
+    changed_by_less_than  // 0 < |curr-prev| < value1 (a real change, just small)
 };
 
 // CE float rounding (TRoundingType)
@@ -115,6 +117,7 @@ struct scan_config_t {
     size_t         max_results = 0;   // 0 -> infra::limits::max_scan_hits
     uint32_t       threads     = 0;   // 0 -> hardware concurrency
     size_t         chunk_bytes = 0;   // 0 -> infra::limits::scan_chunk_bytes
+    size_t         stash_bytes = 0;   // unknown-initial copy cap, 0 -> limits::max_stash_bytes
 };
 
 // Results

@@ -86,10 +86,17 @@ json chains_json(const std::vector<memory::pointer_chain_result_t>& chains, size
         json offs  = json::array();
         for (uintptr_t a : chains[i].addresses) addrs.push_back(static_cast<uint64_t>(a));
         for (int64_t o : chains[i].offsets)     offs.push_back(o);
-        arr.push_back({{"addresses", addrs}, {"offsets", offs},
-                       {"base_hex", addr_hex_str(chains[i].addresses.empty()
-                                                     ? 0 : chains[i].addresses.front())},
-                       {"depth", chains[i].depth()}});
+        json row = {{"addresses", addrs}, {"offsets", offs},
+                    {"base_hex", addr_hex_str(chains[i].addresses.empty()
+                                                  ? 0 : chains[i].addresses.front())},
+                    {"depth", chains[i].depth()}};
+        // a root inside a module survives a restart: name + offset is the
+        // portable form pointerscan_verify accepts back
+        if (!chains[i].module.empty()) {
+            row["module"]        = chains[i].module;
+            row["module_offset"] = chains[i].module_offset;
+        }
+        arr.push_back(std::move(row));
     }
     return arr;
 }
@@ -159,9 +166,11 @@ memory::scan_type_t parse_scan_kind(const json& args) {
     if (k == "decreased_percent") return memory::scan_type_t::decreased_percent;
     if (k == "changed")      return memory::scan_type_t::changed;
     if (k == "unchanged")    return memory::scan_type_t::unchanged;
+    if (k == "changed_by_more_than") return memory::scan_type_t::changed_by_more_than;
+    if (k == "changed_by_less_than") return memory::scan_type_t::changed_by_less_than;
     fail("bad scan kind '" + k + "' (exact|between|bigger|smaller|unknown|increased|"
          "increased_by|increased_percent|decreased|decreased_by|decreased_percent|"
-         "changed|unchanged)");
+         "changed|unchanged|changed_by_more_than|changed_by_less_than)");
 }
 
 memory::rounding_t parse_rounding(const json& args) {
@@ -224,21 +233,22 @@ json tool_memory(const json& args) {
     {
         static const char* kKnown[] = {
             "read", "write", "scan", "rescan", "scan_state", "scan_reset",
-            "scan_save", "scan_load",
+            "scan_save", "scan_load", "scan_export",
             "aob", "pointerscan", "pointerscan_verify", "snapshot", "snapshots", "diff",
             "snapshot_free", "protect", "alloc", "free", "siggen",
             "live_crypto", "watch_list", "watch_add", "watch_remove",
             "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
+            "watch_export_ct", "watch_import_ct",
             "offsets_verify", "dissect",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
         if (!known)
             fail("memory: unknown action (read|write|scan|rescan|scan_state|scan_reset|"
-                 "scan_save|scan_load|aob|pointerscan|pointerscan_verify|snapshot|snapshots|"
+                 "scan_save|scan_load|scan_export|aob|pointerscan|pointerscan_verify|snapshot|snapshots|"
                  "diff|snapshot_free|protect|alloc|free|siggen|live_crypto|watch_list|"
                  "watch_add|watch_remove|watch_clear|watch_set|watch_undo|watch_freeze_once|"
-                 "offsets_verify|dissect)");
+                 "watch_export_ct|watch_import_ct|offsets_verify|dissect)");
     }
 
     // watchlist
@@ -252,7 +262,8 @@ json tool_memory(const json& args) {
                                {"width", width_name(e.width)},
                                {"label", e.label},
                                {"freeze", e.freeze},
-                               {"frozen_bits", e.frozen_bits}});
+                               {"frozen_bits", e.frozen_bits},
+                               {"interval_ms", e.interval_ms}});
             return arr;
         };
 
@@ -282,6 +293,10 @@ json tool_memory(const json& args) {
             const bool freeze = opt_bool(args, "freeze", false);
             const uint64_t id = memory::watch::add(addr, width, std::move(label));
             if (id == 0) fail("memory.watch_add: watch list is full");
+            if (args.contains("interval_ms") &&
+                !memory::watch::set_interval(id, static_cast<uint32_t>(
+                    std::min<uint64_t>(parse_addr(args, "interval_ms"), 60'000))))
+                fail("memory.watch_add: cannot set interval_ms");
             // A fresh entry latches the live value, so a freeze needs a target;
             // report whether it actually armed instead of silently doing nothing.
             const bool freeze_armed = freeze && memory::watch::set_freeze(id, true);
@@ -318,6 +333,12 @@ json tool_memory(const json& args) {
             }
             if (args.contains("label") && args.at("label").is_string()) {
                 if (!memory::watch::set_label(id, args.at("label").get<std::string>()))
+                    fail("memory.watch_set: no such id");
+                touched = true;
+            }
+            if (args.contains("interval_ms")) {
+                if (!memory::watch::set_interval(id, static_cast<uint32_t>(
+                        std::min<uint64_t>(parse_addr(args, "interval_ms"), 60'000))))
                     fail("memory.watch_set: no such id");
                 touched = true;
             }
@@ -365,6 +386,38 @@ json tool_memory(const json& args) {
             return {{"ok", true}, {"entries", entries_json()}};
         }
 
+        if (action == "watch_export_ct") {
+            if (!args.contains("path") || !args.at("path").is_string())
+                fail("memory.watch_export_ct: missing path");
+            const std::string path = args.at("path").get<std::string>();
+            const std::string xml = memory::watch::export_ct();
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            if (!f) fail("memory.watch_export_ct: cannot write " + path);
+            f << xml;
+            if (!f) fail("memory.watch_export_ct: write failed");
+            return {{"path", path}, {"entries", memory::watch::size()},
+                    {"bytes", xml.size()}};
+        }
+
+        if (action == "watch_import_ct") {
+            if (!args.contains("path") || !args.at("path").is_string())
+                fail("memory.watch_import_ct: missing path");
+            const std::string path = args.at("path").get<std::string>();
+            std::ifstream f(path, std::ios::binary);
+            if (!f) fail("memory.watch_import_ct: cannot open " + path);
+            const std::string xml{std::istreambuf_iterator<char>(f),
+                                  std::istreambuf_iterator<char>()};
+            std::string warn;
+            const size_t imported = memory::watch::import_ct(xml, &warn);
+            if (imported == 0)
+                fail("memory.watch_import_ct: " +
+                     (warn.empty() ? std::string("no entries imported") : warn));
+            json out = {{"path", path}, {"imported", imported},
+                        {"entries", entries_json()}};
+            if (!warn.empty()) out["warning"] = warn;
+            return out;
+        }
+
         fail("memory: unknown watch action");
     }
 
@@ -391,6 +444,28 @@ json tool_memory(const json& args) {
                 {"slots_tracked", stats.slots_tracked},
                 {"truncated", stats.truncated},
                 {"cancelled", stats.cancelled}};
+    }
+
+    if (action == "scan_export") {
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("memory.scan_export: missing path");
+        const std::string path = args.at("path").get<std::string>();
+        std::vector<memory::scan_result_t> rows;
+        memory::value_width_t width = memory::value_width_t::u32;
+        if (!g_scan.engine.export_results(rows, width) || rows.empty())
+            fail("memory.scan_export: no scan results (run memory.scan first)");
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) fail("memory.scan_export: cannot write " + path);
+        f << "address,type,value\n";
+        for (const auto& r : rows) {
+            char addr[24];
+            std::snprintf(addr, sizeof(addr), "%llX",
+                          static_cast<unsigned long long>(r.address));
+            f << "0x" << addr << ',' << width_name(r.matched) << ','
+              << memory::format_value_text(r.matched, r.bits) << '\n';
+        }
+        if (!f) fail("memory.scan_export: write failed");
+        return {{"path", path}, {"rows", rows.size()}};
     }
 
     // snapshot actions work without a target, everything below needs one
@@ -676,6 +751,11 @@ json tool_memory(const json& args) {
         cfg.chunk_bytes = static_cast<size_t>(std::min<uint64_t>(
             opt_u64(args, "chunk_bytes", 0),
             reader.hints().max_workers == 1 ? memory::kRemoteMaxChunkBytes : (64u << 20)));
+        // unknown-initial keeps a copy of every scanned byte; the caller can
+        // bound it instead of taking the 1 GiB default
+        cfg.stash_bytes = static_cast<size_t>(std::min<uint64_t>(
+            opt_u64(args, "max_stash_bytes", infra::limits::max_stash_bytes),
+            infra::limits::max_stash_bytes));
         if (args.contains("begin") && args.contains("end")) {
             cfg.begin = static_cast<uintptr_t>(parse_addr(args, "begin"));
             cfg.end   = static_cast<uintptr_t>(parse_addr(args, "end"));
@@ -720,6 +800,8 @@ json tool_memory(const json& args) {
                    type == memory::scan_type_t::smaller_than ||
                    type == memory::scan_type_t::increased_by ||
                    type == memory::scan_type_t::decreased_by ||
+                   type == memory::scan_type_t::changed_by_more_than ||
+                   type == memory::scan_type_t::changed_by_less_than ||
                    type == memory::scan_type_t::increased_percent ||
                    type == memory::scan_type_t::decreased_percent;
         };
@@ -758,6 +840,11 @@ json tool_memory(const json& args) {
             cfg.value1 /= 100.0;
             cfg.value2 /= 100.0;
         }
+        // a delta magnitude is unsigned; a negative one can never match
+        if ((cfg.type == memory::scan_type_t::changed_by_more_than ||
+             cfg.type == memory::scan_type_t::changed_by_less_than) &&
+            cfg.value1 < 0)
+            fail("changed_by_more_than/changed_by_less_than need a non-negative value");
 
         // region set comes from the active backend
         auto regions = runtime::target_scan_regions(s.handle());
@@ -976,6 +1063,40 @@ json tool_memory(const json& args) {
         opt.frontier_cap = static_cast<size_t>(std::min<uint64_t>(
             opt_u64(args, "frontier_cap", 100'000), infra::limits::max_pointer_chains));
 
+        // per-level ranges in chain order (levels[0] is the root hop, the same
+        // order as the returned offsets); wildcard accepts any offset
+        if (args.contains("levels")) {
+            const json& arr = args.at("levels");
+            if (!arr.is_array() || arr.empty())
+                fail("levels must be a non-empty array of "
+                     "{min_offset, max_offset, alignment?, wildcard?}");
+            if (arr.size() > static_cast<size_t>(infra::limits::max_pointer_depth))
+                fail("too many levels (max " +
+                     std::to_string(infra::limits::max_pointer_depth) + ")");
+            for (size_t i = 0; i < arr.size(); ++i) {
+                const json& lv = arr[i];
+                const std::string where = "levels[" + std::to_string(i) + "]";
+                if (!lv.is_object()) fail(where + ": expected an object");
+                memory::pointer_level_t l;
+                l.min_offset = static_cast<int32_t>(std::clamp<int64_t>(
+                    opt_i64(lv, "min_offset", opt.min_offset), INT32_MIN, INT32_MAX));
+                l.max_offset = static_cast<int32_t>(std::clamp<int64_t>(
+                    opt_i64(lv, "max_offset", opt.max_offset), INT32_MIN, INT32_MAX));
+                l.alignment  = static_cast<uint32_t>(
+                    std::min<uint64_t>(opt_u64(lv, "alignment", 0), 4096));
+                l.wildcard   = opt_bool(lv, "wildcard", false);
+                opt.levels.push_back(l);
+            }
+            opt.depth = static_cast<uint32_t>(opt.levels.size());
+        }
+
+        // loaded modules, so a root inside one comes back module-relative
+        if (auto mods = s.backend()->enum_modules(s.handle()); mods.ok) {
+            opt.modules.reserve(mods.items.size());
+            for (const auto& m : mods.items)
+                opt.modules.push_back({m.name, m.base, m.size});
+        }
+
         // region set is explicit bounds or committed memory, capped since pointer sweeps scale with range
         bool range_truncated = false;
         memory::scan_config_t rcfg;
@@ -1071,8 +1192,26 @@ json tool_memory(const json& args) {
                     pc.addresses.assign(offs.size(), 0);
                     if (!pc.addresses.empty())
                         pc.addresses[0] = static_cast<uintptr_t>(parse_addr(c, "base"));
+                } else if (c.contains("module") && c.at("module").is_string()) {
+                    // module-relative root: resolve against the live module base
+                    const std::string want = c.at("module").get<std::string>();
+                    auto mods = s.backend()->enum_modules(s.handle());
+                    if (!mods.ok)
+                        fail(where + ": cannot enumerate modules: " +
+                             runtime::ps4::io_error_str(mods.error));
+                    const auto m = std::find_if(mods.items.begin(), mods.items.end(),
+                                                [&](const auto& x) {
+                                                    return _stricmp(x.name.c_str(), want.c_str()) == 0;
+                                                });
+                    if (m == mods.items.end())
+                        fail(where + ": module '" + want + "' is not loaded");
+                    const uint64_t off = opt_u64(c, "module_offset", 0);
+                    pc.addresses.assign(offs.size(), 0);
+                    pc.addresses[0] = static_cast<uintptr_t>(m->base + off);
+                    pc.module        = m->name;
+                    pc.module_offset = off;
                 } else {
-                    fail(where + ": needs addresses[] or base");
+                    fail(where + ": needs addresses[] or base, or module + module_offset");
                 }
                 if (pc.offsets.empty()) fail(where + ": empty chain");
                 chains.push_back(std::move(pc));
@@ -1157,8 +1296,64 @@ json tool_memory(const json& args) {
         for (size_t i = 0; i < d.changed.size() && i < limit; ++i)
             arr.push_back({{"offset", d.changed[i].offset},
                            {"length", d.changed[i].length}});
-        return {{"changed", arr}, {"count", d.changed.size()},
-                {"truncated", d.changed.size() > limit}};
+        json out = {{"changed", arr}, {"count", d.changed.size()},
+                    {"truncated", d.changed.size() > limit}};
+
+        // optional export for external analysis: every changed span with its
+        // before/after bytes (hex), the whole span, not just the listed page
+        if (args.contains("export")) {
+            const json& ex = args.at("export");
+            if (!ex.is_object()) fail("export must be an object {format, path}");
+            const std::string fmt = opt_str(ex, "format", "csv");
+            if (fmt != "csv" && fmt != "json") fail("export format must be csv or json");
+            if (!ex.contains("path") || !ex.at("path").is_string())
+                fail("export needs a path");
+            const std::string path = ex.at("path").get<std::string>();
+            const auto hex_span = [](const std::vector<uint8_t>& bytes,
+                                     size_t off, size_t len) {
+                std::string hex;
+                hex.reserve(len * 2);
+                for (size_t i = 0; i < len && off + i < bytes.size(); ++i) {
+                    char buf[3];
+                    std::snprintf(buf, sizeof(buf), "%02X", bytes[off + i]);
+                    hex += buf;
+                }
+                return hex;
+            };
+            std::ofstream f(path, std::ios::binary | std::ios::trunc);
+            if (!f) fail("cannot write " + path);
+            if (fmt == "csv") {
+                f << "offset,address,length,before,after\n";
+                for (const auto& span : d.changed) {
+                    char addr[24];
+                    std::snprintf(addr, sizeof(addr), "%llX",
+                                  static_cast<unsigned long long>(ra->snap.base + span.offset));
+                    f << span.offset << ",0x" << addr << ',' << span.length
+                      << ',' << hex_span(ra->snap.bytes, span.offset, span.length)
+                      << ',' << hex_span(rb->snap.bytes, span.offset, span.length) << '\n';
+                }
+            } else {
+                json spans = json::array();
+                for (const auto& span : d.changed)
+                    spans.push_back({{"offset", span.offset},
+                                     {"address", static_cast<uint64_t>(
+                                          ra->snap.base + span.offset)},
+                                     {"length", span.length},
+                                     {"before", hex_span(ra->snap.bytes, span.offset,
+                                                         span.length)},
+                                     {"after", hex_span(rb->snap.bytes, span.offset,
+                                                        span.length)}});
+                f << json{{"a", ra->id}, {"b", rb->id},
+                          {"base", static_cast<uint64_t>(ra->snap.base)},
+                          {"size", ra->snap.size},
+                          {"count", d.changed.size()},
+                          {"spans", std::move(spans)}}.dump(2);
+            }
+            if (!f) fail("write failed: " + path);
+            out["export"] = {{"format", fmt}, {"path", path},
+                             {"spans", d.changed.size()}};
+        }
+        return out;
     }
 
     if (action == "siggen") {
@@ -1243,6 +1438,28 @@ json tool_memory(const json& args) {
                     {"unique", hits_total == 1},
                     {"occurrences", hits_total}};
         out["yara"] = "$a = { " + pat + " }\ncondition: $a";
+
+        // the same signature in the dialects tools paste into (audit #36)
+        const std::string fmt = opt_str(args, "format", "all");
+        static const char* kFormats[] = {"all", "ida", "x64dbg", "ce", "code", "yara"};
+        if (std::none_of(std::begin(kFormats), std::end(kFormats),
+                         [&](const char* f) { return fmt == f; }))
+            fail("bad siggen format (all|ida|x64dbg|ce|code|yara)");
+        std::string compile_err;
+        if (auto p = memory::aob_compile(pat, compile_err)) {
+            const std::string ida = memory::aob_to_ida(*p);
+            const std::string x64 = memory::aob_to_x64dbg(*p);
+            const std::string ce  = memory::aob_to_ce(*p);
+            const auto code = memory::aob_to_code(*p);
+            out["formats"] = {{"ida", ida}, {"x64dbg", x64}, {"ce", ce},
+                              {"code", {{"bytes", code.bytes}, {"mask", code.mask}}}};
+            if (fmt == "ida")        out["signature"] = ida;
+            else if (fmt == "x64dbg") out["signature"] = x64;
+            else if (fmt == "ce")     out["signature"] = ce;
+            else if (fmt == "code")   out["signature"] = {{"bytes", code.bytes},
+                                                          {"mask", code.mask}};
+            else if (fmt == "yara")   out["signature"] = out["yara"];
+        }
         return out;
     }
 

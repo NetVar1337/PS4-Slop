@@ -289,6 +289,8 @@ bool is_relational(scan_type_t t) noexcept {
     case scan_type_t::decreased_percent:
     case scan_type_t::changed:
     case scan_type_t::unchanged:
+    case scan_type_t::changed_by_more_than:
+    case scan_type_t::changed_by_less_than:
         return true;
     default:
         return false;
@@ -362,6 +364,14 @@ bool float_check(const scan_config_t& cfg, F curr, F prev) noexcept {
         return curr != p;
     case scan_type_t::unchanged:
         return curr == p;
+
+    case scan_type_t::changed_by_more_than:
+        return std::fabs(static_cast<double>(curr) - static_cast<double>(p)) >
+               static_cast<double>(v1);
+    case scan_type_t::changed_by_less_than:
+        return curr != p &&
+               std::fabs(static_cast<double>(curr) - static_cast<double>(p)) <
+               static_cast<double>(v1);
     }
     return false;
 }
@@ -400,6 +410,14 @@ bool int_check(const scan_config_t& cfg, value_width_t w,
     case scan_type_t::decreased:    return sc < sp;
     case scan_type_t::increased_by: return sc - sp == s1;
     case scan_type_t::decreased_by: return sp - sc == s1;
+    case scan_type_t::changed_by_more_than:
+    case scan_type_t::changed_by_less_than: {
+        // unsigned magnitude so INT64_MIN/INT64_MAX neighbours do not overflow
+        const uint64_t d = sc >= sp ? static_cast<uint64_t>(sc) - static_cast<uint64_t>(sp)
+                                    : static_cast<uint64_t>(sp) - static_cast<uint64_t>(sc);
+        const uint64_t n = s1 > 0 ? static_cast<uint64_t>(s1) : 0;
+        return cfg.type == scan_type_t::changed_by_more_than ? d > n : (d != 0 && d < n);
+    }
     default:                        return false;
     }
 }
@@ -738,7 +756,9 @@ bool memscan_t::first_scan(reader_t& r,
     const reader_hints_t hints = r.hints();
     run_cfg.chunk_bytes = effective_chunk(run_cfg, hints);
 
-    const uint64_t stash_budget = region_scan ? infra::limits::max_stash_bytes : 0;
+    const uint64_t stash_budget = region_scan
+        ? (run_cfg.stash_bytes ? run_cfg.stash_bytes : infra::limits::max_stash_bytes)
+        : 0;
 
     const unsigned nw = std::max(1u, std::min(worker_count(run_cfg, hints),
                                               static_cast<unsigned>(regions.size())));

@@ -45,6 +45,8 @@ export type WatchEntry = {
   freeze: boolean;
   frozen_bits: number;
   frozen_text: string;
+  /** Per-entry service rate in ms (default 100). */
+  interval_ms?: number;
 };
 
 export type WatchValue = {

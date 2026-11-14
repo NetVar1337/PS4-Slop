@@ -180,6 +180,58 @@ std::string aob_from_bytes(const uint8_t* data, size_t len) {
     return out;
 }
 
+namespace {
+
+// one byte in a byte-wildcard dialect: full match, nibble match or "?"
+std::string sig_byte(const aob_pattern_t& p, size_t i, bool ida_style) {
+    const uint8_t m = p.nibble_mask[i];
+    char buf[4];
+    if (m == 0xFF) {
+        std::snprintf(buf, sizeof(buf), "%02X", p.bytes[i]);
+        return buf;
+    }
+    if (m == 0xF0) {
+        std::snprintf(buf, sizeof(buf), "%X?", (p.bytes[i] >> 4) & 0xF);
+        return buf;
+    }
+    if (m == 0x0F) {
+        std::snprintf(buf, sizeof(buf), "?%X", p.bytes[i] & 0xF);
+        return buf;
+    }
+    return ida_style ? "?" : "??";
+}
+
+std::string sig_join(const aob_pattern_t& p, bool ida_style) {
+    std::string out;
+    out.reserve(p.size() * 3);
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (i) out += ' ';
+        out += sig_byte(p, i, ida_style);
+    }
+    return out;
+}
+
+} // namespace
+
+std::string aob_to_ida(const aob_pattern_t& p)    { return sig_join(p, true); }
+std::string aob_to_x64dbg(const aob_pattern_t& p) { return sig_join(p, false); }
+std::string aob_to_ce(const aob_pattern_t& p)     { return sig_join(p, false); }
+
+aob_code_sig_t aob_to_code(const aob_pattern_t& p) {
+    aob_code_sig_t out;
+    out.bytes.reserve(p.size() * 4);
+    out.mask.reserve(p.size() * 2);
+    for (size_t i = 0; i < p.size(); ++i) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "\\x%02X", p.bytes[i]);
+        out.bytes += buf;
+        // one mask char per byte, so mask[i] pairs with byte i: x = compare,
+        // ? = wildcard (nibble wildcards are not exact, so they read as ?)
+        out.mask += p.nibble_mask[i] == 0xFF ? 'x' : '?';
+    }
+    return out;
+}
+
 // Region scan
 
 std::vector<uintptr_t> aob_scan(reader_t& r,

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/memory/memscan.hpp"
@@ -22,6 +23,8 @@ struct entry_t {
     uint64_t      frozen_bits = 0;
     uint64_t      pre_freeze_bits = 0;   // value before the hold, for undo
     bool          pre_freeze_valid = false;
+    uint32_t      interval_ms = 100;     // per-entry service rate (freeze write-back included)
+    int64_t       last_sample_ms = 0;    // steady clock of the last sampled pass
 };
 
 struct value_t {
@@ -31,6 +34,7 @@ struct value_t {
     bool        held = false;   // value is being held by a freeze write
     bool        wrote = false;  // the hold landed (write or already-equal)
     bool        hold_failed = false; // the freeze write-back was rejected
+    bool        sampled = false;     // serviced this pass (not rate-skipped/deferred)
     uint64_t    bits = 0;
     std::string text;           // format_value_text(width, bits)
 };
@@ -56,6 +60,8 @@ bool poke(uint64_t id, uint64_t bits, std::string* err = nullptr);
 
 bool set_width(uint64_t id, value_width_t width);
 bool set_label(uint64_t id, std::string label);
+// Per-entry service rate in ms (clamped to 10..60000). 0 restores the default
+bool set_interval(uint64_t id, uint32_t interval_ms);
 
 std::vector<entry_t> list();
 
@@ -63,6 +69,14 @@ std::vector<entry_t> list();
 std::vector<value_t> values();
 
 size_t size();
+
+// Cheat Engine .CT round trip (audit #84): one CheatEntry per watch, with the
+// CE VariableType name for its width. import_ct accepts the same shape (plus
+// any .CT whose entries carry Address/VariableType) and appends to the list.
+// Entries with a module-relative address (name+offset) are skipped: this app
+// has no module base to resolve them against at import time
+std::string export_ct();
+size_t import_ct(std::string_view xml, std::string* err = nullptr);
 
 // one service pass, sample values, apply freezes, publish when anything
 // moved, rate limited to about 10hz
@@ -93,6 +107,7 @@ struct pass_stats_t {
     size_t writes         = 0;   // freeze write-backs issued
     size_t clean_holds    = 0;   // frozen value already in place, no write
     size_t deferred       = 0;   // entries left for the next pass (budget)
+    size_t rate_skipped   = 0;   // entries not due yet (per-entry interval_ms)
     size_t write_failures = 0;
 };
 
@@ -101,11 +116,13 @@ struct pass_stats_t {
 // target drifted from the hold (dirty check). A rejected write reports
 // ok=false + hold_failed. Entries the budgets could not reach this pass keep
 // their previous value from `prev` and are serviced first next pass via
-// `cursor` (an index into entries, updated in place)
+// `cursor` (an index into entries, updated in place). `now_ms` (steady clock)
+// enforces each entry's interval_ms; 0 disables the rate gate
 std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
                                  const std::vector<value_t>& prev,
                                  pass_io_t& io, const pass_limits_t& lim,
-                                 size_t& cursor, pass_stats_t* stats = nullptr);
+                                 size_t& cursor, pass_stats_t* stats = nullptr,
+                                 int64_t now_ms = 0);
 
 } // namespace detail
 

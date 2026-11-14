@@ -3,11 +3,15 @@
 #include "core/memory/watch_service.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <mutex>
+#include <optional>
+#include <string_view>
 
 #include "core/infra/clock.hpp"
 #include "core/infra/event_bus.hpp"
 #include "core/infra/limits.hpp"
+#include "core/infra/text_format.hpp"
 #include "core/process/target_service.hpp"
 
 namespace slop::core::memory::watch {
@@ -66,7 +70,8 @@ json entry_json(const entry_t& e) {
                 {"label", e.label},
                 {"freeze", e.freeze},
                 {"frozen_bits", e.frozen_bits},
-                {"frozen_text", format_value_text(e.width, e.frozen_bits)}};
+                {"frozen_text", format_value_text(e.width, e.frozen_bits)},
+                {"interval_ms", e.interval_ms}};
 }
 
 void publish_list_locked(const state_t& s) {
@@ -267,6 +272,16 @@ bool set_label(uint64_t id, std::string label) {
     return true;
 }
 
+bool set_interval(uint64_t id, uint32_t interval_ms) {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+    entry_t* e = find(s, id);
+    if (!e) return false;
+    e->interval_ms = std::clamp<uint32_t>(interval_ms ? interval_ms : 100, 10, 60'000);
+    publish_list_locked(s);
+    return true;
+}
+
 std::vector<entry_t> list() {
     state_t& s = st();
     std::lock_guard lk(s.mu);
@@ -285,6 +300,174 @@ size_t size() {
     return s.entries.size();
 }
 
+// Cheat Engine .CT round trip
+
+namespace {
+
+const char* ce_variable_type(value_width_t w) noexcept {
+    switch (w) {
+    case value_width_t::i8:
+    case value_width_t::u8:  return "Byte";
+    case value_width_t::i16:
+    case value_width_t::u16: return "2 Bytes";
+    case value_width_t::i32:
+    case value_width_t::u32: return "4 Bytes";
+    case value_width_t::i64:
+    case value_width_t::u64: return "8 Bytes";
+    case value_width_t::f32: return "Float";
+    case value_width_t::f64: return "Double";
+    }
+    return "4 Bytes";
+}
+
+bool ce_width_from_name(std::string_view name, value_width_t& out) noexcept {
+    while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) name.remove_suffix(1);
+    while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) name.remove_prefix(1);
+    if (name == "Byte" || name == "byte")   { out = value_width_t::i8;  return true; }
+    if (name == "2 Bytes")                  { out = value_width_t::i16; return true; }
+    if (name == "4 Bytes")                  { out = value_width_t::i32; return true; }
+    if (name == "8 Bytes")                  { out = value_width_t::i64; return true; }
+    if (name == "Float" || name == "float") { out = value_width_t::f32; return true; }
+    if (name == "Double")                   { out = value_width_t::f64; return true; }
+    return false;
+}
+
+void xml_escape(std::string& out, std::string_view text) {
+    for (const char c : text) {
+        switch (c) {
+        case '&':  out += "&amp;";  break;
+        case '<':  out += "&lt;";   break;
+        case '>':  out += "&gt;";   break;
+        case '"':  out += "&quot;"; break;
+        default:   out += c;        break;
+        }
+    }
+}
+
+std::string xml_unescape(std::string_view text) {
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '&') { out += text[i]; continue; }
+        const size_t semi = text.find(';', i);
+        if (semi == std::string_view::npos) { out += text[i]; continue; }
+        const std::string_view ent = text.substr(i + 1, semi - i - 1);
+        if      (ent == "amp")  out += '&';
+        else if (ent == "lt")   out += '<';
+        else if (ent == "gt")   out += '>';
+        else if (ent == "quot") out += '"';
+        else if (ent == "apos") out += '\'';
+        else { out += text.substr(i, semi - i + 1); }
+        i = semi;
+    }
+    return out;
+}
+
+// text between the first <tag> after `from` and its closing tag
+std::optional<std::string_view> xml_text(std::string_view xml, size_t from,
+                                         std::string_view tag) {
+    const std::string open  = "<" + std::string(tag) + ">";
+    const std::string close = "</" + std::string(tag) + ">";
+    const size_t b = xml.find(open, from);
+    if (b == std::string_view::npos) return std::nullopt;
+    const size_t s = b + open.size();
+    const size_t e = xml.find(close, s);
+    if (e == std::string_view::npos) return std::nullopt;
+    return xml.substr(s, e - s);
+}
+
+// CE writes descriptions quoted; strip the quotes so labels round trip
+std::string ct_text(std::string_view raw) {
+    std::string text = xml_unescape(raw);
+    if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+        text = text.substr(1, text.size() - 2);
+    return text;
+}
+
+bool parse_hex_address(std::string_view text, uint64_t& out) noexcept {
+    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.remove_prefix(1);
+    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.remove_suffix(1);
+    if (text.size() > 2 && text[0] == '0' && (text[1] == 'x' || text[1] == 'X'))
+        text.remove_prefix(2);
+    if (text.empty() || text.size() > 16) return false;
+    uint64_t v = 0;
+    for (const char c : text) {
+        int d;
+        if (c >= '0' && c <= '9')      d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        v = (v << 4) | static_cast<uint64_t>(d);
+    }
+    out = v;
+    return true;
+}
+
+} // namespace
+
+std::string export_ct() {
+    state_t& s = st();
+    std::lock_guard lk(s.mu);
+
+    std::string out =
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        "<CheatTable CheatEngineTableVersion=\"45\">\n"
+        "  <CheatEntries>\n";
+    uint64_t id = 1;
+    char addr[24];
+    for (const auto& e : s.entries) {
+        std::snprintf(addr, sizeof(addr), "%llX", static_cast<unsigned long long>(e.addr));
+        out += "    <CheatEntry>\n";
+        out += "      <ID>" + std::to_string(id++) + "</ID>\n";
+        out += "      <Description>\"";
+        xml_escape(out, e.label.empty() ? addr : e.label);
+        out += "\"</Description>\n";
+        out += "      <VariableType>" + std::string(ce_variable_type(e.width)) +
+               "</VariableType>\n";
+        out += "      <Address>" + std::string(addr) + "</Address>\n";
+        out += "    </CheatEntry>\n";
+    }
+    out += "  </CheatEntries>\n</CheatTable>\n";
+    return out;
+}
+
+size_t import_ct(std::string_view xml, std::string* err) {
+    size_t imported = 0;
+    size_t skipped  = 0;
+    size_t at = 0;
+    while (true) {
+        const size_t b = xml.find("<CheatEntry>", at);
+        if (b == std::string_view::npos) break;
+        const size_t e = xml.find("</CheatEntry>", b);
+        if (e == std::string_view::npos) break;
+        const std::string_view entry = xml.substr(b, e - b);
+        at = e + 1;
+
+        const auto addr_text = xml_text(entry, 0, "Address");
+        uint64_t addr = 0;
+        if (!addr_text || !parse_hex_address(*addr_text, addr)) { ++skipped; continue; }
+        value_width_t width = value_width_t::i32;
+        if (const auto vt = xml_text(entry, 0, "VariableType"))
+            if (!ce_width_from_name(*vt, width)) { ++skipped; continue; }
+        std::string label;
+        if (const auto d = xml_text(entry, 0, "Description")) label = ct_text(*d);
+        if (label.empty()) label = infra::fmt::format_address(addr);
+        if (add(addr, width, std::move(label)) == 0) { ++skipped; continue; }
+        ++imported;
+    }
+    if (err) {
+        if (imported == 0)
+            *err = skipped ? "no importable CheatEntry (module-relative or unknown "
+                             "VariableType addresses are skipped)"
+                           : "no CheatEntry found in the table";
+        else if (skipped)
+            *err = std::to_string(skipped) + " entries skipped";
+        else
+            err->clear();
+    }
+    return imported;
+}
+
 namespace detail {
 
 namespace {
@@ -298,7 +481,8 @@ uint64_t width_mask(size_t n) noexcept {
 std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
                                  const std::vector<value_t>& prev,
                                  pass_io_t& io, const pass_limits_t& lim,
-                                 size_t& cursor, pass_stats_t* stats) {
+                                 size_t& cursor, pass_stats_t* stats,
+                                 int64_t now_ms) {
     pass_stats_t local{};
     pass_stats_t& st = stats ? *stats : local;
     st = {};
@@ -329,6 +513,18 @@ std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
         v.addr = e.addr;
         v.held = e.freeze;
 
+        // per-entry rate: not due yet, so show the last sample and keep the
+        // cursor where it is (this is not a budget deferral)
+        if (now_ms != 0 && e.last_sample_ms != 0 &&
+            now_ms - e.last_sample_ms < static_cast<int64_t>(e.interval_ms)) {
+            if (const value_t* p = previous(e.id)) {
+                v.ok = p->ok; v.bits = p->bits; v.hold_failed = p->hold_failed;
+            }
+            v.text = v.ok ? format_value_text(e.width, v.bits) : std::string("-");
+            ++st.rate_skipped;
+            continue;
+        }
+
         if (st.reads >= lim.max_reads) {
             // out of read budget: keep showing what the last pass saw
             if (const value_t* p = previous(e.id)) {
@@ -345,6 +541,7 @@ std::vector<value_t> sample_pass(const std::vector<entry_t>& entries,
         live &= width_mask(n);
         v.ok   = read_ok;
         v.bits = read_ok ? live : 0;
+        v.sampled = true;
 
         if (e.freeze) {
             const uint64_t hold = e.frozen_bits & width_mask(n);
@@ -437,8 +634,9 @@ void tick() {
     }
 
     session_io_t io(*session);
+    const int64_t now = infra::steady_ms();
     const std::vector<value_t> sampled =
-        detail::sample_pass(snap, prev, io, kPassLimits, cursor);
+        detail::sample_pass(snap, prev, io, kPassLimits, cursor, nullptr, now);
 
     // Track live values into frozen_bits while unfrozen so that flipping the
     // freeze on latches the value the caller is looking at
@@ -449,6 +647,8 @@ void tick() {
         for (const auto& v : sampled) {
             entry_t* e = find(s, v.id);
             if (!e) continue;
+            if (!v.sampled) continue;   // rate-skipped or budget-deferred
+            e->last_sample_ms = now;
             if (!e->freeze && v.ok) e->frozen_bits = v.bits;
             // freeze-once: release as soon as the hold actually landed
             if (e->freeze && e->freeze_once && v.wrote) {

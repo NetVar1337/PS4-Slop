@@ -26,6 +26,8 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <set>
@@ -1649,4 +1651,375 @@ TEST_CASE(dissect_classifies_slots) {
     CHECK(rows[5]["kind"] == "double");
     CHECK(rows[6]["kind"] == "int64");
     CHECK(rows[7]["kind"] == "text");
+}
+
+// ===========================================================================
+// Unknown-initial flow, relative deltas, multi-level pointers, CT, sig formats
+// ===========================================================================
+
+namespace {
+
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::string{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+} // namespace
+
+TEST_CASE(compare_changed_by_more_and_less_than) {
+    // ints: magnitude in either direction, 0 is not a change
+    REQUIRE(check_value(cfg_for(scan_type_t::changed_by_more_than, value_width_t::i32, 5),
+                        value_width_t::i32, 20, 10));
+    REQUIRE(!check_value(cfg_for(scan_type_t::changed_by_more_than, value_width_t::i32, 5),
+                         value_width_t::i32, 15, 10));
+    REQUIRE(check_value(cfg_for(scan_type_t::changed_by_more_than, value_width_t::i32, 5),
+                        value_width_t::i32, 10, 20));       // decrease counts too
+    REQUIRE(check_value(cfg_for(scan_type_t::changed_by_less_than, value_width_t::i32, 5),
+                        value_width_t::i32, 12, 10));
+    REQUIRE(!check_value(cfg_for(scan_type_t::changed_by_less_than, value_width_t::i32, 5),
+                         value_width_t::i32, 10, 10));      // no change at all
+    REQUIRE(!check_value(cfg_for(scan_type_t::changed_by_less_than, value_width_t::i32, 5),
+                         value_width_t::i32, 20, 10));
+
+    // signed neighbours do not overflow the magnitude
+    REQUIRE(check_value(cfg_for(scan_type_t::changed_by_more_than, value_width_t::i64, 1),
+                        value_width_t::i64,
+                        static_cast<uint64_t>(INT64_MAX),
+                        static_cast<uint64_t>(INT64_MIN)));
+
+    // floats: exact delta on the value, not on the bits
+    REQUIRE(check_value(cfg_for(scan_type_t::changed_by_more_than, value_width_t::f32, 0.5),
+                        value_width_t::f32, value_from_double(value_width_t::f32, 1.75),
+                        value_from_double(value_width_t::f32, 1.0)));
+    REQUIRE(!check_value(cfg_for(scan_type_t::changed_by_more_than, value_width_t::f32, 0.5),
+                         value_width_t::f32, value_from_double(value_width_t::f32, 1.25),
+                         value_from_double(value_width_t::f32, 1.0)));
+    REQUIRE(check_value(cfg_for(scan_type_t::changed_by_less_than, value_width_t::f64, 0.5),
+                        value_width_t::f64, value_from_double(value_width_t::f64, 1.25),
+                        value_from_double(value_width_t::f64, 1.0)));
+    REQUIRE(!check_value(cfg_for(scan_type_t::changed_by_less_than, value_width_t::f64, 0.5),
+                         value_width_t::f64, value_from_double(value_width_t::f64, 1.0),
+                         value_from_double(value_width_t::f64, 1.0)));
+}
+
+TEST_CASE(pointer_scan_two_levels_with_negative_offset) {
+    fake_reader_t r;
+    const uintptr_t kTarget = 0x90000;
+    const uintptr_t kMid    = 0xA0000;   // holds target - 0x20
+    const uintptr_t kRoot   = 0x80000;   // holds mid + 0x10, so its offset is -0x10
+    uint64_t v = kMid + 0x10;
+    r.write(kRoot, &v, 8);
+    v = kTarget - 0x20;
+    r.write(kMid, &v, 8);
+
+    pointer_scan_options_t opt;
+    opt.target    = kTarget;
+    opt.alignment = 8;
+    opt.levels    = {{-0x100, 0x100, 0, false}, {-0x100, 0x100, 0, false}};
+    opt.modules   = {{"game.exe", kRoot, 0x1000}};
+
+    pointer_scan_stats_t st{};
+    auto chains = pointer_scan(r, {rw_region(0x80000, 0x30000)}, opt,
+                               cancel_token_t{}, &st);
+    // the depth-1 chain (mid -> target) is a valid result too, so pick the
+    // two-hop one by its root
+    const pointer_chain_result_t* chain = nullptr;
+    for (const auto& c : chains)
+        if (c.addresses.size() == 2 && c.addresses.front() == kRoot) chain = &c;
+    REQUIRE(chain != nullptr);
+    REQUIRE_EQ(chain->addresses[1], kMid);
+    REQUIRE_EQ(chain->offsets[0], -0x10);
+    REQUIRE_EQ(chain->offsets[1], 0x20);
+    // the root is inside the module, so the chain is restart-safe
+    REQUIRE_STR_EQ(chain->module, "game.exe");
+    REQUIRE_EQ(chain->module_offset, 0u);
+
+    // the chain resolves back to the target and survives verification
+    auto landed = pointer_chain_resolve(r, *chain);
+    REQUIRE(landed.has_value());
+    REQUIRE_EQ(*landed, kTarget);
+    pointer_verify_options_t vo;
+    vo.target  = kTarget;
+    vo.samples = 1;
+    pointer_verify_stats_t vst{};
+    auto kept = pointer_verify(r, {*chain}, vo, cancel_token_t{}, &vst);
+    REQUIRE_EQ(kept.size(), 1u);
+    REQUIRE_EQ(vst.kept, 1u);
+
+    // the same chain is invisible to a range that excludes -0x10
+    pointer_scan_options_t tight = opt;
+    tight.levels[0] = {0, 0x100, 0, false};
+    auto none = pointer_scan(r, {rw_region(0x80000, 0x30000)}, tight,
+                             cancel_token_t{}, &st);
+    for (const auto& c : none) REQUIRE(c.addresses.front() != kRoot);
+}
+
+TEST_CASE(pointer_scan_wildcard_level_accepts_any_offset) {
+    fake_reader_t r;
+    const uintptr_t kTarget = 0x90000;
+    const uintptr_t kHolder = 0xA0000;
+    const uint64_t v = kTarget + 0x123456;   // far outside the default range
+    r.write(kHolder, &v, 8);
+
+    pointer_scan_options_t opt;
+    opt.target    = kTarget;
+    opt.alignment = 8;
+    opt.levels    = {{0, 0, 0, true}};       // one hop, any offset
+    pointer_scan_stats_t st{};
+    auto chains = pointer_scan(r, {rw_region(0xA0000, 0x1000)}, opt,
+                               cancel_token_t{}, &st);
+    REQUIRE_EQ(chains.size(), 1u);
+    REQUIRE_EQ(chains[0].addresses[0], kHolder);
+    REQUIRE_EQ(chains[0].offsets[0], -0x123456);
+
+    // without the wildcard the same holder is out of range
+    opt.levels = {{-0x1000, 0x1000, 0, false}};
+    REQUIRE(pointer_scan(r, {rw_region(0xA0000, 0x1000)}, opt,
+                         cancel_token_t{}, &st).empty());
+}
+
+TEST_CASE(watch_per_entry_interval_gates_sampling) {
+    fake_io_t io;
+    io.mem[0x1000] = 1;
+    io.mem[0x2000] = 2;
+    std::vector<watch::entry_t> entries(2);
+    entries[0].id = 1; entries[0].addr = 0x1000; entries[0].width = value_width_t::u32;
+    entries[0].interval_ms = 100;
+    entries[1].id = 2; entries[1].addr = 0x2000; entries[1].width = value_width_t::u32;
+    entries[1].interval_ms = 1000;
+
+    size_t cursor = 0;
+    watch::detail::pass_stats_t st{};
+    auto v1 = watch::detail::sample_pass(entries, {}, io, {64, 16}, cursor, &st, 10'000);
+    REQUIRE_EQ(io.reads, 2u);              // never sampled: both are due
+    REQUIRE(v1[0].sampled);
+    REQUIRE(v1[1].sampled);
+
+    entries[0].last_sample_ms = 10'000;
+    entries[1].last_sample_ms = 10'000;
+    st = {};
+    auto v2 = watch::detail::sample_pass(entries, v1, io, {64, 16}, cursor, &st, 10'050);
+    REQUIRE_EQ(io.reads, 2u);              // nothing new was read
+    REQUIRE(!v2[0].sampled);
+    REQUIRE(!v2[1].sampled);
+    REQUIRE_EQ(st.rate_skipped, 2u);
+    REQUIRE_EQ(st.deferred, 0u);
+    REQUIRE_EQ(v2[0].bits, 1u);            // the last sample is still shown
+
+    st = {};
+    auto v3 = watch::detail::sample_pass(entries, v2, io, {64, 16}, cursor, &st, 10'100);
+    REQUIRE(v3[0].sampled);                // 100 ms elapsed
+    REQUIRE(!v3[1].sampled);               // 1000 ms not yet
+    REQUIRE_EQ(st.rate_skipped, 1u);
+    REQUIRE_EQ(io.reads, 3u);
+}
+
+TEST_CASE(watch_ct_round_trip) {
+    watch::clear();
+    REQUIRE_NE(watch::add(0x7FF00100, value_width_t::i32, "player hp"), 0u);
+    REQUIRE_NE(watch::add(0x7FF00200, value_width_t::f32, "ammo & \"clip\""), 0u);
+    REQUIRE_NE(watch::add(0x7FF00300, value_width_t::u8, ""), 0u);
+
+    const std::string xml = watch::export_ct();
+    REQUIRE(xml.find("<CheatTable") != std::string::npos);
+    REQUIRE(xml.find("<VariableType>4 Bytes</VariableType>") != std::string::npos);
+    REQUIRE(xml.find("<VariableType>Float</VariableType>") != std::string::npos);
+    REQUIRE(xml.find("<VariableType>Byte</VariableType>") != std::string::npos);
+    REQUIRE(xml.find("&amp;") != std::string::npos);      // escaped, still valid XML
+    REQUIRE(xml.find("7FF00100") != std::string::npos);
+
+    watch::clear();
+    std::string warn;
+    REQUIRE_EQ(watch::import_ct(xml, &warn), 3u);
+    REQUIRE(warn.empty());
+    auto list = watch::list();
+    REQUIRE_EQ(list.size(), 3u);
+    REQUIRE_EQ(list[0].addr, 0x7FF00100u);
+    REQUIRE_STR_EQ(list[0].label, "player hp");
+    REQUIRE_EQ(list[0].width, value_width_t::i32);
+    REQUIRE_EQ(list[1].width, value_width_t::f32);
+    REQUIRE_STR_EQ(list[1].label, "ammo & \"clip\"");
+    REQUIRE_EQ(list[2].width, value_width_t::i8);          // CE has no unsigned byte
+
+    // module-relative addresses cannot be resolved here: skipped, not guessed
+    const std::string rel =
+        "<CheatTable><CheatEntries><CheatEntry><Address>game.exe+1234</Address>"
+        "<VariableType>4 Bytes</VariableType></CheatEntry></CheatEntries></CheatTable>";
+    REQUIRE_EQ(watch::import_ct(rel, &warn), 0u);
+    REQUIRE(!warn.empty());
+    REQUIRE_EQ(watch::list().size(), 3u);
+
+    // junk input is an error, not a crash
+    REQUIRE_EQ(watch::import_ct("<not-xml>", &warn), 0u);
+    REQUIRE(!warn.empty());
+    watch::clear();
+}
+
+TEST_CASE(sig_formats_render_each_dialect) {
+    auto p = aob_compile("48 8B ?? ?? 0F 84 ?? ?? ?? ??", err_placeholder());
+    REQUIRE(p.has_value());
+    REQUIRE_STR_EQ(aob_to_ida(*p), "48 8B ? ? 0F 84 ? ? ? ?");
+    REQUIRE_STR_EQ(aob_to_x64dbg(*p), "48 8B ?? ?? 0F 84 ?? ?? ?? ??");
+    REQUIRE_STR_EQ(aob_to_ce(*p), "48 8B ?? ?? 0F 84 ?? ?? ?? ??");
+
+    const auto code = aob_to_code(*p);
+    REQUIRE_STR_EQ(code.bytes, "\\x48\\x8B\\x00\\x00\\x0F\\x84\\x00\\x00\\x00\\x00");
+    REQUIRE_STR_EQ(code.mask, "xx??xx????");
+
+    // nibble wildcards keep their nibble in every dialect
+    auto n = aob_compile("4? 8B", err_placeholder());
+    REQUIRE(n.has_value());
+    REQUIRE_STR_EQ(aob_to_ida(*n), "4? 8B");
+    REQUIRE_STR_EQ(aob_to_x64dbg(*n), "4? 8B");
+    REQUIRE_STR_EQ(aob_to_code(*n).mask, "?x");
+}
+
+TEST_CASE(memory_mcp_unknown_initial_flow_live_process) {
+    using nlohmann::json;
+    auto* base = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    REQUIRE(base != nullptr);
+    std::memset(base, 0, 0x1000);
+    const uintptr_t A = reinterpret_cast<uintptr_t>(base);
+    *reinterpret_cast<uint32_t*>(base + 0x40) = 100;
+
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+    bool e = false;
+    mem_call({{"action", "scan_reset"}}, e);
+    REQUIRE(!e);
+
+    // unknown initial: snapshot the range, no address rows yet
+    json r = mem_call({{"action", "scan"}, {"kind", "unknown"}, {"width", "u32"},
+                       {"begin", hex_str(A)}, {"end", hex_str(A + 0x1000)},
+                       {"alignment", 4}, {"max_stash_bytes", 0x1000}}, e);
+    CHECK(!e);
+    if (e) std::printf("  unknown scan: %s\n", r.dump().c_str());
+    CHECK(r.value("region_scan_active", false));
+    CHECK((r.value("slots_tracked", uint64_t{0})) == (uint64_t{0x1000}));   // bytes copied
+    CHECK((r.value("total", size_t{1})) == (size_t{0}));
+
+    // the value moved: increased narrows to the one address
+    *reinterpret_cast<uint32_t*>(base + 0x40) = 250;
+    r = mem_call({{"action", "rescan"}, {"kind", "increased"}, {"width", "u32"},
+                  {"limit", 100}}, e);
+    CHECK(!e);
+    if (e) std::printf("  increased: %s\n", r.dump().c_str());
+    CHECK((r.value("total", size_t{0})) == (size_t{1}));
+    CHECK((r["hits"][0].value("addr", uint64_t{0})) == (uint64_t{A + 0x40}));
+
+    // relative deltas on the same address
+    *reinterpret_cast<uint32_t*>(base + 0x40) = 260;   // +10 from 250
+    r = mem_call({{"action", "rescan"}, {"kind", "changed_by_more_than"},
+                  {"width", "u32"}, {"value", 5}}, e);
+    CHECK(!e);
+    CHECK((r.value("total", size_t{0})) == (size_t{1}));
+    r = mem_call({{"action", "rescan"}, {"kind", "changed_by_less_than"},
+                  {"width", "u32"}, {"value", 5}}, e);
+    CHECK(!e);
+    CHECK((r.value("total", size_t{0})) == (size_t{0}));
+
+    // a negative magnitude is rejected up front
+    r = mem_call({{"action", "rescan"}, {"kind", "changed_by_more_than"},
+                  {"width", "i32"}, {"value", -1}}, e);
+    CHECK(e);
+    CHECK(r.value("error", std::string{}).find("non-negative") != std::string::npos);
+
+    mem_call({{"action", "scan_reset"}}, e);
+    slop::core::process::target_detach();
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+
+TEST_CASE(memory_mcp_exports_csv_ct_and_diff) {
+    using nlohmann::json;
+    namespace fs = std::filesystem;
+    auto* base = static_cast<uint8_t*>(
+        VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    REQUIRE(base != nullptr);
+    std::memset(base, 0, 0x1000);
+    const uintptr_t A = reinterpret_cast<uintptr_t>(base);
+    *reinterpret_cast<uint32_t*>(base + 0x10) = 7;
+    *reinterpret_cast<uint32_t*>(base + 0x20) = 9;
+
+    REQUIRE(slop::core::process::target_attach(GetCurrentProcessId()));
+    bool e = false;
+    const fs::path dir = fs::temp_directory_path();
+
+    // scanner results -> CSV (the whole set, not the returned page)
+    mem_call({{"action", "scan_reset"}}, e);
+    json r = mem_call({{"action", "scan"}, {"kind", "exact"}, {"width", "u32"},
+                       {"value", 7}, {"begin", hex_str(A)}, {"end", hex_str(A + 0x1000)},
+                       {"alignment", 4}}, e);
+    CHECK(!e);
+    CHECK((r.value("total", size_t{0})) == (size_t{1}));
+    const fs::path csv = dir / "slop_scan_export_test.csv";
+    r = mem_call({{"action", "scan_export"}, {"path", csv.string()}}, e);
+    CHECK(!e);
+    CHECK((r.value("rows", size_t{0})) == (size_t{1}));
+    {
+        const std::string text = read_text_file(csv);
+        CHECK(text.find("address,type,value") == 0u);
+        CHECK(text.find(",u32,7") != std::string::npos);
+    }
+    fs::remove(csv);
+
+    // snapshot diff -> CSV with before/after bytes
+    mem_call({{"action", "snapshot_free"}, {"all", true}}, e);
+    r = mem_call({{"action", "snapshot"}, {"addr", hex_str(A)}, {"len", 0x1000}}, e);
+    CHECK(!e);
+    const uint64_t ida = r.value("id", uint64_t{0});
+    *reinterpret_cast<uint32_t*>(base + 0x20) = 0xDEADBEEF;
+    r = mem_call({{"action", "snapshot"}, {"addr", hex_str(A)}, {"len", 0x1000}}, e);
+    CHECK(!e);
+    const uint64_t idb = r.value("id", uint64_t{0});
+    const fs::path dcsv = dir / "slop_diff_export_test.csv";
+    r = mem_call({{"action", "diff"}, {"a", ida}, {"b", idb},
+                  {"export", {{"format", "csv"}, {"path", dcsv.string()}}}}, e);
+    CHECK(!e);
+    if (e) std::printf("  diff export: %s\n", r.dump().c_str());
+    CHECK(r["export"]["spans"].get<size_t>() >= 1u);
+    {
+        const std::string text = read_text_file(dcsv);
+        CHECK(text.find("offset,address,length,before,after") == 0u);
+        CHECK(text.find("09000000") != std::string::npos);   // before
+        CHECK(text.find("EFBEADDE") != std::string::npos);   // after
+    }
+    fs::remove(dcsv);
+    // a bad format is refused, not silently written
+    r = mem_call({{"action", "diff"}, {"a", ida}, {"b", idb},
+                  {"export", {{"format", "xml"}, {"path", dcsv.string()}}}}, e);
+    CHECK(e);
+    CHECK(r.value("error", std::string{}).find("csv or json") != std::string::npos);
+    mem_call({{"action", "snapshot_free"}, {"all", true}}, e);
+
+    // watchlist -> .CT and back, with the per-entry rate
+    mem_call({{"action", "watch_clear"}}, e);
+    r = mem_call({{"action", "watch_add"}, {"addr", hex_str(A + 0x10)}, {"width", "u32"},
+                  {"label", "hp"}, {"interval_ms", 250}}, e);
+    CHECK(!e);
+    CHECK((r["entries"][0].value("interval_ms", 0u)) == (250u));
+    const fs::path ct = dir / "slop_watch_test.CT";
+    r = mem_call({{"action", "watch_export_ct"}, {"path", ct.string()}}, e);
+    CHECK(!e);
+    CHECK((r.value("entries", size_t{0})) == (size_t{1}));
+    mem_call({{"action", "watch_clear"}}, e);
+    r = mem_call({{"action", "watch_import_ct"}, {"path", ct.string()}}, e);
+    CHECK(!e);
+    if (e) std::printf("  ct import: %s\n", r.dump().c_str());
+    CHECK((r.value("imported", size_t{0})) == (size_t{1}));
+    CHECK((r["entries"][0].value("addr", uint64_t{0})) == (uint64_t{A + 0x10}));
+    CHECK(r["entries"][0].value("label", std::string{}) == "hp");
+    CHECK((r["entries"][0].value("interval_ms", 0u)) == (100u));   // .CT carries no rate
+    fs::remove(ct);
+    mem_call({{"action", "watch_clear"}}, e);
+
+    // missing file / missing path are readable errors
+    r = mem_call({{"action", "watch_import_ct"}, {"path", (dir / "nope.CT").string()}}, e);
+    CHECK(e);
+    CHECK(r.value("error", std::string{}).find("cannot open") != std::string::npos);
+    r = mem_call({{"action", "watch_export_ct"}}, e);
+    CHECK(e);
+
+    mem_call({{"action", "scan_reset"}}, e);
+    slop::core::process::target_detach();
+    VirtualFree(base, 0, MEM_RELEASE);
 }

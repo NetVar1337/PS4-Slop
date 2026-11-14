@@ -21,8 +21,9 @@ param(
     [string[]]$AllowSection = @('.text', '.rdata', '.data', '.pdata', '.fptable', '.rsrc', '.reloc'),
     # DllCharacteristics lines dumpbin prints for the flags we require
     [string[]]$RequireFlag = @(
-        'Dynamic base', 'NX compatible', 'High Entropy Virtual Addresses',
-        'Control Flow Guard', 'CET compatible'
+        # no 'Control Flow Guard' / 'CET compatible': the Unicorn JIT executes
+        # generated code that neither mitigation can validate, see SECURITY.md
+        'Dynamic base', 'NX compatible', 'High Entropy Virtual Addresses'
     ),
     [string]$VsRoot = $env:SLOP_VS_ROOT
 )

@@ -4,8 +4,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { Eye, Plus, RotateCcw, Search, Snowflake, X } from "lucide-react";
+import { Download, Eye, Plus, RotateCcw, Search, Snowflake, Upload, X } from "lucide-react";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import IconButton from "@/components/IconButton";
+import { isTauri } from "@/lib/endpoint";
 import { hex, parseAddress } from "@/lib/format";
 import { useEngine } from "@/store/engine";
 import { kFirstKinds, kNextKinds, kWidths, useScanner } from "@/store/scanner";
@@ -15,6 +17,21 @@ const kRow = 19;
 /** Widths a watch can hold ("all" is a scan-only mode). */
 const kWatchWidths = kWidths.filter((w) => w !== "all");
 
+/** Native save dialog in the app, a prompt in browser dev mode. */
+async function pickSavePath(title: string, defaultPath: string): Promise<string | null> {
+  if (isTauri()) return saveDialog({ title, defaultPath });
+  return window.prompt(title, defaultPath);
+}
+
+/** Native open dialog in the app, a prompt in browser dev mode. */
+async function pickOpenPath(title: string): Promise<string | null> {
+  if (isTauri()) {
+    const picked = await openDialog({ title, multiple: false });
+    return typeof picked === "string" ? picked : null;
+  }
+  return window.prompt(title, "table.CT");
+}
+
 /** Inline add-watch row: validated address, width and optional label. */
 function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidth: string }) {
   const add = useWatch((s) => s.add);
@@ -23,6 +40,7 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
     kWatchWidths.includes(defaultWidth as never) ? defaultWidth : "u32",
   );
   const [label, setLabel] = useState("");
+  const [intervalMs, setIntervalMs] = useState("100");
   const [invalid, setInvalid] = useState(false);
 
   const submit = async () => {
@@ -31,7 +49,9 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
       setInvalid(true);
       return;
     }
-    if (await add(parsed, width, label.trim() || undefined)) onDone();
+    const rate = Number.parseInt(intervalMs, 10);
+    if (await add(parsed, width, label.trim() || undefined, Number.isFinite(rate) ? rate : 100))
+      onDone();
   };
 
   return (
@@ -77,6 +97,15 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
         value={label}
         onChange={(e) => setLabel(e.target.value)}
       />
+      <input
+        className="addr-input mono"
+        style={{ width: 52 }}
+        aria-label="Watch interval (ms)"
+        title="Service rate in milliseconds (freeze write-back included)"
+        inputMode="numeric"
+        value={intervalMs}
+        onChange={(e) => setIntervalMs(e.target.value)}
+      />
       <button type="submit" className="row-action" disabled={addr.trim() === ""}>
         Add
       </button>
@@ -99,6 +128,8 @@ export default function ScannerPanel() {
     remove,
     setFreeze,
     poke,
+    exportCt,
+    importCt,
     clear,
   } = useWatch();
   const [editing, setEditing] = useState<number | null>(null);
@@ -193,6 +224,18 @@ export default function ScannerPanel() {
           <span className="faint" style={{ fontSize: 11 }} aria-live="polite">
             {scanner.busy ? "scanning…" : `${scanner.total}`}
           </span>
+          <IconButton
+            tip="Export results as CSV"
+            disabled={scanner.total === 0}
+            onClick={() => {
+              void (async () => {
+                const path = await pickSavePath("Export scan results", "scan-results.csv");
+                if (path) await scanner.exportCsv(path);
+              })();
+            }}
+          >
+            <Download size={12} />
+          </IconButton>
         </div>
 
         <div className="panel-body" ref={scrollRef}>
@@ -239,6 +282,29 @@ export default function ScannerPanel() {
         <div className="dbg-head" style={{ borderTop: "1px solid var(--border-soft)" }}>
           Watchlist
           <div className="spacer" />
+          <IconButton
+            tip="Import a Cheat Engine .CT table"
+            onClick={() => {
+              void (async () => {
+                const path = await pickOpenPath("Import Cheat Engine table");
+                if (path) await importCt(path);
+              })();
+            }}
+          >
+            <Upload size={12} />
+          </IconButton>
+          <IconButton
+            tip="Export the watchlist as a .CT table"
+            disabled={entries.length === 0}
+            onClick={() => {
+              void (async () => {
+                const path = await pickSavePath("Export watchlist", "watchlist.CT");
+                if (path) await exportCt(path);
+              })();
+            }}
+          >
+            <Download size={12} />
+          </IconButton>
           <IconButton
             tip="Add address"
             pressed={adding}

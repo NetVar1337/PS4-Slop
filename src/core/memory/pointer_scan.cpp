@@ -50,12 +50,31 @@ pointer_scan(reader_t& r,
     pointer_scan_stats_t local{};
     pointer_scan_stats_t& st = stats ? *stats : local;
 
-    const uint32_t depth = std::min<uint32_t>(
-        opt.depth ? opt.depth : 1,
-        static_cast<uint32_t>(infra::limits::max_pointer_depth));
-    const int64_t min_off = opt.min_offset;
-    const int64_t max_off = std::max<int64_t>(opt.max_offset, opt.min_offset);
-    const size_t align = std::max<size_t>(opt.alignment ? opt.alignment : 1, 1);
+    // Level table: explicit levels win, otherwise depth copies of the global
+    // range. The sweep walks from the target backwards, so the level used at
+    // iteration k is levels[depth-1-k] (chain order is root first)
+    std::vector<pointer_level_t> levels;
+    if (!opt.levels.empty()) {
+        levels = opt.levels;
+        if (levels.size() > static_cast<size_t>(infra::limits::max_pointer_depth))
+            levels.resize(static_cast<size_t>(infra::limits::max_pointer_depth));
+    } else {
+        const uint32_t d = std::min<uint32_t>(
+            opt.depth ? opt.depth : 1,
+            static_cast<uint32_t>(infra::limits::max_pointer_depth));
+        levels.assign(d, pointer_level_t{opt.min_offset, opt.max_offset, 0, false});
+    }
+    for (auto& lv : levels) {
+        if (!lv.wildcard && lv.max_offset < lv.min_offset)
+            std::swap(lv.min_offset, lv.max_offset);
+        if (lv.alignment == 0) lv.alignment = opt.alignment ? opt.alignment : 1;
+    }
+    const uint32_t depth = static_cast<uint32_t>(levels.size());
+    if (depth == 0) return results;
+
+    // one sweep at the coarsest alignment; per-level alignment filters holders
+    size_t align = 1;
+    for (const auto& lv : levels) align = std::max<size_t>(align, lv.alignment);
 
     // Merge the region set into aligned spans
     std::vector<detail::read_range_t> spans;
@@ -112,6 +131,12 @@ pointer_scan(reader_t& r,
         for (uint32_t level = 0; level < depth && !frontier.empty(); ++level) {
             if (tok.cancelled()) { st.cancelled = true; break; }
 
+            // iteration k walks backwards from the target, so it applies the
+            // chain-order level depth-1-k
+            const pointer_level_t& lv = levels[depth - 1 - level];
+            const int64_t min_off = lv.wildcard ? INT32_MIN : lv.min_offset;
+            const int64_t max_off = lv.wildcard ? INT32_MAX : lv.max_offset;
+
             // Expand every frontier address against the sorted edge list
             std::vector<size_t> next_frontier;
             bool frontier_full = false;
@@ -137,6 +162,7 @@ pointer_scan(reader_t& r,
                     [](uint64_t v, const edge_t& e) { return v < e.value; });
 
                 for (auto it = first; it != last; ++it) {
+                    if (lv.alignment > 1 && (it->holder % lv.alignment) != 0) continue;
                     const int64_t off = static_cast<int64_t>(dest - it->value);
                     nodes.push_back({it->holder, static_cast<int64_t>(fidx), off});
                     next_frontier.push_back(nodes.size() - 1);
@@ -169,6 +195,17 @@ pointer_scan(reader_t& r,
             const node_t& nd = nodes[static_cast<size_t>(n)];
             chain.addresses.push_back(nd.addr);
             chain.offsets.push_back(nd.offset);
+        }
+        // a root inside a module is reported module-relative so the chain
+        // survives a restart at a different base
+        if (!opt.modules.empty() && !chain.addresses.empty()) {
+            const uintptr_t root = chain.addresses.front();
+            for (const auto& m : opt.modules) {
+                if (m.size == 0 || root < m.base || root >= m.base + m.size) continue;
+                chain.module        = m.name;
+                chain.module_offset = static_cast<uint64_t>(root - m.base);
+                break;
+            }
         }
         results.push_back(std::move(chain));
     }
