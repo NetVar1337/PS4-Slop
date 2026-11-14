@@ -7,6 +7,7 @@
 
 #include "core/infra/paths.hpp"
 #include "core/memory/console_scan.hpp"
+#include "core/memory/dissect.hpp"
 #include "core/memory/offsets.hpp"
 #include "core/memory/session_reader.hpp"
 
@@ -228,7 +229,7 @@ json tool_memory(const json& args) {
             "snapshot_free", "protect", "alloc", "free", "siggen",
             "live_crypto", "watch_list", "watch_add", "watch_remove",
             "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
-            "offsets_verify",
+            "offsets_verify", "dissect",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
@@ -237,7 +238,7 @@ json tool_memory(const json& args) {
                  "scan_save|scan_load|aob|pointerscan|pointerscan_verify|snapshot|snapshots|"
                  "diff|snapshot_free|protect|alloc|free|siggen|live_crypto|watch_list|"
                  "watch_add|watch_remove|watch_clear|watch_set|watch_undo|watch_freeze_once|"
-                 "offsets_verify)");
+                 "offsets_verify|dissect)");
     }
 
     // watchlist
@@ -528,6 +529,50 @@ json tool_memory(const json& args) {
         out["module"] = {{"name", m->name}, {"base", static_cast<uint64_t>(m->base)}};
         out["text"] = {{"base", static_cast<uint64_t>(text.base)}, {"size", text.size}};
         return out;
+    }
+
+    // guess the layout of an unknown object, one row per 8-byte slot
+    if (action == "dissect") {
+        const uint64_t addr = parse_addr(args, "addr");
+        const uint64_t size = std::min<uint64_t>(opt_u64(args, "size", 0x100), 0x1000);
+        if (size < 8) fail("dissect: size must be at least 8");
+        std::vector<uint8_t> buf(static_cast<size_t>(size));
+        auto io = s.read(static_cast<uintptr_t>(addr), buf.data(), buf.size());
+        if (!io.ok || io.bytes < 8)
+            fail("dissect: cannot read " + addr_hex_str(addr) + ": " +
+                 runtime::ps4::io_error_str(io.error));
+        buf.resize(io.bytes);
+        auto regions = runtime::target_scan_regions(s.handle());
+        std::sort(regions.begin(), regions.end(),
+                  [](const auto& a, const auto& b) { return a.base < b.base; });
+        const auto region_of = [&](uint64_t v) -> const memory::scan_region_t* {
+            auto it = std::upper_bound(regions.begin(), regions.end(), v,
+                                       [](uint64_t x, const auto& r) { return x < r.base; });
+            if (it == regions.begin()) return nullptr;
+            --it;
+            return v < it->base + it->size ? &*it : nullptr;
+        };
+        constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        auto mods = s.backend()->enum_modules(s.handle());
+        memory::dissect_env_t env;
+        env.readable = [&](uint64_t v) { return region_of(v) != nullptr; };
+        env.executable = [&](uint64_t v) {
+            const auto* r = region_of(v);
+            return r && (r->protect & kExec);
+        };
+        env.symbolize = [&](uint64_t v) -> std::string {
+            if (!mods.ok) return {};
+            for (const auto& m : mods.items)
+                if (v >= m.base && v < m.base + m.size) return m.name + "+" + addr_hex_str(v - m.base);
+            return {};
+        };
+        env.read = [&](uint64_t v, void* out, size_t n) -> size_t {
+            auto r = s.read(static_cast<uintptr_t>(v), out, n);
+            return r.ok ? r.bytes : 0;
+        };
+        return {{"addr", addr}, {"size", buf.size()},
+                {"rows", memory::dissect(addr, buf.data(), buf.size(), env)}};
     }
 
     if (action == "scan_save") {

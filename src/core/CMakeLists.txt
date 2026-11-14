@@ -88,6 +88,8 @@ add_library(slop_core STATIC
     util/sha256.cpp
     memory/offsets.hpp
     memory/offsets.cpp
+    memory/dissect.hpp
+    memory/dissect.cpp
     network/web_fetch.hpp
     network/web_fetch.cpp
     network/mitm_pki.hpp

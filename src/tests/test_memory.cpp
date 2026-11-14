@@ -8,6 +8,7 @@
 #include "core/memory/aob.hpp"
 #include "core/memory/console_scan.hpp"
 #include "core/memory/memscan.hpp"
+#include "core/memory/dissect.hpp"
 #include "core/memory/offsets.hpp"
 #include "core/memory/pointer_scan.hpp"
 #include "core/memory/read_util.hpp"
@@ -1603,4 +1604,49 @@ TEST_CASE(offsets_manifest_is_fingerprint_gated_and_fail_closed) {
     r = verify_offsets(m, in);
     CHECK(r["ok"] == false);
     CHECK(r["errors"].dump().find("not unique") != std::string::npos);
+}
+
+TEST_CASE(dissect_classifies_slots) {
+    // fake address space: code at 0x1000, a vtable at 0x2000 (slot 0 -> code),
+    // an object at 0x3000 (starts with the vtable), a C string at 0x4000
+    std::map<uint64_t, std::vector<uint8_t>> mem;
+    auto put64 = [&](uint64_t a, uint64_t v) { auto& b = mem[a]; b.resize(8); std::memcpy(b.data(), &v, 8); };
+    put64(0x2000, 0x1010);
+    put64(0x3000, 0x2000);
+    mem[0x4000] = {'h', 'e', 'l', 'l', 'o', 0, 0, 0};
+    dissect_env_t env;
+    env.readable = [](uint64_t v) { return v >= 0x1000 && v < 0x5000; };
+    env.executable = [](uint64_t v) { return v >= 0x1000 && v < 0x2000; };
+    env.symbolize = [](uint64_t v) { return v < 0x2000 ? std::string("eboot.bin+") + std::to_string(v) : std::string(); };
+    env.read = [&](uint64_t v, void* out, size_t n) -> size_t {
+        auto it = mem.find(v);
+        if (it == mem.end()) return 0;
+        const size_t k = std::min(n, it->second.size());
+        std::memset(out, 0, n);
+        std::memcpy(out, it->second.data(), k);
+        return n;
+    };
+    uint64_t slots[8];
+    float fl[2] = {1.5f, -32.25f};
+    double dbl = 1234.5;
+    slots[0] = 0;
+    slots[1] = 0x1040;   // code
+    slots[2] = 0x3000;   // object
+    slots[3] = 0x4000;   // char*
+    std::memcpy(&slots[4], fl, 8);
+    std::memcpy(&slots[5], &dbl, 8);
+    slots[6] = 42;
+    std::memcpy(&slots[7], "abcdefg", 8);
+    auto rows = dissect(0x9000, reinterpret_cast<uint8_t*>(slots), sizeof(slots), env);
+    REQUIRE(rows.size() == 8u);
+    CHECK(rows[0]["kind"] == "zero");
+    CHECK(rows[1]["target"]["kind"] == "code");
+    CHECK(rows[2]["target"]["kind"] == "object");
+    CHECK(rows[2]["target"]["vtable"] == 0x2000u);
+    CHECK(rows[3]["target"]["kind"] == "char*");
+    CHECK(rows[3]["target"]["text"] == "hello");
+    CHECK(rows[4]["kind"] == "float2");
+    CHECK(rows[5]["kind"] == "double");
+    CHECK(rows[6]["kind"] == "int64");
+    CHECK(rows[7]["kind"] == "text");
 }
