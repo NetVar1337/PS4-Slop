@@ -80,6 +80,11 @@ foreach(_area IN LISTS _slop_test_areas)
         # (600 s leaves room for the 4x-slower ASan lane, healthy areas take < 40 s)
         TIMEOUT 600
     )
+    # the backend's debug-event listener binds the fixed port 755: the ps4
+    # areas run one at a time, alongside every other area
+    if(_area MATCHES "^ps4")
+        set_tests_properties("slop_tests_${_area}" PROPERTIES RESOURCE_LOCK ps4_debug_port)
+    endif()
 endforeach()
 
 # ASan lane: the mcp area is the HTTP/JSON/SSE/fs/web attack surface, but a

@@ -207,6 +207,10 @@ void parallel_for(size_t count, const cancel_token_t& tok,
                 if (idx >= count) break;
                 run_body(idx, slot);
             }
+            // under done_mu: an unlocked notify can land between the waiter's
+            // predicate check and its block (lost wakeup, the caller hangs), and
+            // the waiter may return and destroy done_cv before a late notify
+            std::lock_guard dl(done_mu);
             workers_done.fetch_add(1, std::memory_order_release);
             done_cv.notify_one();
         });
@@ -219,6 +223,7 @@ void parallel_for(size_t count, const cancel_token_t& tok,
                 if (idx >= count) break;
                 run_body(idx, slot);
             }
+            std::lock_guard dl(done_mu);
             workers_done.fetch_add(1, std::memory_order_release);
             done_cv.notify_one();
         }
