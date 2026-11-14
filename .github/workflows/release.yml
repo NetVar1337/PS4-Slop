@@ -284,4 +284,7 @@ jobs:
           if ! gh release view "$TAG" > /dev/null 2>&1; then
             gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
           fi
+          # SPDX SBOM of the npm/cargo manifests (GitHub dependency graph); the
+          # C++ deps are pinned by hash in cmake/deps.cmake
+          gh api "repos/${GITHUB_REPOSITORY}/dependency-graph/sbom" --jq .sbom > _release/sbom.spdx.json
           gh release upload "$TAG" _release/* --clobber
