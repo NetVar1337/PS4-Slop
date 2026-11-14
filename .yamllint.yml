@@ -1,0 +1,11 @@
+# Workflows pin actions to full commit SHAs and spell out long pwsh commands,
+# so lines past 80 columns are the norm here, not an accident.
+extends: default
+rules:
+  line-length: disable
+  document-start: disable
+  truthy:
+    check-keys: false   # GitHub Actions' `on:` key
+    allowed-values: ['true', 'false', 'TRUE']   # CMAKE_DISABLE_FIND_PACKAGE_* env
+  comments:
+    min-spaces-from-content: 1   # `uses: x@<sha> # v1.2.3` pins

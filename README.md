@@ -383,8 +383,18 @@ On the first successful start on the configured port, a `slopstation` HTTP entry
 | VS Code | `%APPDATA%\Code\User\settings.json` (`mcp.servers`) |
 | OpenCode | `%USERPROFILE%\.config\opencode\config.json` |
 
-Claude Desktop only supports stdio servers in its config file; add the URL through its
-Connectors UI. Unparseable config files are left untouched. When a token is set, it is
+Stdio-only clients (Claude Desktop and others) run the engine with `--stdio`: JSON-RPC
+arrives on stdin and leaves on stdout one message per line, logs go to stderr, and a
+per-process token is generated automatically. If an engine is already running (the
+desktop app), the stdio process bridges to it instead of starting a second one.
+
+```json
+{ "mcpServers": { "slopstation": {
+    "command": "C:\\Users\\you\\AppData\\Local\\dev.slopstation.ui\\engine\\reverse-slop-engine.exe",
+    "args": ["--stdio"] } } }
+```
+
+Unparseable config files are left untouched. When a token is set, it is
 written into these files — **do not sync them publicly**. Run the engine with
 `--no-onboard` to skip registration; set `mcp_onboarded` to `false` to request another pass.
 

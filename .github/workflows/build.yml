@@ -47,6 +47,8 @@ jobs:
         run: |
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
           ./tools/sync_version.ps1 -Check -Tag $tag
+      - name: lint workflows (.yamllint.yml)
+        run: pipx run yamllint==1.37.1 --strict .github .yamllint.yml
 
   # Path filter: a docs-only or frontend-only PR skips the C++ lanes and vice
   # versa. Push/tag/dispatch runs always execute every lane, so main and
@@ -125,6 +127,10 @@ jobs:
       - name: frontend/engine API contract
         shell: pwsh
         run: ./tools/check_api.ps1
+
+      - name: MCP over stdio (--stdio)
+        shell: pwsh
+        run: python tools/mcp_stdio_test.py
 
       - name: upload live battery results
         if: always()
