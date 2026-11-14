@@ -27,6 +27,7 @@ const kAppActions = {
   output_clear: [],
   log: ["text"],
   diag: ["since_revision", "limit"],
+  diag_bundle: ["path"],
   shutdown: ["reason"],
   settings_get: [],
   settings_set: ["key", "value"],

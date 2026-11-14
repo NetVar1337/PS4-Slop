@@ -84,6 +84,8 @@ add_library(slop_core STATIC
     util/fs_tools.cpp
     util/zip_reader.hpp
     util/zip_reader.cpp
+    util/zip_writer.hpp
+    util/zip_writer.cpp
     util/sha256.hpp
     util/sha256.cpp
     memory/offsets.hpp
@@ -142,6 +144,8 @@ add_library(slop_core STATIC
     runtime/scan_bridge.cpp
     runtime/session.hpp
     runtime/session.cpp
+    runtime/console_manager.hpp
+    runtime/console_manager.cpp
     process/process_list.hpp
     process/process_list.cpp
     process/process_icon.hpp

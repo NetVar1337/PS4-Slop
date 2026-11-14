@@ -1,8 +1,38 @@
 // src/tests/test_ps4.cpp
 // PS4 (ps4debug-NG) tests against the fake payload in ps4_fixture.hpp:
-// backend handshake, memory, threads, registry/session and the MCP target tool.
+// backend handshake, memory, threads, registry/session, the MCP target tool
+// and the saved-console manager (switch between two fake consoles).
 
 #include "ps4_fixture.hpp"
+
+#include "core/infra/settings.hpp"
+#include "core/memory/watch_service.hpp"
+#include "core/runtime/console_manager.hpp"
+
+#include <filesystem>
+#include <tuple>
+
+namespace {
+
+// the console manager persists through the settings store: point it at a
+// scratch file so the real profile is never touched
+struct scratch_settings_t {
+    std::filesystem::path dir;
+    scratch_settings_t() {
+        dir = std::filesystem::temp_directory_path() /
+              ("slop_ps4_consoles_" + std::to_string(::GetCurrentProcessId()) + "_" +
+               std::to_string(static_cast<long long>(::GetTickCount64())));
+        std::filesystem::create_directories(dir);
+        slop::core::infra::settings::set_file_for_testing((dir / "settings.json").string());
+        slop::core::infra::settings::load();
+    }
+    ~scratch_settings_t() {
+        // back to the default store; the real profile is never read or written
+        slop::core::infra::settings::set_file_for_testing({});
+    }
+};
+
+} // namespace
 
 TEST_CASE(ps4_backend_handshake_and_enums) {
     server_guard_t g;
@@ -338,4 +368,182 @@ TEST_CASE(ps4_connect_refuses_non_ps4debug_server) {
     ::shutdown(ls, SD_BOTH);
     closesocket(ls);
     th.join();
+}
+
+TEST_CASE(ps4_consoles_crud_persists_and_validates) {
+    scratch_settings_t cfg;
+    bool e = false;
+
+    json saved = slop::core::mcp::call_tool(
+        "target",
+        {{"action", "consoles_save"},
+         {"name", "devkit-a"},
+         {"host", "127.0.0.1"},
+         {"port", 744},
+         {"notes", "primary devkit"},
+         {"default_pid", kFakePid},
+         {"title_filter", "eboot"},
+         {"auto_connect", true},
+         {"profile", {{"watchlist", "a-set"}, {"scan_width", "u32"}, {"scan_kind", "changed"}}}},
+        e);
+    REQUIRE(!e);
+    CHECK(saved.value("saved", false));
+    CHECK(saved["console"].value("name", "") == "devkit-a");
+    CHECK(saved["console"].value("default_pid", 0u) == kFakePid);
+    CHECK(saved["console"]["profile"].value("scan_width", "") == "u32");
+
+    // upsert: the same name replaces instead of appending
+    saved = slop::core::mcp::call_tool(
+        "target",
+        {{"action", "consoles_save"}, {"name", "devkit-a"}, {"host", "10.0.0.9"},
+         {"port", 745}, {"notes", "moved"}},
+        e);
+    REQUIRE(!e);
+    json listed = slop::core::mcp::call_tool("target", {{"action", "consoles_list"}}, e);
+    REQUIRE(!e);
+    CHECK(listed.value("count", 0) == 1);
+    CHECK(listed["consoles"][0].value("host", "") == "10.0.0.9");
+    CHECK(listed["consoles"][0].value("port", 0) == 745);
+    CHECK(listed["consoles"][0].value("notes", "") == "moved");
+    CHECK(listed.value("active", "x").empty());
+
+    // invalid endpoint values are refused, the list is untouched
+    slop::core::mcp::call_tool(
+        "target", {{"action", "consoles_save"}, {"name", "bad name"}, {"host", "1.2.3.4"}}, e);
+    CHECK(e);
+    e = false;
+    slop::core::mcp::call_tool(
+        "target", {{"action", "consoles_save"}, {"name", "empty-host"}, {"host", ""}}, e);
+    CHECK(e);
+    e = false;
+    slop::core::mcp::call_tool(
+        "target", {{"action", "consoles_save"}, {"name", "bad-port"}, {"host", "1.2.3.4"},
+                   {"port", 70000}},
+        e);
+    CHECK(e);
+    e = false;
+    listed = slop::core::mcp::call_tool("target", {{"action", "consoles_list"}}, e);
+    REQUIRE(!e);
+    CHECK(listed.value("count", 0) == 1);
+
+    // persisted: the settings file holds the list and a reload reads it back
+    const json raw = slop::core::infra::settings::get_json("target_consoles");
+    REQUIRE(raw.is_array());
+    CHECK(raw.size() == 1);
+    slop::core::infra::settings::load();
+    listed = slop::core::mcp::call_tool("target", {{"action", "consoles_list"}}, e);
+    REQUIRE(!e);
+    CHECK(listed.value("count", 0) == 1);
+    CHECK(listed["consoles"][0].value("name", "") == "devkit-a");
+
+    // remove drops the endpoint and its watchlist set
+    slop::core::mcp::call_tool("target", {{"action", "consoles_remove"}, {"name", "devkit-a"}}, e);
+    REQUIRE(!e);
+    listed = slop::core::mcp::call_tool("target", {{"action", "consoles_list"}}, e);
+    REQUIRE(!e);
+    CHECK(listed.value("count", 0) == 0);
+    slop::core::mcp::call_tool("target", {{"action", "consoles_remove"}, {"name", "devkit-a"}}, e);
+    CHECK(e);
+}
+
+TEST_CASE(ps4_consoles_switch_between_two_consoles_restores_profile) {
+    scratch_settings_t cfg;
+    server_guard_t a;
+    server_guard_t b;
+    ps4_disconnect_guard_t guard;
+    bool e = false;
+
+    // two saved consoles, each with its own profile
+    for (const auto& [name, port, set, width, kind] :
+         {std::tuple{"devkit-a", a.srv.port, "a-set", "u32", "changed"},
+          std::tuple{"devkit-b", b.srv.port, "b-set", "f32", "exact"}}) {
+        slop::core::mcp::call_tool(
+            "target",
+            {{"action", "consoles_save"},
+             {"name", name},
+             {"host", "127.0.0.1"},
+             {"port", port},
+             {"default_pid", kFakePid},
+             {"profile",
+              {{"watchlist", set}, {"scan_width", width}, {"scan_kind", kind}}}},
+            e);
+        REQUIRE(!e);
+    }
+
+    // switch to A: connects, attaches its default pid, applies its scan defaults
+    json sw = slop::core::mcp::call_tool(
+        "target", {{"action", "consoles_switch"}, {"name", "devkit-a"}}, e);
+    REQUIRE(!e);
+    if (e) std::printf("  switch a: %s\n", sw.dump().c_str());
+    CHECK(sw.value("switched", false));
+    CHECK(sw.value("name", "") == "devkit-a");
+    CHECK(sw.value("attached", false));
+    CHECK(sw.value("pid", 0u) == kFakePid);
+    CHECK(sw.value("endpoint", "") == "127.0.0.1:" + std::to_string(a.srv.port));
+    CHECK(sw["profile"].value("scan_width", "") == "u32");
+    CHECK(slop::core::runtime::consoles::active() == "devkit-a");
+    json st = slop::core::mcp::call_tool("target", {{"action", "status"}}, e);
+    REQUIRE(!e);
+    CHECK(st.value("console", "") == "devkit-a");
+
+    // a watch entry and an armed breakpoint belong to A
+    slop::core::mcp::call_tool(
+        "memory", {{"action", "watch_add"}, {"addr", 0x400200}, {"width", "u32"}}, e);
+    REQUIRE(!e);
+    CHECK(slop::core::memory::watch::size() == 1);
+    slop::core::mcp::call_tool("debugger", {{"action", "ps4_attach"}, {"pid", kFakePid}}, e);
+    REQUIRE(!e);
+    slop::core::mcp::call_tool("debugger", {{"action", "ps4_bp_set"}, {"addr", 0x400500}}, e);
+    REQUIRE(!e);
+    REQUIRE(slop::core::runtime::registry_ps4() != nullptr);
+    CHECK(slop::core::runtime::registry_ps4()->ps4_breakpoints().size() == 1);
+
+    // switch to B: the session, the debugger slots and the watchlist go, B's
+    // profile comes back (empty set + its scan defaults)
+    sw = slop::core::mcp::call_tool(
+        "target", {{"action", "consoles_switch"}, {"name", "devkit-b"}}, e);
+    REQUIRE(!e);
+    if (e) std::printf("  switch b: %s\n", sw.dump().c_str());
+    CHECK(sw.value("previous", "") == "devkit-a");
+    CHECK(sw.value("pid", 0u) == kFakePid);
+    CHECK(sw.value("endpoint", "") == "127.0.0.1:" + std::to_string(b.srv.port));
+    CHECK(sw.value("watchlist_entries", 99) == 0);
+    CHECK(sw["profile"].value("scan_width", "") == "f32");
+    CHECK(sw["profile"].value("scan_kind", "") == "exact");
+    CHECK(slop::core::memory::watch::size() == 0);
+    CHECK(slop::core::runtime::registry_ps4()->ps4_breakpoints().empty());
+    json scan = slop::core::mcp::call_tool("memory", {{"action", "scan_state"}}, e);
+    REQUIRE(!e);
+    CHECK(scan.value("width", "") == "f32");
+    CHECK(scan.value("kind", "") == "exact");
+
+    // B gets its own watch entry, then switching back restores A's set
+    slop::core::mcp::call_tool(
+        "memory", {{"action", "watch_add"}, {"addr", 0x500000}, {"width", "u8"}}, e);
+    REQUIRE(!e);
+    slop::core::mcp::call_tool(
+        "target", {{"action", "consoles_switch"}, {"name", "devkit-a"}}, e);
+    REQUIRE(!e);
+    CHECK(slop::core::memory::watch::size() == 1);
+    const auto entries = slop::core::memory::watch::list();
+    REQUIRE(entries.size() == 1u);
+    CHECK(entries[0].addr == 0x400200);
+    CHECK(entries[0].width == slop::core::memory::value_width_t::u32);
+    // A was last seen on its own port, and the switch recorded firmware
+    json listed = slop::core::mcp::call_tool("target", {{"action", "consoles_list"}}, e);
+    REQUIRE(!e);
+    bool saw_fw = false;
+    for (const auto& c : listed["consoles"]) {
+        if (c.value("name", "") != "devkit-a") continue;
+        saw_fw = c.value("last_fw", "") == "11.00";
+        CHECK(c.value("active", false));
+        CHECK(c.value("last_seen_ms", int64_t{0}) > 0);
+    }
+    CHECK(saw_fw);
+
+    // switching to an unknown name fails without dropping the live console
+    slop::core::mcp::call_tool("target", {{"action", "consoles_switch"}, {"name", "nope"}}, e);
+    CHECK(e);
+    CHECK(slop::core::runtime::registry_ps4_active());
+    CHECK(slop::core::process::active_session() != nullptr);
 }

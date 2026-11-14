@@ -35,6 +35,9 @@ void stop();
 bool running();
 uint16_t port();
 
+// engine version string (the root VERSION file)
+const char* server_version() noexcept;
+
 // live token management (app.rotate_token / engine handover)
 void set_primary_token(std::string token);
 void add_extra_token(std::string token);

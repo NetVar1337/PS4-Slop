@@ -14,11 +14,12 @@ import { isTauri } from "@/lib/endpoint";
 import { call } from "@/lib/rpc";
 import { payloadDownload, payloadLatest, payloadSave, payloadStatus } from "@/lib/ps4debug";
 import type { PayloadInfo, PayloadStatus } from "@/lib/ps4debug";
-import { matchesFilter, useTargets, type ProcessRow } from "@/store/targets";
+import { matchesFilter, useTargets, type ConsoleRow, type ProcessRow } from "@/store/targets";
 import { useEngine } from "@/store/engine";
 
 const kRowHeight = 22;
 const kDefaultPs4Port = 744;
+const kScanWidths = ["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"];
 
 function ConnectForm({
   compact,
@@ -34,10 +35,18 @@ function ConnectForm({
   onPort: (v: number) => void;
 }) {
   const connectPs4 = useTargets((s) => s.connectPs4);
+  const saveConsole = useTargets((s) => s.saveConsole);
   const [busy, setBusy] = useState(false);
   const [discovering, setDiscovering] = useState(false);
   const [found, setFound] = useState<string[]>([]);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
+
+  // a discovered console can be kept as an endpoint without connecting now
+  const saveEndpoint = async (ip: string) => {
+    setDiscoverError(null);
+    if (!(await saveConsole({ name: ip, host: ip, port })))
+      setDiscoverError(`Could not save ${ip}.`);
+  };
 
   const submit = async () => {
     if (host.trim() === "" || busy) return;
@@ -105,6 +114,15 @@ function ConnectForm({
       >
         {discovering ? "Searching…" : "Discover"}
       </button>
+      <button
+        type="button"
+        className="row-action"
+        disabled={host.trim() === ""}
+        data-tip="Keep this endpoint in the console list without connecting"
+        onClick={() => void saveEndpoint(host.trim())}
+      >
+        Save endpoint
+      </button>
       {found.length > 1 &&
         found.map((ip) => (
           <button type="button" key={ip} className="link-button" onClick={() => onHost(ip)}>
@@ -113,6 +131,199 @@ function ConnectForm({
         ))}
       {discoverError !== null && <span className="faint error-text">{discoverError}</span>}
     </form>
+  );
+}
+
+type ConsoleForm = {
+  name: string;
+  host: string;
+  port: number;
+  default_pid: number;
+  watchlist: string;
+  scan_width: string;
+};
+
+const kEmptyConsoleForm: ConsoleForm = {
+  name: "",
+  host: "",
+  port: kDefaultPs4Port,
+  default_pid: 0,
+  watchlist: "",
+  scan_width: "u32",
+};
+
+/** Saved endpoints: add/edit/remove, connect or quick-switch, with the
+ *  firmware/caps the engine recorded on the last connection. */
+function ConsolesCard() {
+  const consoles = useTargets((s) => s.consoles);
+  const activeConsole = useTargets((s) => s.activeConsole);
+  const saveConsole = useTargets((s) => s.saveConsole);
+  const removeConsole = useTargets((s) => s.removeConsole);
+  const switchConsole = useTargets((s) => s.switchConsole);
+  const [open, setOpen] = useState(false);
+  const [form, setForm] = useState<ConsoleForm>(kEmptyConsoleForm);
+  const [busy, setBusy] = useState(false);
+
+  if (consoles.length === 0 && !open) return null;
+
+  const edit = (c: ConsoleRow) => {
+    setForm({
+      name: c.name,
+      host: c.host,
+      port: c.port,
+      default_pid: c.default_pid,
+      watchlist: c.profile.watchlist,
+      scan_width: c.profile.scan_width === "" ? "u32" : c.profile.scan_width,
+    });
+    setOpen(true);
+  };
+
+  const submit = async () => {
+    setBusy(true);
+    try {
+      const ok = await saveConsole({
+        name: form.name.trim(),
+        host: form.host.trim(),
+        port: form.port,
+        default_pid: form.default_pid,
+        profile: { watchlist: form.watchlist.trim(), scan_width: form.scan_width },
+      });
+      if (ok) {
+        setOpen(false);
+        setForm(kEmptyConsoleForm);
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="consoles-card">
+      <div className="payload-head">
+        <span className="payload-title">Consoles</span>
+        <span className="faint">{consoles.length} saved</span>
+        <div className="spacer" />
+        <button
+          type="button"
+          className="row-action"
+          onClick={() => {
+            setForm(kEmptyConsoleForm);
+            setOpen((v) => !v);
+          }}
+        >
+          {open ? "Cancel" : "Add"}
+        </button>
+      </div>
+      {consoles.length > 0 && (
+        <div className="console-list">
+          {consoles.map((c) => (
+            <div className="console-row" key={c.name} data-active={c.name === activeConsole}>
+              <span className="console-name">{c.name}</span>
+              <span className="faint mono">
+                {c.host}:{c.port}
+              </span>
+              <span className="faint">
+                {c.last_fw !== "" ? `fw ${c.last_fw}` : "never connected"}
+                {c.last_seen_ms > 0
+                  ? ` · ${new Date(c.last_seen_ms).toLocaleDateString()}`
+                  : ""}
+              </span>
+              {c.last_caps !== "" && <span className="pill">{c.last_caps}</span>}
+              {c.notes !== "" && <span className="faint console-note">{c.notes}</span>}
+              <div className="spacer" />
+              <button
+                type="button"
+                className="row-action"
+                data-active={c.name === activeConsole}
+                onClick={() => void switchConsole(c.name)}
+              >
+                {c.name === activeConsole ? "Reconnect" : "Switch"}
+              </button>
+              <button type="button" className="link-button" onClick={() => edit(c)}>
+                Edit
+              </button>
+              <button
+                type="button"
+                className="link-button"
+                onClick={() => void removeConsole(c.name)}
+              >
+                Remove
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {open && (
+        <form
+          className="console-form"
+          aria-label="Save console"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void submit();
+          }}
+        >
+          <input
+            className="addr-input"
+            aria-label="Console name"
+            placeholder="Name"
+            value={form.name}
+            onChange={(e) => setForm({ ...form, name: e.target.value })}
+          />
+          <input
+            className="addr-input"
+            aria-label="Console host"
+            placeholder="PS4 IP"
+            value={form.host}
+            onChange={(e) => setForm({ ...form, host: e.target.value })}
+          />
+          <input
+            className="addr-input"
+            style={{ width: 64 }}
+            aria-label="Console port"
+            type="number"
+            min={1}
+            max={65535}
+            value={form.port}
+            onChange={(e) => setForm({ ...form, port: Number(e.target.value) || kDefaultPs4Port })}
+          />
+          <input
+            className="addr-input"
+            style={{ width: 70 }}
+            aria-label="Default pid"
+            type="number"
+            min={0}
+            value={form.default_pid}
+            onChange={(e) => setForm({ ...form, default_pid: Number(e.target.value) || 0 })}
+          />
+          <input
+            className="addr-input"
+            aria-label="Watchlist set"
+            placeholder="Watchlist set"
+            value={form.watchlist}
+            onChange={(e) => setForm({ ...form, watchlist: e.target.value })}
+          />
+          <select
+            className="addr-input"
+            aria-label="Scan width"
+            value={form.scan_width}
+            onChange={(e) => setForm({ ...form, scan_width: e.target.value })}
+          >
+            {kScanWidths.map((w) => (
+              <option key={w} value={w}>
+                {w}
+              </option>
+            ))}
+          </select>
+          <button
+            type="submit"
+            className="row-action"
+            disabled={busy || form.name.trim() === "" || form.host.trim() === ""}
+          >
+            {busy ? "Saving…" : "Save console"}
+          </button>
+        </form>
+      )}
+    </div>
   );
 }
 
@@ -293,6 +504,7 @@ export default function TargetsPanel() {
     disconnectPs4,
     showHost,
     setShowHost,
+    loadConsoles,
   } = useTargets();
   const target = useEngine((s) => s.target);
   const backend = useEngine((s) => s.backend);
@@ -301,6 +513,10 @@ export default function TargetsPanel() {
   const [host, setHost] = useState("");
   const [port, setPort] = useState(kDefaultPs4Port);
   const listing = backend.ps4 || showHost;
+
+  useEffect(() => {
+    void loadConsoles();
+  }, [loadConsoles]);
 
   useEffect(() => {
     if (listing) void refresh();
@@ -368,7 +584,10 @@ export default function TargetsPanel() {
 
       {/* Always present so the grid rows stay head / banner (auto) / list (1fr):
           a bare banner child used to land in the 1fr track and stretch */}
-      <div className="banner-slot">{banner}</div>
+      <div className="banner-slot">
+        {banner}
+        <ConsolesCard />
+      </div>
 
       {!listing ? (
         <div className="empty connect-empty">

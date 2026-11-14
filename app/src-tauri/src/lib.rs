@@ -42,6 +42,23 @@ fn restart_engine(app: AppHandle) -> Result<(), String> {
     supervisor::request_restart(&app)
 }
 
+/// Reveal a file (its folder opens with it selected) or open a folder in the
+/// OS file manager. The crash banner uses it for the engine log, Settings for
+/// the data dir. explorer.exe reports a non-zero exit even on success, so the
+/// child is spawned and not waited on.
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("{path} does not exist"));
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(p)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open {path}: {e}"))
+}
+
 /// where the engine binary lives: next to us once installed; debug builds
 /// check the cmake tree first on purpose, tauri copies the resource engine at
 /// cargo build time and a stale copy cost an afternoon of debugging once
@@ -197,6 +214,7 @@ pub fn run() {
             startup_deadline_ms,
             engine_status,
             restart_engine,
+            open_path,
             payload::ps4debug_payload,
             payload::ps4debug_payload_latest,
             payload::ps4debug_payload_download,

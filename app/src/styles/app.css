@@ -1922,3 +1922,64 @@ fieldset.settings-group {
   font-size: var(--type-small);
   color: var(--text-faint);
 }
+
+/* --- saved consoles (multi-console manager) ------------------------------ */
+
+.consoles-card {
+  display: grid;
+  gap: var(--pad-xs);
+  padding: var(--pad-sm) var(--pad-md);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.console-list {
+  display: grid;
+  gap: 2px;
+}
+
+.console-row {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  min-width: 0;
+  font-size: var(--type-small);
+}
+
+.console-row[data-active="true"] .console-name {
+  color: var(--accent);
+}
+
+.console-name {
+  font-weight: 600;
+}
+
+.console-note {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.console-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pad-xs);
+}
+
+.console-switch {
+  padding: 0 var(--pad-sm);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.console-switch:hover {
+  background: var(--surface);
+}
+
+/* the status bar sits at the bottom: its menus open upwards */
+.menu-pop.up {
+  top: auto;
+  right: 0;
+  bottom: calc(100% + 2px);
+  left: auto;
+  transform-origin: bottom right;
+}

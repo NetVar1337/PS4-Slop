@@ -5,10 +5,11 @@
 
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, KeyRound } from "lucide-react";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import logoUrl from "@/assets/reverse-slop-icon.png";
 import IconButton from "@/components/IconButton";
 import Modal from "@/components/Modal";
-import { getEndpoint } from "@/lib/rpc";
+import { call, getEndpoint } from "@/lib/rpc";
 import { copyText } from "@/lib/clipboard";
 import { isTauri } from "@/lib/endpoint";
 import { useEngine } from "@/store/engine";
@@ -91,6 +92,8 @@ export default function SettingsModal({ onClose }: Props) {
   const [onboardClients, setOnboardClients] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
   const [appVersion, setAppVersion] = useState("");
+  const [diag, setDiag] = useState<string | null>(null);
+  const [diagBusy, setDiagBusy] = useState(false);
   const endpoint = getEndpoint();
   const updatePhase = useUpdater((s) => s.phase);
   const updateVersion = useUpdater((s) => s.version);
@@ -150,6 +153,7 @@ export default function SettingsModal({ onClose }: Props) {
     void setValue("web_allowlist", hosts);
   };
 
+// keep both
   const saveOnboardClients = () => {
     const clients = onboardClients
       .split(/[\n,]+/)
@@ -161,6 +165,25 @@ export default function SettingsModal({ onClose }: Props) {
   const plaintextConfigs = settings?.mcp_plaintext_configs ?? [];
   const setxCommand = 'setx SLOP_MCP_TOKEN "<engine token>"';
 
+  // one zip a user can attach to a bug report: engine log tail, redacted
+  // settings, versions and the console status (engine side: app.diag_bundle)
+  const copyDiagnostics = async () => {
+    setDiagBusy(true);
+    setDiag(null);
+    try {
+      const path = await saveDialog({
+        defaultPath: "slopstation-diagnostics.zip",
+        filters: [{ name: "Zip archive", extensions: ["zip"] }],
+      });
+      if (path === null) return;
+      await call("app", "diag_bundle", { path });
+      setDiag(`Saved ${path}`);
+    } catch (e) {
+      setDiag(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDiagBusy(false);
+    }
+  };
   return (
     <Modal title="Settings" onClose={onClose}>
       <div className="modal-body">
@@ -250,6 +273,18 @@ export default function SettingsModal({ onClose }: Props) {
                 : "bearer token"}
             </div>
           </div>
+          <div className="settings-choices">
+            <button
+              type="button"
+              className="row-action"
+              disabled={!isTauri() || diagBusy}
+              data-tip="Zip with the engine log tail, redacted settings, versions and the console status"
+              onClick={() => void copyDiagnostics()}
+            >
+              {diagBusy ? "Bundling…" : "Copy diagnostics"}
+            </button>
+          </div>
+          {diag !== null && <div className="settings-status mono">{diag}</div>}
         </fieldset>
 
         <fieldset className="settings-group">

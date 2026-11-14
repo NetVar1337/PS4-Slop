@@ -774,4 +774,6 @@ void stop() {
 bool running() { return g_running; }
 uint16_t port() { return g_port; }
 
+const char* server_version() noexcept { return kServerVersion; }
+
 } // namespace slop::core::mcp

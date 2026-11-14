@@ -26,6 +26,21 @@ import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { mockApi } from "@/test/api";
 
+// the diagnostics bundle and the payload save both go through the native save
+// dialog; jsdom has no dialog, so the plugin is stubbed at module level
+vi.mock("@tauri-apps/plugin-dialog", () => ({
+  save: vi.fn(async () => "C:\\tmp\\slopstation-diagnostics.zip"),
+  open: vi.fn(async () => null),
+  message: vi.fn(async () => undefined),
+}));
+
+// the shell-only affordances (save dialog, payload card) render only inside
+// Tauri; the tests drive them, so the detection is pinned
+vi.mock("@/lib/endpoint", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, isTauri: () => true };
+});
+
 const initial = {
   engine: useEngine.getState(),
   disasm: useDisasm.getState(),
@@ -112,6 +127,85 @@ describe("targets panel", () => {
     expect(screen.getByText(/10\.0\.0\.5:744/)).toBeInTheDocument();
     expect(screen.getByText("system")).toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: "PID" })).toHaveAttribute("scope", "col");
+  });
+});
+
+describe("console manager (multi-console, audit 22/81/82)", () => {
+  const consoles = [
+    {
+      name: "devkit-a",
+      host: "10.0.0.5",
+      port: 744,
+      notes: "living room",
+      default_pid: 0,
+      title_filter: "",
+      auto_connect: false,
+      profile: { watchlist: "a-set", scan_width: "u32", scan_kind: "exact" },
+      last_seen_ms: 1_700_000_000_000,
+      last_fw: "11.00",
+      last_branding: "ps4debug-NG",
+      last_caps: "1.1",
+      active: true,
+    },
+    {
+      name: "devkit-b",
+      host: "10.0.0.6",
+      port: 744,
+      notes: "",
+      default_pid: 0,
+      title_filter: "",
+      auto_connect: false,
+      profile: { watchlist: "b-set", scan_width: "f32", scan_kind: "changed" },
+      last_seen_ms: 0,
+      last_fw: "",
+      last_branding: "",
+      last_caps: "",
+      active: false,
+    },
+  ];
+
+  it("lists saved consoles with firmware/caps and switches to another one", async () => {
+    const { calls } = mockApi(({ action }) => {
+      if (action === "consoles_list") return { consoles, active: "devkit-a" };
+      if (action === "consoles_switch") return { endpoint: "10.0.0.6:744" };
+      return { processes: [] };
+    });
+    useEngine.setState({ backend: { badge: "user", ps4: false } });
+    render(<TargetsPanel />);
+    await screen.findByText("devkit-a");
+    expect(screen.getByText(/fw 11\.00/)).toBeInTheDocument();
+    expect(screen.getByText("1.1")).toBeInTheDocument();
+    expect(screen.getByText("living room")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Switch" }));
+    await waitFor(() =>
+      expect(
+        calls.some((c) => c.action === "consoles_switch" && c.params.name === "devkit-b"),
+      ).toBe(true),
+    );
+  });
+
+  it("status bar shows the active console and quick-switches", async () => {
+    const { calls } = mockApi(({ action }) =>
+      action === "consoles_list" ? { consoles, active: "devkit-a" } : {},
+    );
+    render(<StatusBar />);
+    await userEvent.click(await screen.findByRole("button", { name: "devkit-a" }));
+    await userEvent.click(screen.getByRole("menuitemradio", { name: /devkit-b/ }));
+    expect(
+      calls.some((c) => c.action === "consoles_switch" && c.params.name === "devkit-b"),
+    ).toBe(true);
+  });
+
+  it("writes a diagnostics bundle from Settings (item 81)", async () => {
+    const { calls } = mockApi(() => ({}));
+    render(<SettingsModal onClose={() => undefined} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.tool === "app" && c.action === "diag_bundle")).toBe(true),
+    );
+    expect(calls.find((c) => c.action === "diag_bundle")?.params.path).toBe(
+      "C:\\tmp\\slopstation-diagnostics.zip",
+    );
   });
 });
 

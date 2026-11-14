@@ -4,6 +4,7 @@
 #include "core/infra/paths.hpp"
 #include "core/mcp/tools_common.hpp"
 #include "core/network/net_socket.hpp"
+#include "core/runtime/console_manager.hpp"
 
 #include <filesystem>
 #include <list>
@@ -125,6 +126,73 @@ json ps4_status_json(runtime::backend_ps4_t& p4) {
             {"lost_reason", p4.lost_reason()},
             {"drops", p4.drop_count()},
             {"authed", p4.ps4_authed()}};
+}
+
+// ---- saved consoles (multi-console manager) --------------------------------
+
+// the live watchlist as a profile set: what a switch saves and restores
+json watch_json() {
+    json arr = json::array();
+    for (const auto& e : memory::watch::list())
+        arr.push_back({{"addr", e.addr},
+                       {"width", static_cast<int>(e.width)},
+                       {"label", e.label},
+                       {"freeze", e.freeze}});
+    return arr;
+}
+
+size_t restore_watch(const json& arr) {
+    size_t n = 0;
+    for (const auto& e : arr) {
+        if (!e.is_object()) continue;
+        const uint64_t addr = e.value("addr", uint64_t{0});
+        const int      w    = e.value("width", 4);
+        if (addr == 0 || w < 0 || w > 9) continue;
+        const uint64_t id = memory::watch::add(
+            addr, static_cast<memory::value_width_t>(w), e.value("label", std::string{}));
+        if (id == 0) break;   // watch cap
+        if (e.value("freeze", false)) memory::watch::set_freeze(id, true);
+        ++n;
+    }
+    return n;
+}
+
+int64_t epoch_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// a successful connect refreshes the saved endpoint's last-seen/fw/caps so the
+// ui can show what each console was without connecting to it
+void record_console_seen(const std::string& host, uint16_t port) {
+    runtime::consoles::console_t c;
+    const std::string ep = host + ":" + std::to_string(port);
+    for (const auto& saved : runtime::consoles::list()) {
+        if (saved.host + ":" + std::to_string(saved.port) != ep) continue;
+        c = saved;
+        break;
+    }
+    auto* p4 = runtime::registry_ps4();
+    if (c.name.empty() || !p4) return;
+    runtime::consoles::set_active(c.name);
+    c.last_seen_ms  = epoch_ms();
+    c.last_fw       = p4->fw_string();
+    c.last_branding = p4->branding();
+    c.last_caps     = p4->server_caps();
+    std::string err;
+    runtime::consoles::save(c, err);
+}
+
+json consoles_json() {
+    json arr = json::array();
+    const std::string active = runtime::consoles::active();
+    for (const auto& c : runtime::consoles::list()) {
+        json o = runtime::consoles::to_json(c);
+        o["active"] = c.name == active;
+        arr.push_back(std::move(o));
+    }
+    return {{"consoles", arr}, {"count", arr.size()}, {"active", active}};
 }
 
 } // namespace
@@ -326,6 +394,7 @@ json tool_target(const json& args) {
         std::string err;
         if (!process::target_connect_ps4(host, static_cast<uint16_t>(port), pid, err))
             fail("ps4_connect failed: " + err);
+        record_console_seen(host, static_cast<uint16_t>(port));
         g_scan.engine.reset();
         g_scan.used = false;
         g_scan.pid = 0;
@@ -514,9 +583,144 @@ json tool_target(const json& args) {
         return out;
     }
 
+    if (action == "consoles_list") return consoles_json();
+
+    if (action == "consoles_save") {
+        runtime::consoles::console_t c;
+        c.name = args.value("name", std::string{});
+        c.host = args.value("host", std::string{});
+        if (args.contains("port")) {
+            const uint64_t p = parse_addr(args, "port");
+            if (p == 0 || p > 0xFFFF) fail("consoles_save: bad port");
+            c.port = static_cast<uint16_t>(p);
+        }
+        c.notes = args.value("notes", std::string{});
+        if (args.contains("default_pid")) {
+            const uint64_t p = parse_addr(args, "default_pid");
+            if (p > 0xFFFFFFFFull) fail("consoles_save: bad default_pid");
+            c.default_pid = static_cast<uint32_t>(p);
+        }
+        c.title_filter = args.value("title_filter", std::string{});
+        c.auto_connect = args.value("auto_connect", false);
+        if (args.contains("profile") && args["profile"].is_object()) {
+            const json& p         = args["profile"];
+            c.profile.watchlist   = p.value("watchlist", std::string{});
+            c.profile.scan_width  = p.value("scan_width", std::string{});
+            c.profile.scan_kind   = p.value("scan_kind", std::string{});
+        }
+        // keep what the last connection learned about this endpoint
+        runtime::consoles::console_t prev;
+        if (runtime::consoles::find(c.name, prev)) {
+            c.last_seen_ms  = prev.last_seen_ms;
+            c.last_fw       = prev.last_fw;
+            c.last_branding = prev.last_branding;
+            c.last_caps     = prev.last_caps;
+        }
+        std::string err;
+        if (!runtime::consoles::save(c, err)) fail("consoles_save: " + err);
+        // the profile's watchlist set is the live list at save time, so
+        // "save this console" also snapshots the setup it should restore
+        size_t captured = 0;
+        if (!c.profile.watchlist.empty() &&
+            (runtime::consoles::active().empty() || runtime::consoles::active() == c.name)) {
+            const json entries = watch_json();
+            captured = entries.size();
+            if (!runtime::consoles::save_watchlist_set(c.profile.watchlist, entries))
+                fail("consoles_save: could not store watchlist set '" +
+                     c.profile.watchlist + "'");
+        }
+        return {{"saved", true},
+                {"console", runtime::consoles::to_json(c)},
+                {"watchlist_captured", captured}};
+    }
+
+    if (action == "consoles_remove") {
+        const std::string name = args.value("name", std::string{});
+        if (name.empty()) fail("consoles_remove requires 'name'");
+        if (!runtime::consoles::remove(name))
+            fail("consoles_remove: no saved console named '" + name + "'");
+        return {{"removed", true}, {"name", name}, {"active", runtime::consoles::active()}};
+    }
+
+    if (action == "consoles_switch") {
+        const std::string name = args.value("name", std::string{});
+        if (name.empty()) fail("consoles_switch requires 'name'");
+        runtime::consoles::console_t next;
+        if (!runtime::consoles::find(name, next))
+            fail("consoles_switch: no saved console named '" + name + "'");
+        const std::string previous = runtime::consoles::active();
+
+        // 1. the outgoing console keeps its watchlist in its own set
+        if (!previous.empty() && previous != name) {
+            runtime::consoles::console_t prev;
+            if (runtime::consoles::find(previous, prev) && !prev.profile.watchlist.empty())
+                runtime::consoles::save_watchlist_set(prev.profile.watchlist, watch_json());
+        }
+
+        // 2. clean detach: session, debugger slots and scan state go first
+        process::target_disconnect_ps4();
+        clear_breakpoint_conditions();
+        g_scan.engine.reset();
+        g_scan.used = false;
+        g_scan.pid  = 0;
+        memory::watch::clear();
+
+        // 3. connect + attach the console's default pid
+        std::string err;
+        if (!process::target_connect_ps4(next.host, next.port, next.default_pid, err)) {
+            // never leave the user stranded on no console when the old one
+            // is still there
+            std::string back_err;
+            runtime::consoles::console_t prev;
+            const bool have_prev = !previous.empty() &&
+                                   runtime::consoles::find(previous, prev);
+            if (have_prev &&
+                process::target_connect_ps4(prev.host, prev.port, prev.default_pid, back_err)) {
+                runtime::consoles::set_active(previous);
+                fail("consoles_switch: " + err + " (stayed on '" + previous + "')");
+            }
+            runtime::consoles::set_active({});
+            fail("consoles_switch: " + err +
+                 (have_prev ? " (and reconnecting '" + previous + "' failed: " + back_err + ")"
+                            : std::string{}));
+        }
+
+        // 4. restore the profile: watchlist set, then the scan defaults
+        size_t watch_entries = 0;
+        if (!next.profile.watchlist.empty())
+            watch_entries = restore_watch(runtime::consoles::watchlist_set(next.profile.watchlist));
+        if (!next.profile.scan_width.empty()) g_scan.width = next.profile.scan_width;
+        if (!next.profile.scan_kind.empty()) g_scan.kind = next.profile.scan_kind;
+
+        // 5. remember this console as the active one + what it reported
+        runtime::consoles::set_active(name);
+        record_console_seen(next.host, next.port);
+
+        auto* p4 = runtime::registry_ps4();
+        auto s   = process::active_session();
+        json out = {{"switched", true},
+                    {"name", name},
+                    {"previous", previous},
+                    {"endpoint", runtime::registry_ps4_endpoint()},
+                    {"branding", runtime::registry_ps4_branding()},
+                    {"fw", p4 ? p4->fw_string() : std::string{}},
+                    {"backend", runtime::active_badge()},
+                    {"attached", s && s->valid()},
+                    {"watchlist_entries", watch_entries},
+                    {"profile", {{"watchlist", next.profile.watchlist},
+                                 {"scan_width", g_scan.width},
+                                 {"scan_kind", g_scan.kind}}}};
+        if (s && s->valid()) {
+            out["pid"]  = s->pid();
+            out["arch"] = arch_name(s->arch());
+        }
+        return out;
+    }
+
     if (action == "status") {
         json out;
         out["backend"]  = runtime::active_badge();
+        out["console"]  = runtime::consoles::active();
         // ps4 is present whenever a console is selected, also while its
         // connection is down (connected=false, lost=true -> ps4_reconnect)
         auto* p4 = runtime::registry_ps4();
@@ -814,7 +1018,8 @@ json tool_target(const json& args) {
 
     fail("target: unknown action (list|attach|detach|status|modules|"
          "dump_module|ps4_dump_module|threads|regions|handles|heaps|heap_blocks|icon|"
-         "ps4_connect|ps4_disconnect|ps4_reconnect|ps4_auto)");
+         "ps4_connect|ps4_disconnect|ps4_reconnect|ps4_auto|consoles_list|"
+         "consoles_save|consoles_remove|consoles_switch)");
 }
 
 } // namespace slop::core::mcp::detail

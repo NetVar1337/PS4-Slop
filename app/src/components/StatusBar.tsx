@@ -1,11 +1,13 @@
 // app/src/components/StatusBar.tsx
 // indicator row, everything here is pushed by the engine so nothing polls
 
+import { useEffect, useState } from "react";
 import { Command, MonitorCog, Settings2, SunMoon } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import { formatLabel } from "@/lib/format";
 import { useDisasm } from "@/store/disasm";
 import { useEngine } from "@/store/engine";
+import { useTargets } from "@/store/targets";
 import { kThemes, useTheme } from "@/store/theme";
 import { useUi } from "@/store/ui";
 
@@ -34,6 +36,15 @@ export default function StatusBar() {
   const openSettings = useUi((s) => s.openSettings);
   const setRail = useUi((s) => s.setRail);
   const setPaletteOpen = useUi((s) => s.setPaletteOpen);
+  const consoles = useTargets((s) => s.consoles);
+  const activeConsole = useTargets((s) => s.activeConsole);
+  const loadConsoles = useTargets((s) => s.loadConsoles);
+  const switchConsole = useTargets((s) => s.switchConsole);
+  const [consoleMenu, setConsoleMenu] = useState(false);
+
+  useEffect(() => {
+    void loadConsoles();
+  }, [loadConsoles]);
 
   const cycleTheme = () => {
     const i = kThemes.findIndex((t) => t.id === theme);
@@ -67,6 +78,48 @@ export default function StatusBar() {
       </span>
 
       <div className="spacer" />
+
+      {consoles.length > 0 && (
+        <div className="menu-root">
+          <button
+            type="button"
+            className="status-pill console-switch"
+            aria-haspopup="menu"
+            aria-expanded={consoleMenu}
+            data-tip="Saved consoles: quick switch"
+            onClick={() => setConsoleMenu((v) => !v)}
+          >
+            <span className="dot" data-state={activeConsole === "" ? "idle" : "ok"} aria-hidden />
+            {activeConsole === "" ? "No console" : activeConsole}
+          </button>
+          {consoleMenu && (
+            <div
+              className="menu-pop up"
+              role="menu"
+              aria-label="Consoles"
+              onClick={() => setConsoleMenu(false)}
+            >
+              {consoles.map((c) => (
+                <button
+                  type="button"
+                  key={c.name}
+                  role="menuitemradio"
+                  aria-checked={c.name === activeConsole}
+                  className="menu-item"
+                  onClick={() => void switchConsole(c.name)}
+                >
+                  <span>{c.name}</span>
+                  <span className="faint">
+                    {c.host}:{c.port}
+                    {c.last_fw !== "" ? ` · fw ${c.last_fw}` : ""}
+                  </span>
+                  {c.name === activeConsole && <span className="faint">●</span>}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <Pill label={`Backend: ${backend.badge}`} state={backend.ps4 ? "ok" : "idle"} />
       <Pill

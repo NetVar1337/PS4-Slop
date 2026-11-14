@@ -5,6 +5,8 @@
 
 #include "core/infra/lifecycle.hpp"
 #include "core/infra/mcp_onboard.hpp"
+#include "core/infra/paths.hpp"
+#include "core/util/zip_writer.hpp"
 
 namespace slop::core::mcp::detail {
 
@@ -114,6 +116,72 @@ json tool_app(const json& args) {
         return {{"revision", snap.revision},
                 {"count", arr.size()},
                 {"entries", std::move(arr)}};
+    }
+
+    if (action == "diag_bundle") {
+        // support hand-off: one zip with the engine log tail, the settings
+        // (secrets redacted), versions and the console status
+        const std::string path = args.value("path", std::string{});
+        if (path.empty()) fail("app.diag_bundle requires 'path' (the .zip to write)");
+
+        constexpr size_t kTail = 2000;
+        std::string diag_text;
+        for (const auto& e : infra::diag::snapshot(0, kTail).entries) {
+            diag_text += std::to_string(e.timestamp_ms);
+            diag_text += ' ';
+            diag_text += diag_level_name(e.level);
+            diag_text += " [";
+            diag_text += e.tag;
+            diag_text += "] ";
+            diag_text += e.message;
+            diag_text += "\r\n";
+        }
+        std::string output_text;
+        const auto lines = infra::event_bus::output_since(0);
+        for (size_t i = lines.size() > kTail ? lines.size() - kTail : 0; i < lines.size(); ++i) {
+            output_text += std::to_string(lines[i].ms);
+            output_text += ' ';
+            output_text += lines[i].text;
+            output_text += "\r\n";
+        }
+
+        json status = json::object();
+        try {
+            status = tool_target({{"action", "status"}});
+        } catch (...) {
+            // a bundle is most useful when the engine is unhealthy: a failing
+            // status call must never block it
+        }
+        json ps4 = status.contains("ps4") ? status["ps4"] : json::object();
+        ps4["backend"] = status.value("backend", std::string{});
+        ps4["console"] = status.value("console", std::string{});
+
+        json versions = {{"engine", server_version()},
+                         {"platform", "windows"},
+                         {"ps4_fw", ps4.value("fw", std::string{})},
+                         {"ps4_branding", ps4.value("branding", std::string{})}};
+        json manifest = {{"created_ms", infra::steady_ms()},
+                         {"engine_version", server_version()},
+                         {"note", "settings.json has mcp_token/proxy_token redacted to "
+                                  "'set'/'unset'"}};
+
+        std::vector<util::zip::file_t> files;
+        files.push_back({"versions.json", versions.dump(2)});
+        files.push_back({"settings.json", redacted_settings().dump(2)});
+        files.push_back({"ps4_status.json", ps4.dump(2)});
+        files.push_back({"diag.log", std::move(diag_text)});
+        files.push_back({"output.log", std::move(output_text)});
+        files.push_back({"bundle.json", manifest.dump(2)});
+
+        json names = json::array();
+        for (const auto& f : files) names.push_back(f.name);
+        std::string zip;
+        std::string err;
+        if (!util::zip::write_stored(files, zip, &err)) fail("app.diag_bundle: " + err);
+        if (!infra::paths::write_file_atomic(path, zip))
+            fail("app.diag_bundle: cannot write " + path);
+        return {{"ok", true}, {"path", path}, {"bytes", zip.size()},
+                {"entries", std::move(names)}};
     }
 
     if (action == "shutdown") {

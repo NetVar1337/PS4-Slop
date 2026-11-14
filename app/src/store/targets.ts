@@ -26,7 +26,41 @@ export type Ps4Info = {
   branding: string;
 };
 
+/** Per-console profile restored by target.consoles_switch. */
+export type ConsoleProfile = {
+  watchlist: string;
+  scan_width: string;
+  scan_kind: string;
+};
+
+/** One saved endpoint from target.consoles_list. */
+export type ConsoleRow = {
+  name: string;
+  host: string;
+  port: number;
+  notes: string;
+  default_pid: number;
+  title_filter: string;
+  auto_connect: boolean;
+  profile: ConsoleProfile;
+  /** Filled in by the engine on connect/switch (fw/caps from ps4_status). */
+  last_seen_ms: number;
+  last_fw: string;
+  last_branding: string;
+  last_caps: string;
+  active: boolean;
+};
+
 const kShowHostKey = "reverse-slop.show-host-processes";
+
+/** The remembered backend choice (audit #82), read once at store creation. */
+export function readShowHost(): boolean {
+  try {
+    return localStorage.getItem(kShowHostKey) === "1";
+  } catch {
+    return false;
+  }
+}
 
 type TargetsStore = {
   processes: ProcessRow[];
@@ -41,6 +75,9 @@ type TargetsStore = {
    * workbench should show by default; listing it is an explicit opt-in.
    */
   showHost: boolean;
+  /** Saved endpoints (multi-console manager) and the active one. */
+  consoles: ConsoleRow[];
+  activeConsole: string;
   setFilter: (v: string) => void;
   setShowHost: (v: boolean) => void;
   refresh: () => Promise<void>;
@@ -51,15 +88,21 @@ type TargetsStore = {
   detach: () => Promise<void>;
   connectPs4: (host: string, port: number) => Promise<boolean>;
   disconnectPs4: () => Promise<void>;
+  loadConsoles: () => Promise<void>;
+  saveConsole: (c: {
+    name: string;
+    host: string;
+    port?: number;
+    notes?: string;
+    default_pid?: number;
+    title_filter?: string;
+    auto_connect?: boolean;
+    profile?: Partial<ConsoleProfile>;
+  }) => Promise<boolean>;
+  removeConsole: (name: string) => Promise<void>;
+  /** Disconnect the current console and connect the saved one. */
+  switchConsole: (name: string) => Promise<boolean>;
 };
-
-function initialShowHost(): boolean {
-  try {
-    return localStorage.getItem(kShowHostKey) === "1";
-  } catch {
-    return false;
-  }
-}
 
 export const useTargets = create<TargetsStore>((set, get) => ({
   processes: [],
@@ -68,7 +111,9 @@ export const useTargets = create<TargetsStore>((set, get) => ({
   loading: false,
   error: null,
   ps4: null,
-  showHost: initialShowHost(),
+  consoles: [],
+  activeConsole: "",
+  showHost: readShowHost(),
 
   setFilter: (filter) => set({ filter }),
 
@@ -152,6 +197,8 @@ export const useTargets = create<TargetsStore>((set, get) => ({
       });
       set({ ps4: { endpoint: res.endpoint ?? `${host}:${port}`, branding: res.branding ?? "" } });
       await get().refresh();
+      // connecting to a saved endpoint makes it the active console
+      await get().loadConsoles();
       return true;
     } catch (e) {
       set({ error: errorText(e) });
@@ -170,6 +217,59 @@ export const useTargets = create<TargetsStore>((set, get) => ({
       set({ ps4: null, modules: [] });
       if (get().showHost) await get().refresh();
       else set({ processes: [] });
+    }
+  },
+
+  loadConsoles: async () => {
+    try {
+      const res = await call<{ consoles?: ConsoleRow[]; active?: string }>(
+        "target",
+        "consoles_list",
+      );
+      set({ consoles: res.consoles ?? [], activeConsole: res.active ?? "" });
+    } catch {
+      // keep the last list; the panel already shows the engine error
+    }
+  },
+
+  saveConsole: async (c) => {
+    set({ error: null });
+    try {
+      await call("target", "consoles_save", c);
+      await get().loadConsoles();
+      return true;
+    } catch (e) {
+      set({ error: errorText(e) });
+      return false;
+    }
+  },
+
+  removeConsole: async (name) => {
+    try {
+      await call("target", "consoles_remove", { name });
+    } catch (e) {
+      set({ error: errorText(e) });
+    }
+    await get().loadConsoles();
+  },
+
+  switchConsole: async (name) => {
+    set({ error: null });
+    try {
+      const res = await call<{ endpoint?: string; branding?: string; attached?: boolean }>(
+        "target",
+        "consoles_switch",
+        { name },
+      );
+      set({ ps4: { endpoint: res.endpoint ?? "", branding: res.branding ?? "" } });
+      await get().loadConsoles();
+      await get().refresh();
+      return true;
+    } catch (e) {
+      set({ error: errorText(e) });
+      // the engine may have fallen back to the previous console
+      await get().loadConsoles();
+      return false;
     }
   },
 }));

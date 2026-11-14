@@ -2,7 +2,7 @@
 // the shell, css grid layout driven by splitter custom properties
 
 import { useEffect, useRef } from "react";
-import { RotateCcw, X } from "lucide-react";
+import { FolderOpen, RotateCcw, X } from "lucide-react";
 import ActivityRail from "@/components/ActivityRail";
 import CommandPalette from "@/components/CommandPalette";
 import IconButton from "@/components/IconButton";
@@ -21,6 +21,7 @@ import TargetsPanel from "@/components/panels/TargetsPanel";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
 import { panelId, tabId } from "@/components/Tabs";
 import { useShortcuts } from "@/lib/shortcuts";
+import { openPath } from "@/lib/shell";
 import { useEngine } from "@/store/engine";
 import { useOutput } from "@/store/output";
 import { kLayoutVars, useUi, type LayoutVar } from "@/store/ui";
@@ -47,6 +48,15 @@ function EngineBanner() {
         {crash !== null && crash.log_path !== "" ? ` · log: ${crash.log_path}` : ""}
       </span>
       <div className="spacer" />
+      {crash !== null && crash.log_path !== "" && (
+        <button
+          type="button"
+          className="row-action"
+          onClick={() => void openPath(crash.log_path)}
+        >
+          <FolderOpen size={11} aria-hidden /> Open log folder
+        </button>
+      )}
       <button type="button" className="row-action" onClick={() => void retry()}>
         <RotateCcw size={11} aria-hidden /> Retry
       </button>

@@ -4,7 +4,7 @@ import { useDebugger } from "@/store/debugger";
 import { functionLabel, kFilterDebounceMs, rowAt, useDisasm } from "@/store/disasm";
 import { useMemory } from "@/store/memory";
 import { kFlushMs, useOutput } from "@/store/output";
-import { useTargets } from "@/store/targets";
+import { readShowHost, useTargets } from "@/store/targets";
 import { kThemes } from "@/store/theme";
 import { parseLayout, useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
@@ -230,6 +230,66 @@ describe("targets (item 96)", () => {
     await useTargets.getState().detach();
     expect(useTargets.getState().modules).toEqual([]);
     expect(useTargets.getState().error).toContain("detach failed");
+  });
+
+  it("remembers the console vs local-process choice across launches (item 82)", () => {
+    expect(readShowHost()).toBe(false);
+    useTargets.getState().setShowHost(true);
+    expect(localStorage.getItem("reverse-slop.show-host-processes")).toBe("1");
+    // a fresh launch reads the same key
+    expect(readShowHost()).toBe(true);
+    useTargets.getState().setShowHost(false);
+    expect(readShowHost()).toBe(false);
+  });
+
+  it("loads saved consoles and switches between them", async () => {
+    const consoles = [
+      {
+        name: "devkit-a",
+        host: "10.0.0.5",
+        port: 744,
+        notes: "",
+        default_pid: 0,
+        title_filter: "",
+        auto_connect: false,
+        profile: { watchlist: "a", scan_width: "u32", scan_kind: "exact" },
+        last_seen_ms: 0,
+        last_fw: "11.00",
+        last_branding: "ps4debug-NG",
+        last_caps: "1.1",
+        active: true,
+      },
+      {
+        name: "devkit-b",
+        host: "10.0.0.6",
+        port: 744,
+        notes: "",
+        default_pid: 0,
+        title_filter: "",
+        auto_connect: false,
+        profile: { watchlist: "b", scan_width: "f32", scan_kind: "changed" },
+        last_seen_ms: 0,
+        last_fw: "",
+        last_branding: "",
+        last_caps: "",
+        active: false,
+      },
+    ];
+    const { calls } = mockApi(({ action }) => {
+      if (action === "consoles_list") return { consoles, active: "devkit-a" };
+      if (action === "consoles_switch")
+        return { endpoint: "10.0.0.6:744", branding: "ps4debug-NG" };
+      return { processes: [] };
+    });
+    await useTargets.getState().loadConsoles();
+    expect(useTargets.getState().consoles).toHaveLength(2);
+    expect(useTargets.getState().activeConsole).toBe("devkit-a");
+
+    expect(await useTargets.getState().switchConsole("devkit-b")).toBe(true);
+    expect(calls.some((c) => c.action === "consoles_switch" && c.params.name === "devkit-b")).toBe(
+      true,
+    );
+    expect(useTargets.getState().ps4?.endpoint).toBe("10.0.0.6:744");
   });
 });
 

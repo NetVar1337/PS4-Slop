@@ -8,9 +8,12 @@
 #include "core/mcp/mcp_server.hpp"
 #include "core/mcp/mcp_tools.hpp"
 #include "core/disasm/binary_state.hpp"
+#include "core/infra/diag.hpp"
+#include "core/infra/event_bus.hpp"
 #include "core/infra/settings.hpp"
 #include "core/mcp/tools_common.hpp"
 #include "core/network/net_socket.hpp"
+#include "core/util/zip_reader.hpp"
 
 #include <windows.h>
 
@@ -2241,6 +2244,60 @@ TEST_CASE(mcp_app_settings_api_redacts_and_validates) {
     REQUIRE(slop::core::infra::settings::get<bool>("script_unsafe", false));
     set = fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 9100}}).at("data");
     REQUIRE(set.value("restart_required", false));
+}
+
+TEST_CASE(mcp_app_diag_bundle_redacts_and_zips) {
+    scratch_settings_t scratch;
+    server_fixture_t fx;
+    slop::core::infra::diag::info("test", "bundle marker line");
+    slop::core::infra::event_bus::output("output marker line");
+
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("slop_diag_" + std::to_string(::GetCurrentProcessId()));
+    std::filesystem::create_directories(dir);
+    const auto zip_path = dir / "diag.zip";
+    std::error_code ec;
+    std::filesystem::remove(zip_path, ec);
+
+    json res = fx.api("app", "diag_bundle", {{"path", zip_path.string()}});
+    REQUIRE(res.value("ok", false));
+    const json data = res.at("data");
+    CHECK(data.value("bytes", 0) > 0);
+
+    std::ifstream f(zip_path, std::ios::binary);
+    REQUIRE(f.is_open());
+    const std::string bytes((std::istreambuf_iterator<char>(f)),
+                            std::istreambuf_iterator<char>());
+    slop::core::util::zip::archive_t ar;
+    std::string err;
+    REQUIRE(ar.open(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), &err));
+    for (const char* name : {"versions.json", "settings.json", "ps4_status.json",
+                             "diag.log", "output.log", "bundle.json"})
+        CHECK(ar.find(name) != nullptr);
+
+    // settings are redacted: the bearer token never reaches the archive
+    const auto* entry = ar.find("settings.json");
+    REQUIRE(entry != nullptr);
+    std::vector<uint8_t> out;
+    REQUIRE(ar.extract(*entry, out, &err));
+    const std::string settings_text(out.begin(), out.end());
+    CHECK(json::parse(settings_text).value("mcp_token", "") == "set");
+    const std::string token = slop::core::infra::settings::mcp_token();
+    REQUIRE(!token.empty());
+    CHECK(settings_text.find(token) == std::string::npos);
+    CHECK(bytes.find(token) == std::string::npos);
+
+    // the log tail carries the marker line
+    entry = ar.find("diag.log");
+    REQUIRE(entry != nullptr);
+    out.clear();
+    REQUIRE(ar.extract(*entry, out, &err));
+    CHECK(std::string(out.begin(), out.end()).find("bundle marker line") != std::string::npos);
+
+    // a bundle needs a destination
+    json bad = fx.api("app", "diag_bundle", json::object());
+    CHECK(!bad.value("ok", true));
+    std::filesystem::remove_all(dir, ec);
 }
 
 TEST_CASE(mcp_rotate_token_applies_live) {
