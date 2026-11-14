@@ -192,18 +192,17 @@ jobs:
           path: mcp_live_results.json
           if-no-files-found: ignore
 
-      # Nightly e2e smoke against the engine + SlopTarget this job just built
-      # (was a separate workflow that rebuilt the whole tree).
+      # e2e smoke against the engine + SlopTarget this job just built: PR
+      # blocking now that the driver is stable (it was nightly-only), plus
+      # nightly and manual runs.
       - name: setup node (e2e)
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: app/e2e/package-lock.json
 
-      - name: e2e smoke (engine + SlopTarget over /api)
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      - name: e2e smoke (engine + SlopTarget over /api/v1)
         shell: pwsh
         run: |
           npm --prefix app/e2e ci --prefer-offline --no-audit --no-fund
