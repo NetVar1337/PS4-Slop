@@ -58,7 +58,12 @@ void init() {
     std::filesystem::create_directories(g_crashes_dir, ec);
 }
 
-const std::string& app_data()      { return g_app_data; }
+// lazy: a host that never calls init() (the test binary, a library embedder)
+// still gets the platform default instead of an empty path
+const std::string& app_data() {
+    if (g_app_data.empty()) init();
+    return g_app_data;
+}
 const std::string& settings_file() { return g_settings_file; }
 const std::string& sessions_dir()  { return g_sessions_dir; }
 const std::string& crashes_dir()   { return g_crashes_dir; }

@@ -60,7 +60,11 @@ std::string symbols_path_for(uint64_t hash) {
     char name[32];
     std::snprintf(name, sizeof(name), "%016llX.json",
                   static_cast<unsigned long long>(hash));
+#ifdef _WIN32
     return dir + "\\" + name;
+#else
+    return dir + "/" + name;
+#endif
 }
 
 struct session_meta_t {

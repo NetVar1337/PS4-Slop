@@ -698,7 +698,20 @@ TEST_CASE(persist_patch_journal_survives_reload) {
         REQUIRE(o.has_value());
         off = *o;
         original = bin.file[off];
-        REQUIRE(bin.patches.empty());   // fresh store
+    }
+    // the journal is keyed by image hash and shared by every test in this run,
+    // so an earlier patch of the same fixture is still armed: clear it before
+    // asserting on a known-good byte
+    if (!ds::get().patches.empty()) {
+        bool revert_error = true;
+        slop::core::mcp::call_tool("patch", {{"action", "revert_all"}}, revert_error);
+        REQUIRE(!revert_error);
+    }
+    {
+        ds::binary_lock_t lk;
+        auto& bin = ds::get();
+        original = bin.file[off];
+        REQUIRE(bin.patches.empty());
     }
 
     bool is_error = true;
