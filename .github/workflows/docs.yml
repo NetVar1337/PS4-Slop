@@ -1,0 +1,84 @@
+name: docs
+
+# Builds the mdBook site from docs/ on every PR that touches it, and deploys it to
+# GitHub Pages from main. mdBook is pinned by version and fetched as a release
+# binary: no third-party action in the build path, and no cargo build per run.
+on:
+  pull_request:
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - 'tools/gen_help_index.mjs'
+      - '.github/workflows/docs.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'book.toml'
+      - 'tools/gen_help_index.mjs'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MDBOOK_VERSION: 0.5.4
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: install mdbook ${{ env.MDBOOK_VERSION }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o mdbook.tar.gz "$url"
+          tar -xzf mdbook.tar.gz
+          rm -f mdbook.tar.gz
+          ./mdbook --version
+
+      - name: build the book
+        run: ./mdbook build
+
+      - name: generate the in-app help index
+        run: |
+          node tools/gen_help_index.mjs --base /SlopStation/ --out docs/book/help-index.json
+          node -e '
+            const j = require("./docs/book/help-index.json");
+            if (!Array.isArray(j.entries) || j.entries.length === 0) {
+              console.error("help index is empty");
+              process.exit(1);
+            }
+            console.log(`help index: ${j.count} entries`);
+          '
+
+      - name: upload the Pages artifact
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: docs/book
+
+  deploy:
+    # Pages deploys only from main; PRs stop after the build proves the site compiles
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

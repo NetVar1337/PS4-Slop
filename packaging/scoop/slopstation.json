@@ -1,0 +1,34 @@
+{
+  "$schema": "https://raw.githubusercontent.com/ScoopInstaller/Scoop/master/schema.json",
+  "version": "__VERSION__",
+  "description": "PS4 reverse-engineering workbench: live debugging, scanning, decompiler, Lua and an MCP server.",
+  "homepage": "https://github.com/NetVar1337/SlopStation",
+  "license": "MIT",
+  "notes": [
+    "Console work needs a PS4 running the ps4debug-NG payload; the app can send it over BinLoader (port 9090).",
+    "Use SlopStation only on consoles, games and systems you own or are authorized to test."
+  ],
+  "architecture": {
+    "64bit": {
+      "url": "__ZIP_URL__",
+      "hash": "__ZIP_SHA256__",
+      "extract_dir": "SlopStation"
+    }
+  },
+  "bin": "SlopStation.exe",
+  "shortcuts": [["SlopStation.exe", "SlopStation"]],
+  "checkver": {
+    "github": "https://github.com/NetVar1337/SlopStation"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/NetVar1337/SlopStation/releases/download/v$version/SlopStation-portable-v$version.zip",
+        "hash": {
+          "url": "https://github.com/NetVar1337/SlopStation/releases/download/v$version/SHA256SUMS",
+          "regex": "$sha256\\s+SlopStation-portable-v$version\\.zip"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,69 @@
+name: packages
+
+# Fills the winget / Scoop / Chocolatey manifests from a published release's
+# SHA256SUMS (tools/gen_packages.ps1) and uploads them as an artifact. The winget PR
+# is opened only when a WINGET_TOKEN secret exists, so a fork without the secret still
+# gets the manifests.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to generate manifests for (e.g. v0.2.3)
+        required: true
+        type: string
+
+concurrency:
+  group: packages-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  manifests:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      # exposed to the steps only; absent on forks, which skips the winget PR
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: check the tag
+        shell: pwsh
+        run: |
+          if (-not $env:TAG) { throw 'no release tag' }
+          $version = $env:TAG -replace '^v', ''
+          $file = (Get-Content VERSION -TotalCount 1).Trim()
+          if ($version -ne $file) { throw "tag $($env:TAG) does not match VERSION $file" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: generate the manifests
+        shell: pwsh
+        run: ./tools/gen_packages.ps1 -Version $env:VERSION -Tag $env:TAG -OutDir _packages
+
+      - name: upload the manifests
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-manifests
+          path: _packages/**
+          if-no-files-found: error
+
+      # winget-releaser generates the winget-pkgs manifests from the release assets and
+      # opens the PR. Skipped when the secret is absent: `secrets` is not available in a
+      # job-level `if`, so the check lives on the step via env.
+      - name: open the winget PR
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54 # v2
+        with:
+          identifier: NetVar1337.SlopStation
+          installers-regex: 'SlopStation_.*_x64-setup\.exe$'
+          version: ${{ env.VERSION }}
+          release-tag: ${{ env.TAG }}
+          token: ${{ env.WINGET_TOKEN }}

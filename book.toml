@@ -1,0 +1,30 @@
+# mdBook site for the docs/ tree: https://netvar1337.github.io/SlopStation/
+#
+#   cargo install mdbook --locked     # or grab the release binary, see docs.yml
+#   mdbook build                      # -> docs/book/
+#   mdbook serve --open               # live reload on http://localhost:3000
+#
+# create-missing = false: a SUMMARY.md entry without a file fails the build
+# instead of silently generating a stub page (CI must catch broken links).
+[book]
+title = "SlopStation"
+description = "PS4 reverse-engineering workbench: live memory, scanning and debugging over ps4debug-NG, static analysis, a decompiler, Lua scripting and an MCP server for AI agents"
+authors = ["NetVar1337"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "docs/book"
+create-missing = false
+
+[output.html]
+site-url = "/SlopStation/"
+git-repository-url = "https://github.com/NetVar1337/SlopStation"
+edit-url-template = "https://github.com/NetVar1337/SlopStation/edit/main/docs/{path}"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+no-section-label = true
+
+[output.html.fold]
+enable = true
+level = 1
