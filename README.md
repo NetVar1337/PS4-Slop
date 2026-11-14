@@ -131,6 +131,10 @@ any local process — everything except the `ps4_*` actions works.
   crypto-constant search.
 - Memory snapshots with compare/list/free; `scan_save`/`scan_load` persist an address-list
   scan across restarts.
+- `offsets_verify`: fingerprint-gated offset manifests. A manifest pins the build (title
+  ID, app version, SHA-256 of the module's executable segment) and gives every offset an
+  anchor signature that must match exactly once; any mismatch returns no addresses at all.
+  Format in [`src/core/memory/offsets.hpp`](src/core/memory/offsets.hpp).
 - Shared watchlist sampled about 10 Hz with freeze writes; UI and MCP edits appear in
   both. `watch_freeze_once` releases after the first write-back and `watch_undo` restores
   the captured value.
@@ -345,7 +349,7 @@ Every tool takes an `action`; `tools/list` returns the exact schemas.
 | Tool | Actions |
 | --- | --- |
 | `target` | `list`, `attach`, `detach`, `status`, `modules`, `dump_module`, `threads`, `regions`, `handles`, `heaps`, `heap_blocks`, `icon`, `ps4_connect`, `ps4_disconnect`, `ps4_reconnect`, `ps4_auto`, `ps4_discover`, `ps4_send_payload`, `ps4_dump_module` |
-| `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `scan_save`, `scan_load`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `watch_undo`, `watch_freeze_once`, `pointerscan_verify` |
+| `memory` | `read`, `write`, `scan`, `rescan`, `scan_state`, `scan_reset`, `scan_save`, `scan_load`, `aob`, `pointerscan`, `snapshot`, `snapshots`, `diff`, `snapshot_free`, `protect`, `alloc`, `free`, `siggen`, `live_crypto`, `watch_list`, `watch_add`, `watch_remove`, `watch_clear`, `watch_set`, `watch_undo`, `watch_freeze_once`, `pointerscan_verify`, `offsets_verify` |
 | `debugger` | `status` plus every `ps4_*` action above |
 | `disasm` | `assemble`, `disassemble`, `loaded`, `pe`, `functions`, `xrefs`, `strings`, `symbols`, `symbol_set`, `blocks`, `globals`, `vtables`, `load`, `unload`, `analyze_stop`, `managed` |
 | `decomp` | `function` |

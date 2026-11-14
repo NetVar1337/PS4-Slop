@@ -7,6 +7,7 @@
 
 #include "core/infra/paths.hpp"
 #include "core/memory/console_scan.hpp"
+#include "core/memory/offsets.hpp"
 #include "core/memory/session_reader.hpp"
 
 namespace slop::core::mcp::detail {
@@ -227,6 +228,7 @@ json tool_memory(const json& args) {
             "snapshot_free", "protect", "alloc", "free", "siggen",
             "live_crypto", "watch_list", "watch_add", "watch_remove",
             "watch_clear", "watch_set", "watch_undo", "watch_freeze_once",
+            "offsets_verify",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
@@ -234,7 +236,8 @@ json tool_memory(const json& args) {
             fail("memory: unknown action (read|write|scan|rescan|scan_state|scan_reset|"
                  "scan_save|scan_load|aob|pointerscan|pointerscan_verify|snapshot|snapshots|"
                  "diff|snapshot_free|protect|alloc|free|siggen|live_crypto|watch_list|"
-                 "watch_add|watch_remove|watch_clear|watch_set|watch_undo|watch_freeze_once)");
+                 "watch_add|watch_remove|watch_clear|watch_set|watch_undo|watch_freeze_once|"
+                 "offsets_verify)");
     }
 
     // watchlist
@@ -472,6 +475,60 @@ json tool_memory(const json& args) {
 
     const auto s_hold = need_session();
     auto& s = *s_hold;
+
+    // fingerprint-gated offset manifest (core/memory/offsets.hpp): pinned
+    // build + unique anchors, or no addresses at all
+    if (action == "offsets_verify") {
+        json manifest;
+        if (args.contains("manifest")) {
+            manifest = args.at("manifest");
+        } else if (args.contains("path") && args.at("path").is_string()) {
+            std::ifstream f(args.at("path").get<std::string>(), std::ios::binary);
+            if (!f) fail("offsets_verify: cannot open " + args.at("path").get<std::string>());
+            manifest = json::parse(f, nullptr, false);
+            if (manifest.is_discarded()) fail("offsets_verify: manifest is not valid JSON");
+        } else {
+            fail("offsets_verify requires 'manifest' (object) or 'path' (JSON file)");
+        }
+        const std::string mod = manifest.is_object() ? manifest.value("module", std::string{}) : "";
+        if (mod.empty()) fail("offsets_verify: manifest.module is required");
+        auto mods = s.backend()->enum_modules(s.handle());
+        if (!mods.ok) fail("module enumeration failed: " + runtime::ps4::io_error_str(mods.error));
+        const auto m = std::find_if(mods.items.begin(), mods.items.end(),
+                                    [&](const auto& x) { return _stricmp(x.name.c_str(), mod.c_str()) == 0; });
+        if (m == mods.items.end()) fail("offsets_verify: module '" + mod + "' is not loaded");
+        // the module's first executable region is the segment the hash pins
+        constexpr uint32_t kExec = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                   PAGE_EXECUTE_WRITECOPY;
+        memory::scan_region_t text{};
+        for (const auto& r : runtime::target_scan_regions(s.handle()))
+            if ((r.protect & kExec) && r.base >= m->base && r.base < m->base + m->size &&
+                (text.size == 0 || r.base < text.base))
+                text = r;
+        if (text.size == 0) fail("offsets_verify: no executable segment in " + mod);
+        if (text.size > (512ull << 20)) fail("offsets_verify: executable segment over 512 MiB");
+        std::vector<uint8_t> bytes(text.size);
+        auto io = s.read(text.base, bytes.data(), bytes.size());
+        if (!io.ok || io.bytes != bytes.size())
+            fail("offsets_verify: cannot read the executable segment at " + addr_hex_str(text.base));
+
+        memory::offsets_input_t in;
+        in.text_base = text.base;
+        in.text = bytes.data();
+        in.text_len = bytes.size();
+        if (auto* p4 = runtime::registry_ps4_active()
+                ? dynamic_cast<runtime::backend_ps4_t*>(&runtime::active()) : nullptr) {
+            runtime::backend_ps4_t::ps4_app_info_t app;
+            if (p4->ps4_foreground_app(app).ok) {
+                in.title_id = app.titleid;
+                in.app_ver = app.app_ver;
+            }
+        }
+        json out = memory::verify_offsets(manifest, in);
+        out["module"] = {{"name", m->name}, {"base", static_cast<uint64_t>(m->base)}};
+        out["text"] = {{"base", static_cast<uint64_t>(text.base)}, {"size", text.size}};
+        return out;
+    }
 
     if (action == "scan_save") {
         const std::string name = opt_str(args, "name", "default");

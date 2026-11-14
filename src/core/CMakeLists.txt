@@ -84,6 +84,10 @@ add_library(slop_core STATIC
     util/fs_tools.cpp
     util/zip_reader.hpp
     util/zip_reader.cpp
+    util/sha256.hpp
+    util/sha256.cpp
+    memory/offsets.hpp
+    memory/offsets.cpp
     network/web_fetch.hpp
     network/web_fetch.cpp
     network/mitm_pki.hpp

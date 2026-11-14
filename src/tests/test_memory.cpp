@@ -8,10 +8,12 @@
 #include "core/memory/aob.hpp"
 #include "core/memory/console_scan.hpp"
 #include "core/memory/memscan.hpp"
+#include "core/memory/offsets.hpp"
 #include "core/memory/pointer_scan.hpp"
 #include "core/memory/read_util.hpp"
 #include "core/memory/snapshot.hpp"
 #include "core/memory/watch_service.hpp"
+#include "core/util/sha256.hpp"
 #include "core/process/target_service.hpp"
 
 #include <windows.h>
@@ -1545,4 +1547,60 @@ TEST_CASE(memory_scan_export_import_roundtrip) {
 
     // an empty row set is not a usable scan state
     REQUIRE(!engine.import_results({}, value_width_t::u32));
+}
+
+TEST_CASE(offsets_manifest_is_fingerprint_gated_and_fail_closed) {
+    using nlohmann::json;
+    std::vector<uint8_t> text(0x400, 0x90);
+    const uint8_t anchor[] = {0x48, 0x8B, 0x05, 0x11, 0x22, 0x33, 0x44};
+    std::memcpy(text.data() + 0x120, anchor, sizeof(anchor));
+    text[0x300] = 0x48;   // a near-miss prefix must not count as a second hit
+    offsets_input_t in;
+    in.title_id = "CUSA00001";
+    in.app_ver = "01.02";
+    in.text_base = 0x400000;
+    in.text = text.data();
+    in.text_len = text.size();
+    const std::string sha = slop::core::util::sha256_hex(text.data(), text.size());
+    REQUIRE(sha.size() == 64);
+
+    json m = {{"title_id", "CUSA00001"}, {"app_ver", "01.02"}, {"module", "eboot.bin"},
+              {"text_sha256", sha},
+              {"offsets", {{{"name", "player"}, {"rva", "0x123"}, {"aob", "48 8B 05 ?? ?? ?? ??"},
+                            {"aob_offset", 3}},
+                           {{"name", "fn"}, {"aob", "48 8B 05 11"}}}}};
+    json r = verify_offsets(m, in);
+    CHECK(r["ok"] == true);
+    CHECK(r["resolved"]["player"] == 0x400123u);
+    CHECK(r["resolved"]["fn"] == 0x400120u);
+
+    // a different build: hash mismatch, nothing resolved
+    auto bad = m;
+    bad["text_sha256"] = std::string(64, '0');
+    r = verify_offsets(bad, in);
+    CHECK(r["ok"] == false);
+    CHECK(r["resolved"].empty());
+
+    // wrong title / missing hash both refuse up front
+    bad = m;
+    bad["title_id"] = "CUSA99999";
+    CHECK(verify_offsets(bad, in)["ok"] == false);
+    bad = m;
+    bad.erase("text_sha256");
+    CHECK(verify_offsets(bad, in)["ok"] == false);
+
+    // one bad entry poisons the whole manifest
+    bad = m;
+    bad["offsets"][0]["rva"] = "0x124";
+    r = verify_offsets(bad, in);
+    CHECK(r["ok"] == false);
+    CHECK(r["resolved"].empty());
+
+    // an anchor that matches twice is rejected
+    std::memcpy(text.data() + 0x200, anchor, sizeof(anchor));
+    in.text = text.data();
+    m["text_sha256"] = slop::core::util::sha256_hex(text.data(), text.size());
+    r = verify_offsets(m, in);
+    CHECK(r["ok"] == false);
+    CHECK(r["errors"].dump().find("not unique") != std::string::npos);
 }
