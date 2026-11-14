@@ -44,7 +44,99 @@ std::string win32_error(const char* what) {
     return std::string(what) + " (win32 error " + std::to_string(GetLastError()) + ")";
 }
 
+// \\?\C:\x -> C:\x, \\?\UNC\srv\share -> \\srv\share, and a ":stream" suffix
+// (NTFS alternate data stream) is dropped: the jail must judge the file the
+// bytes land in, not the stream name
+std::wstring normalise_input(const std::wstring& in) {
+    std::wstring p = in;
+    if (p.size() >= 4 && p[0] == L'\\' && p[1] == L'\\' &&
+        (p[2] == L'?' || p[2] == L'.') && p[3] == L'\\') {
+        p.erase(0, 4);
+        if (p.size() >= 4 && (p[0] == L'U' || p[0] == L'u') &&
+            (p[1] == L'N' || p[1] == L'n') && (p[2] == L'C' || p[2] == L'c') &&
+            p[3] == L'\\')
+            p.replace(0, 4, L"\\\\");
+    }
+    const size_t drive = (p.size() >= 2 && p[1] == L':') ? 2 : 0;
+    if (const size_t colon = p.find(L':', drive); colon != std::wstring::npos)
+        p.resize(colon);
+    return p;
+}
+
 } // namespace
+
+bool canonical_path(const std::string& path, std::string* out, std::string* error) {
+    auto fail = [&](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (path.empty()) return fail("empty path");
+    const std::wstring w = normalise_input(to_w(path));
+    if (w.empty()) return fail("empty path");
+
+    // lexical pass first: GetFullPathName makes the path absolute and folds
+    // `.` and `..` without touching the disk
+    std::wstring full(MAX_PATH * 2, L'\0');
+    for (;;) {
+        const DWORD n = GetFullPathNameW(w.c_str(), static_cast<DWORD>(full.size()),
+                                         full.data(), nullptr);
+        if (n == 0) return fail(win32_error("cannot resolve path"));
+        if (n < full.size()) { full.resize(n); break; }
+        full.resize(static_cast<size_t>(n) + 1);   // n excludes the terminator
+    }
+
+    // then walk up to the nearest existing ancestor and let the kernel report
+    // its real name: that is what expands 8.3 names and follows junctions
+    std::wstring head = full, tail;
+    for (;;) {
+        HANDLE h = CreateFileW(head.c_str(), FILE_READ_ATTRIBUTES,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS,
+                               nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            std::wstring real(32768, L'\0');
+            const DWORD n = GetFinalPathNameByHandleW(
+                h, real.data(), static_cast<DWORD>(real.size()),
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            CloseHandle(h);
+            if (n == 0) return fail(win32_error("cannot resolve path"));
+            real.resize(n);
+            if (real.rfind(L"\\\\?\\UNC\\", 0) == 0)
+                real.replace(0, 7, L"\\\\");
+            else if (real.rfind(L"\\\\?\\", 0) == 0)
+                real.erase(0, 4);
+            *out = to_utf8(real.c_str()) + to_utf8(tail.c_str());
+            return true;
+        }
+        const DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND &&
+            err != ERROR_BAD_NETPATH)
+            return fail(win32_error("cannot resolve path"));
+        // a dangling link: creating through it would land outside every jail
+        if (const DWORD attr = GetFileAttributesW(head.c_str());
+            attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT))
+            return fail("cannot resolve reparse point (its target does not exist)");
+        const size_t slash = head.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) return fail("cannot resolve path");
+        // "C:\" itself is unreachable: there is no parent left to try
+        if (head.size() <= 3 && head.size() >= 2 && head[1] == L':')
+            return fail(win32_error("cannot resolve path"));
+        tail = head.substr(slash) + tail;
+        head.resize(slash);
+        if (head.size() == 2 && head[1] == L':') head += L'\\';
+        if (head.empty()) return fail("cannot resolve path");
+    }
+}
+
+bool path_within(const std::string& path, const std::string& root) {
+    if (root.empty() || path.size() < root.size()) return false;
+    for (size_t i = 0; i < root.size(); ++i)
+        if (tolower(static_cast<unsigned char>(path[i])) !=
+            tolower(static_cast<unsigned char>(root[i])))
+            return false;
+    if (path.size() == root.size()) return true;
+    return root.back() == '\\' || path[root.size()] == '\\';
+}
 
 bool read_file(const std::string& path, uint64_t offset, std::vector<uint8_t>* out,
                size_t max_bytes, uint64_t* total_size, std::string* error) {

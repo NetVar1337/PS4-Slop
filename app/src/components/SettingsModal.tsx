@@ -153,7 +153,7 @@ export default function SettingsModal({ onClose }: Props) {
     void setValue("web_allowlist", hosts);
   };
 
-// keep both
+  // keep both
   const saveOnboardClients = () => {
     const clients = onboardClients
       .split(/[\n,]+/)
@@ -326,13 +326,13 @@ export default function SettingsModal({ onClose }: Props) {
             </div>
             <div className="faint">
               Client configs reference <code>${"${SLOP_MCP_TOKEN}"}</code>; set that user
-              environment variable once with the command above (it is not set for you) and
-              restart the client.
+              environment variable once with the command above (it is not set for you) and restart
+              the client.
             </div>
             {plaintextConfigs.length > 0 && (
               <div className="settings-status" role="alert">
-                Plaintext token in: {plaintextConfigs.join(", ")}. Regenerate the token, or
-                turn off “Write the token into client configs” and restart the engine.
+                Plaintext token in: {plaintextConfigs.join(", ")}. Regenerate the token, or turn off
+                “Write the token into client configs” and restart the engine.
               </div>
             )}
             {revealedToken !== null && (
@@ -431,8 +431,8 @@ export default function SettingsModal({ onClose }: Props) {
           />
           <label className="settings-field">
             <span>
-              Onboarding clients (one per line; empty = auto: Tern when installed, else every
-              known client)
+              Onboarding clients (one per line; empty = auto: Tern when installed, else every known
+              client)
             </span>
             <textarea
               className="code-area mono settings-textarea"

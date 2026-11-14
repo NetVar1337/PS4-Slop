@@ -36,6 +36,17 @@ std::vector<file_entry_t> list_directory(const std::string& dir,
 bool create_directory(const std::string& path, std::string* error = nullptr);
 bool delete_path(const std::string& path, std::string* error = nullptr);
 
+// The path the filesystem will really use: `..` segments, symlinks and
+// junctions (GetFinalPathNameByHandle), 8.3 short names, \\?\ / \\.\ prefixes
+// and NTFS alternate data streams (`file.txt:stream`) are all resolved away.
+// A path that does not exist yet resolves through its nearest existing parent,
+// so a write/create target can be judged before it is created.
+bool canonical_path(const std::string& path, std::string* out,
+                    std::string* error = nullptr);
+
+// true when `path` (already canonical) is `root` or below it, case-insensitive
+bool path_within(const std::string& path, const std::string& root);
+
 // Recursive case-insensitive filename substring search under `root`
 std::vector<file_entry_t> search_files(const std::string& root,
                                        const std::string& needle,

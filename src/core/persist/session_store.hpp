@@ -19,6 +19,10 @@ struct session_meta_t {
 
 class session_store_t {
 public:
+    // schema generations this build knows. open() migrates an older file up
+    // and refuses one written by a newer build instead of guessing
+    static constexpr int kSchemaVersion = 1;
+
     session_store_t() = default;
     ~session_store_t();
 
@@ -28,6 +32,8 @@ public:
     bool open(const std::string& path, std::string* error = nullptr);
     void close();
     bool ok() const { return db_ != nullptr; }
+    // PRAGMA user_version of the open store, -1 when it is not open
+    int schema_version() const;
 
     // sessions
     std::optional<uint64_t> save_session(const std::string& name,

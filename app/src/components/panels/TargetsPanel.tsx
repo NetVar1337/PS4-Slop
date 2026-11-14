@@ -224,9 +224,7 @@ function ConsolesCard() {
               </span>
               <span className="faint">
                 {c.last_fw !== "" ? `fw ${c.last_fw}` : "never connected"}
-                {c.last_seen_ms > 0
-                  ? ` · ${new Date(c.last_seen_ms).toLocaleDateString()}`
-                  : ""}
+                {c.last_seen_ms > 0 ? ` · ${new Date(c.last_seen_ms).toLocaleDateString()}` : ""}
               </span>
               {c.last_caps !== "" && <span className="pill">{c.last_caps}</span>}
               {c.notes !== "" && <span className="faint console-note">{c.notes}</span>}

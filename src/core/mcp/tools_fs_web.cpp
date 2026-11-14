@@ -40,6 +40,45 @@ void guard_engine_data(const std::string& key, const std::string& p) {
              "tokens and session stores are not reachable through fs");
 }
 
+// settings fs_root: optional allowlist of folders. Unset (the default) keeps
+// the historic whole-profile access; set, every fs action is confined to it
+std::vector<std::string> fs_roots() {
+    std::vector<std::string> out;
+    const json j = infra::settings::get_json("fs_root");
+    if (j.is_string()) {
+        out.push_back(j.get<std::string>());
+    } else if (j.is_array()) {
+        for (const auto& e : j)
+            if (e.is_string()) out.push_back(e.get<std::string>());
+    }
+    return out;
+}
+
+// Every action goes through here. The path is canonicalised first, so `..`,
+// junctions, 8.3 names, \\?\ prefixes and ADS streams cannot walk out of a
+// root; walks only ever descend from a checked root and never follow reparse
+// points, so their hits stay inside it too
+void guard_fs(const std::string& key, const std::string& p) {
+    guard_engine_data(key, p);
+    const json setting = infra::settings::get_json("fs_root");
+    if (setting.is_null()) return;   // unset: the historic whole-profile access
+    const auto roots = fs_roots();
+    if (roots.empty())
+        fail("fs: the fs_root setting holds no usable folder; set it to a path "
+             "or a list of paths, or remove it");
+    std::string canon, err;
+    if (!util::canonical_path(p, &canon, &err))
+        fail("fs: " + key + " cannot be resolved: " + err);
+    for (const auto& root : roots) {
+        std::string root_canon;
+        if (util::canonical_path(root, &root_canon) &&
+            util::path_within(canon, root_canon))
+            return;
+    }
+    fail("fs: " + key + " is outside fs_root (" + canon +
+         "); add the folder to the fs_root setting to allow it");
+}
+
 // valid utf-8 without NULs reads back as text, anything else as hex
 bool looks_text(const std::vector<uint8_t>& b) {
     size_t i = 0;
@@ -66,7 +105,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     if (action == "read_file") {
         if (!args.contains("path")) fail("missing path");
         const std::string path = args.at("path").get<std::string>();
-        guard_engine_data("path", path);
+        guard_fs("path", path);
         const uint64_t offset = args.contains("offset") ? parse_addr(args, "offset") : 0;
         const size_t want = args.contains("max_bytes")
             ? static_cast<size_t>(std::min<uint64_t>(parse_addr(args, "max_bytes"), kReadMax))
@@ -98,7 +137,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     if (action == "write_file") {
         if (!args.contains("path")) fail("missing path");
         const std::string path = args.at("path").get<std::string>();
-        guard_engine_data("path", path);
+        guard_fs("path", path);
         std::vector<uint8_t> bytes;
         if (args.contains("hex"))
             bytes = hex_decode(args.at("hex").get<std::string>());
@@ -115,7 +154,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     if (action == "list_directory") {
         if (!args.contains("path")) fail("missing path");
         const std::string path = args.at("path").get<std::string>();
-        guard_engine_data("path", path);
+        guard_fs("path", path);
         std::string err;
         auto items = util::list_directory(path, &err);
         if (items.empty() && !err.empty()) fail(err);
@@ -133,7 +172,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     if (action == "create_directory") {
         if (!args.contains("path")) fail("missing path");
         const std::string path = args.at("path").get<std::string>();
-        guard_engine_data("path", path);
+        guard_fs("path", path);
         std::string err;
         if (!util::create_directory(path, &err))
             fail(err);
@@ -142,7 +181,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
     if (action == "delete_path") {
         if (!args.contains("path")) fail("missing path");
         const std::string path = args.at("path").get<std::string>();
-        guard_engine_data("path", path);
+        guard_fs("path", path);
         std::string err;
         if (!util::delete_path(path, &err))
             fail(err);
@@ -152,7 +191,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
         if (!args.contains("root") || !args.contains("needle"))
             fail("missing root/needle");
         const std::string root = args.at("root").get<std::string>();
-        guard_engine_data("root", root);
+        guard_fs("root", root);
         auto hits = util::search_files(
             root, args.at("needle").get<std::string>(),
             std::min<size_t>(args.value("limit", 200u), 2000u), cancel);
@@ -168,7 +207,7 @@ json tool_fs(const json& args, const infra::cancel_token_t& cancel) {
         if (!args.contains("root") || !args.contains("needle"))
             fail("missing root/needle");
         const std::string root = args.at("root").get<std::string>();
-        guard_engine_data("root", root);
+        guard_fs("root", root);
         auto hits = util::grep_in_files(
             root, args.at("needle").get<std::string>(),
             args.value("suffix", std::string{}),

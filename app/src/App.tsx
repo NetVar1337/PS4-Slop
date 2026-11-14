@@ -49,11 +49,7 @@ function EngineBanner() {
       </span>
       <div className="spacer" />
       {crash !== null && crash.log_path !== "" && (
-        <button
-          type="button"
-          className="row-action"
-          onClick={() => void openPath(crash.log_path)}
-        >
+        <button type="button" className="row-action" onClick={() => void openPath(crash.log_path)}>
           <FolderOpen size={11} aria-hidden /> Open log folder
         </button>
       )}

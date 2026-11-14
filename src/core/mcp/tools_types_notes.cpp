@@ -3,6 +3,10 @@
 
 #include "core/mcp/tools_common.hpp"
 
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+
 namespace slop::core::mcp::detail {
 
 namespace {
@@ -24,6 +28,111 @@ json enum_to_json(const re::type_catalog::enum_def_t& e) {
     for (const auto& [n, v] : e.values)
         vals.push_back({{"name", n}, {"value", v}});
     return {{"name", e.name}, {"underlying", e.underlying}, {"values", vals}};
+}
+
+// --- Git-shareable annotation files (notes.export / notes.import) ---
+//
+// symbols/<hash>.json holds everything an analyst would want reviewed: names,
+// comments, bookmarks and the struct/enum catalog. Keys are zero padded so a
+// lexicographic sort is a numeric VA sort, arrays are sorted and the dump is
+// indented: two sessions that changed different addresses produce a diff with
+// exactly those lines in it.
+
+constexpr const char* kSymbolsFormat = "reverse-slop-symbols";
+
+std::string va_key(uint64_t va) {
+    char k[24];
+    std::snprintf(k, sizeof(k), "%016llX", static_cast<unsigned long long>(va));
+    return k;
+}
+
+struct notes_snapshot_t {
+    uint64_t                        hash = 0;
+    uint64_t                        base = 0;
+    std::string                     image;
+    std::map<uint64_t, std::string> names;
+    std::map<uint64_t, std::string> comments;
+    std::vector<uint64_t>           bookmarks;
+    std::vector<re::type_catalog::struct_def_t> structs;
+    std::vector<re::type_catalog::enum_def_t>   enums;
+};
+
+notes_snapshot_t snapshot_notes() {
+    notes_snapshot_t s;
+    {
+        ds::binary_lock_t lk;
+        auto& b = ds::get();
+        s.hash = b.file_hash;
+        s.base = b.base;
+        s.image = b.name;
+        s.names.insert(b.symbols.begin(), b.symbols.end());
+        s.comments.insert(b.comments.begin(), b.comments.end());
+        s.bookmarks = b.bookmarks;
+    }
+    s.structs = re::type_catalog::list_structs();   // sorted by name
+    s.enums   = re::type_catalog::list_enums();
+    return s;
+}
+
+json notes_doc(const notes_snapshot_t& s) {
+    json names = json::object();
+    for (const auto& [va, name] : s.names) names[va_key(va)] = name;
+    json comments = json::object();
+    for (const auto& [va, text] : s.comments) comments[va_key(va)] = text;
+    std::vector<uint64_t> marks = s.bookmarks;
+    std::sort(marks.begin(), marks.end());
+    marks.erase(std::unique(marks.begin(), marks.end()), marks.end());
+    json bookmarks = json::array();
+    for (uint64_t va : marks) bookmarks.push_back(va_key(va));
+    json structs = json::array();
+    for (const auto& st : s.structs) structs.push_back(struct_to_json(st));
+    json enums = json::array();
+    for (const auto& e : s.enums) enums.push_back(enum_to_json(e));
+    return {{"format", kSymbolsFormat},
+            {"version", 1},
+            {"image", {{"hash", va_key(s.hash)},
+                       {"base", va_key(s.base)},
+                       {"name", s.image}}},
+            {"names", names},
+            {"comments", comments},
+            {"bookmarks", bookmarks},
+            {"structs", structs},
+            {"enums", enums}};
+}
+
+std::string notes_file_path(const std::string& dir, uint64_t hash) {
+    return (std::filesystem::path(dir) / "symbols" / (va_key(hash) + ".json")).string();
+}
+
+std::optional<re::type_catalog::struct_def_t> struct_from_json(const json& j) {
+    if (!j.is_object() || !j.contains("name") || !j.at("name").is_string()) return std::nullopt;
+    re::type_catalog::struct_def_t s;
+    s.name   = j.at("name").get<std::string>();
+    s.packed = j.value("packed", false);
+    if (j.contains("fields") && j.at("fields").is_array())
+        for (const auto& f : j.at("fields")) {
+            re::type_catalog::field_t fld;
+            fld.name = f.value("name", std::string{});
+            fld.type = f.value("type", std::string{});
+            fld.offset = f.value("offset", 0ull);   // create_struct re-lays out
+            fld.size = f.value("size", 0ull);
+            fld.array_count = f.value("array_count", 0u);
+            if (!fld.name.empty() && !fld.type.empty()) s.fields.push_back(std::move(fld));
+        }
+    return s;
+}
+
+std::optional<re::type_catalog::enum_def_t> enum_from_json(const json& j) {
+    if (!j.is_object() || !j.contains("name") || !j.at("name").is_string()) return std::nullopt;
+    re::type_catalog::enum_def_t e;
+    e.name = j.at("name").get<std::string>();
+    e.underlying = j.value("underlying", std::string{"u32"});
+    if (j.contains("values") && j.at("values").is_array())
+        for (const auto& v : j.at("values"))
+            if (v.is_object() && v.contains("name") && v.at("name").is_string())
+                e.values.emplace_back(v.at("name").get<std::string>(),
+                                      v.value("value", static_cast<int64_t>(0)));
+    return e;
 }
 
 } // namespace
@@ -272,8 +381,109 @@ json tool_notes(const json& args) {
         std::sort(marks.begin(), marks.end());
         return {{"bookmarks", marks}, {"count", marks.size()}};
     }
+    if (action == "export") {
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("missing path (folder to write symbols/<hash>.json into)");
+        const notes_snapshot_t snap = snapshot_notes();
+        const std::string file = notes_file_path(args.at("path").get<std::string>(), snap.hash);
+        std::error_code ec;
+        std::filesystem::create_directories(
+            std::filesystem::path(file).parent_path(), ec);
+        if (ec) fail("cannot create " + std::filesystem::path(file).parent_path().string() +
+                     ": " + ec.message());
+        std::ofstream f(file, std::ios::binary | std::ios::trunc);
+        if (!f) fail("cannot write " + file);
+        f << notes_doc(snap).dump(2) << "\n";
+        f.close();
+        if (!f) fail("write failed: " + file);
+        return {{"path", file},
+                {"hash", va_key(snap.hash)},
+                {"names", snap.names.size()},
+                {"comments", snap.comments.size()},
+                {"bookmarks", snap.bookmarks.size()},
+                {"structs", snap.structs.size()},
+                {"enums", snap.enums.size()}};
+    }
+    if (action == "import") {
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("missing path (folder holding symbols/<hash>.json)");
+        const std::string mode = args.value("merge", std::string{"ours"});
+        if (mode != "ours" && mode != "theirs" && mode != "union")
+            fail("merge must be ours|theirs|union");
+        const notes_snapshot_t snap = snapshot_notes();
+        const std::string file = notes_file_path(args.at("path").get<std::string>(), snap.hash);
+        std::ifstream f(file, std::ios::binary);
+        if (!f) fail("no annotation file for this image: " + file);
+        const json doc = json::parse(f, nullptr, false);
+        if (doc.is_discarded() || !doc.is_object()) fail("not a JSON object: " + file);
+        if (doc.value("format", std::string{}) != kSymbolsFormat)
+            fail("not a " + std::string(kSymbolsFormat) + " file: " + file);
+
+        // theirs: the file wins every conflict. ours/union: local values stay
+        // and only gaps are filled (a VA holds exactly one name or comment, so
+        // a union of differing texts is not representable). Sets always merge
+        const bool theirs = mode == "theirs";
+        size_t n_names = 0, n_comments = 0, n_marks = 0, n_structs = 0, n_enums = 0;
+        auto for_each_entry = [&](const char* key, auto&& apply) {
+            if (!doc.contains(key) || !doc.at(key).is_object()) return;
+            for (auto it = doc.at(key).begin(); it != doc.at(key).end(); ++it) {
+                if (!it.value().is_string()) continue;
+                const uint64_t va = std::strtoull(it.key().c_str(), nullptr, 16);
+                if (va) apply(va, it.value().get_ref<const std::string&>());
+            }
+        };
+        for_each_entry("names", [&](uint64_t va, const std::string& name) {
+            const std::string have = ds::symbol_name(va);
+            if (have == name || (!theirs && !have.empty())) return;
+            ds::set_symbol(va, name);
+            ++n_names;
+        });
+        for_each_entry("comments", [&](uint64_t va, const std::string& text) {
+            const std::string have = ds::comment_for(va);
+            if (have == text || (!theirs && !have.empty())) return;
+            ds::set_comment(va, text);
+            ++n_comments;
+        });
+        if (doc.contains("bookmarks") && doc.at("bookmarks").is_array())
+            for (const auto& v : doc.at("bookmarks")) {
+                if (!v.is_string()) continue;
+                const uint64_t va = std::strtoull(v.get_ref<const std::string&>().c_str(),
+                                                  nullptr, 16);
+                if (va && !ds::is_bookmarked(va)) {
+                    ds::toggle_bookmark(va);
+                    ++n_marks;
+                }
+            }
+        if (doc.contains("structs") && doc.at("structs").is_array())
+            for (const auto& j : doc.at("structs")) {
+                auto def = struct_from_json(j);
+                if (!def) continue;
+                const bool exists = re::type_catalog::get_struct(def->name).has_value();
+                if (exists && !theirs) continue;
+                if (exists) re::type_catalog::remove_struct(def->name);
+                std::string err;
+                if (re::type_catalog::create_struct(std::move(*def), &err)) ++n_structs;
+            }
+        if (doc.contains("enums") && doc.at("enums").is_array())
+            for (const auto& j : doc.at("enums")) {
+                auto def = enum_from_json(j);
+                if (!def) continue;
+                const bool exists = re::type_catalog::get_enum(def->name).has_value();
+                if (exists && !theirs) continue;
+                if (exists) re::type_catalog::remove_enum(def->name);
+                std::string err;
+                if (re::type_catalog::create_enum(std::move(*def), &err)) ++n_enums;
+            }
+        return {{"path", file},
+                {"merge", mode},
+                {"names", n_names},
+                {"comments", n_comments},
+                {"bookmarks", n_marks},
+                {"structs", n_structs},
+                {"enums", n_enums}};
+    }
     fail("notes: unknown action (set_comment|get_comment|comments|"
-         "bookmark_toggle|bookmarks)");
+         "bookmark_toggle|bookmarks|export|import)");
 }
 
 } // namespace slop::core::mcp::detail

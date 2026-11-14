@@ -15,6 +15,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <algorithm>
 #include <cstdio>
 #include <cctype>
 #include <fstream>
@@ -31,7 +32,7 @@ using json = nlohmann::json;
 binary_t g_bin;
 
 // guards load unload and the symbol map against ui vs mcp worker races, only mutators take it
-std::mutex g_mu;
+std::recursive_mutex g_mu;
 
 uint64_t fnv1a(const uint8_t* d, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -64,6 +65,7 @@ std::string symbols_path_for(uint64_t hash) {
 struct session_meta_t {
     std::unordered_map<uint64_t, std::string> comments;
     std::vector<uint64_t>                     bookmarks;
+    std::vector<binary_t::patch_rec_t>        patches;   // journal, in order
 };
 
 void load_meta(binary_t& b, session_meta_t& out) {
@@ -119,11 +121,32 @@ void load_meta(binary_t& b, session_meta_t& out) {
             for (const auto& v : j["bookmarks"])
                 if (v.is_number_unsigned()) out.bookmarks.push_back(remap(v.get<uint64_t>()));
         }
+        // patch journal: runs of {va, before hex, after hex}, expanded back to
+        // one record per byte and replayed by load_locked
+        if (j.contains("patches") && j["patches"].is_array()) {
+            for (const auto& v : j["patches"]) {
+                if (!v.is_object()) continue;
+                const uint64_t va = remap(v.value("va", 0ull));
+                const std::string before = v.value("before", std::string{});
+                const std::string after  = v.value("after", std::string{});
+                const size_t n = std::min(before.size(), after.size()) / 2;
+                for (size_t k = 0; k < n; ++k) {
+                    binary_t::patch_rec_t rec{};
+                    rec.va     = va + k;
+                    rec.before = static_cast<uint8_t>(
+                        std::strtoul(before.substr(k * 2, 2).c_str(), nullptr, 16));
+                    rec.after  = static_cast<uint8_t>(
+                        std::strtoul(after.substr(k * 2, 2).c_str(), nullptr, 16));
+                    out.patches.push_back(rec);
+                }
+            }
+        }
     } catch (...) {
         // corrupt store, start clean
         b.symbols.clear();
         out.comments.clear();
         out.bookmarks.clear();
+        out.patches.clear();
     }
 }
 
@@ -146,11 +169,39 @@ void save_meta(const binary_t& b) {
     for (uint64_t va : b.bookmarks)
         marks.push_back(static_cast<uint64_t>(va));
 
+    // kept in application order: revert_all replays it backwards, and a byte
+    // patched twice must come back to its first value. Consecutive bytes
+    // collapse into one run with hex before/after, so a 4 MiB xor unpack is a
+    // single entry here instead of four million
+    static constexpr char kHex[] = "0123456789abcdef";
+    json patches = json::array();
+    for (size_t i = 0; i < b.patches.size();) {
+        size_t j = i + 1;
+        while (j < b.patches.size() &&
+               b.patches[j].va == b.patches[j - 1].va + 1 &&
+               b.patches[j].offset == b.patches[j - 1].offset + 1)
+            ++j;
+        std::string before_hex, after_hex;
+        before_hex.reserve((j - i) * 2);
+        after_hex.reserve((j - i) * 2);
+        for (size_t k = i; k < j; ++k) {
+            before_hex.push_back(kHex[b.patches[k].before >> 4]);
+            before_hex.push_back(kHex[b.patches[k].before & 0xF]);
+            after_hex.push_back(kHex[b.patches[k].after >> 4]);
+            after_hex.push_back(kHex[b.patches[k].after & 0xF]);
+        }
+        patches.push_back({{"va", b.patches[i].va},
+                           {"before", before_hex},
+                           {"after", after_hex}});
+        i = j;
+    }
+
     json root = json::object();
     root["base"]      = b.base;      // rebase key for the remap on load
     root["symbols"]   = hex_j;
     root["comments"]  = cmts;
     root["bookmarks"] = marks;
+    root["patches"]   = patches;
 
     std::ofstream f(path, std::ios::trunc);
     if (f) f << root.dump(2);
@@ -391,8 +442,23 @@ bool load_locked(const std::string& path, uint64_t base_override, bool apply_rel
     g_bin.bookmarks = std::move(meta.bookmarks);
     g_bin.ready = true;
 
-    // the type catalog rides the same per hash store, rebind on load
+    // the type catalog rides the same per hash store, rebind on load. Before
+    // the journal replay: bind_binary hashes the bytes it is given, and the
+    // catalog must key on the image as loaded, not as patched
     slop::core::re::type_catalog::bind_binary(g_bin.file.data(), g_bin.file.size());
+
+    // the journal rides the same store: re-apply the saved bytes so a reloaded
+    // image comes back patched and revert_all still restores the originals
+    for (const auto& rec : meta.patches) {
+        auto off = g_bin.offset_of(rec.va);
+        if (!off || *off >= g_bin.file.size()) continue;
+        binary_t::patch_rec_t live = rec;
+        live.offset = *off;
+        g_bin.file[*off] = rec.after;
+        g_bin.patches.push_back(live);
+    }
+    // the indexes above were built from the unpatched bytes
+    if (!g_bin.patches.empty()) g_bin.indexes_dirty = true;
 
     char timing[160];
     std::snprintf(timing, sizeof(timing),
@@ -589,13 +655,18 @@ std::vector<uint64_t> bookmarks_snapshot() {
     return g_bin.bookmarks;
 }
 
+void persist_annotations() {
+    std::lock_guard lk(g_mu);
+    if (g_bin.ready) save_meta(g_bin);
+}
+
 const char* symbol_for(uint64_t va) {
     const auto& s = g_bin.symbols;
     const auto it = s.find(va);
     return it != s.end() ? it->second.c_str() : nullptr;
 }
 
-std::mutex& state_mutex() { return g_mu; }
+std::recursive_mutex& state_mutex() { return g_mu; }
 
 bool hype_ready() {
     std::lock_guard lk(g_mu);

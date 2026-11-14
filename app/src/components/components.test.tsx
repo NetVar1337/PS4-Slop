@@ -191,9 +191,9 @@ describe("console manager (multi-console, audit 22/81/82)", () => {
     render(<StatusBar />);
     await userEvent.click(await screen.findByRole("button", { name: "devkit-a" }));
     await userEvent.click(screen.getByRole("menuitemradio", { name: /devkit-b/ }));
-    expect(
-      calls.some((c) => c.action === "consoles_switch" && c.params.name === "devkit-b"),
-    ).toBe(true);
+    expect(calls.some((c) => c.action === "consoles_switch" && c.params.name === "devkit-b")).toBe(
+      true,
+    );
   });
 
   it("writes a diagnostics bundle from Settings (item 81)", async () => {

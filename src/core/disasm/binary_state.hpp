@@ -156,13 +156,20 @@ bool toggle_bookmark(uint64_t va);       // true when now bookmarked
 bool is_bookmarked(uint64_t va);
 std::vector<uint64_t> bookmarks_snapshot();
 
+// Writes the per-hash store (symbols, comments, bookmarks, patch journal).
+// Takes state_mutex() itself, so it is safe from any thread and from code
+// that already holds the lock
+void persist_annotations();
+
 // render thread conveniences, no lock
 const char* symbol_for(uint64_t va);                        // null when unnamed
 
 // out of thread access
 // pin the session while reading fns xrefs pe or file from another thread
 
-std::mutex& state_mutex();
+// recursive: patching writes the journal back through persist_annotations()
+// while the caller already holds the session lock
+std::recursive_mutex& state_mutex();
 
 class binary_lock_t {
 public:
@@ -171,7 +178,7 @@ public:
     binary_lock_t& operator=(const binary_lock_t&) = delete;
 
 private:
-    std::unique_lock<std::mutex> lk_;
+    std::unique_lock<std::recursive_mutex> lk_;
 };
 
 } // namespace slop::core::disasm::binary_state

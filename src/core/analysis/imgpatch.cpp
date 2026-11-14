@@ -74,6 +74,13 @@ void finish(op_result_t& res, ds::binary_t& bin, size_t patched_count) {
     res.ok = true;
 }
 
+// The journal is part of the per-hash annotation store: write it back whenever
+// an op actually landed bytes, so a reloaded image comes back patched and
+// revert_all still restores the originals
+void persist_journal(ds::binary_t& bin, size_t before) {
+    if (bin.patches.size() != before) ds::persist_annotations();
+}
+
 } // namespace
 
 // NOP junk
@@ -81,6 +88,7 @@ void finish(op_result_t& res, ds::binary_t& bin, size_t patched_count) {
 op_result_t nop_junk(ds::binary_t& bin, uint64_t fn_va, bool aggressive,
                      size_t nop_threshold) {
     op_result_t res;
+    const size_t journal_before = bin.patches.size();
     if (nop_threshold < 2) nop_threshold = 2;
     if (nop_threshold > 16) nop_threshold = 16;
 
@@ -155,6 +163,7 @@ op_result_t nop_junk(ds::binary_t& bin, uint64_t fn_va, bool aggressive,
     }
 
     finish(res, bin, res.patches.size());
+    persist_journal(bin, journal_before);
     return res;
 }
 
@@ -164,6 +173,7 @@ op_result_t resolve_opaque_predicates(ds::binary_t& bin, uint64_t fn_va,
                                       bool dry_run) {
     op_result_t res;
     res.dry_run = dry_run;
+    const size_t journal_before = bin.patches.size();
     auto insns = decode_fn(bin, fn_va, 8192);
     if (insns.empty()) { res.error = "cannot decode function range"; return res; }
 
@@ -215,6 +225,7 @@ op_result_t resolve_opaque_predicates(ds::binary_t& bin, uint64_t fn_va,
     }
 
     finish(res, bin, res.patches.size());
+    persist_journal(bin, journal_before);
     return res;
 }
 
@@ -222,6 +233,7 @@ op_result_t resolve_opaque_predicates(ds::binary_t& bin, uint64_t fn_va,
 
 op_result_t patch_anti_debug(ds::binary_t& bin, uint64_t fn_va,
                              const anti_debug_opts_t& opts, bool dry_run) {
+    const size_t journal_before = bin.patches.size();
     static const char* kApis[] = {
         "IsDebuggerPresent", "CheckRemoteDebuggerPresent",
         "NtQueryInformationProcess", "NtSetInformationThread",
@@ -300,6 +312,7 @@ op_result_t patch_anti_debug(ds::binary_t& bin, uint64_t fn_va,
     }
 
     finish(res, bin, res.patches.size());
+    persist_journal(bin, journal_before);
     return res;
 }
 
@@ -308,6 +321,7 @@ op_result_t patch_anti_debug(ds::binary_t& bin, uint64_t fn_va,
 op_result_t unpack_xor(ds::binary_t& bin, uint64_t va, size_t size,
                        const std::string& method, const std::string& key_hex) {
     op_result_t res;
+    const size_t journal_before = bin.patches.size();
     constexpr size_t kMaxRegion = 4u << 20;
     if (size == 0 || size > kMaxRegion) {
         res.error = "bad region size (1..4 MiB)";
@@ -402,6 +416,7 @@ op_result_t unpack_xor(ds::binary_t& bin, uint64_t va, size_t size,
 
     if (!res.patches.empty()) bin.indexes_dirty = true;
     res.ok = true;
+    persist_journal(bin, journal_before);
     return res;
 }
 
@@ -507,6 +522,7 @@ op_result_t decode_strings(ds::binary_t& bin, uint64_t fn_va) {
 op_result_t write_bytes(ds::binary_t& bin, uint64_t va,
                         const std::vector<uint8_t>& bytes) {
     op_result_t res;
+    const size_t journal_before = bin.patches.size();
     auto off = bin.offset_of(va);
     if (!off || *off + bytes.size() > bin.file.size()) {
         res.error = "range not mapped in image";
@@ -529,11 +545,13 @@ op_result_t write_bytes(ds::binary_t& bin, uint64_t va,
     bin.indexes_dirty = true;
     res.bytes_changed = bytes.size();
     res.ok = true;
+    persist_journal(bin, journal_before);
     return res;
 }
 
 op_result_t revert_all(ds::binary_t& bin) {
     op_result_t res;
+    const size_t journal_before = bin.patches.size();
     if (!bin.patches.empty()) quiesce(bin);
     for (auto it = bin.patches.rbegin(); it != bin.patches.rend(); ++it) {
         if (it->offset < bin.file.size())
@@ -549,6 +567,7 @@ op_result_t revert_all(ds::binary_t& bin) {
     // rebuild also restarts the whole hyperion analysis)
     bin.indexes_dirty = res.bytes_changed > 0;
     res.ok = true;
+    persist_journal(bin, journal_before);
     return res;
 }
 
