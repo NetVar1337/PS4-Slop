@@ -286,5 +286,10 @@ jobs:
           fi
           # SPDX SBOM of the npm/cargo manifests (GitHub dependency graph); the
           # C++ deps are pinned by hash in cmake/deps.cmake
-          gh api "repos/${GITHUB_REPOSITORY}/dependency-graph/sbom" --jq .sbom > _release/sbom.spdx.json
+          # (404 while the repo's dependency graph is disabled: warn, never block a release)
+          if ! gh api "repos/${GITHUB_REPOSITORY}/dependency-graph/sbom" --jq .sbom > sbom.spdx.json; then
+            echo "::warning::no SBOM: enable the dependency graph in the repo settings"
+          else
+            mv sbom.spdx.json _release/
+          fi
           gh release upload "$TAG" _release/* --clobber
