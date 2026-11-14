@@ -12,7 +12,7 @@
 
 <p align="center">
   <a href="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml"><img alt="build" src="https://github.com/NetVar1337/SlopStation/actions/workflows/build.yml/badge.svg"></a>
-  <img alt="version" src="https://img.shields.io/badge/version-0.2.1-informational">
+  <img alt="version" src="https://img.shields.io/badge/version-0.2.2-informational">
   <img alt="platform" src="https://img.shields.io/badge/host-Windows%2010%2F11%20x64-blue">
   <img alt="target" src="https://img.shields.io/badge/target-PS4%20%2B%20ps4debug--NG-black">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
