@@ -159,6 +159,15 @@ set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 
+if(NOT WIN32)
+    # portable subset (see the top-level CMakeLists.txt)
+    FetchContent_MakeAvailable(nlohmann_json zydis fmt spdlog capstone zlib_kr)
+    if(NOT TARGET ZLIB::ZLIB)
+        add_library(ZLIB::ZLIB ALIAS zlibstatic)
+    endif()
+    return()
+endif()
+
 FetchContent_MakeAvailable(freetype nlohmann_json zydis imgui httplib unicorn sqlite lua fmt spdlog capstone zlib_kr)
 
 # zlib builds both a shared and a static lib, we only want the static one so

@@ -18,7 +18,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/VERSION"
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/magicmida-version.txt")
 
-project(reverse-slop VERSION ${SLOP_VERSION} LANGUAGES C CXX ASM_MASM)
+# MASM only exists on Windows; elsewhere only the portable libraries build
+set(_slop_languages C CXX)
+if(CMAKE_HOST_WIN32)
+    list(APPEND _slop_languages ASM_MASM)
+endif()
+project(reverse-slop VERSION ${SLOP_VERSION} LANGUAGES ${_slop_languages})
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,6 +83,21 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(deps)
+
+# Off Windows: the platform-independent part only (Hyperion's loaders,
+# analyzer and decompiler, plus the portable core pieces), built as a compile
+# check by the linux CI lane. First step of a non-Windows engine; everything
+# else (Win32 backend, WinHTTP, raw capture, DX11/ImGui, the engine host)
+# still needs Windows.
+if(NOT WIN32)
+    add_subdirectory(src/hyperion)
+    add_library(slop_portable STATIC src/core/memory/dissect.cpp)
+    target_include_directories(slop_portable PUBLIC "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(slop_portable PUBLIC nlohmann_json::nlohmann_json)
+    target_compile_options(slop_portable PRIVATE -Wall -Wextra -Werror)
+    return()
+endif()
+
 include(slop_resources)
 
 # Everything below is first-party: dependency targets were created above and
