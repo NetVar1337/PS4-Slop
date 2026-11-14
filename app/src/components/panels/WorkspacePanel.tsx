@@ -5,6 +5,7 @@ import { FolderOpen, ScanSearch, X } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import Tabs, { panelId, tabId } from "@/components/Tabs";
 import DisassemblyView from "@/components/panels/DisassemblyView";
+import DecompView from "@/components/panels/DecompView";
 import DebuggerView from "@/components/panels/DebuggerView";
 import MemoryView from "@/components/panels/MemoryView";
 import PeView from "@/components/panels/PeView";
@@ -21,6 +22,7 @@ import { useUi, type WorkspaceTab } from "@/store/ui";
 // console / attach states.
 const kTabs: readonly { id: WorkspaceTab; label: string; needs: "image" | "target" | "none" }[] = [
   { id: "disassembly", label: "Disassembly", needs: "image" },
+  { id: "decomp", label: "Pseudocode", needs: "image" },
   { id: "strings", label: "Strings", needs: "image" },
   { id: "memory", label: "Memory", needs: "target" },
   { id: "debugger", label: "Debugger", needs: "none" },
@@ -94,6 +96,8 @@ export default function WorkspacePanel() {
     switch (active) {
       case "disassembly":
         return <DisassemblyView />;
+      case "decomp":
+        return <DecompView />;
       case "strings":
         return <StringsView />;
       case "pe":

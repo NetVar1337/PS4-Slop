@@ -32,6 +32,7 @@ export type EngineEvent =
       };
     }
   | { type: "image.changed"; data: { loaded: boolean; name?: string; format?: ImageFormat } }
+  | { type: "types.changed"; data: { generation: number } }
   | { type: "watch.list"; data: { entries: WatchEntry[] } }
   | { type: "watch.values"; data: { attached: boolean; values: WatchValue[] } }
   | { type: "debugger.stop"; data: DebuggerStop }
@@ -95,6 +96,7 @@ const kEventNames: EventName[] = [
   "backend.changed",
   "hype.progress",
   "image.changed",
+  "types.changed",
   "watch.list",
   "watch.values",
   "debugger.stop",

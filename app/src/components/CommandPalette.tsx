@@ -8,6 +8,7 @@ import { Command } from "cmdk";
 import { openBinary } from "@/lib/openBinary";
 import { browserLabel, hex, parseAddress } from "@/lib/format";
 import { functionLabel, useDisasm, type FunctionRow } from "@/store/disasm";
+import { useDecomp } from "@/store/decomp";
 import { useEngine } from "@/store/engine";
 import { useMemory } from "@/store/memory";
 import { kThemes, useTheme } from "@/store/theme";
@@ -67,10 +68,32 @@ export default function CommandPalette() {
   const close = () => setOpen(false);
   const tab = (id: WorkspaceTab) => () => setWorkspaceTab(id);
   const rail = (id: RailView) => () => setRail(id);
+  // Pseudocode follows the listing selection, so the tab only has to be shown
+  const showDecomp = (split: boolean) => () => {
+    const sel = useDisasm.getState().selected;
+    setWorkspaceTab("decomp");
+    useDecomp.getState().setSplit(split);
+    if (sel !== null) void useDecomp.getState().load(sel);
+  };
 
   const actions: Action[] = useMemo(
     () => [
       { id: "tab-disassembly", group: "Navigate", label: "Disassembly", run: tab("disassembly") },
+      { id: "tab-decomp", group: "Navigate", label: "Pseudocode", run: tab("decomp") },
+      {
+        id: "show-pseudocode",
+        group: "Navigate",
+        label: "Show pseudocode",
+        enabled: image.ready,
+        run: showDecomp(false),
+      },
+      {
+        id: "show-cfg",
+        group: "Navigate",
+        label: "Show CFG",
+        enabled: image.ready,
+        run: showDecomp(true),
+      },
       { id: "tab-strings", group: "Navigate", label: "Strings", run: tab("strings") },
       { id: "tab-memory", group: "Navigate", label: "Memory", run: tab("memory") },
       { id: "tab-debugger", group: "Navigate", label: "Debugger", run: tab("debugger") },
@@ -161,6 +184,17 @@ export default function CommandPalette() {
                 })}
               >
                 Disassembly at {hex(addr, 1)}
+              </Command.Item>
+            )}
+            {image.ready && (
+              <Command.Item
+                value={`pseudocode ${query}`}
+                onSelect={runAndClose(() => {
+                  setWorkspaceTab("decomp");
+                  void useDecomp.getState().load(addr);
+                })}
+              >
+                Pseudocode at {hex(addr, 1)}
               </Command.Item>
             )}
             {attached && (

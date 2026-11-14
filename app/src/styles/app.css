@@ -1983,3 +1983,256 @@ fieldset.settings-group {
   left: auto;
   transform-origin: bottom right;
 }
+
+/* --- pseudocode view + CFG ----------------------------------------------- */
+
+.decomp {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  height: 100%;
+}
+
+.decomp-head {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  padding: var(--pad-sm) var(--pad-md);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.decomp-goto {
+  display: flex;
+  gap: var(--pad-xs);
+  align-items: center;
+}
+
+.decomp-input {
+  width: 108px;
+  padding: 2px var(--pad-sm);
+  font-size: 12px;
+  background: var(--bg-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
+.decomp-input:focus {
+  border-color: var(--accent);
+}
+
+.decomp-title {
+  flex: 1;
+  overflow: hidden;
+  font-size: 12px;
+  color: var(--accent);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.decomp-note {
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: var(--type-small);
+}
+
+.decomp-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-height: 0;
+}
+
+.decomp-body[data-split="true"] {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.decomp-pane {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.decomp-sig {
+  padding: var(--pad-sm) var(--pad-md);
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--border-soft);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.decomp-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pad-md);
+  padding: 2px var(--pad-md) var(--pad-sm);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.decomp-code {
+  min-height: 0;
+  padding: var(--pad-sm) 0;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.decomp-line {
+  display: flex;
+  gap: var(--pad-md);
+  padding: 0 var(--pad-md);
+  white-space: pre;
+}
+
+.decomp-line:hover {
+  background: var(--hover-tint);
+}
+
+.decomp-gutter {
+  flex: none;
+  width: 62px;
+  color: var(--text-faint);
+}
+
+.decomp-src {
+  flex: 1;
+  white-space: pre;
+}
+
+.decomp-kw {
+  color: var(--warning);
+}
+
+.decomp-type,
+.decomp-str {
+  color: var(--success);
+}
+
+.decomp-num {
+  color: var(--accent);
+}
+
+.decomp-com {
+  color: var(--text-faint);
+  font-style: italic;
+}
+
+.decomp-punct {
+  color: var(--text-dim);
+}
+
+.decomp-fn,
+.decomp-type {
+  padding: 0;
+  font: inherit;
+  white-space: pre;
+}
+
+.decomp-fn {
+  color: var(--accent);
+}
+
+.decomp-fn:hover,
+.decomp-fn:focus-visible {
+  text-decoration: underline;
+}
+
+.decomp-type[aria-pressed="true"] {
+  background: var(--selection);
+  border-radius: var(--radius-sm);
+}
+
+.decomp-calls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--pad-sm);
+  max-height: 96px;
+  padding: var(--pad-sm) var(--pad-md);
+  overflow: auto;
+  border-top: 1px solid var(--border-soft);
+}
+
+.decomp-call {
+  padding: 0 var(--pad-sm);
+  font-size: 11px;
+  color: var(--text-dim);
+  border-radius: var(--radius-sm);
+  white-space: pre;
+}
+
+.decomp-call:hover {
+  color: var(--bg-0);
+  background: var(--accent);
+}
+
+.decomp-cfg {
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--border-soft);
+}
+
+.cfg {
+  height: 100%;
+  min-height: 0;
+}
+
+.cfg-viewport {
+  height: 100%;
+  overflow: auto;
+}
+
+.cfg-canvas {
+  position: relative;
+}
+
+.cfg-edges {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+}
+
+.cfg-edge {
+  fill: none;
+  stroke: var(--text-faint);
+  stroke-width: 1.2;
+}
+
+.cfg-edge[data-edge="fallthrough"] {
+  stroke-dasharray: 4 3;
+}
+
+.cfg-arrow {
+  fill: var(--text-faint);
+}
+
+.cfg-node {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 3px var(--pad-sm);
+  overflow: hidden;
+  text-align: left;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.cfg-node:hover,
+.cfg-node:focus-visible {
+  border-color: var(--accent);
+}
+
+.cfg-node-va {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.cfg-node-sum {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

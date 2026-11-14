@@ -6,7 +6,7 @@
 import { create } from "zustand";
 
 export type RailView = "targets" | "modules" | "scripts";
-export type WorkspaceTab = "disassembly" | "strings" | "memory" | "debugger" | "pe";
+export type WorkspaceTab = "disassembly" | "decomp" | "strings" | "memory" | "debugger" | "pe";
 export type OutputTab = "output" | "log";
 
 /** Splitter-driven CSS variables and their defaults (px), see app.css. */
@@ -39,6 +39,7 @@ const kDefaultLayout: Layout = {
 const kRails: readonly RailView[] = ["targets", "modules", "scripts"];
 const kWorkspaceTabs: readonly WorkspaceTab[] = [
   "disassembly",
+  "decomp",
   "strings",
   "memory",
   "debugger",

@@ -2,12 +2,14 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import CommandPalette from "@/components/CommandPalette";
+import CfgGraph from "@/components/CfgGraph";
 import SettingsModal from "@/components/SettingsModal";
 import Splash from "@/components/Splash";
 import Splitter from "@/components/Splitter";
 import StatusBar from "@/components/StatusBar";
 import Tabs from "@/components/Tabs";
 import DebuggerView from "@/components/panels/DebuggerView";
+import DecompView from "@/components/panels/DecompView";
 import InspectorPanel from "@/components/panels/InspectorPanel";
 import MemoryView from "@/components/panels/MemoryView";
 import ScannerPanel from "@/components/panels/ScannerPanel";
@@ -15,8 +17,10 @@ import ScriptsPanel from "@/components/panels/ScriptsPanel";
 import StringsView from "@/components/panels/StringsView";
 import TargetsPanel from "@/components/panels/TargetsPanel";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
+import { hex } from "@/lib/format";
 import { setEndpoint } from "@/lib/rpc";
 import { useDebugger } from "@/store/debugger";
+import { useDecomp } from "@/store/decomp";
 import { useDisasm } from "@/store/disasm";
 import { useEngine } from "@/store/engine";
 import { useMemory } from "@/store/memory";
@@ -49,6 +53,7 @@ const initial = {
   watch: useWatch.getState(),
   ui: useUi.getState(),
   debugger: useDebugger.getState(),
+  decomp: useDecomp.getState(),
   settings: useSettings.getState(),
 };
 
@@ -60,6 +65,7 @@ beforeEach(() => {
   useWatch.setState(initial.watch, true);
   useUi.setState(initial.ui, true);
   useDebugger.setState(initial.debugger, true);
+  useDecomp.setState(initial.decomp, true);
   useSettings.setState(initial.settings, true);
   setEndpoint({ port: 8765, token: "" });
 });
@@ -84,6 +90,9 @@ describe("image format labels (item 82)", () => {
     const tabs = within(list).getAllByRole("tab");
     expect(tabs[0]).toHaveAttribute("aria-selected", "true");
     tabs[0].focus();
+    await userEvent.keyboard("{ArrowRight}");
+    expect(useUi.getState().workspaceTab).toBe("decomp");
+    expect(within(list).getByRole("tab", { name: "Pseudocode" })).toHaveFocus();
     await userEvent.keyboard("{ArrowRight}");
     expect(useUi.getState().workspaceTab).toBe("strings");
     expect(within(list).getByRole("tab", { name: "Strings" })).toHaveFocus();
@@ -587,5 +596,131 @@ describe("scripts panel: snippets, completion, unsafe consent (68, 69, 70)", () 
     await userEvent.click(screen.getByRole("button", { name: "Save snippet" }));
     await waitFor(() => expect(calls.some((c) => c.action === "save")).toBe(true));
     expect(calls.find((c) => c.action === "save")?.params.name).toBe("saved-one");
+  });
+});
+
+// disasm.blocks / xray.cfg graph shape: nodes carry the range and an
+// instruction count, edges the successor kind
+const cfgFixture = {
+  nodes: [
+    { id: 0x1000, start: 0x1000, end: 0x1010, size: 16, insn_count: 3, summary: "test eax, eax" },
+    { id: 0x1010, start: 0x1010, end: 0x1020, size: 16, insn_count: 2, summary: "mov ecx, 4" },
+    { id: 0x1020, start: 0x1020, end: 0x1030, size: 16, insn_count: 5, summary: "call memcpy" },
+    { id: 0x1030, start: 0x1030, end: 0x1038, size: 8, insn_count: 1, summary: "ret" },
+  ],
+  edges: [
+    { from: 0x1000, to: 0x1010, kind: "fallthrough" },
+    { from: 0x1000, to: 0x1020, kind: "branch" },
+    { from: 0x1010, to: 0x1030, kind: "fallthrough" },
+    { from: 0x1020, to: 0x1030, kind: "branch" },
+    { from: 0x1030, to: 0x1000, kind: "branch" },
+  ],
+};
+
+describe("pseudocode view (audit 52)", () => {
+  const decompFixture = {
+    signature: "int Player::Update(int arg_10)",
+    callconv: "win64",
+    function_va: 0x4dda48,
+    insn_count: 12,
+    call_sites: [{ va: 0x4ddb00, arg_types: ["int", "char *"] }],
+    types_generation: 7,
+    lines: [
+      { va: 0x4dda48, text: "if (arg_10 == 0x10) {" },
+      { va: 0, text: "  return memcpy(dst, src, 4);" },
+      { va: 0x4dda60, text: "} // done" },
+    ],
+  };
+
+  it("highlights tokens and follows a function name into the listing", async () => {
+    const { calls } = mockApi(({ tool, action }) => {
+      if (tool === "decomp") return decompFixture;
+      if (action === "blocks") return { entry: 0x4dda48, graph: cfgFixture };
+      if (action === "functions")
+        return {
+          functions: [{ va: 0x4d0000, size: 32, name: "memcpy" }],
+          total: 1,
+          matched: 1,
+        };
+      return { instructions: [] };
+    });
+    useDisasm.setState({ selected: 0x4dda48, image: { ready: true, format: "elf" } });
+    const { container } = render(<DecompView />);
+
+    await waitFor(() => expect(container.querySelector(".decomp-kw")?.textContent).toBe("if"));
+    expect(container.querySelector(".decomp-num")?.textContent).toBe("0x10");
+    expect(container.querySelector(".decomp-com")?.textContent).toBe("// done");
+    expect(container.querySelector(".decomp-meta")?.textContent).toContain("types gen 7");
+    expect(container.querySelector(".decomp-meta")?.textContent).toContain("12 insns");
+    expect(screen.getByRole("button", { name: "call site 004DDB00" })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "go to memcpy" }));
+    await waitFor(() => expect(useDisasm.getState().selected).toBe(0x4d0000));
+    expect(useUi.getState().workspaceTab).toBe("disassembly");
+    expect(calls.find((c) => c.action === "functions")?.params.filter).toBe("memcpy");
+  });
+
+  it("shows the CFG beside the code and jumps to a block", async () => {
+    mockApi(({ tool, action }) => {
+      if (tool === "decomp") return decompFixture;
+      if (action === "blocks") return { entry: 0x4dda48, graph: cfgFixture };
+      return { instructions: [] };
+    });
+    useDisasm.setState({ selected: 0x4dda48, image: { ready: true, format: "elf" } });
+    const { container } = render(<DecompView />);
+    await userEvent.click(screen.getByRole("button", { name: "Control-flow graph" }));
+    await waitFor(() => expect(container.querySelectorAll(".cfg-node")).toHaveLength(4));
+    expect(container.querySelectorAll(".cfg-edge")).toHaveLength(5);
+
+    await userEvent.click(screen.getByRole("button", { name: /^block 00001020/ }));
+    await waitFor(() => expect(useDisasm.getState().selected).toBe(0x1020));
+    expect(useUi.getState().workspaceTab).toBe("disassembly");
+  });
+});
+
+describe("CFG graph layout", () => {
+  it("draws one box per block, one edge per successor, one column per depth", () => {
+    const onPick = vi.fn();
+    const { container } = render(<CfgGraph graph={cfgFixture} entry={0x1000} onPick={onPick} />);
+    const boxes = [...container.querySelectorAll<HTMLElement>(".cfg-node")];
+    expect(boxes).toHaveLength(4);
+    expect(container.querySelectorAll(".cfg-edge")).toHaveLength(5);
+    expect(container.querySelectorAll('.cfg-edge[data-edge="fallthrough"]')).toHaveLength(2);
+
+    // 0x1010 and 0x1020 are both one hop from the entry: same column
+    const left = (va: number) =>
+      boxes.find((b) => b.getAttribute("aria-label")?.includes(hex(va, 8)))?.style.left;
+    expect(left(0x1010)).toBe(left(0x1020));
+    expect(left(0x1000)).not.toBe(left(0x1010));
+
+    fireEvent.click(screen.getByRole("button", { name: /^block 00001020/ }));
+    expect(onPick).toHaveBeenCalledWith(0x1020);
+  });
+
+  it("has an empty state and refuses more than 500 blocks", () => {
+    const { container, rerender } = render(<CfgGraph graph={null} onPick={vi.fn()} />);
+    expect(screen.getByText("No control-flow graph.")).toBeInTheDocument();
+
+    const nodes = Array.from({ length: 501 }, (_, i) => ({
+      id: 0x1000 + i * 0x10,
+      start: 0x1000 + i * 0x10,
+      end: 0x1010 + i * 0x10,
+      size: 16,
+      insn_count: 2,
+    }));
+    rerender(<CfgGraph graph={{ nodes, edges: [] }} onPick={vi.fn()} />);
+    expect(screen.getByText("Too many blocks (501).")).toBeInTheDocument();
+    expect(container.querySelectorAll(".cfg-node")).toHaveLength(0);
+  });
+
+  it("opens the CFG from the palette", async () => {
+    mockApi(() => ({}));
+    useDisasm.setState({ image: { ready: true, format: "elf" } });
+    render(<CommandPalette />);
+    act(() => useUi.getState().setPaletteOpen(true));
+    await userEvent.type(await screen.findByPlaceholderText(/Type a command/), "CFG");
+    await userEvent.keyboard("{Enter}");
+    expect(useUi.getState().workspaceTab).toBe("decomp");
+    expect(useDecomp.getState().split).toBe(true);
   });
 });
