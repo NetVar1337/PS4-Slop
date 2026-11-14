@@ -3,8 +3,6 @@ name: build
 on:
   push:
     branches: [main]
-    # a version tag (v0.1.1 or 0.1.1) also publishes the build as a github release
-    tags: ['v*', '[0-9]*']
   pull_request:
   workflow_dispatch:
   # Full static analysis + ASan + the whole suite run nightly, off the
@@ -357,9 +355,9 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 30
     needs: [changes, cxx, frontend-build]
-    # Packaging is the release gate: main, tags and manual runs. A PR can
-    # opt in with the ci:package label when it changes the bundle.
-    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:package')
+    # Packaging is opt-in on PRs (ci:package) and manual runs; tags use the
+    # release workflow, which reuses the main-run artifacts.
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'ci:package')
     env:
       # secrets are not usable in step `if:`; expose presence as a flag
       SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_SIGNING_ENDPOINT != '' && secrets.AZURE_SIGNING_ACCOUNT != '' && secrets.AZURE_SIGNING_PROFILE != '' }}
@@ -574,64 +572,3 @@ jobs:
           compression-level: 0
           path: _release/*
           if-no-files-found: error
-
-  # A tag build publishes only after every lane passed: builds, all test
-  # areas (plain + ASan), static analysis, frontend tests, version check.
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: [version, cxx, frontend-build, bundle]
-    permissions:
-      # write so a tag build can publish its release
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 1
-
-      - name: download release files
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: reverse-slop-release
-          path: _release
-
-      - name: verify SHA256SUMS
-        working-directory: _release
-        run: sha256sum --check --strict SHA256SUMS
-
-      - name: publish the github release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          # release notes: this version's CHANGELOG.md section (required), then
-          # GitHub's generated commit/PR list
-          version="${TAG#v}"
-          awk -v v="$version" '
-            index($0, "## [" v "]") == 1 { on = 1; next }
-            on && index($0, "## [") == 1 { exit }
-            on && /^\[[^]]*\]: / { exit }
-            on { print }' CHANGELOG.md > notes.md
-          if ! grep -q '[^[:space:]]' notes.md; then
-            echo "CHANGELOG.md has no entry for [$version]" >&2
-            exit 1
-          fi
-          # updater manifest: the Tauri updater reads this from the latest
-          # release and verifies the installer against the embedded public key
-          setup=$(cd _release && ls *-setup.exe | head -1)
-          sig=$(cat "_release/${setup}.sig")
-          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${setup}"
-          jq -n --arg v "$version" --arg notes "$(cat notes.md)" \
-                --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-                --arg sig "$sig" --arg url "$url" \
-            '{version:$v, notes:$notes, pub_date:$date,
-              platforms:{"windows-x86_64":{signature:$sig, url:$url}}}' \
-            > _release/latest.json
-          cat _release/latest.json
-          # first run on a tag creates the release, a rerun or a manual dispatch
-          # on the same tag just replaces its assets
-          if ! gh release view "$TAG" > /dev/null 2>&1; then
-            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
-          fi
-          gh release upload "$TAG" _release/* --clobber
