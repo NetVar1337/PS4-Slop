@@ -6,9 +6,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowRight, ChevronLeft, ChevronRight, RefreshCw } from "lucide-react";
+import { ArrowRight, ChevronLeft, ChevronRight, Microscope, RefreshCw, X } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import { hex, parseAddress } from "@/lib/format";
+import { call, errorText } from "@/lib/rpc";
 import { byteAt, kHexCols, kHexRowPx, kWindowBytes, protectName, useMemory } from "@/store/memory";
 
 const kRow = kHexRowPx;
@@ -16,6 +17,63 @@ const kCols = kHexCols;
 
 function ascii(b: number | undefined): string {
   return b === undefined ? " " : b >= 0x20 && b < 0x7f ? String.fromCharCode(b) : ".";
+}
+
+interface DissectRow {
+  offset: number;
+  hex: string;
+  kind: string;
+  value?: unknown;
+  target?: { kind: string; text?: string; symbol?: string; vtable_symbol?: string };
+}
+
+function describe(r: DissectRow): string {
+  if (r.target) {
+    const t = r.target;
+    const what = t.text !== undefined ? `"${t.text}"` : (t.vtable_symbol ?? t.symbol ?? "");
+    return `→ ${t.kind}${what ? ` ${what}` : ""}`;
+  }
+  return r.value === undefined ? "" : JSON.stringify(r.value);
+}
+
+// one row per 8-byte slot from memory.dissect: a first draft of a struct
+function DissectPane({ addr, onClose }: { addr: number; onClose: () => void }) {
+  const [rows, setRows] = useState<DissectRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setRows(null);
+    setError(null);
+    call<{ rows: DissectRow[] }>("memory", "dissect", { addr, size: 0x100 })
+      .then((r) => setRows(r.rows))
+      .catch((e: unknown) => setError(errorText(e)));
+  }, [addr]);
+  return (
+    <div className="stack" style={{ maxHeight: "40%", borderTop: "1px solid var(--border)" }}>
+      <div className="view-bar">
+        <span className="panel-title">Dissect {hex(addr, 12)}</span>
+        <div className="spacer" />
+        <IconButton tip="Close dissect" onClick={onClose}>
+          <X size={13} />
+        </IconButton>
+      </div>
+      <div className="panel-body mono" style={{ fontSize: 11, padding: "var(--pad-sm)" }}>
+        {error !== null && (
+          <div className="error-text" role="alert">
+            {error}
+          </div>
+        )}
+        {rows === null && error === null && <div className="faint">reading…</div>}
+        {rows?.map((r) => (
+          <div key={r.offset} style={{ display: "flex", gap: 12 }}>
+            <span className="faint">+{r.offset.toString(16).toUpperCase().padStart(3, "0")}</span>
+            <span style={{ minWidth: 150 }}>{r.hex}</span>
+            <span style={{ minWidth: 70 }}>{r.kind}</span>
+            <span>{describe(r)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function RegionList() {
@@ -85,6 +143,7 @@ export default function MemoryView() {
     useMemory.getState();
   const [edit, setEdit] = useState<number | null>(null);
   const [gotoError, setGotoError] = useState(false);
+  const [dissectAt, setDissectAt] = useState<number | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -171,6 +230,13 @@ export default function MemoryView() {
             {loading ? " · reading…" : ""}
           </span>
           <div className="spacer" />
+          <IconButton
+            tip="Dissect the structure at the cursor"
+            disabled={windowSize === 0}
+            onClick={() => setDissectAt(cursor)}
+          >
+            <Microscope size={13} />
+          </IconButton>
           <IconButton tip="Re-read" onClick={reload}>
             <RefreshCw size={13} />
           </IconButton>
@@ -251,6 +317,7 @@ export default function MemoryView() {
             })}
           </div>
         </div>
+        {dissectAt !== null && <DissectPane addr={dissectAt} onClose={() => setDissectAt(null)} />}
       </div>
     </div>
   );
