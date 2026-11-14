@@ -109,11 +109,13 @@ TEST_CASE(ps4_chaos_peer_close_drops_socket_and_reconnect_restores) {
 TEST_CASE(ps4_chaos_stall_hits_idle_timeout) {
     server_guard_t g;
     backend_ps4_t b;
-    b.set_timeouts(250, 2000, 2000);
     std::string err;
     REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
+    // the tight command budget is for the stall below; the handshake above
+    // runs with the default budget so a loaded machine cannot time it out
+    b.set_timeouts(250, 2000, 2000);
     g.srv.chaos.stall_cmd = ps4::CMD_PROC_WRITE;   // the payload never answers
     const uint8_t v[4] = {1, 2, 3, 4};
     const auto t0 = std::chrono::steady_clock::now();

@@ -45,10 +45,10 @@ through one UI, one Lua surface and one MCP server.
 | **Live memory** | Regions, modules, threads, read/write/protect/alloc, Cheat Engine-style scans, AOB wildcards, pointer chains, snapshots and diffs, a shared watchlist with freeze/freeze-once/undo. |
 | **Live debugging** | Software breakpoints (conditional, hit counts, log-only), DR0–DR3 watchpoints, continue/step/suspend, pushed stop events with registers, `.pdata` callstacks, FP/FS-GS, remote calls, continuous trace to JSONL, trace/find-write one-shots; the same surface on PS5 (ps5debug-NG) minus the on-console scan engine. |
 | **On-console tooling** | Native scan/rescan, Turbo Scan, verified bulk writes, fork module/snapshot commands, Zydis disassembly, xrefs, Keystone assembly, ELF upload. |
-| **Static analysis** | ELF64 with NID→name resolution, SELF, PE, Mach-O/`.ipa`, .NET; function/xref/string indexes; Xray passes; patching with a journal; binary diffing; packer heuristics. |
+| **Static analysis** | ELF64 with NID→name resolution, SELF, PE, Mach-O/`.ipa`, .NET; function/xref/string indexes; Xray passes; patching with a persisted journal; binary diffing; packer heuristics; FLIRT import; CFG graphs. |
 | **Decompiler** | Hyperion p-code lifting, SSA, DCE, type inference and structuring to C-like output (SysV AMD64, Win64, AAPCS64). |
-| **Emulation** | Isolated Unicorn x86-64 runs with demand paging from the loaded image or live memory, tracing, byte-level taint and devirtualization helpers. |
-| **Automation** | Lua 5.4 against the shared session, plus an MCP server with action-based tools, task playbooks (`guide`), a JSONL audit log and an optional confirm gate. |
+| **Emulation** | Isolated Unicorn x86-64 and ARM64 runs with demand paging from the loaded image or live memory, persistent sessions with snapshot/restore, tracing, byte-level taint, backward slicing, Orbis syscalls and devirtualization helpers. |
+| **Automation** | Lua 5.4 against the shared session (snippets, `slop.api()`, wall-clock caps), plus an MCP server with action-based tools, resources/prompts, progress notifications, per-tool rate limits, task playbooks (`guide`), a JSONL audit log and an optional confirm gate. |
 | **Payload host** | Built-in HTTP payload host with a sha256 `manifest.json`; UDP broadcast discovery; the bundled ps4debug-NG payload. |
 | **Host network** | Raw-socket capture, DNS log, stream reassembly, PCAP export, and a localhost HTTP inspection proxy. |
 
@@ -297,6 +297,7 @@ The listener binds `127.0.0.1` only.
 | `POST /api/v1` | Direct frontend RPC; one request or an array |
 | `POST /api` | Deprecated alias of `/api/v1` (answers with a `Deprecation` header) |
 | `GET /api/v1/events` | Frontend SSE stream: `hello`, `output`, `boot.stage`, `target.changed`, `backend.changed`, `hype.progress`, `watch.list`, `watch.values`, `debugger.stop`, `debugger.state`, `debugger.log`, `types.changed`, `disasm.index_updated`, `app.quitting` |
+| `GET /api/v1/events/ws` | The same event stream over RFC 6455 (text frames, ping/pong, close); the UI prefers it and falls back to SSE |
 | `GET /events` | Deprecated alias of `/api/v1/events` |
 | `GET /api/v1/openapi.json` | OpenAPI 3.1 descriptor generated from the MCP tool schemas |
 
@@ -345,8 +346,8 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8765/mcp -ContentType 'appl
 - `--port <n>` overrides the port (it beats `SLOP_MCP_PORT` and the settings port). If the
   port is busy the engine takes an ephemeral port and skips onboarding, and a stale
   `engine.json` registration is probed and dropped instead of announced.
-- The event stream (`/api/v1/events`) authenticates with a **single-use ticket** from
-  `app.events_ticket` — no token in URLs.
+- The event stream (`/api/v1/events` or `/api/v1/events/ws`) authenticates with a
+  **single-use ticket** from `app.events_ticket` — no token in URLs.
 - Other settings: `script_unsafe` (full Lua `io`/`os`), `web_allow_private` /
   `web_allowlist` (deny loopback/LAN by default), `proxy_token`,
   `proxy_redact_secrets` (default on), `fs_root` (jails every `fs` action),
