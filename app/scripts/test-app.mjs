@@ -29,6 +29,19 @@ class FakeSource {
   }
 }
 
+// The UI tries the websocket stream first and falls back to SSE when the
+// socket closes before opening (an engine without the route). This fake always
+// takes that path, so the SSE assertions below also cover the fallback.
+class FakeSocket {
+  static urls = [];
+  constructor(url) {
+    this.url = url;
+    FakeSocket.urls.push(url);
+    setTimeout(() => this.onclose?.(), 0);
+  }
+  close() {}
+}
+
 const tick = () => new Promise((r) => setTimeout(r, 0));
 const until = async (pred) => {
   for (let i = 0; i < 100 && !pred(); i++) await tick();
@@ -36,6 +49,7 @@ const until = async (pred) => {
 const reply = (data) => ({ ok: true, json: async () => ({ ok: true, data }) });
 
 globalThis.EventSource = FakeSource;
+globalThis.WebSocket = FakeSocket;
 globalThis.fetch = async () => reply({ revision: 0, lines: [] });
 // Node's own localStorage needs --localstorage-file and warns without it; the
 // stores only need a session-scoped one
@@ -55,6 +69,8 @@ try {
   const { useOutput } = await server.ssrLoadModule("/src/store/output.ts");
   const { useWatch } = await server.ssrLoadModule("/src/store/watch.ts");
   events.connect();
+  await until(() => FakeSource.current !== undefined);
+  assert.ok(FakeSocket.urls.at(-1).endsWith("/api/v1/events/ws"), "websocket tried first");
   const send = (name, data) => FakeSource.current.emit(name, data);
   let detach = useOutput.getState().attach();
   detach();
@@ -210,6 +226,7 @@ try {
     events.connect();
     await until(() => FakeSource.current !== before);
     assert.equal(auth, "Bearer secret-token");
+    assert.equal(FakeSocket.urls.at(-1), "ws://127.0.0.1:43123/api/v1/events/ws?ticket=t-123");
     assert.equal(FakeSource.current.url, "http://127.0.0.1:43123/api/v1/events?ticket=t-123");
     assert.ok(!FakeSource.current.url.includes("secret-token"));
     events.disconnect();

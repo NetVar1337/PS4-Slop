@@ -182,28 +182,27 @@ inline std::string tcp_listener_owner(uint16_t port) {
     std::fclose(f);
     if (inode.empty()) return {};
     const std::string want = "socket:[" + inode + "]";
-    for (int pid = 1; pid < 4194304; ++pid) {
-        char dir[128];
-        std::snprintf(dir, sizeof(dir), "/proc/%d/fd", pid);
-        DIR* d = ::opendir(dir);
-        if (!d) continue;
+    // true when /proc/<pid>/fd holds the listening socket
+    const auto owns = [&want](const std::string& pid) {
+        DIR* d = ::opendir(("/proc/" + pid + "/fd").c_str());
+        if (!d) return false;
         bool hit = false;
         while (dirent* e = ::readdir(d)) {
             if (e->d_name[0] == '.') continue;
-            char path[512], target[512];
-            std::snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
-            const ssize_t n = ::readlink(path, target, sizeof(target) - 1);
+            char target[512];
+            const std::string path = "/proc/" + pid + "/fd/" + e->d_name;
+            const ssize_t n = ::readlink(path.c_str(), target, sizeof(target) - 1);
             if (n <= 0) continue;
             target[n] = '\0';
             if (want == target) { hit = true; break; }
         }
         ::closedir(d);
-        if (!hit) continue;
-        char exe[512];
-        std::snprintf(exe, sizeof(exe), "/proc/%d/exe", pid);
+        return hit;
+    };
+    const auto describe = [](const std::string& pid) {
+        std::string who = "pid " + pid;
         char name[512];
-        const ssize_t n = ::readlink(exe, name, sizeof(name) - 1);
-        std::string who = "pid " + std::to_string(pid);
+        const ssize_t n = ::readlink(("/proc/" + pid + "/exe").c_str(), name, sizeof(name) - 1);
         if (n > 0) {
             name[n] = '\0';
             const std::string s = name;
@@ -211,8 +210,25 @@ inline std::string tcp_listener_owner(uint16_t port) {
             who += " (" + (slash == std::string::npos ? s : s.substr(slash + 1)) + ")";
         }
         return who;
+    };
+    // the common case (our own stale listener) first, labelled like the Win32 path
+    const std::string self = std::to_string(::getpid());
+    if (owns(self)) return "pid " + self + " (this process)";
+    // then only the pids that exist, not the whole pid_max range
+    DIR* proc = ::opendir("/proc");
+    if (!proc) return {};
+    std::string found;
+    while (dirent* e = ::readdir(proc)) {
+        const char* n = e->d_name;
+        if (*n < '1' || *n > '9') continue;
+        bool numeric = true;
+        for (const char* c = n; *c; ++c) numeric = numeric && *c >= '0' && *c <= '9';
+        if (!numeric || self == n || !owns(n)) continue;
+        found = describe(n);
+        break;
     }
-    return {};
+    ::closedir(proc);
+    return found;
 }
 
 } // namespace slop::core::compat

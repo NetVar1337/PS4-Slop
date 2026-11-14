@@ -30,7 +30,9 @@ function initial(): Language {
 }
 
 function apply(language: Language): void {
-  // Screen readers and hyphenation follow the document language
+  // Screen readers and hyphenation follow the document language. The catalog is
+  // also imported by stores that run without a DOM (SSR smoke test, workers)
+  if (typeof document === "undefined") return;
   document.documentElement.lang = language;
 }
 
