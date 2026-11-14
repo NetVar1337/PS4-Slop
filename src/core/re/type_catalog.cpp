@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,12 @@ struct catalog_t {
 };
 
 catalog_t g_cat;
+
+// bumped by every mutation and by bind_binary; the decompile cache stamps
+// entries with it so an edit re-renders on the next decomp.function
+std::atomic<uint64_t> g_generation{1};
+
+void bump_generation() { g_generation.fetch_add(1, std::memory_order_release); }
 
 std::string store_dir() {
     char base[MAX_PATH]{};
@@ -153,6 +160,7 @@ void bind_binary(const uint8_t* bytes, size_t len) {
     g_cat.enums.clear();
     g_cat.bound_hash = h;
     load_locked(g_cat);
+    bump_generation();
 }
 
 // mini parser
@@ -418,6 +426,7 @@ bool create_struct(struct_def_t def, std::string* error) {
     std::lock_guard lk(g_cat.mu);
     g_cat.structs[def.name] = std::move(def);
     if (!save_locked(g_cat)) { if (error) *error = "persist failed"; return false; }
+    bump_generation();
     return true;
 }
 
@@ -429,13 +438,14 @@ bool add_member(const std::string& struct_name, const field_t& field,
     it->second.fields.push_back(field);
     layout_struct(it->second);
     if (!save_locked(g_cat)) { if (error) *error = "persist failed"; return false; }
+    bump_generation();
     return true;
 }
 
 bool remove_struct(const std::string& name) {
     std::lock_guard lk(g_cat.mu);
     const size_t n = g_cat.structs.erase(name);
-    if (n) save_locked(g_cat);
+    if (n) { save_locked(g_cat); bump_generation(); }
     return n != 0;
 }
 
@@ -447,15 +457,18 @@ bool create_enum(enum_def_t def, std::string* error) {
     std::lock_guard lk(g_cat.mu);
     g_cat.enums[def.name] = std::move(def);
     if (!save_locked(g_cat)) { if (error) *error = "persist failed"; return false; }
+    bump_generation();
     return true;
 }
 
 bool remove_enum(const std::string& name) {
     std::lock_guard lk(g_cat.mu);
     const size_t n = g_cat.enums.erase(name);
-    if (n) save_locked(g_cat);
+    if (n) { save_locked(g_cat); bump_generation(); }
     return n != 0;
 }
+
+uint64_t generation() { return g_generation.load(std::memory_order_acquire); }
 
 // field reads
 

@@ -225,14 +225,14 @@ json tool_disasm(const json& args) {
         static const char* kKnown[] = {
             "assemble", "disassemble", "loaded", "pe", "functions", "xrefs",
             "strings", "symbols", "symbol_set", "blocks", "globals", "vtables",
-            "load", "unload", "analyze_stop",
+            "load", "load_self", "unload", "analyze_stop", "managed",
         };
         const bool known = std::any_of(std::begin(kKnown), std::end(kKnown),
                                         [&](const char* k) { return action == k; });
         if (!known)
             fail("disasm: unknown action (assemble|disassemble|loaded|pe|functions|"
-                 "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|unload|"
-                 "analyze_stop|managed)");
+                 "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|"
+                 "load_self|unload|analyze_stop|managed)");
     }
 
     if (action == "disassemble") {
@@ -427,6 +427,39 @@ json tool_disasm(const json& args) {
                                   "decompiler/analyzer DB";
         return out;
     }
+    if (action == "load_self") {
+        // PS4 SELF: retail eboot.bin/.sprx carry encrypted segments whose keys
+        // never leave the console. The loadable source is the decrypted image
+        // (target.ps4_dump_module from live memory, or fpkg tooling); this
+        // action either loads that dump or explains exactly how to get one.
+        if (!args.contains("path") || !args.at("path").is_string())
+            fail("missing path (the SELF to inspect, e.g. eboot.bin)");
+        const std::string path = args.at("path").get<std::string>();
+        const std::string dump = args.value("decrypted_dump", std::string{});
+        const uint64_t base_override = args.contains("base") ? parse_addr(args, "base") : 0;
+        const bool relocate = args.value("relocate", true);
+        const std::string source = dump.empty() ? path : dump;
+
+        if (!ds::load_file(source, base_override, relocate)) {
+            const std::string err = ds::last_load_error();
+            if (err.find("encrypted SELF") != std::string::npos)
+                fail("cannot load " + path + ": " + err +
+                     ". Pass decrypted_dump=<decrypted ELF> after dumping the module "
+                     "from live console memory with target.ps4_dump_module "
+                     "{name:'eboot.bin', path:'C:/dumps/eboot.bin', load:false}, or "
+                     "extract it from an fpkg with a decrypted eboot (see "
+                     "docs/encrypted-self.md)");
+            fail("failed to load " + source + ": " + err);
+        }
+        json out = loaded_image_json();
+        out["ok"]           = true;
+        out["loaded_from"]  = source;
+        out["decrypted_dump_used"] = !dump.empty();
+        out["hype_wait_hint"] = "poll disasm.loaded -> hype.ready for the "
+                                "decompiler/analyzer DB";
+        return out;
+    }
+
     if (action == "unload") {
         ds::unload();
         return {{"ok", true}, {"ready", false}};
@@ -538,6 +571,7 @@ json tool_disasm(const json& args) {
     bool*                           fidx_ok = nullptr;   // null => always built
     bool*                           xidx_ok = nullptr;
     const std::unordered_map<uint64_t, std::string>* syms = nullptr;
+    const hype::AnalysisDB* hdb = nullptr;   // session analyzer DB when ready
     uint64_t default_base = 0;
     disasm::image_format_t format = disasm::image_format_t::pe;
     disasm::image_arch_t arch = disasm::image_arch_t::x64;
@@ -565,10 +599,15 @@ json tool_disasm(const json& args) {
             (action == "functions" || action == "xrefs" || action == "strings")) {
             ds::rebuild_indexes_locked(bin);
         }
+        // one function set: Hyperion's analysis results fold into the index
+        // once it is ready (deduped, marked source=hyperion)
+        if (action == "functions" || action == "xrefs" || action == "blocks")
+            ds::merge_hype_functions_locked(bin);
         pe = &bin.pe; file = &bin.file; fidx = &bin.fns; xidx = &bin.xrefs;
         format = bin.format;
         arch = bin.arch;
         syms = &bin.symbols;
+        if (bin.hype && bin.hype->ready()) hdb = &bin.hype->db();
         img_name = bin.name; img_path = bin.path;
         default_base = bin.base;   // VA base the whole session was built with
     }
@@ -622,22 +661,20 @@ json tool_disasm(const json& args) {
         if (filter_hex.rfind("0x", 0) == 0) filter_hex.erase(0, 2);
 
         const auto& fns = fidx->functions();
-        // hyperion adds names and cfg stats on the same rows
-        const hype::AnalysisDB* hdb = nullptr;
-        if (!have_path) {
-            auto& bin = ds::get();
-            if (bin.hype && bin.hype->ready()) hdb = &bin.hype->db();
-        }
+        // hyperion adds names and cfg stats on the same rows (hdb from the
+        // session setup above)
 
         // One row per function: the index's starts plus anything only the
         // analyzer recovered (stripped exports, TLS-only entry, packed
         // headers: Hyperion still finds functions via RTTI/vtables/tables)
-        struct row_t { uint64_t va; uint64_t size; bool from_index; };
+        struct row_t { uint64_t va; uint64_t size; bool from_index; const char* source; };
         std::vector<row_t> rows;
         rows.reserve(fns.size() + (hdb ? hdb->funcs.size() : 0));
         std::unordered_set<uint64_t> seen;
         for (const auto& fn : fns) {
-            rows.push_back({fn.va, fn.size, true});
+            rows.push_back({fn.va, fn.size, true,
+                            fn.source == disasm::fn_source_t::hyperion
+                                ? "hyperion" : "index"});
             seen.insert(fn.va);
         }
         size_t hype_extra = 0;
@@ -645,7 +682,7 @@ json tool_disasm(const json& args) {
             for (const auto& [va, hf] : hdb->funcs) {
                 (void)hf;
                 if (seen.insert(va).second) {
-                    rows.push_back({va, 0, false});
+                    rows.push_back({va, 0, false, "hyperion"});
                     ++hype_extra;
                 }
             }
@@ -689,7 +726,7 @@ json tool_disasm(const json& args) {
             const size_t idx = matched++;
             if (idx < offset || arr.size() >= limit) continue;
             json o = {{"va", r.va}, {"name", std::move(name)}, {"name_source", source},
-                      {"source", r.from_index ? "index" : "hyperion"}};
+                      {"source", r.source}};
             if (r.from_index) o["size"] = r.size;
             if (std::string_view(source) == "user") o["symbol"] = o["name"];
             if (hdb) {
@@ -713,7 +750,8 @@ json tool_disasm(const json& args) {
                     {"index_total", fns.size()},
                     {"stats", {{"seeds", fidx->stats().seeds},
                                {"recursive_descent", fidx->stats().rd_functions},
-                               {"heuristic", fidx->stats().heuristic_fns}}}};
+                               {"heuristic", fidx->stats().heuristic_fns},
+                               {"hyperion", fidx->stats().hype_functions}}}};
         if (!filter.empty()) out["filter"] = filter;
         // explicit either way: total counts every function, so returned < total
         // alone says nothing about this filtered page
@@ -856,7 +894,10 @@ json tool_disasm(const json& args) {
         const size_t limit = std::min<size_t>(args.value("limit", 1000u), 10000u);
         // exec sections are garbage on packed code so theyre skipped unless asked for
         const bool include_exec = args.value("include_exec", false);
+        // decode: preview high-entropy blobs the code references
+        const bool decode = args.value("decode", false);
         json arr = json::array();
+        json decoded = json::array();
         disasm::string_stats_t stats{};
         for (const auto& sec : pe->sections) {
             if (sec.virtual_size == 0) continue;
@@ -873,9 +914,40 @@ json tool_disasm(const json& args) {
                                {"text", h.text}, {"utf16", h.utf16}});
             }
             if (arr.size() >= limit) break;
+
+            if (!decode || decoded.size() >= limit) continue;
+            // 512-byte windows: only high-entropy blobs, only when some
+            // instruction references an address inside the window
+            for (size_t boff = 0; boff + 64 <= len; boff += 512) {
+                const size_t blen = std::min<size_t>(512, len - boff);
+                const uint8_t* bp = file->data() + *soff + boff;
+                if (disasm::shannon_entropy(bp, blen) < 7.0) continue;
+                const uint64_t bva = base + sec.rva + boff;
+                bool referenced = false;
+                // xidx is empty for non-x86 sessions and unbuilt path images,
+                // in which case refs_to is empty and the hdb check below runs
+                for (size_t k = 0; k < blen && !referenced; k += 8)
+                    referenced = !xidx->refs_to(bva + k).empty();
+                if (!referenced && hdb) {
+                    for (size_t k = 0; k < blen && !referenced; k += 8)
+                        referenced = hdb->xrefs_to.count(bva + k) != 0;
+                }
+                if (!referenced) continue;
+                for (const auto& c : disasm::decode_candidates(bp, blen, 4)) {
+                    decoded.push_back({{"va", bva}, {"scheme", c.scheme},
+                                       {"text", c.text}, {"score", c.score}});
+                    if (decoded.size() >= limit) break;
+                }
+                if (decoded.size() >= limit) break;
+            }
         }
-        return {{"image", img_name}, {"strings", arr},
-                {"total_scanned", stats.scanned}, {"truncated", stats.truncated}};
+        json out = {{"image", img_name}, {"strings", arr},
+                    {"total_scanned", stats.scanned}, {"truncated", stats.truncated}};
+        if (decode) {
+            out["decoded"] = decoded;
+            out["decoded_count"] = decoded.size();
+        }
+        return out;
     }
 
     // hyperion backed actions, shared session only
@@ -904,6 +976,10 @@ json tool_disasm(const json& args) {
             const hype::Function* f = bin.hype->function_at(addr);
             if (!f) fail("no hyperion function contains address " + hex64(addr));
             json arr = json::array();
+            // Graph shape for the UI canvas: nodes carry the address range and
+            // an instruction summary, edges the successor kind
+            // (fallthrough when the target is the block's own end, else branch)
+            json nodes = json::array(), edges = json::array();
             for (const auto& [start, bb] : f->blocks) {
                 json succs = json::array(), preds = json::array();
                 for (auto s : bb.succs) succs.push_back(s);
@@ -912,6 +988,21 @@ json tool_disasm(const json& args) {
                                {"size", bb.end - start},
                                {"insn_count", bb.insns.size()},
                                {"succs", succs}, {"preds", preds}});
+                std::string summary;
+                if (!bb.insns.empty()) {
+                    const auto& first = bb.insns.front();
+                    summary = first.mnemonic;
+                    if (first.op_str[0]) summary += std::string(" ") + first.op_str;
+                    if (bb.insns.size() > 1)
+                        summary += " ... (" + std::to_string(bb.insns.size()) + " insns)";
+                }
+                nodes.push_back({{"id", start}, {"start", start}, {"end", bb.end},
+                                 {"size", bb.end - start},
+                                 {"insn_count", bb.insns.size()},
+                                 {"summary", summary}});
+                for (auto s : bb.succs)
+                    edges.push_back({{"from", start}, {"to", s},
+                                     {"kind", s == bb.end ? "fallthrough" : "branch"}});
             }
             json loops = json::array();
             for (const auto& lp : f->loops)
@@ -922,6 +1013,7 @@ json tool_disasm(const json& args) {
                                   ? bin.hype->db().names.at(f->entry)
                                   : disasm::default_function_name(f->entry)},
                     {"blocks", arr}, {"count", arr.size()},
+                    {"graph", {{"nodes", nodes}, {"edges", edges}}},
                     {"loops", loops}};
         }
 
@@ -957,8 +1049,8 @@ json tool_disasm(const json& args) {
     }
 
     fail("disasm: unknown action (assemble|disassemble|loaded|pe|functions|"
-         "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|unload|"
-         "analyze_stop|managed)");
+         "xrefs|strings|symbols|symbol_set|blocks|globals|vtables|load|load_self|"
+         "unload|analyze_stop|managed)");
 }
 
 } // namespace slop::core::mcp::detail

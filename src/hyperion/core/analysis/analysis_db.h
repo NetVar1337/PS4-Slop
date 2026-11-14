@@ -124,6 +124,9 @@ struct AnalysisDB {
     std::unordered_map<va_t, Global>            globals;
     std::unordered_map<va_t, va_t>              resolved_indirect;
     std::unordered_map<va_t, FuncSignature>     signatures;
+    // call instruction VA -> parameter types of its direct callee, filled by
+    // the one-level inter-procedural pass (propagate_call_arg_types)
+    std::unordered_map<va_t, std::vector<std::string>> call_arg_types;
     TypeSystem                                  types;
     mutable std::mutex                          mtx;
 

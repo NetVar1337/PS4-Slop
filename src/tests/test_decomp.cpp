@@ -8,6 +8,7 @@
 
 #include "core/disasm/binary_state.hpp"
 #include "core/mcp/mcp_tools.hpp"
+#include "core/re/type_catalog.hpp"
 #include "elf_fixture.hpp"
 #include "core/disasm/hyperion_session.hpp"
 #include "hyperion/core/decompiler/emitter.h"
@@ -21,10 +22,13 @@
 #include <Zydis/Encoder.h>
 
 #include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <thread>
+
+#include <windows.h>
 
 namespace disasm = slop::core::disasm;
 namespace hs     = slop::core::disasm::hyperion_session;
@@ -549,4 +553,75 @@ TEST_CASE(decomp_disasm_functions_filters_and_pages_server_side) {
     REQUIRE_EQ(seen.size(), total);
     REQUIRE(std::is_sorted(seen.begin(), seen.end()));
     bs::unload();
+}
+
+namespace {
+
+// points the per-binary annotation/type stores at a temp dir so a mutation
+// test never touches the real user profile
+struct scoped_localappdata_t {
+    std::string old;
+    bool        had = false;
+    explicit scoped_localappdata_t(const std::string& dir) {
+        char buf[MAX_PATH]{};
+        const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) { had = true; old.assign(buf, n); }
+        SetEnvironmentVariableA("LOCALAPPDATA", dir.c_str());
+    }
+    ~scoped_localappdata_t() {
+        SetEnvironmentVariableA("LOCALAPPDATA", had ? old.c_str() : nullptr);
+    }
+};
+
+} // namespace
+
+TEST_CASE(decomp_rerenders_after_type_edit) {
+    using L = elf_fixture::ps4_layout;
+    namespace bs = disasm::binary_state;
+    namespace tc = slop::core::re::type_catalog;
+
+    const auto dir = std::filesystem::temp_directory_path() /
+                     ("slop_types_" + std::to_string(GetCurrentProcessId()));
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    {
+        scoped_localappdata_t env(dir.string());
+        elf_fixture::temp_file_t tf(elf_fixture::build_ps4_elf(), "decomp_types");
+        REQUIRE(bs::load_file(tf.path.string(), 0x400000));
+        REQUIRE(wait_hype_ready());
+
+        bool is_error = false;
+        const auto call = [&](const char* tool, nlohmann::json args) {
+            auto r = slop::core::mcp::call_tool(tool, std::move(args), is_error);
+            REQUIRE_FALSE(is_error);
+            return r;
+        };
+
+        const uint64_t target = 0x400000 + L::kFunc2;
+        const auto before = call("decomp", {{"action", "function"}, {"addr", target}});
+        REQUIRE(before.contains("lines"));
+        const uint64_t gen_before = before.value("types_generation", uint64_t{0});
+
+        // struct edit bumps the generation; the next decomp.function reports
+        // the new generation (the session re-renders instead of serving cache)
+        const auto created = call("types", {{"action", "create_struct"},
+                                            {"decl", "struct SlopRerender { u32 a; u64 b; };"}});
+        REQUIRE_EQ(created.value("declared", size_t{0}), size_t{1});
+        const uint64_t gen_struct = tc::generation();
+        REQUIRE_GT(gen_struct, gen_before);
+
+        const auto after = call("decomp", {{"action", "function"}, {"addr", target}});
+        REQUIRE_GT(after.value("types_generation", uint64_t{0}), gen_before);
+        REQUIRE_EQ(after["lines"].size(), before["lines"].size());
+
+        // enum edits bump it again
+        const auto en = call("types", {{"action", "create_enum"},
+                                       {"name", "SlopRerenderKind"},
+                                       {"values", nlohmann::json::array(
+                                           {{{"name", "A"}, {"value", 1}}})}});
+        REQUIRE(en.value("created", false));
+        REQUIRE_GT(tc::generation(), gen_struct);
+        bs::unload();
+    }
+    std::filesystem::remove_all(dir, ec);
 }

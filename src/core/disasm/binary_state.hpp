@@ -83,6 +83,9 @@ struct binary_t {
     // set by patch mutations, indexes are stale until rebuilt
     bool indexes_dirty = false;
 
+    // Hyperion's function starts were merged into fns (one shot per analysis)
+    bool hype_fns_merged = false;
+
     // file offset for a va when backed
     std::optional<size_t> offset_of(uint64_t va) const;
 
@@ -115,6 +118,14 @@ std::optional<disasm::insn_t> decode_insn(const binary_t& b, uint64_t va,
 // After byte patches: rebuild fns/xrefs/strings for the image's arch and
 // restart hyperion on the patched bytes. Caller holds state_mutex()
 void rebuild_indexes_locked(binary_t& b);
+
+// Fold Hyperion's function starts (entries, thunks, tail-call targets) into
+// b.fns once its analysis is ready, so disasm.functions, xrefs and the UI see
+// one set. Publishes disasm.index_updated {what:"functions"} when rows were
+// added. Returns the number of starts added. Caller holds state_mutex()
+size_t merge_hype_functions_locked(binary_t& b);
+// Same, taking the state mutex itself
+size_t sync_hype_functions();
 
 // load the main module of the attached target
 bool load_from_target();

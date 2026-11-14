@@ -35,4 +35,24 @@ std::vector<libsig_hit_t> libsig_scan(
 std::optional<std::vector<libsig_t>> parse_sig_set(const std::string& json_text,
                                                    std::string* error = nullptr);
 
+// IDA FLIRT (.sig) import
+
+struct flirt_sig_t {
+    std::string library;      // library name from the header
+    std::string ctype;        // compiler id string, e.g. "Visual C++"
+    uint8_t     version = 0;  // FLIRT format version (5..10)
+    uint8_t     arch    = 0;  // FlirtArch value
+    std::vector<libsig_t> sigs;
+};
+
+// Parse an IDA FLIRT signature file into libsig patterns: one entry per
+// module, named after its first public function, anchored on the module's
+// pattern bytes (variant-mask wildcards become ??). zlib-compressed files
+// (feature bit 0x10) are inflated first. crc16 tails and referenced-function
+// constraints are not modelled by libsig, so a FLIRT match here is a
+// candidate: confirm it by disassembling the hit. Every read is bounds
+// checked; malformed input returns nullopt with `error` set.
+std::optional<flirt_sig_t> parse_flirt_sig(const uint8_t* data, size_t len,
+                                           std::string* error = nullptr);
+
 } // namespace slop::core::analysis

@@ -21,6 +21,15 @@ namespace hype {
 // around every ARM decode; one handle per thread decodes in parallel
 CapstoneDisasm& thread_capstone(Arch arch);
 
+// One-level inter-procedural type propagation, both bounded single passes.
+// propagate_call_arg_types copies each direct callee's parameter types onto
+// the call instruction (AnalysisDB::call_arg_types) so callers render typed
+// arguments. promote_rtti_this_types turns the first parameter of every
+// method recovered through RTTI into `Class* this`. Both return how many
+// entries they filled; neither invents types for unanalyzed code.
+size_t propagate_call_arg_types(AnalysisDB& db);
+size_t promote_rtti_this_types(const std::vector<RTTIClass>& classes, AnalysisDB& db);
+
 class Analyzer {
 public:
     Analyzer(PEImage& img, WorkerPool& pool);

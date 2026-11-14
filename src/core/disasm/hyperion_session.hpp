@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -77,13 +78,19 @@ struct session_t {
 
     // Decompile the function containing `va` to pseudo-C lines. Results are
     // cached per function entry (LRU, kDecompCacheCapacity functions) and
-    // invalidated by reanalysis or renames
+    // invalidated by reanalysis, renames, or a changed type generation
     bool decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
                    std::string& err);
     static constexpr size_t kDecompCacheCapacity = 256;
     void   set_decomp_cache_capacity(size_t n);   // >= 1; trims on shrink
     size_t decomp_cache_size() const;
     bool   decomp_cached(uint64_t entry) const;
+
+    // Source of the types/names generation the decompile cache stamps entries
+    // with (binary_state wires this to re::type_catalog::generation). A
+    // changed value re-renders the next decompile instead of serving stale
+    // pseudocode. Null source means generation 0 (never invalidates)
+    void set_type_generation(std::function<uint64_t()> fn);
 
     // User renames to apply onto the AnalysisDB once analysis lands (names
     // the analyzer derives would otherwise clobber mid-analysis renames)
@@ -125,12 +132,18 @@ private:
     std::vector<BlockRange> block_ranges_;
 
     // Decompile cache, keyed by function entry, most recent first. Valid
-    // until reanalyze/queue_names; guarded by decomp_mu_
-    using decomp_lru_t = std::list<std::pair<uint64_t, std::vector<hype::PseudoLine>>>;
+    // until reanalyze/queue_names or a type generation change; guarded by
+    // decomp_mu_
+    struct decomp_entry_t {
+        uint64_t                      entry = 0;
+        uint64_t                      gen   = 0;
+        std::vector<hype::PseudoLine> lines;
+    };
+    using decomp_lru_t = std::list<decomp_entry_t>;
     decomp_lru_t decomp_lru_;
     std::unordered_map<uint64_t, decomp_lru_t::iterator> decomp_cache_;
-    std::atomic<uint64_t> decomp_cache_gen_{0};
     size_t decomp_cache_cap_ = kDecompCacheCapacity;
+    std::function<uint64_t()> type_gen_;   // guarded by decomp_mu_
 
     std::thread        worker_;
     mutable std::mutex start_mu_;   // serializes start/reanalyze/stop/dtor

@@ -1841,6 +1841,48 @@ void Analyzer::detect_main() {
     }
 }
 
+size_t propagate_call_arg_types(AnalysisDB& db) {
+    size_t filled = 0;
+    for (auto& [entry, func] : db.funcs) {
+        (void)entry;
+        if (!func.analyzed) continue;
+        for (auto& [bstart, bb] : func.blocks) {
+            (void)bstart;
+            for (const auto& insn : bb.insns) {
+                if (!insn.is_call()) continue;
+                const va_t target = insn.branch_target();
+                if (!target) continue;
+                const auto sit = db.signatures.find(target);
+                if (sit == db.signatures.end() || sit->second.param_types.empty()) continue;
+                if (db.call_arg_types.try_emplace(insn.addr, sit->second.param_types).second)
+                    ++filled;
+            }
+        }
+    }
+    return filled;
+}
+
+size_t promote_rtti_this_types(const std::vector<RTTIClass>& classes, AnalysisDB& db) {
+    size_t promoted = 0;
+    for (const auto& cls : classes) {
+        if (cls.demangled_name.empty()) continue;
+        const std::string this_type = cls.demangled_name + "*";
+        for (const va_t method : cls.methods) {
+            const auto it = db.signatures.find(method);
+            if (it == db.signatures.end() || it->second.param_types.empty()) continue;
+            // only replace the generic recovered type, never a declared one
+            if (it->second.param_types[0] != "int64_t" &&
+                it->second.param_types[0] != "void*")
+                continue;
+            it->second.param_types[0] = this_type;
+            if (it->second.param_names.empty()) it->second.param_names.push_back("this");
+            else                               it->second.param_names[0] = "this";
+            ++promoted;
+        }
+    }
+    return promoted;
+}
+
 void Analyzer::propagate_interproc_types() {
     static const std::unordered_map<std::string, FuncSignature> known_sigs = {
         {"strlen",   {{"str"}, {"const char*"}, "size_t", 1}},
@@ -1898,32 +1940,14 @@ void Analyzer::propagate_interproc_types() {
         }
     }
 
-    // Loop 3 (call-site propagation) is currently a read-only no-op
-    // placeholder: every analyzed function already owns a signature from
-    // the commit above, so the lookup below can never insert. Fans out
-    // freely.
-    parallel_for(pool_, order.size(), [&](size_t k) {
-        Function& func = *order[k];
-        const va_t entry = func.entry;
-        if (!func.analyzed) return;
-        for (auto& [ba, bb] : func.blocks) {
-            for (auto& insn : bb.insns) {
-                if (!insn.is_call()) continue;
-                va_t target = insn.branch_target();
-                if (!target) continue;
-                auto sit = db_.signatures.find(target);
-                if (sit == db_.signatures.end()) continue;
-                auto& callee_sig = sit->second;
+    // Loop 3: one level of argument types at call sites, plus RTTI `this`
+    // promotion. Both are single bounded passes over the committed DB.
+    const size_t call_args = propagate_call_arg_types(db_);
+    const size_t this_types = promote_rtti_this_types(rtti_.classes(), db_);
 
-                if (callee_sig.return_type != "int64_t") {
-                    auto caller_it = db_.signatures.find(entry);
-                    (void)caller_it;
-                }
-            }
-        }
-    });
-
-    spdlog::info("interproc: propagated {} function signatures", propagated + (u32)db_.signatures.size());
+    spdlog::info("interproc: propagated {} function signatures, {} call sites, "
+                 "{} rtti this types",
+                 propagated + (u32)db_.signatures.size(), call_args, this_types);
 }
 
 bool Analyzer::decode_insn(va_t addr, const u8* data, size_t len, Insn& out) {

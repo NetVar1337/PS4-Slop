@@ -97,7 +97,8 @@ SelfExtractResult SELFLoader::extract_elf(const u8* data, size_t size) {
             [](const SelfSegmentInfo& s) { return s.blocked && s.encrypted; });
         return fail(fmt::format(
             "encrypted SELF: {} of {} data segments are encrypted (first: SELF "
-            "segment {} = program header {}). Retail eboot.bin/.sprx files are "
+            "segment {} = program header {} at file offset 0x{:X}, {} bytes "
+            "stored). Retail eboot.bin/.sprx files are "
             "decrypted only on the console; run the title on a PS4 with the "
             "ps4debug payload and call target.ps4_dump_module {{name, load:true}} "
             "(or dump the decrypted ELF with a homebrew dumper) and load that "
@@ -105,7 +106,9 @@ SelfExtractResult SELFLoader::extract_elf(const u8* data, size_t size) {
             r.encrypted_segments,
             std::count_if(r.segments.begin(), r.segments.end(),
                           [](const SelfSegmentInfo& s) { return s.blocked; }),
-            enc - r.segments.begin(), enc->id));
+            enc - r.segments.begin(), enc->id,
+            static_cast<unsigned long long>(enc->offset),
+            static_cast<unsigned long long>(enc->file_size)));
     }
 
     // output layout: ELF header + phdrs at their file offsets, each

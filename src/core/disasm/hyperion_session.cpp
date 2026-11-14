@@ -500,14 +500,18 @@ void session_t::invalidate_decomp_cache() {
     std::lock_guard lk(decomp_mu_);
     decomp_cache_.clear();
     decomp_lru_.clear();
-    ++decomp_cache_gen_;
+}
+
+void session_t::set_type_generation(std::function<uint64_t()> fn) {
+    std::lock_guard lk(decomp_mu_);
+    type_gen_ = std::move(fn);
 }
 
 void session_t::set_decomp_cache_capacity(size_t n) {
     std::lock_guard lk(decomp_mu_);
     decomp_cache_cap_ = n ? n : 1;
     while (decomp_cache_.size() > decomp_cache_cap_) {
-        decomp_cache_.erase(decomp_lru_.back().first);
+        decomp_cache_.erase(decomp_lru_.back().entry);
         decomp_lru_.pop_back();
     }
 }
@@ -535,12 +539,18 @@ bool session_t::decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
     }
     {
         std::lock_guard lk(decomp_mu_);
+        const uint64_t gen = type_gen_ ? type_gen_() : 0;
         auto cached = decomp_cache_.find(f->entry);
         if (cached != decomp_cache_.end()) {
-            // hit: move to the most-recently-used end
-            decomp_lru_.splice(decomp_lru_.begin(), decomp_lru_, cached->second);
-            out = cached->second->second;
-            return true;
+            if (cached->second->gen == gen) {
+                // hit: move to the most-recently-used end
+                decomp_lru_.splice(decomp_lru_.begin(), decomp_lru_, cached->second);
+                out = cached->second->lines;
+                return true;
+            }
+            // types/names changed since this entry was rendered
+            decomp_lru_.erase(cached->second);
+            decomp_cache_.erase(cached);
         }
         hype::Decompiler dec;
         out = dec.decompile(*f, db(), &rtti());
@@ -551,10 +561,10 @@ bool session_t::decompile(uint64_t va, std::vector<hype::PseudoLine>& out,
         // Bounded LRU: evict the least recently used function, never the
         // whole cache (a full flush made every big-binary session thrash)
         if (decomp_cache_.size() >= decomp_cache_cap_ && !decomp_lru_.empty()) {
-            decomp_cache_.erase(decomp_lru_.back().first);
+            decomp_cache_.erase(decomp_lru_.back().entry);
             decomp_lru_.pop_back();
         }
-        decomp_lru_.emplace_front(f->entry, out);
+        decomp_lru_.push_front({f->entry, gen, out});
         decomp_cache_[f->entry] = decomp_lru_.begin();
     }
     return true;

@@ -7,6 +7,7 @@
 
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/hyperion_session.hpp"
+#include "core/infra/event_bus.hpp"
 #include "threading/parallel.h"
 #include "core/loader/elf_loader.h"
 #include "core/loader/ps4_nid.h"
@@ -24,6 +25,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace hs = slop::core::disasm::hyperion_session;
@@ -615,4 +617,127 @@ TEST_CASE(hyperion_decomp_cache_is_lru) {
     std::vector<hype::PseudoLine> again;
     REQUIRE(s.decompile(L::kFunc3, again, err));
     REQUIRE_EQ(again.size(), out.size());
+}
+
+TEST_CASE(hyperion_functions_merge_into_index) {
+    auto sub = slop::core::infra::event_bus::subscribe();
+    REQUIRE(ds::load_file(SLOP_TARGET_EXE_PATH));
+    REQUIRE(wait_hype_ready());
+    const auto& bin = ds::get();
+    REQUIRE(bin.hype != nullptr);
+
+    // every analyzer function start is now an index start, and the rows the
+    // merge added are marked with their source
+    std::unordered_set<uint64_t> starts;
+    for (const auto& f : bin.fns.functions()) starts.insert(f.va);
+    for (const auto& [entry, f] : bin.hype->db().funcs) {
+        (void)f;
+        REQUIRE(starts.count(entry) != 0);
+    }
+    REQUIRE_GT(bin.fns.stats().hype_functions, 0u);
+    bool saw_source = false;
+    for (const auto& f : bin.fns.functions())
+        if (f.source == disasm::fn_source_t::hyperion) saw_source = true;
+    REQUIRE(saw_source);
+
+    // the UI is told the index changed
+    bool saw_event = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    std::string frame;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (!sub->wait(frame, 200)) break;
+        if (frame.find("disasm.index_updated") != std::string::npos &&
+            frame.find("\"functions\"") != std::string::npos) {
+            saw_event = true;
+            break;
+        }
+    }
+    REQUIRE(saw_event);
+    ds::unload();
+}
+
+TEST_CASE(hyperion_interproc_types_propagate_to_call_sites) {
+    hype::AnalysisDB db;
+    hype::Function caller;
+    caller.entry = 0x1000;
+    caller.analyzed = true;
+    hype::BasicBlock bb;
+    bb.start = 0x1000;
+    bb.end = 0x1010;
+    hype::Insn call{};
+    call.addr = 0x1004;
+    call.type = hype::InsnType::Call;
+    call.op_count = 1;
+    call.ops[0].type = hype::OpType::Imm;
+    call.ops[0].val = 0x2000;
+    bb.insns.push_back(call);
+    caller.blocks[0x1000] = bb;
+    caller.block_addrs = {0x1000};
+    db.funcs[0x1000] = caller;
+
+    hype::FuncSignature sig;
+    sig.param_types = {"void*", "size_t"};
+    sig.param_names = {"dst", "n"};
+    sig.param_count = 2;
+    db.signatures[0x2000] = sig;
+
+    REQUIRE_EQ(hype::propagate_call_arg_types(db), size_t{1});
+    REQUIRE(db.call_arg_types.count(0x1004) != 0);
+    REQUIRE_EQ(db.call_arg_types[0x1004].size(), size_t{2});
+    REQUIRE_STR_EQ(db.call_arg_types[0x1004][0], "void*");
+    REQUIRE_STR_EQ(db.call_arg_types[0x1004][1], "size_t");
+    // second pass is a no-op
+    REQUIRE_EQ(hype::propagate_call_arg_types(db), size_t{0});
+}
+
+TEST_CASE(hyperion_rtti_promotes_this_types) {
+    hype::AnalysisDB db;
+    hype::FuncSignature sig;
+    sig.param_types = {"int64_t"};
+    sig.param_names = {"a1"};
+    sig.param_count = 1;
+    db.signatures[0x3000] = sig;
+
+    hype::RTTIClass cls;
+    cls.demangled_name = "Player";
+    cls.methods = {0x3000};
+    REQUIRE_EQ(hype::promote_rtti_this_types({cls}, db), size_t{1});
+    REQUIRE_STR_EQ(db.signatures[0x3000].param_types[0], "Player*");
+    REQUIRE_STR_EQ(db.signatures[0x3000].param_names[0], "this");
+
+    // a declared type is never overwritten
+    db.signatures[0x3000].param_types[0] = "MyStruct*";
+    REQUIRE_EQ(hype::promote_rtti_this_types({cls}, db), size_t{0});
+    REQUIRE_STR_EQ(db.signatures[0x3000].param_types[0], "MyStruct*");
+}
+
+TEST_CASE(hyperion_decomp_cache_rekeys_on_type_generation) {
+    using L = elf_fixture::ps4_layout;
+    auto elf = elf_fixture::build_ps4_elf();
+    hs::session_t s;
+    REQUIRE(s.start_sync(elf.data(), elf.size(), 0));
+
+    std::atomic<uint64_t> gen{1};
+    s.set_type_generation([&gen] { return gen.load(std::memory_order_acquire); });
+
+    const auto text_of = [](const std::vector<hype::PseudoLine>& lines) {
+        std::string t;
+        for (const auto& l : lines) t += l.text + "\n";
+        return t;
+    };
+
+    std::vector<hype::PseudoLine> first, cached, rerendered;
+    std::string err;
+    REQUIRE(s.decompile(L::kEntry, first, err));
+    REQUIRE(!text_of(first).empty());
+
+    // a name edit without a generation bump serves the cached render
+    s.db_mut().names[L::kFunc2] = "renamed_callee";
+    REQUIRE(s.decompile(L::kEntry, cached, err));
+    REQUIRE_STR_EQ(text_of(cached), text_of(first));
+
+    // bumping the generation (a type/name edit) re-renders from the DB
+    gen.fetch_add(1, std::memory_order_release);
+    REQUIRE(s.decompile(L::kEntry, rerendered, err));
+    REQUIRE(text_of(rerendered).find("renamed_callee") != std::string::npos);
 }

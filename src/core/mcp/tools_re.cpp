@@ -231,20 +231,41 @@ json tool_re(const json& args) {
         return {{"hits", arr}, {"count", arr.size()}};
     }
     if (action == "libsig") {
-        if (!args.contains("sigset")) fail("missing sigset JSON");
-        std::string sig_err;
-        auto sigs = analysis::parse_sig_set(
-            args.at("sigset").get<std::string>(), &sig_err);
-        if (!sigs) fail(sig_err.empty() ? "bad sigset" : sig_err);
-        auto hits = analysis::libsig_scan(*pe, *file, *fidx, *sigs);
+        std::vector<analysis::libsig_t> sigs;
+        json out = json::object();
+        if (args.contains("sig_path") && args.at("sig_path").is_string()) {
+            // IDA FLIRT .sig import: parsed into the same pattern matcher
+            const std::string sig_path = args.at("sig_path").get<std::string>();
+            std::ifstream f(sig_path, std::ios::binary);
+            if (!f) fail("cannot open signature file " + sig_path);
+            std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                                       std::istreambuf_iterator<char>{});
+            std::string sig_err;
+            auto parsed = analysis::parse_flirt_sig(bytes.data(), bytes.size(), &sig_err);
+            if (!parsed) fail(sig_err.empty() ? "bad FLIRT signature file" : sig_err);
+            sigs = std::move(parsed->sigs);
+            out["library"]       = parsed->library;
+            out["ctype"]         = parsed->ctype;
+            out["flirt_version"] = parsed->version;
+        } else {
+            if (!args.contains("sigset")) fail("missing sigset JSON or sig_path");
+            std::string sig_err;
+            auto parsed = analysis::parse_sig_set(
+                args.at("sigset").get<std::string>(), &sig_err);
+            if (!parsed) fail(sig_err.empty() ? "bad sigset" : sig_err);
+            sigs = std::move(*parsed);
+        }
+        auto hits = analysis::libsig_scan(*pe, *file, *fidx, sigs);
         json arr = json::array();
         for (const auto& h : hits) {
             json o = {{"name", h.sig_name}, {"va", h.va}};
             if (h.function_va) o["function_va"] = *h.function_va;
             arr.push_back(std::move(o));
         }
-        return {{"hits", arr}, {"count", arr.size()},
-                {"requested", sigs->size()}};
+        out["hits"]      = arr;
+        out["count"]     = arr.size();
+        out["requested"] = sigs.size();
+        return out;
     }
 
     fail("re: unknown action (rtti_scan|vftable|danger|libsig)");

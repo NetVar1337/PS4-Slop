@@ -323,6 +323,43 @@ bool function_index_t::build_from_bounds(const pe_image_t& pe,
     return true;
 }
 
+size_t function_index_t::merge_starts(
+        const std::vector<std::pair<uint64_t, uint64_t>>& starts,
+        size_t max_functions) {
+    if (starts.empty()) return 0;
+
+    std::unordered_set<uint64_t> known;
+    known.reserve(fns_.size());
+    for (const auto& f : fns_) known.insert(f.va);
+
+    size_t added = 0;
+    for (const auto& [va, size] : starts) {
+        if (!va || !known.insert(va).second) continue;
+        if (fns_.size() >= max_functions) { stats_.truncated = true; break; }
+        fns_.push_back({va, static_cast<size_t>(size), fn_source_t::hyperion});
+        ++added;
+    }
+    if (!added) return 0;
+    stats_.hype_functions += added;
+
+    // index entries sort before hyperion ones on the same VA so the dedupe
+    // keeps the decode-built extent
+    std::sort(fns_.begin(), fns_.end(), [](const function_t& a, const function_t& b) {
+        if (a.va != b.va) return a.va < b.va;
+        return static_cast<uint8_t>(a.source) < static_cast<uint8_t>(b.source);
+    });
+    fns_.erase(std::unique(fns_.begin(), fns_.end(),
+                           [](const function_t& a, const function_t& b) {
+                               return a.va == b.va;
+                           }),
+               fns_.end());
+    for (size_t i = 0; i + 1 < fns_.size(); ++i) {
+        const size_t span = static_cast<size_t>(fns_[i + 1].va - fns_[i].va);
+        fns_[i].size = fns_[i].size ? std::min(fns_[i].size, span) : span;
+    }
+    return added;
+}
+
 std::optional<uint64_t> function_index_t::containing(uint64_t va) const {
     // Binary search: greatest start <= va
     auto it = std::upper_bound(fns_.begin(), fns_.end(), va,

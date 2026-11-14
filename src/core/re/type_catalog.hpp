@@ -47,6 +47,10 @@ std::vector<enum_def_t>     list_enums(const std::string& filter = "");
 
 // mutations (persist immediately)
 
+// Monotonic counter bumped by every mutation and by bind_binary. Consumers
+// that cache derived output (the decompiler) compare it to re-render.
+uint64_t generation();
+
 bool create_struct(struct_def_t def, std::string* error = nullptr);
 bool add_member(const std::string& struct_name, const field_t& field,
                 std::string* error = nullptr);

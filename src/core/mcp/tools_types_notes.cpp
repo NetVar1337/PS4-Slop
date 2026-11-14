@@ -142,6 +142,13 @@ json tool_types(const json& args) {
     namespace tc = re::type_catalog;
     const std::string action = require_action(args);
 
+    // every mutation bumps the catalog generation; tell the UI so it can
+    // refresh rendered types and decompiled functions
+    const auto publish_types_changed = [] {
+        slop::core::infra::event_bus::publish(
+            "types.changed", {{"generation", tc::generation()}});
+    };
+
     if (action == "create_struct" || action == "declare") {
         std::string decl_text;
         if (args.contains("decl") && args.at("decl").is_string())
@@ -158,6 +165,7 @@ json tool_types(const json& args) {
         for (auto& e : pr.enums)
             if (tc::create_enum(std::move(e), &errs)) ++n;
         if (n == 0) fail(errs.empty() ? "nothing declared" : errs);
+        publish_types_changed();
         return {{"declared", n}};
     }
 
@@ -179,11 +187,15 @@ json tool_types(const json& args) {
         f.array_count = static_cast<uint32_t>(args.value("array_count", 0u));
         std::string err;
         if (!tc::add_member(args.at("name").get<std::string>(), f, &err)) fail(err);
+        publish_types_changed();
         auto s = tc::get_struct(args.at("name").get<std::string>());
         return struct_to_json(*s);
     }
-    if (action == "remove_struct")
-        return {{"removed", tc::remove_struct(args.at("name").get<std::string>())}};
+    if (action == "remove_struct") {
+        const bool removed = tc::remove_struct(args.at("name").get<std::string>());
+        if (removed) publish_types_changed();
+        return {{"removed", removed}};
+    }
 
     if (action == "create_enum") {
         tc::enum_def_t e;
@@ -198,6 +210,7 @@ json tool_types(const json& args) {
         }
         std::string err;
         if (!tc::create_enum(std::move(e), &err)) fail(err);
+        publish_types_changed();
         return {{"created", true}};
     }
     if (action == "get_enum") {
@@ -211,8 +224,11 @@ json tool_types(const json& args) {
         for (const auto& e : all) arr.push_back(enum_to_json(e));
         return {{"enums", arr}, {"count", arr.size()}};
     }
-    if (action == "remove_enum")
-        return {{"removed", tc::remove_enum(args.at("name").get<std::string>())}};
+    if (action == "remove_enum") {
+        const bool removed = tc::remove_enum(args.at("name").get<std::string>());
+        if (removed) publish_types_changed();
+        return {{"removed", removed}};
+    }
 
     if (action == "format_at") {
         // pretty print typed memory like MYSTRUCT @ 140001234

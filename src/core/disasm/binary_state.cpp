@@ -232,6 +232,7 @@ void unload_locked() {
     g_bin.bookmarks.clear();
     g_bin.patches.clear();
     g_bin.indexes_dirty = false;
+    g_bin.hype_fns_merged = false;
     g_bin.ready = false;
 }
 
@@ -354,6 +355,11 @@ bool load_locked(const std::string& path, uint64_t base_override, bool apply_rel
     if (!g_bin.hype->start(g_bin.file.data(), g_bin.file.size(), g_bin.base)) {
         slop::core::infra::diag::warn("hyperion", g_bin.hype->error());
         g_bin.hype.reset();
+    } else {
+        // struct/enum edits bump the catalog generation; the decompile cache
+        // compares it per entry so the next decomp.function re-renders
+        g_bin.hype->set_type_generation(
+            [] { return slop::core::re::type_catalog::generation(); });
     }
 
     // The three sync stages are mutually independent (read-only over the
@@ -550,8 +556,49 @@ void rebuild_indexes_locked(binary_t& b) {
     b.strings = collect_strings(b.pe, b.file, b.base);
     b.indexes_dirty = false;
 
-    // reanalyze the patched bytes in the background
+    // reanalyze the patched bytes in the background; the new analysis gets
+    // its own one-shot merge into the index
+    b.hype_fns_merged = false;
     if (b.hype) b.hype->reanalyze(b.file);
+}
+
+size_t merge_hype_functions_locked(binary_t& b) {
+    if (!b.ready || !b.hype || b.hype_fns_merged || !b.hype->ready()) return 0;
+    b.hype_fns_merged = true;
+
+    const auto& db = b.hype->db();
+    std::vector<std::pair<uint64_t, uint64_t>> starts;
+    starts.reserve(db.funcs.size());
+    for (const auto& [entry, f] : db.funcs) {
+        // only starts the image actually maps: analyzer entries outside the
+        // sections would let containing() claim unmapped addresses
+        if (entry < b.base || entry - b.base > 0xFFFFFFFFull) continue;
+        if (!b.pe.rva_to_offset(static_cast<uint32_t>(entry - b.base))) continue;
+        uint64_t end = entry;
+        for (const auto& [bstart, bb] : f.blocks) {
+            (void)bstart;
+            if (bb.end > end) end = bb.end;
+        }
+        starts.emplace_back(entry, end > entry ? end - entry : 0);
+    }
+    const size_t added = b.fns.merge_starts(starts);
+    if (added) {
+        slop::core::infra::diag::info(
+            "fnindex", "merged " + std::to_string(added) +
+                " hyperion function starts (" + std::to_string(b.fns.functions().size()) +
+                " total)");
+        // its own type, not target.changed: that one carries the attach state
+        // and the engine store replaces its target object with the payload
+        slop::core::infra::event_bus::publish("disasm.index_updated", json{
+            {"what", "functions"}, {"source", "hyperion"}, {"added", added},
+            {"total", b.fns.functions().size()}});
+    }
+    return added;
+}
+
+size_t sync_hype_functions() {
+    std::lock_guard lk(g_mu);
+    return merge_hype_functions_locked(g_bin);
 }
 
 bool load_from_target() {
@@ -670,7 +717,9 @@ std::recursive_mutex& state_mutex() { return g_mu; }
 
 bool hype_ready() {
     std::lock_guard lk(g_mu);
-    return g_bin.ready && g_bin.hype && g_bin.hype->ready();
+    if (!g_bin.ready || !g_bin.hype || !g_bin.hype->ready()) return false;
+    merge_hype_functions_locked(g_bin);
+    return true;
 }
 
 float hype_progress() {
@@ -688,6 +737,7 @@ hype_status_t hype_status() {
     st.engine_present = g_bin.hype != nullptr;
     if (!g_bin.hype) return st;
     st.ready        = g_bin.hype->ready();
+    if (st.ready) merge_hype_functions_locked(g_bin);
     st.truncated    = st.ready && g_bin.hype->truncated();
     st.running      = !st.ready && g_bin.hype->running();
     st.progress     = st.ready ? 1.f : g_bin.hype->progress();

@@ -181,6 +181,19 @@ json tool_decomp(const json& args) {
         }
     }
 
+    // one level of inter-procedural types: the callee's parameter types at
+    // each direct call site (AnalysisDB::call_arg_types)
+    json jcalls = json::array();
+    for (const auto& [bstart, bb] : f->blocks) {
+        (void)bstart;
+        for (const auto& in : bb.insns) {
+            if (!in.is_call() || jcalls.size() >= 64) continue;
+            const auto cit = bin.hype->db().call_arg_types.find(in.addr);
+            if (cit == bin.hype->db().call_arg_types.end()) continue;
+            jcalls.push_back({{"va", in.addr}, {"arg_types", cit->second}});
+        }
+    }
+
     return {{"ok", true},
             {"engine", "hyperion"},
             {"signature", signature},
@@ -188,6 +201,8 @@ json tool_decomp(const json& args) {
             {"function_va", entry},
             {"insn_count", insn_count},
             {"vars", jvars},
+            {"call_sites", jcalls},
+            {"types_generation", re::type_catalog::generation()},
             {"lines", jlines}};
 }
 

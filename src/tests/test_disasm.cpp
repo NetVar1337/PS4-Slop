@@ -5,6 +5,7 @@
 #include "harness.hpp"
 
 #include "core/analysis/packer.hpp"
+#include "core/analysis/libsig.hpp"
 #include "core/disasm/binary_state.hpp"
 #include "core/disasm/engine.hpp"
 #include "core/disasm/function_index.hpp"
@@ -16,8 +17,11 @@
 #include "core/loader/elf_loader.h"
 #include "core/loader/ps4_nid.h"
 #include "core/loader/self_loader.h"
+#include "core/mcp/mcp_tools.hpp"
 
 #include "elf_fixture.hpp"
+
+#include <zlib.h>
 
 #include <algorithm>
 #include <atomic>
@@ -710,4 +714,343 @@ TEST_CASE(disasm_arm64_decode_parallel_per_thread_handles) {
     }
     for (auto& th : threads) th.join();
     REQUIRE_EQ(bad.load(), 0);
+}
+
+// === unified function index (Hyperion merge) ===
+
+TEST_CASE(function_index_merges_hyperion_starts) {
+    const auto& bytes = slop_target_bytes();
+    auto pe = pe_parse(bytes.data(), bytes.size());
+    REQUIRE(pe.ok);
+
+    engine_t eng;
+    REQUIRE(eng.init());
+    function_index_t fi;
+    REQUIRE(fi.build(pe, bytes, eng, pe.image_base));
+    const size_t before = fi.functions().size();
+    const uint64_t entry = pe.image_base + pe.entry_rva;
+
+    // entry is already a start; entry+1 is not, and is passed twice
+    const function_t* entry_fn = nullptr;
+    for (const auto& f : fi.functions())
+        if (f.va == entry) { entry_fn = &f; break; }
+    REQUIRE(entry_fn != nullptr);
+    REQUIRE_GT(entry_fn->size, 2u);
+
+    const size_t added = fi.merge_starts({{entry, 16}, {entry + 1, 0}, {entry + 1, 0}});
+    REQUIRE_EQ(added, size_t{1});
+    REQUIRE_EQ(fi.functions().size(), before + 1);
+    REQUIRE_EQ(fi.stats().hype_functions, size_t{1});
+
+    const function_t* merged = nullptr;
+    const function_t* kept = nullptr;
+    for (const auto& f : fi.functions()) {
+        if (f.va == entry) kept = &f;
+        if (f.va == entry + 1) merged = &f;
+    }
+    REQUIRE(kept != nullptr);
+    REQUIRE(merged != nullptr);
+    // the decode-built entry keeps ownership; its extent clips at the new start
+    REQUIRE(kept->source == fn_source_t::index);
+    REQUIRE_EQ(kept->size, size_t{1});
+    REQUIRE(merged->source == fn_source_t::hyperion);
+    REQUIRE_GE(merged->size, size_t{1});
+    // sorted + containing() agrees
+    REQUIRE(std::is_sorted(fi.functions().begin(), fi.functions().end(),
+                           [](const function_t& a, const function_t& b) {
+                               return a.va < b.va;
+                           }));
+    REQUIRE_EQ(*fi.containing(entry + 1), entry + 1);
+}
+
+// === string decoding previews ===
+
+TEST_CASE(strings_decode_candidates_finds_obfuscation) {
+    const auto has = [](const std::vector<decode_candidate_t>& cs,
+                        const std::string& scheme, const std::string& text) {
+        return std::any_of(cs.begin(), cs.end(), [&](const decode_candidate_t& c) {
+            return c.scheme == scheme && c.text == text;
+        });
+    };
+
+    // single-byte XOR
+    const std::string plain = "hello obfuscated world";
+    std::vector<uint8_t> xored(plain.size());
+    for (size_t i = 0; i < plain.size(); ++i)
+        xored[i] = static_cast<uint8_t>(plain[i]) ^ 0x5A;
+    REQUIRE(has(decode_candidates(xored.data(), xored.size()), "xor:0x5A", plain));
+
+    // base64
+    const std::string b64 = "aGVsbG8gd29ybGQ=";   // "hello world"
+    REQUIRE(has(decode_candidates(reinterpret_cast<const uint8_t*>(b64.data()),
+                                  b64.size()),
+                "base64", "hello world"));
+
+    // UTF-16LE
+    std::vector<uint8_t> u16;
+    for (char c : std::string("wide string")) {
+        u16.push_back(static_cast<uint8_t>(c));
+        u16.push_back(0);
+    }
+    REQUIRE(has(decode_candidates(u16.data(), u16.size()), "utf16le", "wide string"));
+
+    // ROT13
+    const std::string rot = "uryyb jbeyq";        // "hello world"
+    REQUIRE(has(decode_candidates(reinterpret_cast<const uint8_t*>(rot.data()),
+                                  rot.size()),
+                "rot13", "hello world"));
+
+    // entropy gate: uniform bytes score 8 bits, plain text much lower
+    std::vector<uint8_t> uniform(256);
+    for (size_t i = 0; i < uniform.size(); ++i) uniform[i] = static_cast<uint8_t>(i);
+    REQUIRE_GT(shannon_entropy(uniform.data(), uniform.size()), 7.9);
+    REQUIRE_LT(shannon_entropy(reinterpret_cast<const uint8_t*>(plain.data()),
+                               plain.size()), 5.0);
+}
+
+TEST_CASE(disasm_strings_decode_action_returns_candidates) {
+    bool is_error = false;
+    auto out = slop::core::mcp::call_tool(
+        "disasm", {{"action", "strings"}, {"path", SLOP_TARGET_EXE_PATH},
+                   {"decode", true}, {"limit", 50}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE(out.contains("decoded"));
+    REQUIRE_EQ(out.value("decoded_count", size_t{99}), out["decoded"].size());
+    for (const auto& c : out["decoded"]) {
+        REQUIRE(c.contains("scheme"));
+        REQUIRE(c.contains("score"));
+        REQUIRE_GT(c.value("score", 0.0), 0.9);
+    }
+}
+
+// === FLIRT import ===
+namespace {
+
+void flirt_le16(std::vector<uint8_t>& b, uint16_t v) {
+    b.push_back(static_cast<uint8_t>(v & 0xFF));
+    b.push_back(static_cast<uint8_t>(v >> 8));
+}
+void flirt_le32(std::vector<uint8_t>& b, uint32_t v) {
+    for (int i = 0; i < 4; ++i) b.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+void flirt_be16(std::vector<uint8_t>& b, uint16_t v) {
+    b.push_back(static_cast<uint8_t>(v >> 8));
+    b.push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+// Minimal FLIRT v6 file: one leaf module with `pattern` and one public name.
+// `compressed` sets the zlib feature bit and deflates the pattern stream.
+std::vector<uint8_t> build_flirt(const std::vector<uint8_t>& pattern,
+                                 const std::string& name, bool compressed) {
+    std::vector<uint8_t> out = {'I', 'D', 'A', 'S', 'G', 'N'};
+    out.push_back(6);                 // version
+    out.push_back(0);                 // arch: 386
+    flirt_le32(out, 0x800);           // file_types: PE
+    flirt_le16(out, 2);               // os_types
+    flirt_le16(out, 0x100);           // app_types: 32-bit
+    flirt_le16(out, compressed ? 0x10 : 0);   // features
+    flirt_le16(out, 0);               // old_n_functions
+    flirt_le16(out, 0);               // crc16
+    for (int i = 0; i < 12; ++i) out.push_back(0);   // ctype
+    out.push_back(6);                 // library name length
+    flirt_le16(out, 0);               // ctypes_crc16
+    flirt_le32(out, 1);               // nfuncs
+    for (char c : std::string("libxyz")) out.push_back(static_cast<uint8_t>(c));
+
+    std::vector<uint8_t> tree;
+    tree.push_back(0);                // root: pattern length
+    tree.push_back(0);                // root: variant mask (max_2_bytes)
+    tree.push_back(1);                // root: one child node
+    tree.push_back(static_cast<uint8_t>(pattern.size()));   // leaf length (<0x10)
+    tree.push_back(0);                // leaf variant mask
+    tree.insert(tree.end(), pattern.begin(), pattern.end());
+    tree.push_back(0);                // leaf: no children -> modules
+    tree.push_back(0);                // crc_len
+    flirt_be16(tree, 0);              // crc
+    tree.push_back(static_cast<uint8_t>(pattern.size()));   // module length
+    tree.push_back(0);                // public function offset
+    tree.push_back(0);                // flags -> next byte starts the name
+    for (char c : name) tree.push_back(static_cast<uint8_t>(c));
+    tree.push_back(0);                // terminating flags: no more names/modules
+
+    if (!compressed) {
+        out.insert(out.end(), tree.begin(), tree.end());
+        return out;
+    }
+    uLongf clen = compressBound(static_cast<uLong>(tree.size()));
+    std::vector<uint8_t> z(clen);
+    REQUIRE_EQ(compress(z.data(), &clen, tree.data(),
+                        static_cast<uLong>(tree.size())), Z_OK);
+    z.resize(clen);
+    out.insert(out.end(), z.begin(), z.end());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE(flirt_sig_import_parses_and_matches) {
+    namespace analysis = slop::core::analysis;
+    const std::vector<uint8_t> pattern = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x83, 0xEC};
+
+    for (bool compressed : {false, true}) {
+        const auto sig = build_flirt(pattern, "test_func", compressed);
+        std::string err;
+        auto parsed = analysis::parse_flirt_sig(sig.data(), sig.size(), &err);
+        REQUIRE(parsed.has_value());
+        REQUIRE_STR_EQ(parsed->library, "libxyz");
+        REQUIRE_EQ(parsed->version, 6);
+        REQUIRE_EQ(parsed->sigs.size(), size_t{1});
+        REQUIRE_STR_EQ(parsed->sigs[0].name, "test_func");
+        REQUIRE_STR_EQ(parsed->sigs[0].pattern,
+                       std::string("48 89 5C 24 08 48 83 EC"));
+    }
+
+    // hostile input: truncated header / truncated tree fail cleanly
+    {
+        const auto full = build_flirt(pattern, "test_func", false);
+        std::string err;
+        REQUIRE_FALSE(analysis::parse_flirt_sig(full.data(), 12, &err));
+        REQUIRE(!err.empty());
+        REQUIRE_FALSE(analysis::parse_flirt_sig(full.data(), full.size() - 3, &err));
+        REQUIRE(!err.empty());
+    }
+
+    // end to end: a pattern taken from real code matches in SlopTarget.exe.
+    // Pick a window that occurs exactly once in the file so the scan's single
+    // per-section hit is guaranteed to be inside an indexed function.
+    const auto& bytes = slop_target_bytes();
+    auto pe = pe_parse(bytes.data(), bytes.size());
+    REQUIRE(pe.ok);
+    engine_t eng;
+    REQUIRE(eng.init());
+    function_index_t fi;
+    REQUIRE(fi.build(pe, bytes, eng, pe.image_base));
+    const auto entry_off = pe.rva_to_offset(pe.entry_rva);
+    REQUIRE(entry_off.has_value());
+
+    std::vector<uint8_t> real_pattern;
+    uint64_t expected_va = 0;
+    for (size_t off = 0; off + 8 <= 96 && real_pattern.empty(); ++off) {
+        const size_t fo = *entry_off + off;
+        if (fo + 8 > bytes.size()) break;
+        std::vector<uint8_t> window(bytes.begin() + static_cast<std::ptrdiff_t>(fo),
+                                    bytes.begin() + static_cast<std::ptrdiff_t>(fo + 8));
+        size_t occurrences = 0;
+        for (size_t i = 0; i + 8 <= bytes.size() && occurrences < 2; ++i)
+            if (std::equal(window.begin(), window.end(),
+                           bytes.begin() + static_cast<std::ptrdiff_t>(i)))
+                ++occurrences;
+        if (occurrences != 1) continue;
+        const uint64_t va = pe.image_base + pe.entry_rva + off;
+        if (!fi.containing(va)) continue;
+        real_pattern = std::move(window);
+        expected_va = va;
+    }
+    REQUIRE(!real_pattern.empty());
+
+    const auto sig = build_flirt(real_pattern, "entry_like", false);
+    std::string err;
+    auto parsed = analysis::parse_flirt_sig(sig.data(), sig.size(), &err);
+    REQUIRE(parsed.has_value());
+    const auto hits = analysis::libsig_scan(pe, bytes, fi, parsed->sigs);
+    REQUIRE_EQ(hits.size(), size_t{1});
+    // the imported pattern anchors at the exact VA it was taken from, and the
+    // hit maps back to the indexed function that owns it
+    REQUIRE_EQ(hits[0].va, expected_va);
+    REQUIRE(hits[0].function_va.has_value());
+    REQUIRE_EQ(*hits[0].function_va, *fi.containing(expected_va));
+}
+
+TEST_CASE(flirt_sig_import_via_re_tool) {
+    const std::vector<uint8_t> pattern = {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x83, 0xEC};
+    elf_fixture::temp_file_t sig(build_flirt(pattern, "tool_func", false), "flirt");
+
+    bool is_error = false;
+    auto out = slop::core::mcp::call_tool(
+        "re", {{"action", "libsig"}, {"path", SLOP_TARGET_EXE_PATH},
+               {"sig_path", sig.path.string()}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("library", std::string{}), "libxyz");
+    REQUIRE_EQ(out.value("requested", size_t{0}), size_t{1});
+    REQUIRE(out.contains("hits"));
+}
+
+// === encrypted SELF guidance ===
+
+TEST_CASE(disasm_load_self_mcp_guides_decrypted_dump) {
+    namespace bs = slop::core::disasm::binary_state;
+    const auto self = elf_fixture::wrap_self(elf_fixture::build_ps4_elf(),
+                                             elf_fixture::self_mode::encrypted);
+    elf_fixture::temp_file_t enc(self, "selfenc_mcp");
+
+    bool is_error = false;
+    auto err_out = slop::core::mcp::call_tool(
+        "disasm", {{"action", "load_self"}, {"path", enc.path.string()}}, is_error);
+    REQUIRE(is_error);
+    REQUIRE(err_out.contains("error"));
+    const std::string err = err_out.at("error").get<std::string>();
+    REQUIRE(err.find("encrypted SELF") != std::string::npos);
+    REQUIRE(err.find("decrypted_dump") != std::string::npos);
+    REQUIRE(err.find("ps4_dump_module") != std::string::npos);
+
+    // with the decrypted image supplied the load succeeds
+    elf_fixture::temp_file_t dump(elf_fixture::build_ps4_elf(), "selfdump");
+    auto ok = slop::core::mcp::call_tool(
+        "disasm", {{"action", "load_self"}, {"path", enc.path.string()},
+                   {"decrypted_dump", dump.path.string()}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE(ok.value("ok", false));
+    REQUIRE(ok.value("decrypted_dump_used", false));
+    REQUIRE_STR_EQ(ok.value("loaded_from", std::string{}), dump.path.string());
+    bs::unload();
+}
+
+// === CFG graph endpoints ===
+
+TEST_CASE(disasm_blocks_and_xray_cfg_return_graph) {
+    namespace bs = slop::core::disasm::binary_state;
+    REQUIRE(bs::load_file(SLOP_TARGET_EXE_PATH));
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (std::chrono::steady_clock::now() < deadline && !bs::hype_ready())
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    REQUIRE(bs::hype_ready());
+
+    // pick the function with the most blocks so the graph has edges
+    uint64_t target = 0;
+    size_t best_blocks = 0;
+    {
+        std::lock_guard lk(bs::state_mutex());
+        for (const auto& [entry, f] : bs::get().hype->db().funcs)
+            if (f.blocks.size() > best_blocks) { best_blocks = f.blocks.size(); target = entry; }
+    }
+    REQUIRE(target != 0);
+
+    bool is_error = false;
+    auto blocks = slop::core::mcp::call_tool(
+        "disasm", {{"action", "blocks"}, {"addr", target}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE(blocks.contains("graph"));
+    const auto& g = blocks.at("graph");
+    REQUIRE_EQ(g.at("nodes").size(), blocks.at("blocks").size());
+    REQUIRE_EQ(g.at("nodes").at(0).value("id", uint64_t{0}),
+               g.at("nodes").at(0).value("start", uint64_t{1}));
+    REQUIRE(g.at("nodes").at(0).contains("summary"));
+    size_t succ_total = 0;
+    for (const auto& b : blocks.at("blocks"))
+        succ_total += b.at("succs").size();
+    REQUIRE_EQ(g.at("edges").size(), succ_total);
+    bool kind_ok = true;
+    for (const auto& e : g.at("edges")) {
+        const std::string kind = e.value("kind", std::string{});
+        if (kind != "fallthrough" && kind != "branch") kind_ok = false;
+    }
+    REQUIRE(kind_ok);
+
+    auto cfg = slop::core::mcp::call_tool(
+        "xray", {{"action", "cfg"}, {"addr", target}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE(cfg.contains("graph"));
+    REQUIRE_EQ(cfg.at("graph").at("nodes").size(), cfg.at("blocks").size());
+    REQUIRE_EQ(cfg.at("graph").at("edges").size(), cfg.value("edge_count", size_t{0}));
+    bs::unload();
 }

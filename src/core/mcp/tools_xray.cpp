@@ -86,12 +86,21 @@ json tool_xray(const json& args) {
             if (!r.ok) fail(r.error);
             if (action == "cfg") {
                 json blocks = json::array();
-                for (const auto& b : r.blocks)
+                json nodes = json::array(), edges = json::array();
+                for (const auto& b : r.blocks) {
                     blocks.push_back({{"start", b.start}, {"end", b.end},
                                       {"instructions", b.instructions},
                                       {"successors", b.successors}});
+                    nodes.push_back({{"id", b.start}, {"start", b.start},
+                                     {"end", b.end}, {"size", b.end - b.start},
+                                     {"insn_count", b.instructions}});
+                    for (uint64_t s : b.successors)
+                        edges.push_back({{"from", b.start}, {"to", s},
+                                         {"kind", s == b.end ? "fallthrough" : "branch"}});
+                }
                 out["blocks"] = blocks;
                 out["block_count"] = r.blocks.size();
+                out["graph"] = {{"nodes", nodes}, {"edges", edges}};
             } else {
                 auto c = xray::function_complexity(img, fn_va);
                 out["instruction_count"]  = c.instruction_count;
