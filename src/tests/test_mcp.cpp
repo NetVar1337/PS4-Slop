@@ -10,6 +10,7 @@
 #include "core/disasm/binary_state.hpp"
 #include "core/infra/settings.hpp"
 #include "core/mcp/tools_common.hpp"
+#include "core/network/net_socket.hpp"
 
 #include <windows.h>
 
@@ -342,6 +343,61 @@ TEST_CASE(mcp_target_status_shape) {
     REQUIRE_GT(payload.at("image").value("functions", 0u), 0u);
     REQUIRE(!std::string(payload.at("image").value("name", "")).empty());
     slop::core::disasm::binary_state::unload();
+}
+
+TEST_CASE(mcp_ps4_send_payload_streams_the_file) {
+    slop::core::network::sock::ensure_wsa();
+    SOCKET srv = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    REQUIRE(srv != INVALID_SOCKET);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    REQUIRE(::bind(srv, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
+    REQUIRE(::listen(srv, 1) == 0);
+    int alen = sizeof(addr);
+    REQUIRE(::getsockname(srv, reinterpret_cast<sockaddr*>(&addr), &alen) == 0);
+    const uint16_t port = ntohs(addr.sin_port);
+
+    std::vector<uint8_t> got;
+    std::thread reader([&] {
+        SOCKET c = ::accept(srv, nullptr, nullptr);
+        if (c == INVALID_SOCKET) return;
+        char buf[8192];
+        for (;;) {
+            const int n = ::recv(c, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            got.insert(got.end(), buf, buf + n);
+        }
+        ::closesocket(c);
+    });
+
+    const auto path =
+        std::filesystem::temp_directory_path() / "slop_payload_send_test.bin";
+    std::vector<uint8_t> payload(64 * 1024);
+    for (size_t i = 0; i < payload.size(); ++i)
+        payload[i] = static_cast<uint8_t>((i * 31) & 0xFF);
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(payload.data()),
+                  static_cast<std::streamsize>(payload.size()));
+    }
+
+    server_fixture_t fx;
+    bool is_error = true;
+    json res = fx.call("target",
+                       {{"action", "ps4_send_payload"},
+                        {"host", "127.0.0.1"},
+                        {"port", port},
+                        {"path", path.string()}},
+                       is_error);
+    REQUIRE(!is_error);
+    REQUIRE_EQ(res.value("bytes", 0ull), payload.size());
+    reader.join();
+    ::closesocket(srv);
+    std::filesystem::remove(path);
+    REQUIRE_EQ(got.size(), payload.size());
+    REQUIRE(std::equal(got.begin(), got.end(), payload.begin()));
 }
 
 TEST_CASE(mcp_bad_action_rejected) {

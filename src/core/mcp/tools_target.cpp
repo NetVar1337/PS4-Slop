@@ -1,9 +1,11 @@
 // src/core/mcp/tools_target.cpp
 // tool: target (processes, attach, modules, ps4 connect)
 
+#include "core/infra/paths.hpp"
 #include "core/mcp/tools_common.hpp"
 #include "core/network/net_socket.hpp"
 
+#include <filesystem>
 #include <list>
 
 namespace slop::core::mcp::detail {
@@ -242,6 +244,68 @@ json tool_target(const json& args) {
             out["hint"] = "Use target.ps4_connect or ps4_auto with host=\"" +
                           found.front() + "\" (or host=\"auto\" to pick the first).";
         return out;
+    }
+
+    if (action == "ps4_send_payload") {
+        // BinLoader-style TCP send: one fresh connection, raw .bin/.elf bytes.
+        const std::string host = resolve_host_arg(
+            args.contains("host") && args["host"].is_string()
+                ? args["host"].get<std::string>()
+                : "auto");
+        const uint64_t port =
+            args.contains("port") ? parse_addr(args, "port") : 9090;
+        if (port == 0 || port > 0xFFFF) fail("ps4_send_payload: bad port");
+
+        std::string path;
+        if (args.contains("path") && args["path"].is_string())
+            path = args["path"].get<std::string>();
+        if (path.empty()) {
+            char exe[MAX_PATH]{};
+            const DWORD n = ::GetModuleFileNameA(nullptr, exe, MAX_PATH);
+            if (n > 0 && n < MAX_PATH) {
+                const std::filesystem::path dir =
+                    std::filesystem::path(std::string(exe, n)).parent_path();
+                const std::filesystem::path candidates[] = {
+                    dir.parent_path() / "payloads" / "ps4debug-ng" / "ps4debug-ng.bin",
+                    std::filesystem::path(infra::paths::app_data()) / "payloads" /
+                        "ps4debug-ng" / "ps4debug-ng.bin",
+                };
+                for (const auto& c : candidates) {
+                    if (std::filesystem::is_regular_file(c)) {
+                        path = c.string();
+                        break;
+                    }
+                }
+            }
+        }
+        if (path.empty())
+            fail("ps4_send_payload: no payload found; pass path=... (the bundled "
+                 "payload is payloads/ps4debug-ng/ps4debug-ng.bin)");
+        std::ifstream in(path, std::ios::binary);
+        if (!in) fail("ps4_send_payload: cannot open " + path);
+        std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)),
+                                  std::istreambuf_iterator<char>());
+        if (data.empty()) fail("ps4_send_payload: payload is empty: " + path);
+        if (data.size() > (64ull << 20))
+            fail("ps4_send_payload: payload larger than 64 MiB");
+
+        std::string err;
+        const auto ips = network::sock::resolve(host, &err);
+        if (ips.empty()) fail("ps4_send_payload: " + err);
+        const auto s = network::sock::connect(ips.front(), static_cast<uint16_t>(port),
+                                              5000, nullptr, &err);
+        if (s == network::sock::kInvalid) fail("ps4_send_payload: " + err);
+        network::sock::set_timeouts(s, 5000, 5000);
+        const bool sent = network::sock::send_all(s, data.data(), data.size());
+        network::sock::close(s);
+        if (!sent) fail("ps4_send_payload: send failed");
+        return {{"sent", true},
+                {"host", host},
+                {"port", port},
+                {"bytes", data.size()},
+                {"path", path},
+                {"hint", "The loader should execute the payload; connect with "
+                         "target.ps4_connect {host} once it is listening on 744."}};
     }
 
     if (action == "ps4_connect") {
