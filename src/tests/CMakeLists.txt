@@ -27,6 +27,9 @@ add_executable(slop_tests
     test_magicmida.cpp
     test_ipa.cpp
     test_ps4.cpp
+    test_ps4_debug.cpp
+    test_ps4_chaos.cpp
+    test_ps4_tooling.cpp
     test_harness.cpp
 )
 
