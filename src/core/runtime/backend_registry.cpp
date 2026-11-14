@@ -1,5 +1,9 @@
 #include "core/runtime/backend_registry.hpp"
+#ifdef _WIN32
 #include "core/runtime/backend_usermode.hpp"
+#else
+#include "core/runtime/backend_posix.hpp"
+#endif
 #include "core/runtime/backend_ps4.hpp"
 
 #include <atomic>
@@ -9,7 +13,11 @@ namespace slop::core::runtime {
 
 namespace {
 
+#ifdef _WIN32
 backend_usermode_t       g_user{};
+#else
+backend_posix_t          g_user{};
+#endif
 backend_ps4_t            g_ps4{};
 backend_ps5_t            g_ps5{};
 std::atomic<backend_t*>  g_active{nullptr};

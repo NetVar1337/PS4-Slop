@@ -254,8 +254,8 @@ std::string parse_pcapng(cursor_t& c, traffic_store_t& store, import_result_t& o
 
 std::string import_file(traffic_store_t& store, const std::string& path,
                         import_result_t* out) {
-    std::FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "rb") != 0 || !fp) return "cannot open '" + path + "'";
+    std::FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return "cannot open '" + path + "'";
     std::vector<uint8_t> file;
     {
         if (std::fseek(fp, 0, SEEK_END) != 0) { std::fclose(fp); return "cannot seek '" + path + "'"; }

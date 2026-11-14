@@ -15,8 +15,12 @@
 
 #include <nlohmann/json.hpp>
 
+#ifdef _WIN32
 #include <windows.h>
 #include <shlobj.h>
+#else
+#include <cstdlib>
+#endif
 
 #include <algorithm>
 #include <filesystem>
@@ -34,15 +38,28 @@ namespace {
 // path helpers
 
 std::string env_or(const char* var, const std::string& fallback) {
+#ifdef _WIN32
     char buf[MAX_PATH]{};
     const DWORD n = GetEnvironmentVariableA(var, buf, MAX_PATH);
     if (n == 0 || n >= MAX_PATH) return fallback;
     return std::string(buf, n);
+#else
+    const char* v = std::getenv(var);
+    return (v && *v) ? std::string(v) : fallback;
+#endif
 }
 
+#ifdef _WIN32
 std::string localappdata() { return env_or("LOCALAPPDATA", ""); }
 std::string appdata()      { return env_or("APPDATA", ""); }
 std::string userprofile()  { return env_or("USERPROFILE", ""); }
+#else
+std::string userprofile()  { return env_or("HOME", ""); }
+[[maybe_unused]] std::string localappdata() {
+    return env_or("XDG_DATA_HOME", userprofile() + "/.local/share");
+}
+std::string appdata()      { return env_or("XDG_CONFIG_HOME", userprofile() + "/.config"); }
+#endif
 
 // json helpers
 
@@ -69,6 +86,11 @@ bool write_json_file(const std::string& path, const json& j) {
 // entry builder
 
 constexpr const char* kServerName = "slopstation";
+#ifdef _WIN32
+constexpr const char* kSep = "\\";
+#else
+constexpr const char* kSep = "/";
+#endif
 
 // Configs reference the env var by default so a rotated token never leaves
 // plaintext behind in a dotfile repo; mcp_token_in_configs opts into plaintext
@@ -91,7 +113,7 @@ json make_mcp_entry(uint16_t port, const std::string& token) {
 
 // Tern keeps every MCP server centrally in one array and always gets the env
 // reference: its config is the one users share/sync most
-std::string tern_path() { return appdata() + "\\tern\\settings.json"; }
+std::string tern_path() { return appdata() + kSep + "tern" + kSep + "settings.json"; }
 
 json make_tern_entry(uint16_t port) {
     return {{"name", kServerName},
@@ -174,7 +196,7 @@ install_result_t install_url_entry(const char* client, const std::string& path,
 
 // old builds wrote a dead entry into ~/.claude/settings.json, wipe just ours
 void remove_legacy_claude_code_settings_entry() {
-    const std::string path = userprofile() + "\\.claude\\settings.json";
+    const std::string path = userprofile() + kSep + ".claude" + kSep + "settings.json";
     json settings;
     if (read_json_file(path, settings) != read_t::ok) return;
     if (!settings.contains("mcpServers") ||
@@ -189,7 +211,7 @@ void remove_legacy_claude_code_settings_entry() {
 install_result_t do_claude_code_global(uint16_t port, const std::string& token, bool update_only) {
     // ~/.claude.json is claude codes state file so only add our key and touch nothing else
     remove_legacy_claude_code_settings_entry();   // old builds wrote there
-    return install_url_entry("Claude Code (global)", userprofile() + "\\.claude.json",
+    return install_url_entry("Claude Code (global)", userprofile() + kSep + ".claude.json",
                              port, token, /*with_type=*/true, update_only);
 }
 
@@ -197,7 +219,7 @@ install_result_t do_claude_desktop(uint16_t port, const std::string& token) {
     (void)port;
     (void)token;
     // desktop config only does stdio servers so all we can do here is clean up
-    const std::string path = appdata() + "\\Claude\\claude_desktop_config.json";
+    const std::string path = appdata() + kSep + "Claude" + kSep + "claude_desktop_config.json";
     json cfg;
     if (read_json_file(path, cfg) == read_t::ok &&
         cfg.contains("mcpServers") && cfg.at("mcpServers").is_object() &&
@@ -214,19 +236,19 @@ install_result_t do_claude_desktop(uint16_t port, const std::string& token) {
 }
 
 install_result_t do_cursor(uint16_t port, const std::string& token, bool update_only) {
-    return install_url_entry("Cursor", userprofile() + "\\.cursor\\mcp.json",
+    return install_url_entry("Cursor", userprofile() + kSep + ".cursor" + kSep + "mcp.json",
                              port, token, /*with_type=*/false, update_only);
 }
 
 install_result_t do_windsurf(uint16_t port, const std::string& token, bool update_only) {
     return install_url_entry("Windsurf",
-                             userprofile() + "\\.codeium\\windsurf\\mcp_config.json",
+                             userprofile() + kSep + ".codeium" + kSep + "windsurf" + kSep + "mcp_config.json",
                              port, token, /*with_type=*/false, update_only);
 }
 
 install_result_t do_vscode(uint16_t port, const std::string& token, bool update_only) {
     // vs code tucks servers under mcp.servers
-    const std::string path = appdata() + "\\Code\\User\\settings.json";
+    const std::string path = appdata() + kSep + "Code" + kSep + "User" + kSep + "settings.json";
 
     json settings;
     switch (read_json_file(path, settings)) {
@@ -260,7 +282,7 @@ install_result_t do_vscode(uint16_t port, const std::string& token, bool update_
 install_result_t do_opencode(uint16_t port, const std::string& token, bool update_only) {
     // ~/.config/opencode/config.json  (XDG on Linux; %USERPROFILE%\.config on Win)
     return install_url_entry("OpenCode",
-                             userprofile() + "\\.config\\opencode\\config.json",
+                             userprofile() + kSep + ".config" + kSep + "opencode" + kSep + "config.json",
                              port, token, /*with_type=*/false, update_only);
 }
 
@@ -417,21 +439,21 @@ std::vector<install_result_t> uninstall_all() {
     };
 
     remove_key("Claude Code (global)",
-               userprofile() + "\\.claude.json", "mcpServers");
+               userprofile() + kSep + ".claude.json", "mcpServers");
     // Pre-fix builds wrote into settings.json instead of .claude.json  
     // clean both so uninstall actually removes what install wrote
     remove_key("Claude Code (legacy settings)",
-               userprofile() + "\\.claude\\settings.json", "mcpServers");
+               userprofile() + kSep + ".claude" + kSep + "settings.json", "mcpServers");
     remove_key("Claude Desktop",
-               appdata() + "\\Claude\\claude_desktop_config.json", "mcpServers");
+               appdata() + kSep + "Claude" + kSep + "claude_desktop_config.json", "mcpServers");
     remove_key("Cursor",
-               userprofile() + "\\.cursor\\mcp.json", "mcpServers");
+               userprofile() + kSep + ".cursor" + kSep + "mcp.json", "mcpServers");
     remove_key("Windsurf",
-               userprofile() + "\\.codeium\\windsurf\\mcp_config.json", "mcpServers");
+               userprofile() + kSep + ".codeium" + kSep + "windsurf" + kSep + "mcp_config.json", "mcpServers");
     remove_key("VS Code",
-               appdata() + "\\Code\\User\\settings.json", "servers", "mcp");
+               appdata() + kSep + "Code" + kSep + "User" + kSep + "settings.json", "servers", "mcp");
     remove_key("OpenCode",
-               userprofile() + "\\.config\\opencode\\config.json", "mcpServers");
+               userprofile() + kSep + ".config" + kSep + "opencode" + kSep + "config.json", "mcpServers");
 
     // Tern keeps servers in an array, so it needs its own removal
     {
@@ -507,11 +529,11 @@ std::vector<std::string> plaintext_token_clients() {
             out.push_back(client);
     };
 
-    check("Claude Code (global)", userprofile() + "\\.claude.json", "mcpServers");
-    check("Cursor", userprofile() + "\\.cursor\\mcp.json", "mcpServers");
-    check("Windsurf", userprofile() + "\\.codeium\\windsurf\\mcp_config.json", "mcpServers");
-    check("VS Code", appdata() + "\\Code\\User\\settings.json", "servers", "mcp");
-    check("OpenCode", userprofile() + "\\.config\\opencode\\config.json", "mcpServers");
+    check("Claude Code (global)", userprofile() + kSep + ".claude.json", "mcpServers");
+    check("Cursor", userprofile() + kSep + ".cursor" + kSep + "mcp.json", "mcpServers");
+    check("Windsurf", userprofile() + kSep + ".codeium" + kSep + "windsurf" + kSep + "mcp_config.json", "mcpServers");
+    check("VS Code", appdata() + kSep + "Code" + kSep + "User" + kSep + "settings.json", "servers", "mcp");
+    check("OpenCode", userprofile() + kSep + ".config" + kSep + "opencode" + kSep + "config.json", "mcpServers");
 
     json tern;
     if (read_json_file(tern_path(), tern) == read_t::ok && tern.is_object() &&

@@ -2,6 +2,7 @@
 // tool: disasm (load/decode/functions/xrefs/strings/assemble)
 
 #include "core/mcp/tools_common.hpp"
+#include "core/compat/portable.hpp"
 
 namespace slop::core::mcp::detail {
 

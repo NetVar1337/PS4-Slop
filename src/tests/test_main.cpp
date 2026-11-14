@@ -3,7 +3,13 @@
 
 #include "harness.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+
+#include <cstdlib>
+#endif
 
 #include <string>
 
@@ -17,6 +23,7 @@ int main() {
     // profile: point it at a per-run scratch folder. The patch journal in
     // particular changes image bytes, so a journal left behind by one run
     // would silently alter the next run's fixtures
+#ifdef _WIN32
     char tmp[MAX_PATH]{};
     const DWORD n = GetTempPathA(MAX_PATH, tmp);
     if (n > 0 && n < MAX_PATH) {
@@ -25,5 +32,9 @@ int main() {
         CreateDirectoryA(dir.c_str(), nullptr);
         SetEnvironmentVariableA("LOCALAPPDATA", dir.c_str());
     }
+#else
+    const std::string dir = "/tmp/slop_tests_profile_" + std::to_string(::getpid());
+    ::setenv("XDG_DATA_HOME", dir.c_str(), 1);
+#endif
     return slop_test::run_all();
 }

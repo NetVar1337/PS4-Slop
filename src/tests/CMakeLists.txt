@@ -4,6 +4,33 @@ if(NOT SLOP_BUILD_TESTS)
     return()
 endif()
 
+if(NOT WIN32)
+    # Portable subset: the areas whose fixtures are built in memory or on
+    # loopback (Mach-O/IPA, Unicorn emulation, the ps4debug/ps5debug fake
+    # servers). Areas that need SlopTarget.exe or Win32 APIs are Windows-only.
+    add_executable(slop_tests
+        test_main.cpp
+        test_ipa.cpp
+        test_emu.cpp
+        test_ps4.cpp
+        test_ps4_chaos.cpp
+        test_ps4_debug.cpp
+        test_ps5.cpp
+        test_disasm_accuracy.cpp
+    )
+    target_include_directories(slop_tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/tests"
+        "${CMAKE_SOURCE_DIR}/src")
+    target_link_libraries(slop_tests PRIVATE slop_core httplib::httplib)
+    target_compile_options(slop_tests PRIVATE
+        -Wall -Wextra -Werror -Wno-switch -Wno-unused-but-set-variable
+        -Wno-unused-function -Wno-stringop-truncation)
+    set_target_properties(slop_tests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    add_test(NAME slop_tests COMMAND slop_tests)
+    return()
+endif()
+
 add_executable(slop_tests
     test_main.cpp
     test_app_performance.cpp

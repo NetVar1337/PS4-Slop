@@ -1,6 +1,7 @@
 // src/core/analysis/packer.cpp
 
 #include "core/analysis/packer.hpp"
+#include "core/compat/portable.hpp"
 
 #include <algorithm>
 #include <array>

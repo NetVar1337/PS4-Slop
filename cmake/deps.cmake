@@ -160,16 +160,16 @@ set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
 
-if(NOT WIN32)
-    # portable subset (see the top-level CMakeLists.txt)
-    FetchContent_MakeAvailable(nlohmann_json zydis fmt spdlog capstone zlib_kr)
-    if(NOT TARGET ZLIB::ZLIB)
-        add_library(ZLIB::ZLIB ALIAS zlibstatic)
-    endif()
-    return()
-endif()
+# Everything the headless core needs on either platform; the window shell's
+# font/UI deps are Windows-only and fetched below.
+FetchContent_MakeAvailable(nlohmann_json zydis fmt spdlog capstone zlib_kr httplib unicorn sqlite lua)
 
-FetchContent_MakeAvailable(freetype nlohmann_json zydis imgui httplib unicorn sqlite lua fmt spdlog capstone zlib_kr)
+if(WIN32)
+    FetchContent_MakeAvailable(freetype imgui)
+else()
+    # TLS for the web client and the proxy's upstream leg (Schannel on Windows)
+    find_package(OpenSSL REQUIRED)
+endif()
 
 # Unicorn's qemu util defines crc32() with the same CRC-32 algorithm zlib
 # exports (same table, same complement convention). Enabling the aarch64
@@ -179,6 +179,9 @@ FetchContent_MakeAvailable(freetype nlohmann_json zydis imgui httplib unicorn sq
 # renaming a symbol that also feeds the generated TCG helper names
 if(MSVC AND TARGET unicorn)
     target_link_options(unicorn INTERFACE /FORCE:MULTIPLE)
+elseif(TARGET unicorn)
+    # same duplicate crc32 as the MSVC case above; ELF has no /FORCE:MULTIPLE
+    target_link_options(unicorn INTERFACE -Wl,--allow-multiple-definition)
 endif()
 
 # zlib builds both a shared and a static lib, we only want the static one so
@@ -241,9 +244,12 @@ set(slop_lua_sources
 set_source_files_properties(${slop_lua_sources} PROPERTIES LANGUAGE CXX)
 add_library(slop_lua STATIC ${slop_lua_sources})
 target_include_directories(slop_lua SYSTEM PUBLIC "${lua_SOURCE_DIR}/src")
-target_compile_definitions(slop_lua PRIVATE
-    LUA_USE_WINDOWS
-)
+if(WIN32)
+    target_compile_definitions(slop_lua PRIVATE LUA_USE_WINDOWS)
+else()
+    # POSIX rather than LINUX: LUA_USE_LINUX also wants readline and libdl
+    target_compile_definitions(slop_lua PRIVATE LUA_USE_POSIX)
+endif()
 if(MSVC)
     target_compile_options(slop_lua PRIVATE /W0)
 endif()
@@ -257,6 +263,7 @@ if(MSVC)
     endforeach()
 endif()
 
+if(WIN32)
 add_library(slop_imgui STATIC
     "${imgui_SOURCE_DIR}/imgui.cpp"
     "${imgui_SOURCE_DIR}/imgui_draw.cpp"
@@ -278,4 +285,5 @@ target_link_libraries(slop_imgui PUBLIC freetype d3d11 dxgi)
 
 if(MSVC)
     target_compile_options(slop_imgui PRIVATE /W0)
+endif()
 endif()

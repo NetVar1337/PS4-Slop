@@ -1,8 +1,12 @@
 #include "core/infra/settings.hpp"
 #include "core/infra/paths.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
+#else
+#include <openssl/rand.h>
+#endif
 
 #include <chrono>
 #include <filesystem>
@@ -10,7 +14,9 @@
 #include <mutex>
 #include <sstream>
 
+#ifdef _WIN32
 #pragma comment(lib, "bcrypt.lib")
+#endif
 
 namespace slop::core::infra::settings {
 
@@ -46,9 +52,13 @@ void backup_corrupt_locked(const std::string& p) {
 
 std::string generate_token() {
     unsigned char buf[32]{};
+#ifdef _WIN32
     if (!BCRYPT_SUCCESS(::BCryptGenRandom(nullptr, buf, sizeof(buf),
                                           BCRYPT_USE_SYSTEM_PREFERRED_RNG)))
         return {};
+#else
+    if (::RAND_bytes(buf, sizeof(buf)) != 1) return {};
+#endif
     static constexpr char kHex[] = "0123456789abcdef";
     std::string out;
     out.reserve(sizeof(buf) * 2);

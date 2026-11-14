@@ -4,11 +4,21 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
 #include <iphlpapi.h>
 #include <mswsock.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#include <ifaddrs.h>
+#include <linux/if_ether.h>
+#include <linux/if_packet.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#endif
 
 #include "core/network/capture_service.hpp"
 
@@ -22,8 +32,10 @@
 #include <optional>
 #include <thread>
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#endif
 
 namespace slop::core::network {
 namespace capture {
@@ -75,6 +87,7 @@ state_t& st() {
     return s;
 }
 
+#ifdef _WIN32
 std::string wsa_error_text(int e) {
     switch (e) {
         case WSAEACCES: return "access denied - run the engine elevated for SIO_RCVALL";
@@ -93,6 +106,7 @@ std::string narrow(const wchar_t* w) {
     ::WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), n, nullptr, nullptr);
     return out;
 }
+#endif
 
 struct adapter_addr_t {
     std::string key, name;
@@ -104,6 +118,7 @@ struct adapter_addr_t {
 
 // up, non-loopback adapters: one bind address per family; every unicast
 // address (loopback included) goes into `locals`
+#ifdef _WIN32
 std::vector<adapter_addr_t> enumerate(std::vector<parse::ip_addr_t>& locals) {
     std::vector<adapter_addr_t> out;
     locals.clear();
@@ -153,7 +168,44 @@ std::vector<adapter_addr_t> enumerate(std::vector<parse::ip_addr_t>& locals) {
     }
     return out;
 }
+#else
+// one AF_PACKET socket per interface (both families arrive on it), every
+// unicast address goes into `locals`
+std::vector<adapter_addr_t> enumerate(std::vector<parse::ip_addr_t>& locals) {
+    std::vector<adapter_addr_t> out;
+    locals.clear();
+    ifaddrs* ifs = nullptr;
+    if (::getifaddrs(&ifs) != 0) return out;
+    for (ifaddrs* i = ifs; i; i = i->ifa_next) {
+        if (!i->ifa_addr) continue;
+        const int fam = i->ifa_addr->sa_family;
+        adapter_addr_t aa;
+        if (fam == AF_INET) {
+            const auto* sin = reinterpret_cast<const sockaddr_in*>(i->ifa_addr);
+            aa.ip = parse::make_v4(reinterpret_cast<const uint8_t*>(&sin->sin_addr));
+            aa.family = 4;
+        } else if (fam == AF_INET6) {
+            const auto* sin6 = reinterpret_cast<const sockaddr_in6*>(i->ifa_addr);
+            aa.ip = parse::make_v6(reinterpret_cast<const uint8_t*>(&sin6->sin6_addr));
+            aa.family = 6;
+        } else {
+            continue;
+        }
+        locals.push_back(aa.ip);
+        if ((i->ifa_flags & IFF_UP) == 0 || (i->ifa_flags & IFF_LOOPBACK) != 0) continue;
+        aa.name = i->ifa_name;
+        aa.key = aa.name;
+        if (std::any_of(out.begin(), out.end(),
+                        [&](const adapter_addr_t& e) { return e.key == aa.key; }))
+            continue;
+        out.push_back(std::move(aa));
+    }
+    ::freeifaddrs(ifs);
+    return out;
+}
+#endif
 
+#ifdef _WIN32
 // opens a raw socket on one adapter address with RCVALL enabled
 sock_t open_socket(const adapter_addr_t& a) {
     sock_t s;
@@ -201,6 +253,47 @@ void close_socket(sock_t& s) {
     s.s = INVALID_SOCKET;
     s.info.active = false;
 }
+#else
+// AF_PACKET socket bound to one interface: receives both families' frames.
+// Needs CAP_NET_RAW (root or `setcap cap_net_raw+ep`); the error says so.
+sock_t open_socket(const adapter_addr_t& a) {
+    sock_t s;
+    s.key = a.key;
+    s.info.name = a.name;
+    s.info.address = parse::to_string(a.ip);
+    s.info.family = 4;
+    const int sk = ::socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (sk < 0) {
+        s.info.error = "AF_PACKET raw socket: " + std::string(std::strerror(errno)) +
+                       " (capture needs CAP_NET_RAW)";
+        return s;
+    }
+    sockaddr_ll ll{};
+    ll.sll_family = AF_PACKET;
+    ll.sll_protocol = htons(ETH_P_ALL);
+    ll.sll_ifindex = static_cast<int>(::if_nametoindex(a.name.c_str()));
+    if (ll.sll_ifindex == 0 ||
+        ::bind(sk, reinterpret_cast<sockaddr*>(&ll), sizeof(ll)) != 0) {
+        s.info.error = "bind to " + a.name + ": " + std::strerror(errno);
+        ::close(sk);
+        return s;
+    }
+    const int flags = ::fcntl(sk, F_GETFL, 0);
+    ::fcntl(sk, F_SETFL, flags | O_NONBLOCK);
+    int rcvbuf = 4 << 20;
+    ::setsockopt(sk, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    s.s = sk;
+    s.info.active = true;
+    return s;
+}
+
+void close_socket(sock_t& s) {
+    if (s.s == INVALID_SOCKET) return;
+    ::close(s.s);
+    s.s = INVALID_SOCKET;
+    s.info.active = false;
+}
+#endif
 
 bool is_local(const state_t& s, const parse::ip_addr_t& a) {
     return std::find(s.locals.begin(), s.locals.end(), a) != s.locals.end();
@@ -337,6 +430,7 @@ void handle_v6_transport(state_t& s, const parse::ip_addr_t& src, const parse::i
     handle_l4(s, src, dst, ip.proto, ip.l4, ip.l4_len, ip.l4_wire_len, n + 40, at);
 }
 
+#ifdef _WIN32
 LPFN_WSARECVMSG wsa_recvmsg(SOCKET sk) {
     static LPFN_WSARECVMSG fn = nullptr;
     if (!fn) {
@@ -374,6 +468,7 @@ int recv_v6(SOCKET sk, std::vector<uint8_t>& buf, parse::ip_addr_t& src, parse::
     }
     return dst.valid() ? static_cast<int>(got) : -1;
 }
+#endif
 
 // re-enumerates adapters: refreshes the local address set, opens sockets for
 // new interfaces and closes those whose adapter went away. Socket thread only
@@ -423,9 +518,12 @@ void capture_thread() {
         for (size_t i = 0; i < fds.size(); ++i) {
             const auto& fd = fds[i];
             if (!(fd.revents & (POLLRDNORM | POLLERR | POLLHUP))) continue;
+#ifdef _WIN32
             const bool v6 = s.socks[i].info.family == 6;
+#endif
             // drain what is queued on this socket, bounded per wakeup
             for (int burst = 0; burst < 256; ++burst) {
+#ifdef _WIN32
                 if (v6) {
                     parse::ip_addr_t src, dst;
                     const int n = recv_v6(fd.fd, buf, src, dst);
@@ -439,6 +537,27 @@ void capture_thread() {
                 if (n <= 0) break;
                 std::lock_guard lk(s.mu);
                 handle_datagram(s, buf.data(), static_cast<size_t>(n), now_ms());
+#else
+                // AF_PACKET hands over the link-layer frame; skip Ethernet
+                // (and one 802.1Q tag) to reach the IP datagram
+                const ssize_t n = ::recv(fd.fd, buf.data(), buf.size(), 0);
+                if (n <= 0) break;
+                size_t off = 0;
+                if (n >= 14) {
+                    const uint16_t ethertype =
+                        static_cast<uint16_t>((buf[12] << 8) | buf[13]);
+                    if (ethertype == 0x8100 && n >= 18)
+                        off = 18;
+                    else if (ethertype == 0x0800 || ethertype == 0x86DD)
+                        off = 14;
+                    else
+                        continue;   // ARP and friends are not IP
+                } else {
+                    continue;
+                }
+                std::lock_guard lk(s.mu);
+                handle_datagram(s, buf.data() + off, static_cast<size_t>(n) - off, now_ms());
+#endif
             }
         }
     }

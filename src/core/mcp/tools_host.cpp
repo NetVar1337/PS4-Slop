@@ -229,8 +229,13 @@ json tool_host(const json& args) {
         h.srv = std::make_unique<httplib::Server>();
         // no port sharing with another process (httplib defaults to SO_REUSEADDR)
         h.srv->set_socket_options([](socket_t s) {
-            BOOL excl = TRUE;
-            ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&excl), sizeof(excl));
+#ifdef _WIN32
+        BOOL excl = TRUE;
+        ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&excl), sizeof(excl));
+#else
+        int reuse = 1;
+        ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
         });
         register_handlers(h);
         const int sock = h.srv->bind_to_port(bind, static_cast<int>(p));

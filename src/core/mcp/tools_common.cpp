@@ -2,6 +2,7 @@
 // shared state and helpers for the tool handlers
 
 #include "core/mcp/tools_common.hpp"
+#include "core/compat/portable.hpp"
 
 namespace slop::core::mcp::detail {
 
@@ -188,8 +189,7 @@ image_cache_t& load_image(const std::string& path) {
     std::lock_guard ilk(g_image_mu);
     if (g_image.path == path && !g_image.file.empty()) return g_image;
 
-    std::FILE* f = nullptr;
-    fopen_s(&f, path.c_str(), "rb");
+    std::FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) fail("cannot open image file");
     fseek(f, 0, SEEK_END);
     const long size = ftell(f);

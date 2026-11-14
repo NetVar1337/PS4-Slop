@@ -91,17 +91,29 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(deps)
 
-# Off Windows: the platform-independent part only (Hyperion's loaders,
-# analyzer and decompiler, plus the portable core pieces), built as a compile
-# check by the linux CI lane. First step of a non-Windows engine; everything
-# else (Win32 backend, WinHTTP, raw capture, DX11/ImGui, the engine host)
-# still needs Windows.
+# Off Windows: the headless engine, its core and the portable test subset.
+# The window shell (DX11/ImGui), the Win32 user-mode backend and the pieces
+# that need Windows-only services (Schannel, CNG certificate minting, the
+# Win32 debug API, the magicmida sidecar) are replaced by POSIX ports or
+# gated out; docs/linux.md lists what runs and what does not.
 if(NOT WIN32)
+    add_compile_definitions(
+        SLOP_VERSION_STRING="${PROJECT_VERSION}"
+        SLOP_MAGICMIDA_VERSION="${SLOP_MAGICMIDA_VERSION}"
+    )
+    enable_testing()
+
     add_subdirectory(src/hyperion)
-    add_library(slop_portable STATIC src/core/memory/dissect.cpp)
-    target_include_directories(slop_portable PUBLIC "${CMAKE_SOURCE_DIR}/src")
-    target_link_libraries(slop_portable PUBLIC nlohmann_json::nlohmann_json)
-    target_compile_options(slop_portable PRIVATE -Wall -Wextra -Werror)
+    add_subdirectory(src/core)
+
+    if(SLOP_BUILD_ENGINE)
+        add_subdirectory(src/engine)
+    endif()
+
+    if(SLOP_BUILD_TESTS)
+        add_subdirectory(src/tests)
+    endif()
+
     return()
 endif()
 

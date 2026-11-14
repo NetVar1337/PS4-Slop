@@ -5,7 +5,13 @@
 #include "core/infra/clock.hpp"
 #include "core/infra/jobs.hpp"
 
+#include "core/infra/paths.hpp"
+
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -29,12 +35,14 @@ constexpr uint16_t kMachineAmd64 = 0x8664;
 constexpr uint64_t kMaxPeBytes = 512ull * 1024ull * 1024ull;
 constexpr const char* kVersion = SLOP_MAGICMIDA_VERSION;   // tools/magicmida-version.txt
 
+#ifdef _WIN32
 struct handle_closer_t {
     void operator()(void* handle) const noexcept {
         if (handle && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
     }
 };
 using unique_handle_t = std::unique_ptr<void, handle_closer_t>;
+#endif
 
 struct job_record_t {
     mutable std::mutex mutex;
@@ -47,6 +55,7 @@ std::mutex g_jobs_mutex;
 std::unordered_map<uint64_t, std::shared_ptr<job_record_t>> g_jobs;
 
 std::string env_value(const char* name) {
+#ifdef _WIN32
     const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
     if (needed == 0) return {};
     std::string value(needed, '\0');
@@ -54,9 +63,14 @@ std::string env_value(const char* name) {
     if (written == 0 || written >= needed) return {};
     value.resize(written);
     return value;
+#else
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::string(v) : std::string{};
+#endif
 }
 
 fs::path executable_dir() {
+#ifdef _WIN32
     std::string path(MAX_PATH, '\0');
     for (;;) {
         const DWORD count = GetModuleFileNameA(nullptr, path.data(),
@@ -68,6 +82,13 @@ fs::path executable_dir() {
         }
         path.resize(path.size() * 2);
     }
+#else
+    char buf[4096];
+    const ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return fs::current_path();
+    buf[n] = '\0';
+    return fs::path(buf).parent_path();
+#endif
 }
 
 fs::path default_root() {
@@ -77,12 +98,19 @@ fs::path default_root() {
     const fs::path bundled = executable_dir() / "tools" / "magicmida" / kVersion;
     if (fs::exists(bundled)) return bundled;
 
+#ifdef _WIN32
     const std::string local = env_value("LOCALAPPDATA");
     if (!local.empty())
         return fs::path(local) / "reverse-slop" / "tools" / "magicmida" / kVersion;
+#else
+    const std::string& data = infra::paths::app_data();
+    if (!data.empty())
+        return fs::path(data) / "tools" / "magicmida" / kVersion;
+#endif
     return bundled;
 }
 
+#ifdef _WIN32
 std::string quote_arg(const std::string& arg) {
     std::string out{"\""};
     size_t slashes = 0;
@@ -103,7 +131,9 @@ std::string quote_arg(const std::string& arg) {
     out.push_back('\"');
     return out;
 }
+#endif
 
+#ifdef _WIN32
 bool move_output(const fs::path& from, const fs::path& to, std::string& error) {
     if (from == to) return true;
     std::error_code ec;
@@ -120,6 +150,7 @@ bool move_output(const fs::path& from, const fs::path& to, std::string& error) {
     fs::remove(from, ec);
     return true;
 }
+#endif
 
 } // namespace
 
@@ -258,6 +289,13 @@ result_t run(const request_t& request, const infra::cancel_token_t& cancel_token
         if (destination != generated) fs::remove(destination, ec);
     }
 
+#ifndef _WIN32
+    // the sidecar is a Windows PE; there is nothing to launch here
+    (void)cancel_token;
+    out.error = "the Magicmida sidecar is a Windows executable and cannot run on this platform";
+    finish();
+    return out;
+#else
     const std::string command = quote_arg(sidecar.string()) + " /unpack " +
                                 quote_arg(fs::absolute(request.input_path).string());
     std::vector<char> command_line(command.begin(), command.end());
@@ -352,6 +390,7 @@ result_t run(const request_t& request, const infra::cancel_token_t& cancel_token
     out.ok = true;
     finish();
     return out;
+#endif
 }
 
 uint64_t start(request_t request, std::string& error) {

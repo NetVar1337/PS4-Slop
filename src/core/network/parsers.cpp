@@ -2,8 +2,12 @@
 
 #include "core/network/parsers.hpp"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
 
 #include <algorithm>
 #include <cctype>

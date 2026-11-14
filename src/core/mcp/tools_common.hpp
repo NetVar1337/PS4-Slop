@@ -4,8 +4,12 @@
 // shared state and helpers for the per-domain tool handlers (tools_*.cpp)
 // every handler and helper lives in slop::core::mcp::detail
 
+#ifdef _WIN32
 #include <windows.h>
 #include <ws2tcpip.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
 
 #include "core/infra/app_control.hpp"
 #include "core/infra/cancel.hpp"

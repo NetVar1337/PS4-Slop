@@ -220,7 +220,13 @@ int l_version(lua_State* L) {
 // raise lua errors from a dedicated noinline frame, longjmp on x64 walks
 // every frame and an inlined raise with c++ locals can crash the unwinder
 // the message goes through %s so dynamic content is never a format string
-__declspec(noinline) int lua_fail(lua_State* L, const char* msg) {
+#ifdef _MSC_VER
+#define SLOP_NOINLINE __declspec(noinline)
+#else
+#define SLOP_NOINLINE __attribute__((noinline))
+#endif
+
+SLOP_NOINLINE int lua_fail(lua_State* L, const char* msg) {
     return luaL_error(L, "%s", msg);
 }
 
@@ -228,7 +234,7 @@ __declspec(noinline) int lua_fail(lua_State* L, const char* msg) {
 // every binding entry re-checks the budget. a tight slop.mem.read_bytes loop
 // runs one native call per vm instruction and would otherwise outrun the
 // deadline. called before any lock is taken, so longjmp is safe here
-__declspec(noinline) void check_deadline(lua_State* L) {
+SLOP_NOINLINE void check_deadline(lua_State* L) {
     const script_ctx_t* c = ctx_of(L);
     if (c->cancel.cancelled()) lua_fail(L, "script cancelled");
     if (now_ms() > c->deadline_ms) lua_fail(L, "script execution timed out");
@@ -250,7 +256,7 @@ void push_str_array(lua_State* L, const std::vector<std::string>& v) {
 
 // Requires a loaded image; errors (Lua-level) otherwise. Returns nothing on
 // failure (longjmp out of the binding)
-__declspec(noinline) bool need_image(lua_State* L) {
+SLOP_NOINLINE bool need_image(lua_State* L) {
     if (ds::has_binary()) return true;
     lua_fail(L, "no image loaded in reverse-slop (slop.image.load a binary first)");
     return false;   // unreachable
@@ -1813,7 +1819,7 @@ bool mcp_action_impl(lua_State* L, const char* tool, const char* action, fill_fn
 }
 
 // raises from a frame without C++ locals
-__declspec(noinline) int mcp_action(lua_State* L, const char* tool, const char* action,
+SLOP_NOINLINE int mcp_action(lua_State* L, const char* tool, const char* action,
                                     fill_fn fill = nullptr) {
     if (mcp_action_impl(L, tool, action, fill)) return 1;
     luaL_where(L, 1);

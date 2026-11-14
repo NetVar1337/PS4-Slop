@@ -12,11 +12,16 @@
 // fast instead of paying another timeout. reconnect() restores the session.
 
 #include "core/runtime/backend_ps5.hpp"
+#include "core/compat/portable.hpp"
 #include "core/runtime/ps5_protocol.hpp"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
 
 #include "core/infra/clock.hpp"
 #include "core/infra/diag.hpp"
@@ -130,7 +135,10 @@ public:
         ioctlsocket(s, FIONBIO, &nonblock);
         int r = ::connect(s, list->ai_addr, static_cast<int>(list->ai_addrlen));
         freeaddrinfo(list);
-        if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
+        // POSIX reports a non-blocking connect as EINPROGRESS, Winsock as
+        // WSAEWOULDBLOCK; both mean "wait for writability"
+        if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK &&
+            WSAGetLastError() != WSAEINPROGRESS) {
             const int wsa_err = WSAGetLastError();
             closesocket(s);
             err = "connect to " + h + ":" + port_str + " failed (WSA " +
@@ -153,8 +161,13 @@ public:
                 return false;
             }
             int soerr = 0;
+#ifdef _WIN32
             int slen  = sizeof(soerr);
             getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &slen);
+#else
+            socklen_t slen = sizeof(soerr);
+            getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &slen);
+#endif
             if (soerr != 0 || FD_ISSET(s, &eset)) {
                 closesocket(s);
                 err = "connect to " + h + ":" + port_str + " failed (SO_ERROR " +
@@ -225,7 +238,7 @@ public:
             if (w == 0) return fail(ps5::kErrTimeout, "console stopped accepting data (send timeout)");
             if (w < 0) return fail(ps5::kErrSendFailed, "select failed while sending (WSA " +
                                                          std::to_string(WSAGetLastError()) + ")");
-            const int n = ::send(s, p, static_cast<int>(left > 0x10000 ? 0x10000 : left), 0);
+            const int n = ::send(s, p, static_cast<int>(left > 0x10000 ? 0x10000 : left), SLOP_SEND_FLAGS);
             if (n <= 0) return fail(ps5::kErrSendFailed, "send failed (WSA " +
                                                          std::to_string(WSAGetLastError()) + ")");
             p    += n;
@@ -518,7 +531,7 @@ private:
             tv.tv_usec = 200 * 1000;
             if (select(0, &rset, nullptr, nullptr, &tv) <= 0) continue;
             sockaddr_in peer{};
-            int peer_len = static_cast<int>(sizeof(peer));
+            slop_socklen_t peer_len = static_cast<slop_socklen_t>(sizeof(peer));
             SOCKET c = accept(ls, reinterpret_cast<sockaddr*>(&peer), &peer_len);
             if (c == INVALID_SOCKET) continue;
             const uint32_t want = allow_peer_.load();
@@ -594,6 +607,7 @@ std::string io_error_str(uint32_t code) {
     default: break;
     }
     if (code < 0xE0000000u) {
+#ifdef _WIN32
         char* msg = nullptr;
         const DWORD n = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
                                        FORMAT_MESSAGE_IGNORE_INSERTS,
@@ -607,6 +621,12 @@ std::string io_error_str(uint32_t code) {
         }
         if (msg) LocalFree(msg);
         return text;
+#else
+        // the code is a Win32 error value carried by the protocol; keep the
+        // shared wording and append the host's text
+        return "Win32 error " + std::to_string(code) + ": " +
+               std::strerror(static_cast<int>(code));
+#endif
     }
     return "error " + hex32(code);
 }

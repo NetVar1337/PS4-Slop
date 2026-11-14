@@ -48,6 +48,7 @@
 - [Building](project/building.md)
 - [Tests](project/tests.md)
 - [Security and qualification](project/security.md)
+- [Linux engine](linux.md)
 - [Roadmap, changelog and audit](project/links.md)
 - [Ecosystem merge plan](MERGE.md)
 - [Audit](AUDIT.md)

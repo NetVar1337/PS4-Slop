@@ -10,7 +10,9 @@
 
 // Vendored header defines an unused static helper (usleep shim) that trips
 // C4505 at TU end, kept suppressed for the rest of this file
+#ifdef _MSC_VER
 #pragma warning(disable : 4505)
+#endif
 #include <unicorn/unicorn.h>
 #include <Zydis/Zydis.h>
 

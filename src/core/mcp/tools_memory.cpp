@@ -2,6 +2,7 @@
 // tool: memory (read/write/scan/aob/pointer scan/snapshots/watch)
 
 #include "core/mcp/tools_common.hpp"
+#include "core/compat/portable.hpp"
 
 #include <filesystem>
 
@@ -1376,13 +1377,13 @@ json tool_memory(const json& args) {
             auto in = eng.decode(addr + off, buf.data() + off, len - off);
             if (!in || in->length == 0) break;
             ++insns;
-            for (size_t b = 0; b < in->length; ++b) {
+            for (size_t b = 0; b < static_cast<size_t>(in->length); ++b) {
                 bool wild = false;
                 // rip relative and rel32 bytes move on a rebase
                 const bool is_branch =
                     in->flow != disasm::flow_t::none &&
                     in->flow != disasm::flow_t::ret;
-                if (in->has_rip_rel && in->length >= 6 && b >= in->length - 4 &&
+                if (in->has_rip_rel && in->length >= 6 && b >= static_cast<size_t>(in->length - 4) &&
                     !is_branch)
                     wild = true;
                 else if (is_branch && in->length == 5 && b >= 1)

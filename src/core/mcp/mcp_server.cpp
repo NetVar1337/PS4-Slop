@@ -1137,8 +1137,13 @@ bool start(const server_config_t& cfg) {
     // httplib's default SO_REUSEADDR lets a second process bind the same
     // 127.0.0.1 port on Windows and silently take half the connections
     srv->set_socket_options([](socket_t s) {
+#ifdef _WIN32
         BOOL excl = TRUE;
         ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&excl), sizeof(excl));
+#else
+        int reuse = 1;
+        ::setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
     });
 
     // long lived sse streams each pin a worker, so the pool is sized well past the stream cap

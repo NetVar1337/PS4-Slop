@@ -1,6 +1,7 @@
 // src/core/analysis/danger.cpp
 
 #include "core/analysis/danger.hpp"
+#include "core/compat/portable.hpp"
 
 #include <algorithm>
 #include <cctype>

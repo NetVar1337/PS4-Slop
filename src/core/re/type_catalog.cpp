@@ -4,12 +4,13 @@
 
 #include <nlohmann/json.hpp>
 
-#include <windows.h>
+#include "core/infra/paths.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -38,12 +39,11 @@ std::atomic<uint64_t> g_generation{1};
 void bump_generation() { g_generation.fetch_add(1, std::memory_order_release); }
 
 std::string store_dir() {
-    char base[MAX_PATH]{};
-    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    const std::string dir = std::string(base, n) + "\\reverse-slop\\types";
-    CreateDirectoryA((std::string(base, n) + "\\reverse-slop").c_str(), nullptr);
-    CreateDirectoryA(dir.c_str(), nullptr);
+    const std::string& base = infra::paths::app_data();
+    if (base.empty()) return {};
+    const std::string dir = base + "/types";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
     return dir;
 }
 

@@ -3,6 +3,7 @@
 
 #include "core/infra/paths.hpp"
 #include "core/mcp/tools_common.hpp"
+#include "core/compat/portable.hpp"
 #include "core/network/net_socket.hpp"
 #include "core/runtime/console_manager.hpp"
 
@@ -40,7 +41,7 @@ std::vector<std::string> discover_ps4(int timeout_ms) {
     for (;;) {
         char buf[64];
         sockaddr_in from{};
-        int fromlen = sizeof(from);
+        slop_socklen_t fromlen = sizeof(from);
         const int n = ::recvfrom(s, buf, sizeof(buf), 0,
                                  reinterpret_cast<sockaddr*>(&from), &fromlen);
         if (n == SOCKET_ERROR) break;   // receive timeout: stop collecting

@@ -486,7 +486,7 @@ TEST_CASE(ps4_debug_port_in_use_names_owner) {
     a.sin_port = 0;
     REQUIRE(bind(hog, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0);
     REQUIRE(listen(hog, 1) == 0);
-    int alen = sizeof(a);
+    slop_socklen_t alen = sizeof(a);
     getsockname(hog, reinterpret_cast<sockaddr*>(&a), &alen);
     const uint16_t port = ntohs(a.sin_port);
 

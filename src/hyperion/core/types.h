@@ -35,7 +35,9 @@ inline std::string default_func_name(va_t va) {
     std::string out("sub_");
     // n is provably in [1,16] here, but /analyze cannot prove the rev[--n]
     // index's lower bound and reports a false C6385.
+#ifdef _MSC_VER
 #pragma warning(suppress : 6385)
+#endif
     while (n) out.push_back(rev[--n]);
     return out;
 }

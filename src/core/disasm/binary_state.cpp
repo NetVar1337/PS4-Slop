@@ -1,8 +1,9 @@
 // src/core/disasm/binary_state.cpp
 
-#include <windows.h>
-
 #include "core/disasm/binary_state.hpp"
+#include "core/compat/portable.hpp"
+
+#include "core/infra/paths.hpp"
 
 #include "core/disasm/hyperion_session.hpp"
 #include "core/infra/diag.hpp"
@@ -17,6 +18,7 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <cctype>
 #include <fstream>
 #include <future>
@@ -44,12 +46,11 @@ uint64_t fnv1a(const uint8_t* d, size_t n) {
 }
 
 std::string symbols_dir() {
-    char base[MAX_PATH]{};
-    const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    const std::string dir = std::string(base, n) + "\\reverse-slop\\symbols";
-    CreateDirectoryA((std::string(base, n) + "\\reverse-slop").c_str(), nullptr);
-    CreateDirectoryA(dir.c_str(), nullptr);
+    const std::string& base = infra::paths::app_data();
+    if (base.empty()) return {};
+    const std::string dir = base + "/symbols";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
     return dir;
 }
 

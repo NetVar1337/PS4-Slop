@@ -544,6 +544,57 @@ jobs:
 
   # Frontend unit tests on linux: pure node/vite, no windows toolchain needed,
   # fully parallel with every compile lane.
+  # Headless Linux engine: the portable core + engine host, the portable test
+  # subset, and a boot smoke check against the real binary.
+  linux:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++ libssl-dev
+
+      - name: cache dependency sources
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: _ext/*-src
+          key: ext-linux-v1-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            ext-linux-v1-
+
+      - name: configure
+        run: cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: build engine + tests
+        run: cmake --build build-linux -j "$(nproc)" --target reverse-slop-engine slop_tests
+
+      - name: portable test subset
+        run: ./build-linux/tests/slop_tests
+
+      - name: engine boot smoke check
+        run: |
+          ./build-linux/src/engine/reverse-slop-engine --no-onboard --port 8799 > engine.out 2> engine.err &
+          for _ in $(seq 1 100); do
+            grep -q SLOP_ENGINE_READY engine.out && break
+            sleep 0.2
+          done
+          cat engine.out
+          port=$(awk '/SLOP_ENGINE_READY/{print $2}' engine.out)
+          token=$(awk '/SLOP_ENGINE_READY/{print $3}' engine.out)
+          test -n "$port"
+          curl -fsS "http://127.0.0.1:$port/health"
+          curl -fsS -H "Authorization: Bearer $token" -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
+            "http://127.0.0.1:$port/mcp" | head -c 400
+          kill %1
+
   frontend-tests:
     needs: changes
     if: github.event_name != 'pull_request' || needs.changes.outputs.frontend == 'true'

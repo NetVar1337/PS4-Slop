@@ -3,7 +3,75 @@
 #include "core/disasm/pe_parser.hpp"
 #include "core/runtime/session.hpp"
 
+#include "core/infra/paths.hpp"
+
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+
+// The PE structs module_dump walks come from <windows.h> on Windows. These are
+// the same layouts, only the fields this file reads.
+#pragma pack(push, 1)
+struct IMAGE_DOS_HEADER {
+    uint16_t e_magic;
+    uint16_t e_cblp, e_cp, e_crlc, e_cparhdr, e_minalloc, e_maxalloc, e_ss, e_sp;
+    uint16_t e_csum, e_ip, e_cs, e_lfarlc, e_ovno;
+    uint16_t e_res[4];
+    uint16_t e_oemid, e_oeminfo;
+    uint16_t e_res2[10];
+    int32_t  e_lfanew;
+};
+struct IMAGE_FILE_HEADER {
+    uint16_t Machine, NumberOfSections;
+    uint32_t TimeDateStamp, PointerToSymbolTable, NumberOfSymbols;
+    uint16_t SizeOfOptionalHeader, Characteristics;
+};
+struct IMAGE_SECTION_HEADER {
+    uint8_t  Name[8];
+    uint32_t VirtualSize, VirtualAddress, SizeOfRawData, PointerToRawData;
+    uint32_t PointerToRelocations, PointerToLinenumbers;
+    uint16_t NumberOfRelocations, NumberOfLinenumbers;
+    uint32_t Characteristics;
+};
+struct IMAGE_OPTIONAL_HEADER32 {
+    uint16_t Magic;
+    uint8_t  MajorLinkerVersion, MinorLinkerVersion;
+    uint32_t SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint, BaseOfCode, BaseOfData;
+    uint32_t ImageBase, SectionAlignment, FileAlignment;
+    uint16_t MajorOperatingSystemVersion, MinorOperatingSystemVersion;
+    uint16_t MajorImageVersion, MinorImageVersion;
+    uint16_t MajorSubsystemVersion, MinorSubsystemVersion;
+    uint32_t Win32VersionValue, SizeOfImage, SizeOfHeaders, CheckSum;
+    uint16_t Subsystem, DllCharacteristics;
+    uint32_t SizeOfStackReserve, SizeOfStackCommit, SizeOfHeapReserve, SizeOfHeapCommit;
+    uint32_t LoaderFlags, NumberOfRvaAndSizes;
+    uint8_t  DataDirectory[16 * 8];
+};
+struct IMAGE_OPTIONAL_HEADER64 {
+    uint16_t Magic;
+    uint8_t  MajorLinkerVersion, MinorLinkerVersion;
+    uint32_t SizeOfCode, SizeOfInitializedData, SizeOfUninitializedData;
+    uint32_t AddressOfEntryPoint, BaseOfCode;
+    uint64_t ImageBase;
+    uint32_t SectionAlignment, FileAlignment;
+    uint16_t MajorOperatingSystemVersion, MinorOperatingSystemVersion;
+    uint16_t MajorImageVersion, MinorImageVersion;
+    uint16_t MajorSubsystemVersion, MinorSubsystemVersion;
+    uint32_t Win32VersionValue, SizeOfImage, SizeOfHeaders, CheckSum;
+    uint16_t Subsystem, DllCharacteristics;
+    uint64_t SizeOfStackReserve, SizeOfStackCommit, SizeOfHeapReserve, SizeOfHeapCommit;
+    uint32_t LoaderFlags, NumberOfRvaAndSizes;
+    uint8_t  DataDirectory[16 * 8];
+};
+#pragma pack(pop)
+
+inline constexpr uint16_t IMAGE_DOS_SIGNATURE = 0x5A4D;
+inline constexpr uint32_t IMAGE_NT_SIGNATURE = 0x00004550;
+inline constexpr uint16_t IMAGE_NT_OPTIONAL_HDR32_MAGIC = 0x10B;
+inline constexpr uint16_t IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20B;
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -42,6 +110,31 @@ bool read_exact(const module_read_fn_t& read, uintptr_t address, void* dst,
 
 bool write_atomic(const std::string& output_path,
                   const std::vector<uint8_t>& data, std::string& error) {
+#ifndef _WIN32
+    // same contract: temp file, flushed, renamed over the destination
+    const std::string tmp = output_path + ".slop-tmp-" + std::to_string(::getpid());
+    {
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (!f) {
+            error = "failed to create temporary dump file";
+            return false;
+        }
+        const size_t n = std::fwrite(data.data(), 1, data.size(), f);
+        const bool flushed = std::fflush(f) == 0;
+        std::fclose(f);
+        if (n != data.size() || !flushed) {
+            std::remove(tmp.c_str());
+            error = "failed to write dump file";
+            return false;
+        }
+    }
+    if (std::rename(tmp.c_str(), output_path.c_str()) != 0) {
+        std::remove(tmp.c_str());
+        error = "failed to replace the dump file";
+        return false;
+    }
+    return true;
+#else
     const std::filesystem::path final_path{output_path};
     if (final_path.empty()) {
         error = "output path is empty";
@@ -86,6 +179,7 @@ bool write_atomic(const std::string& output_path,
         error = "failed to write dump file (error " + std::to_string(code) + ")";
     }
     return ok;
+#endif
 }
 
 } // namespace

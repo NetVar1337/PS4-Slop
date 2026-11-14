@@ -497,8 +497,8 @@ void append_block(std::vector<uint8_t>& out, uint32_t type, const std::vector<ui
 }
 
 bool write_file(const std::string& path, const std::vector<uint8_t>& out, std::string* error) {
-    std::FILE* fp = nullptr;
-    if (fopen_s(&fp, path.c_str(), "wb") != 0 || !fp) {
+    std::FILE* fp = std::fopen(path.c_str(), "wb");
+    if (!fp) {
         if (error) *error = "cannot open output file '" + path + "'";
         return false;
     }

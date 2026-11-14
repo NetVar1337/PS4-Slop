@@ -83,6 +83,7 @@ release on demand.
 | Needed for | Requirement |
 | --- | --- |
 | Running the app | Windows 10/11 x64, WebView2 runtime (bundled with Windows 11) |
+| Headless engine on Linux | x86-64, CMake + Ninja + g++ + libssl-dev — see [`docs/linux.md`](docs/linux.md) |
 | Console work | A PS4 on the same network running the ps4debug-NG payload |
 | Building | Visual Studio 2022+ with _Desktop development with C++_, CMake ≥ 3.25, Ninja, Node.js + npm, Rust/Cargo |
 | Optional | Administrator rights for host packet capture; Magicmida for Themida unpacking |

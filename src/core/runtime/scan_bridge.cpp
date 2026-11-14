@@ -4,7 +4,13 @@
 
 #include "core/runtime/backend_registry.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+// the Windows protection vocabulary the backends report
+inline constexpr uint32_t MEM_COMMIT = 0x1000;
+inline constexpr uint32_t PAGE_GUARD = 0x100;
+#endif
 
 namespace slop::core::runtime {
 

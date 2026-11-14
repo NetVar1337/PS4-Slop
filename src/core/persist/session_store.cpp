@@ -3,7 +3,9 @@
 #include "core/persist/session_store.hpp"
 #include "core/infra/paths.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <sqlite3.h>
 
@@ -16,7 +18,11 @@ namespace {
 std::string now_iso_utc() {
     std::time_t t = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
     gmtime_s(&tm, &t);
+#else
+    gmtime_r(&t, &tm);
+#endif
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return buf;

@@ -1,4 +1,4 @@
-add_library(slop_core STATIC
+set(SLOP_CORE_SOURCES
     infra/capability.hpp
     infra/published.hpp
     infra/cancel.hpp
@@ -202,6 +202,33 @@ add_library(slop_core STATIC
     infra/mcp_onboard.cpp
 )
 
+if(NOT WIN32)
+    # Whole-file replacements: the Win32 implementation cannot be #ifdef'd
+    # into shape (Win32 debug API, Schannel, CNG certificate minting, GDI
+    # icons, Toolhelp heaps). Everything else keeps its file and grows a
+    # POSIX branch; docs/linux.md lists both sets.
+    list(REMOVE_ITEM SLOP_CORE_SOURCES
+        runtime/backend_usermode.cpp
+        util/fs_tools.cpp
+        network/tls_stream.cpp
+        network/mitm_pki.cpp
+        process/process_icon.cpp
+        process/heap_list.cpp
+        debugger/local_debugger.cpp
+    )
+    list(APPEND SLOP_CORE_SOURCES
+        runtime/backend_posix.cpp
+        util/fs_tools_posix.cpp
+        network/tls_stream_posix.cpp
+        network/mitm_pki_posix.cpp
+        process/process_icon_posix.cpp
+        process/heap_list_posix.cpp
+        debugger/local_debugger_posix.cpp
+    )
+endif()
+
+add_library(slop_core STATIC ${SLOP_CORE_SOURCES})
+
 target_include_directories(slop_core PUBLIC "${CMAKE_SOURCE_DIR}/src")
 
 # Deliberately NOT slop_imgui, core must never see ImGui headers
@@ -212,14 +239,26 @@ target_link_libraries(slop_core PUBLIC
     slop_hyperion
 )
 
-# Win32 system libs (static link, no import lib needed for ntdll, resolved at runtime)
-target_link_libraries(slop_core PRIVATE
-    psapi advapi32 shlwapi ole32 shell32 crypt32 winhttp dbghelp setupapi
-    unicorn
-    slop_sqlite
-    slop_lua
-    ws2_32
-)
+if(WIN32)
+    # Win32 system libs (static link, no import lib needed for ntdll, resolved at runtime)
+    target_link_libraries(slop_core PRIVATE
+        psapi advapi32 shlwapi ole32 shell32 crypt32 winhttp dbghelp setupapi
+        unicorn
+        slop_sqlite
+        slop_lua
+        ws2_32
+    )
+else()
+    target_link_libraries(slop_core PRIVATE
+        unicorn
+        slop_sqlite
+        slop_lua
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        pthread
+        dl
+    )
+endif()
 
 target_compile_definitions(slop_core PUBLIC
     NOMINMAX
@@ -229,4 +268,8 @@ target_compile_definitions(slop_core PUBLIC
 
 if(MSVC)
     target_compile_options(slop_core PRIVATE /W4 /WX /EHsc)
+else()
+    # MSVC /W4 does not flag these two, and the ported code is full of them
+    target_compile_options(slop_core PRIVATE
+        -Wall -Wextra -Werror -Wno-switch -Wno-unused-but-set-variable)
 endif()

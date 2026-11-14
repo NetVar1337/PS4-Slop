@@ -8,10 +8,14 @@
 
 // Vendored header defines an unused static helper (usleep shim) that trips
 // C4505 at TU end, suppressed for this include only
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4505)
+#endif
 #include <unicorn/unicorn.h>
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -75,7 +79,7 @@ orbis_result_t sys_mmap(void* uc, orbis_state_t& st, const uint64_t args[6]) {
                           (args[2] & kProtWrite ? UC_PROT_WRITE : 0) |
                           (args[2] & kProtExec ? UC_PROT_EXEC : 0);
     if (uc_mem_map(eng(uc), base, static_cast<size_t>(len),
-                   prot ? prot : UC_PROT_ALL) != UC_ERR_OK)
+                   prot ? prot : static_cast<uint32_t>(UC_PROT_ALL)) != UC_ERR_OK)
         return errno_result(kOrbisENOMEM);
     st.maps[base] = static_cast<size_t>(len);
     return {true, base};

@@ -4,10 +4,14 @@
 
 // Vendored header defines an unused static helper (usleep shim) that trips
 // C4505 at TU end, suppressed for this include only
+#ifdef _MSC_VER
 #pragma warning(push)
 #pragma warning(disable : 4505)
+#endif
 #include <unicorn/unicorn.h>
+#ifdef _MSC_VER
 #pragma warning(pop)
+#endif
 
 namespace slop::core::emu {
 

@@ -3,17 +3,24 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
 
 #include "core/network/net_socket.hpp"
+#include "core/compat/portable.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <mutex>
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace slop::core::network::sock {
 
@@ -146,8 +153,13 @@ socket_t connect(const parse::ip_addr_t& ip, uint16_t port, int timeout_ms,
             if (r < 0) break;
             if (r == 0) continue;
             int soerr = 0;
+#ifdef _WIN32
             int sl = sizeof(soerr);
             ::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &sl);
+#else
+            socklen_t sl = sizeof(soerr);
+            ::getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &sl);
+#endif
             if (soerr != 0 || (fd.revents & (POLLERR | POLLHUP))) {
                 ::closesocket(s);
                 if (error)
@@ -168,7 +180,7 @@ socket_t connect(const parse::ip_addr_t& ip, uint16_t port, int timeout_ms,
 bool send_all(socket_t s, const uint8_t* d, size_t n) {
     while (n > 0) {
         const int w = ::send(static_cast<SOCKET>(s), reinterpret_cast<const char*>(d),
-                             static_cast<int>(std::min<size_t>(n, 1 << 20)), 0);
+                             static_cast<int>(std::min<size_t>(n, 1 << 20)), SLOP_SEND_FLAGS);
         if (w <= 0) return false;
         d += w;
         n -= static_cast<size_t>(w);
@@ -202,14 +214,22 @@ void close(socket_t s) {
 
 std::string peer_address(socket_t s, uint16_t* port) {
     sockaddr_storage ss{};
+#ifdef _WIN32
     int len = sizeof(ss);
+#else
+    socklen_t len = sizeof(ss);
+#endif
     if (::getpeername(static_cast<SOCKET>(s), reinterpret_cast<sockaddr*>(&ss), &len) != 0) return {};
     return sockaddr_text(ss, port);
 }
 
 std::string local_address(socket_t s, uint16_t* port) {
     sockaddr_storage ss{};
+#ifdef _WIN32
     int len = sizeof(ss);
+#else
+    socklen_t len = sizeof(ss);
+#endif
     if (::getsockname(static_cast<SOCKET>(s), reinterpret_cast<sockaddr*>(&ss), &len) != 0) return {};
     return sockaddr_text(ss, port);
 }

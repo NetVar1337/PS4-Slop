@@ -1,7 +1,11 @@
 // src/core/disasm/hyperion_session.cpp
 
-// GlobalMemoryStatusEx, for sizing the analysis budget against available RAM
+// available RAM, for sizing the analysis budget
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "core/disasm/hyperion_session.hpp"
 
@@ -34,15 +38,23 @@ size_t analysis_insn_budget() {
             const unsigned long long v = std::strtoull(env, &end, 10);
             if (end != env) return static_cast<size_t>(v);
         }
+#ifdef _WIN32
         MEMORYSTATUSEX mem{};
         mem.dwLength = sizeof(mem);
         if (!GlobalMemoryStatusEx(&mem)) return static_cast<size_t>(1'000'000);
+        const uint64_t avail_phys = mem.ullAvailPhys;
+#else
+        const long pages = ::sysconf(_SC_AVPHYS_PAGES);
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        if (pages <= 0 || page_size <= 0) return static_cast<size_t>(1'000'000);
+        const uint64_t avail_phys = static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
+#endif
 
         // The instruction map, sweep cache, CFG copy, xrefs and allocator
         // overhead coexist during analysis. Leave most currently available
         // memory to the loaded image, the UI and the operating system.
         constexpr uint64_t kBytesPerInsn = 1024;
-        const uint64_t affordable = (mem.ullAvailPhys / 4) / kBytesPerInsn;
+        const uint64_t affordable = (avail_phys / 4) / kBytesPerInsn;
         return static_cast<size_t>(std::clamp<uint64_t>(affordable, 250'000, 2'000'000));
     }();
     return budget;

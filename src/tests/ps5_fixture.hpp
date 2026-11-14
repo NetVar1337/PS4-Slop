@@ -14,9 +14,14 @@
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/ps5_protocol.hpp"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
+#include "core/compat/portable.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -65,7 +70,7 @@ uint16_t free_tcp_port() {
         closesocket(s);
         return 0;
     }
-    int len = sizeof(addr);
+    slop_socklen_t len = sizeof(addr);
     getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len);
     const uint16_t port = ntohs(addr.sin_port);
     closesocket(s);
@@ -214,7 +219,7 @@ struct fake_ps5_server_t {
         addr.sin_port = 0;   // ephemeral
         if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
         if (listen(listen_fd, 4) != 0) return false;
-        int len = sizeof(addr);
+        slop_socklen_t len = sizeof(addr);
         getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
         port = ntohs(addr.sin_port);
         th = std::thread([this] { accept_loop(); });

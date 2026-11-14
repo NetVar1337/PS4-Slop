@@ -2,8 +2,13 @@
 
 #include "core/infra/lifecycle.hpp"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <dpapi.h>
+#else
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -33,7 +38,9 @@
 #include "core/process/target_service.hpp"
 #include "core/runtime/backend_registry.hpp"
 
+#ifdef _WIN32
 #pragma comment(lib, "crypt32.lib")
+#endif
 
 namespace slop::core::infra::lifecycle {
 
@@ -71,9 +78,12 @@ std::string endpoint_file() {
     return dir + "\\engine.json";
 }
 
-// the token never lands on disk in the clear: DPAPI (current user) blob as hex
+// the token never lands on disk in the clear: DPAPI (current user) blob as
+// hex on Windows; on POSIX the endpoint file is 0600 and the token is stored
+// as-is (there is no per-user key service to borrow)
 std::string protect(const std::string& plain) {
     if (plain.empty()) return {};
+#ifdef _WIN32
     DATA_BLOB in{static_cast<DWORD>(plain.size()),
                  reinterpret_cast<BYTE*>(const_cast<char*>(plain.data()))};
     DATA_BLOB out{};
@@ -83,8 +93,12 @@ std::string protect(const std::string& plain) {
     std::string hex = fmt::format_hex_packed({out.pbData, out.cbData});
     ::LocalFree(out.pbData);
     return hex;
+#else
+    return plain;
+#endif
 }
 
+#ifdef _WIN32
 std::string unprotect(const std::string& hex) {
     std::vector<uint8_t> blob;
     std::string err;
@@ -99,14 +113,27 @@ std::string unprotect(const std::string& hex) {
     ::LocalFree(out.pbData);
     return plain;
 }
+#endif
 
+#ifdef _WIN32
 std::wstring image_path_of(HANDLE process) {
     wchar_t buf[MAX_PATH * 2]{};
     DWORD n = static_cast<DWORD>(std::size(buf));
     if (!::QueryFullProcessImageNameW(process, 0, buf, &n)) return {};
     return std::wstring(buf, n);
 }
+#else
+std::string image_path_of(uint32_t pid) {
+    char link[64], buf[4096];
+    std::snprintf(link, sizeof(link), "/proc/%u/exe", pid);
+    const ssize_t n = ::readlink(link, buf, sizeof(buf) - 1);
+    if (n <= 0) return {};
+    buf[n] = '\0';
+    return buf;
+}
+#endif
 
+#ifdef _WIN32
 std::string utf8(const std::wstring& w) {
     if (w.empty()) return {};
     const int n = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
@@ -125,22 +152,37 @@ std::wstring wide(const std::string& s) {
     ::MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), out.data(), n);
     return out;
 }
+#endif
 
 void write_endpoint(uint16_t p, const std::string& token) {
     const std::string path = endpoint_file();
     if (path.empty()) return;
+#ifdef _WIN32
     const json doc{{"pid", static_cast<uint32_t>(::GetCurrentProcessId())},
                    {"port", p},
                    {"exe", utf8(image_path_of(::GetCurrentProcess()))},
                    {"token_dpapi", protect(token)}};
-    paths::write_file_atomic(path, doc.dump(2));
+#else
+    const json doc{{"pid", static_cast<uint32_t>(::getpid())},
+                   {"port", p},
+                   {"exe", image_path_of(static_cast<uint32_t>(::getpid()))},
+                   {"token", protect(token)}};
+#endif
+    if (!paths::write_file_atomic(path, doc.dump(2))) return;
+#ifndef _WIN32
+    ::chmod(path.c_str(), 0600);   // the bearer token is plaintext here
+#endif
 }
 
 void remove_endpoint() {
     endpoint_t existing;
     // only delete the file if it is still ours
-    if (read_endpoint(existing) && existing.pid != ::GetCurrentProcessId())
-        return;
+#ifdef _WIN32
+    const uint32_t self = static_cast<uint32_t>(::GetCurrentProcessId());
+#else
+    const uint32_t self = static_cast<uint32_t>(::getpid());
+#endif
+    if (read_endpoint(existing) && existing.pid != self) return;
     const std::string path = endpoint_file();
     if (path.empty()) return;
     std::error_code ec;
@@ -430,10 +472,15 @@ bool read_endpoint(endpoint_t& out) {
     endpoint_t ep;
     ep.pid   = doc.value("pid", uint32_t{0});
     ep.port  = doc.value("port", uint16_t{0});
+#ifdef _WIN32
     ep.token = unprotect(doc.value("token_dpapi", std::string{}));
+#else
+    ep.token = doc.value("token", std::string{});
+#endif
     const std::string exe = doc.value("exe", std::string{});
     if (ep.pid == 0 || ep.port == 0) return false;
 
+#ifdef _WIN32
     // a crash leaves the file behind, treat a dead pid as no endpoint
     HANDLE h = ::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ep.pid);
     if (h == nullptr) return false;
@@ -446,6 +493,11 @@ bool read_endpoint(endpoint_t& out) {
     if (exe.empty() || image.empty() ||
         ::CompareStringOrdinal(image.c_str(), -1, wide(exe).c_str(), -1, TRUE) != CSTR_EQUAL)
         return false;
+#else
+    if (::kill(static_cast<pid_t>(ep.pid), 0) != 0) return false;
+    const std::string image = image_path_of(ep.pid);
+    if (exe.empty() || image.empty() || image != exe) return false;
+#endif
 
     out = std::move(ep);
     return true;

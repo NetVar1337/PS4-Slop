@@ -5,15 +5,20 @@
 // runs under broker_gate(), so all clients serialize on the one connection.
 
 #include "core/runtime/gdb_rsp.hpp"
+#include "core/compat/portable.hpp"
 
 #include "core/runtime/backend_ps4.hpp"
 #include "core/runtime/backend_registry.hpp"
 #include "core/runtime/broker.hpp"
 #include "core/runtime/ps4_protocol.hpp"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -889,7 +894,7 @@ struct gdb_rsp_server_t::impl_t {
     void accept_loop() {
         while (running) {
             sockaddr_in addr{};
-            int alen = sizeof(addr);
+            slop_socklen_t alen = sizeof(addr);
             const SOCKET s = ::accept(listen_sock, reinterpret_cast<sockaddr*>(&addr), &alen);
             if (s == INVALID_SOCKET) break;
             auto c = std::make_shared<conn_t>();
@@ -942,7 +947,7 @@ struct gdb_rsp_server_t::impl_t {
             return false;
         }
         sockaddr_in bound{};
-        int bl = sizeof(bound);
+        slop_socklen_t bl = sizeof(bound);
         ::getsockname(listen_sock, reinterpret_cast<sockaddr*>(&bound), &bl);
         port = ntohs(bound.sin_port);
         bind = b;

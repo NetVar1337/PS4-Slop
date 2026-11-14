@@ -5,13 +5,18 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
 
 #include "core/network/http_proxy.hpp"
 
 #include "core/network/mitm_pki.hpp"
 #include "core/network/net_socket.hpp"
+#include "core/compat/portable.hpp"
 #include "core/network/parsers.hpp"
 #include "core/network/redact.hpp"
 #include "core/network/tls_stream.hpp"
@@ -20,7 +25,9 @@
 #include <chrono>
 #include <cstring>
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace slop::core::network {
 
@@ -490,7 +497,7 @@ void http_proxy_t::impl_t::pump(endpoint_t& a, endpoint_t& b, recorder_t* rec, b
             const int r = ::WSAPoll(fds, static_cast<ULONG>(nf), 250);
             if (r < 0) break;
             if (r > 0) {
-                const SHORT ready = POLLRDNORM | POLLHUP | POLLERR;
+                const int ready = POLLRDNORM | POLLHUP | POLLERR;
                 if (ia >= 0 && (fds[ia].revents & ready)) { ok = service_a(); progressed = true; }
                 if (ok && ib >= 0 && (fds[ib].revents & ready)) { ok = service_b(); progressed = true; }
             }
@@ -563,7 +570,7 @@ void http_proxy_t::impl_t::accept_loop() {
                                                     "proxy connection limit reached\n");
             u_long nb = 1;
             ::ioctlsocket(c, FIONBIO, &nb);
-            ::send(c, msg.data(), static_cast<int>(msg.size()), 0);
+            ::send(c, msg.data(), static_cast<int>(msg.size()), SLOP_SEND_FLAGS);
             sock::close(cs);
             continue;
         }
@@ -910,8 +917,13 @@ bool http_proxy_t::start(const proxy_options_t& o, std::string* error) {
     const int af = bind_ip->family == 4 ? AF_INET : AF_INET6;
     SOCKET l = ::socket(af, SOCK_STREAM, IPPROTO_TCP);
     if (l == INVALID_SOCKET) return fail("socket() failed");
+#ifdef _WIN32
     BOOL excl = TRUE;
     ::setsockopt(l, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&excl), sizeof(excl));
+#else
+    int reuse = 1;
+    ::setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#endif
     sockaddr_storage ss{};
     int len = 0;
     if (af == AF_INET) {

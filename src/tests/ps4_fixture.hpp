@@ -17,9 +17,14 @@
 #include "core/runtime/gdb_rsp.hpp"
 #include "core/runtime/ps4_protocol.hpp"
 
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include "core/compat/posix_socket.hpp"
+#endif
+#include "core/compat/portable.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -75,7 +80,7 @@ inline uint16_t ephemeral_port() {
     a.sin_port = 0;
     uint16_t port = 0;
     if (bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
-        int len = sizeof(a);
+        slop_socklen_t len = sizeof(a);
         getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
         port = ntohs(a.sin_port);
     }
@@ -104,7 +109,7 @@ thread_local int tl_budget = -1;   // reply bytes left before the cut, -1 = unli
 
 bool send_raw(SOCKET s, const char* p, size_t left) {
     while (left > 0) {
-        int n = ::send(s, p, static_cast<int>(left), 0);
+        int n = ::send(s, p, static_cast<int>(left), SLOP_SEND_FLAGS);
         if (n <= 0) return false;
         p += n;
         left -= static_cast<size_t>(n);
@@ -333,7 +338,7 @@ struct fake_ps4_server_t {
         addr.sin_port = 0;   // ephemeral
         if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) return false;
         if (listen(listen_fd, 4) != 0) return false;
-        int len = sizeof(addr);
+        slop_socklen_t len = sizeof(addr);
         getsockname(listen_fd, reinterpret_cast<sockaddr*>(&addr), &len);
         port = ntohs(addr.sin_port);
         th = std::thread([this] { accept_loop(); });
@@ -681,7 +686,8 @@ private:
             u_long nb = 1;
             ::ioctlsocket(ev, FIONBIO, &nb);
             int rc = ::connect(ev, reinterpret_cast<sockaddr*>(&a), sizeof(a));
-            if (rc != 0 && ::WSAGetLastError() == WSAEWOULDBLOCK) {
+            if (rc != 0 && (::WSAGetLastError() == WSAEWOULDBLOCK ||
+                            ::WSAGetLastError() == WSAEINPROGRESS)) {
                 fd_set wf;
                 FD_ZERO(&wf);
                 FD_SET(ev, &wf);
@@ -689,7 +695,7 @@ private:
                 tv.tv_sec = 2;
                 rc = ::select(0, nullptr, &wf, nullptr, &tv);
                 int soerr = 0;
-                int slen = sizeof(soerr);
+                slop_socklen_t slen = sizeof(soerr);
                 if (rc <= 0 ||
                     ::getsockopt(ev, SOL_SOCKET, SO_ERROR,
                                  reinterpret_cast<char*>(&soerr), &slen) != 0 ||

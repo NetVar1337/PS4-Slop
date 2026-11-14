@@ -339,7 +339,7 @@ TEST_CASE(ps4_connect_refuses_non_ps4debug_server) {
     addr.sin_port = 0;
     REQUIRE(bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0);
     REQUIRE(listen(ls, 1) == 0);
-    int len = sizeof(addr);
+    slop_socklen_t len = sizeof(addr);
     getsockname(ls, reinterpret_cast<sockaddr*>(&addr), &len);
     const uint16_t port = ntohs(addr.sin_port);
     std::atomic<bool> stop{false};
