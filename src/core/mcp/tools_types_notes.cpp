@@ -3,6 +3,8 @@
 
 #include "core/mcp/tools_common.hpp"
 
+#include "core/network/web_fetch.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -133,6 +135,70 @@ std::optional<re::type_catalog::enum_def_t> enum_from_json(const json& j) {
                 e.values.emplace_back(v.at("name").get<std::string>(),
                                       v.value("value", static_cast<int64_t>(0)));
     return e;
+}
+
+// apply an annotation document to the session; shared by notes.import (a file
+// an analyst committed) and notes.pull (the same file fetched from a shared
+// symbol store). mode: ours = only fill gaps, theirs = the document wins,
+// union = sets merge and local text stays.
+json merge_notes_doc(const json& doc, const std::string& mode) {
+    const bool theirs = mode == "theirs";
+    size_t n_names = 0, n_comments = 0, n_marks = 0, n_structs = 0, n_enums = 0;
+    auto for_each_entry = [&](const char* key, auto&& apply) {
+        if (!doc.contains(key) || !doc.at(key).is_object()) return;
+        for (auto it = doc.at(key).begin(); it != doc.at(key).end(); ++it) {
+            if (!it.value().is_string()) continue;
+            const uint64_t va = std::strtoull(it.key().c_str(), nullptr, 16);
+            if (va) apply(va, it.value().get_ref<const std::string&>());
+        }
+    };
+    for_each_entry("names", [&](uint64_t va, const std::string& name) {
+        const std::string have = ds::symbol_name(va);
+        if (have == name || (!theirs && !have.empty())) return;
+        ds::set_symbol(va, name);
+        ++n_names;
+    });
+    for_each_entry("comments", [&](uint64_t va, const std::string& text) {
+        const std::string have = ds::comment_for(va);
+        if (have == text || (!theirs && !have.empty())) return;
+        ds::set_comment(va, text);
+        ++n_comments;
+    });
+    if (doc.contains("bookmarks") && doc.at("bookmarks").is_array())
+        for (const auto& v : doc.at("bookmarks")) {
+            if (!v.is_string()) continue;
+            const uint64_t va = std::strtoull(v.get_ref<const std::string&>().c_str(),
+                                              nullptr, 16);
+            if (va && !ds::is_bookmarked(va)) {
+                ds::toggle_bookmark(va);
+                ++n_marks;
+            }
+        }
+    if (doc.contains("structs") && doc.at("structs").is_array())
+        for (const auto& j : doc.at("structs")) {
+            auto def = struct_from_json(j);
+            if (!def) continue;
+            const bool exists = re::type_catalog::get_struct(def->name).has_value();
+            if (exists && !theirs) continue;
+            if (exists) re::type_catalog::remove_struct(def->name);
+            std::string err;
+            if (re::type_catalog::create_struct(std::move(*def), &err)) ++n_structs;
+        }
+    if (doc.contains("enums") && doc.at("enums").is_array())
+        for (const auto& j : doc.at("enums")) {
+            auto def = enum_from_json(j);
+            if (!def) continue;
+            const bool exists = re::type_catalog::get_enum(def->name).has_value();
+            if (exists && !theirs) continue;
+            if (exists) re::type_catalog::remove_enum(def->name);
+            std::string err;
+            if (re::type_catalog::create_enum(std::move(*def), &err)) ++n_enums;
+        }
+    return {{"names", n_names},
+            {"comments", n_comments},
+            {"bookmarks", n_marks},
+            {"structs", n_structs},
+            {"enums", n_enums}};
 }
 
 } // namespace
@@ -435,71 +501,73 @@ json tool_notes(const json& args) {
         if (doc.value("format", std::string{}) != kSymbolsFormat)
             fail("not a " + std::string(kSymbolsFormat) + " file: " + file);
 
-        // theirs: the file wins every conflict. ours/union: local values stay
-        // and only gaps are filled (a VA holds exactly one name or comment, so
-        // a union of differing texts is not representable). Sets always merge
-        const bool theirs = mode == "theirs";
-        size_t n_names = 0, n_comments = 0, n_marks = 0, n_structs = 0, n_enums = 0;
-        auto for_each_entry = [&](const char* key, auto&& apply) {
-            if (!doc.contains(key) || !doc.at(key).is_object()) return;
-            for (auto it = doc.at(key).begin(); it != doc.at(key).end(); ++it) {
-                if (!it.value().is_string()) continue;
-                const uint64_t va = std::strtoull(it.key().c_str(), nullptr, 16);
-                if (va) apply(va, it.value().get_ref<const std::string&>());
-            }
-        };
-        for_each_entry("names", [&](uint64_t va, const std::string& name) {
-            const std::string have = ds::symbol_name(va);
-            if (have == name || (!theirs && !have.empty())) return;
-            ds::set_symbol(va, name);
-            ++n_names;
-        });
-        for_each_entry("comments", [&](uint64_t va, const std::string& text) {
-            const std::string have = ds::comment_for(va);
-            if (have == text || (!theirs && !have.empty())) return;
-            ds::set_comment(va, text);
-            ++n_comments;
-        });
-        if (doc.contains("bookmarks") && doc.at("bookmarks").is_array())
-            for (const auto& v : doc.at("bookmarks")) {
-                if (!v.is_string()) continue;
-                const uint64_t va = std::strtoull(v.get_ref<const std::string&>().c_str(),
-                                                  nullptr, 16);
-                if (va && !ds::is_bookmarked(va)) {
-                    ds::toggle_bookmark(va);
-                    ++n_marks;
-                }
-            }
-        if (doc.contains("structs") && doc.at("structs").is_array())
-            for (const auto& j : doc.at("structs")) {
-                auto def = struct_from_json(j);
-                if (!def) continue;
-                const bool exists = re::type_catalog::get_struct(def->name).has_value();
-                if (exists && !theirs) continue;
-                if (exists) re::type_catalog::remove_struct(def->name);
-                std::string err;
-                if (re::type_catalog::create_struct(std::move(*def), &err)) ++n_structs;
-            }
-        if (doc.contains("enums") && doc.at("enums").is_array())
-            for (const auto& j : doc.at("enums")) {
-                auto def = enum_from_json(j);
-                if (!def) continue;
-                const bool exists = re::type_catalog::get_enum(def->name).has_value();
-                if (exists && !theirs) continue;
-                if (exists) re::type_catalog::remove_enum(def->name);
-                std::string err;
-                if (re::type_catalog::create_enum(std::move(*def), &err)) ++n_enums;
-            }
+        const json counts = merge_notes_doc(doc, mode);
         return {{"path", file},
                 {"merge", mode},
-                {"names", n_names},
-                {"comments", n_comments},
-                {"bookmarks", n_marks},
-                {"structs", n_structs},
-                {"enums", n_enums}};
+                {"names", counts.at("names")},
+                {"comments", counts.at("comments")},
+                {"bookmarks", counts.at("bookmarks")},
+                {"structs", counts.at("structs")},
+                {"enums", counts.at("enums")}};
+    }
+    if (action == "push" || action == "pull") {
+        // shared symbol server: any HTTP endpoint that serves the same
+        // symbols/<hash>.json files (a static file server, a gist mirror, a
+        // small team service). The egress policy of the `web` tool applies, so
+        // a LAN server needs web_allow_private or a web_allowlist entry.
+        if (!args.contains("url") || !args.at("url").is_string())
+            fail("missing url (base of the shared symbol store)");
+        std::string base = args.at("url").get<std::string>();
+        while (!base.empty() && base.back() == '/') base.pop_back();
+        const notes_snapshot_t snap = snapshot_notes();
+        const std::string url = base + "/symbols/" + va_key(snap.hash) + ".json";
+
+        util::egress_policy_t policy;
+        policy.allow_private = infra::settings::get<bool>("web_allow_private", false);
+        const json allow = infra::settings::get_json("web_allowlist");
+        if (allow.is_array())
+            for (const auto& e : allow)
+                if (e.is_string()) policy.allowlist.push_back(e.get<std::string>());
+
+        std::string err;
+        if (action == "push") {
+            const std::string body = notes_doc(snap).dump(2) + "\n";
+            auto resp = util::http_post(url, body, "application/json", policy, 15000, &err);
+            if (!resp) fail("push failed: " + err);
+            if (resp->status < 200 || resp->status >= 300)
+                fail("push rejected: HTTP " + std::to_string(resp->status));
+            return {{"pushed", true},
+                    {"url", url},
+                    {"status", resp->status},
+                    {"bytes", body.size()},
+                    {"names", snap.names.size()},
+                    {"comments", snap.comments.size()},
+                    {"bookmarks", snap.bookmarks.size()}};
+        }
+        auto resp = util::http_get(url, policy, 15000, &err);
+        if (!resp) fail("pull failed: " + err);
+        if (resp->status == 404) fail("no annotations for this image yet: " + url);
+        if (resp->status < 200 || resp->status >= 300)
+            fail("pull rejected: HTTP " + std::to_string(resp->status));
+        const json doc = json::parse(resp->body, nullptr, false);
+        if (doc.is_discarded() || !doc.is_object()) fail("not a JSON object: " + url);
+        if (doc.value("format", std::string{}) != kSymbolsFormat)
+            fail("not a " + std::string(kSymbolsFormat) + " file: " + url);
+        const std::string mode = args.value("merge", std::string{"ours"});
+        if (mode != "ours" && mode != "theirs" && mode != "union")
+            fail("merge must be ours|theirs|union");
+        const json counts = merge_notes_doc(doc, mode);
+        return {{"pulled", true},
+                {"url", url},
+                {"merge", mode},
+                {"names", counts.at("names")},
+                {"comments", counts.at("comments")},
+                {"bookmarks", counts.at("bookmarks")},
+                {"structs", counts.at("structs")},
+                {"enums", counts.at("enums")}};
     }
     fail("notes: unknown action (set_comment|get_comment|comments|"
-         "bookmark_toggle|bookmarks|export|import)");
+         "bookmark_toggle|bookmarks|export|import|push|pull)");
 }
 
 } // namespace slop::core::mcp::detail
