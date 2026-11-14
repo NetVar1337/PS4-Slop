@@ -104,7 +104,7 @@ jobs:
 
       - name: build + run tests (ctest -L area)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestJobs 4
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=OFF" -Test -TestLabel area
 
       - name: upload engine artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
