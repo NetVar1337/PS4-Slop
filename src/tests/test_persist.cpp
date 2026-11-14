@@ -26,6 +26,7 @@
 #include <iterator>
 #include <process.h>
 #include <string>
+#include <map>
 #include <thread>
 #include <vector>
 
@@ -635,7 +636,123 @@ struct web_origin_t {
     }
 };
 
+// a symbol store: accepts an upload and serves it back, so notes.push and
+// notes.pull can be exercised without a real server
+struct symbol_store_t {
+    httplib::Server srv;
+    int port = 0;
+    std::thread th;
+    std::mutex mu;
+    std::map<std::string, std::string> files;
+    int puts = 0;
+
+    symbol_store_t() {
+        srv.Post(R"(/symbols/(.*))", [this](const httplib::Request& req, httplib::Response& res) {
+            std::lock_guard lk(mu);
+            files[req.matches[1]] = req.body;
+            ++puts;
+            res.status = 201;
+        });
+        srv.Get(R"(/symbols/(.*))", [this](const httplib::Request& req, httplib::Response& res) {
+            std::lock_guard lk(mu);
+            auto it = files.find(req.matches[1]);
+            if (it == files.end()) {
+                res.status = 404;
+                return;
+            }
+            res.set_content(it->second, "application/json");
+        });
+        port = srv.bind_to_any_port("127.0.0.1");
+        th = std::thread([this] { srv.listen_after_bind(); });
+        srv.wait_until_ready();
+    }
+    ~symbol_store_t() {
+        srv.stop();
+        if (th.joinable()) th.join();
+    }
+    std::string base() const { return "http://127.0.0.1:" + std::to_string(port); }
+};
+
 } // namespace
+
+TEST_CASE(persist_notes_push_and_pull_shared_store) {
+    const fs::path data = temp_project("notesync");
+    fs::create_directories(data);
+    env_guard_t env("LOCALAPPDATA", data.string());
+    // the store is on loopback, which the web egress policy denies by default
+    slop::core::infra::settings::set("web_allow_private", true);
+
+    REQUIRE(ds::load_file(SLOP_TARGET_EXE_PATH));
+    uint64_t entry = 0;
+    {
+        ds::binary_lock_t lk;
+        auto& bin = ds::get();
+        entry = bin.base + bin.pe.entry_rva;
+    }
+
+    bool is_error = true;
+    auto r = slop::core::mcp::call_tool(
+        "notes", {{"action", "set_comment"}, {"addr", entry}, {"text", "shared"}},
+        is_error);
+    REQUIRE(!is_error);
+
+    symbol_store_t store;
+    // push publishes this image's file under its hash
+    r = slop::core::mcp::call_tool("notes", {{"action", "push"}, {"url", store.base()}},
+                                   is_error);
+    REQUIRE(!is_error);
+    REQUIRE(r.value("pushed", false));
+    REQUIRE_EQ(r.value("status", 0), 201);
+    REQUIRE_EQ(store.puts, 1);
+    REQUIRE_EQ(store.files.size(), 1u);
+    const std::string body = store.files.begin()->second;
+    REQUIRE(body.find("reverse-slop-symbols") != std::string::npos);
+    REQUIRE(body.find("shared") != std::string::npos);
+
+    // a local edit is replaced by the published text with merge=theirs
+    r = slop::core::mcp::call_tool(
+        "notes", {{"action", "set_comment"}, {"addr", entry}, {"text", "local"}},
+        is_error);
+    REQUIRE(!is_error);
+    r = slop::core::mcp::call_tool(
+        "notes", {{"action", "pull"}, {"url", store.base()}, {"merge", "theirs"}},
+        is_error);
+    REQUIRE(!is_error);
+    REQUIRE(r.value("pulled", false));
+    REQUIRE_GE(r.value("comments", 0u), 1u);
+    r = slop::core::mcp::call_tool("notes", {{"action", "get_comment"}, {"addr", entry}},
+                                   is_error);
+    REQUIRE_STR_EQ(r.value("comment", "").c_str(), "shared");
+
+    // merge=ours keeps the local text
+    r = slop::core::mcp::call_tool(
+        "notes", {{"action", "set_comment"}, {"addr", entry}, {"text", "mine"}},
+        is_error);
+    REQUIRE(!is_error);
+    r = slop::core::mcp::call_tool("notes", {{"action", "pull"}, {"url", store.base()}},
+                                   is_error);
+    REQUIRE(!is_error);
+    r = slop::core::mcp::call_tool("notes", {{"action", "get_comment"}, {"addr", entry}},
+                                   is_error);
+    REQUIRE_STR_EQ(r.value("comment", "").c_str(), "mine");
+
+    // a store without this image's file answers 404 and the tool says so
+    store.files.clear();
+    r = slop::core::mcp::call_tool("notes", {{"action", "pull"}, {"url", store.base()}},
+                                   is_error);
+    REQUIRE(is_error);
+    REQUIRE(r.value("error", std::string{}).find("no annotations") != std::string::npos);
+
+    // a reachable-but-not-a-store answer is refused, not applied
+    store.files["x"] = "not json";
+    r = slop::core::mcp::call_tool("notes", {{"action", "pull"}, {"url", store.base()}},
+                                   is_error);
+    REQUIRE(is_error);
+
+    ds::unload();
+    std::error_code ec;
+    fs::remove_all(data, ec);
+}
 
 TEST_CASE(persist_web_dns_pin_denies_redirect_to_private_target) {
     web_origin_t origin;
