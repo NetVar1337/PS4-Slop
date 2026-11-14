@@ -9,14 +9,7 @@ import { kThemes, useTheme, type ThemeName } from "@/store/theme";
 
 export type RailView = "targets" | "modules" | "scripts";
 export type WorkspaceTab =
-  | "disassembly"
-  | "decomp"
-  | "strings"
-  | "memory"
-  | "debugger"
-  | "pe"
-  | "structs"
-  | "unpacker";
+  "disassembly" | "decomp" | "strings" | "memory" | "debugger" | "pe" | "structs" | "unpacker";
 export type OutputTab = "output" | "log";
 
 /** Splitter-driven CSS variables and their defaults (px), see app.css. */
