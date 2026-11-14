@@ -4,6 +4,7 @@
 import { useEffect, useState } from "react";
 import { Command, MonitorCog, Settings2, SunMoon } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { formatLabel } from "@/lib/format";
 import { useDisasm } from "@/store/disasm";
 import { useEngine } from "@/store/engine";
@@ -23,6 +24,7 @@ function Pill({ label, state }: { label: string; state: DotState }) {
 }
 
 export default function StatusBar() {
+  const t = useT();
   const connected = useEngine((s) => s.connected);
   const backend = useEngine((s) => s.backend);
   const target = useEngine((s) => s.target);
@@ -47,7 +49,7 @@ export default function StatusBar() {
   }, [loadConsoles]);
 
   const cycleTheme = () => {
-    const i = kThemes.findIndex((t) => t.id === theme);
+    const i = kThemes.findIndex((th) => th.id === theme);
     setTheme(kThemes[(i + 1) % kThemes.length].id);
   };
 
@@ -60,21 +62,21 @@ export default function StatusBar() {
         : "idle";
 
   const engineLabel = connected
-    ? "Engine: Connected"
+    ? t("status.engineConnected")
     : crash !== null
       ? crash.retry_in_ms === null
-        ? "Engine: Crashed"
-        : "Engine: Restarting…"
-      : "Engine: Offline";
+        ? t("status.engineCrashed")
+        : t("status.engineRestarting")
+      : t("status.engineOffline");
 
   return (
-    <footer className="statusbar" aria-label="Status">
+    <footer className="statusbar" aria-label={t("status.label")}>
       <span role="status">
         {target.attached
-          ? `${target.name ?? "target"} (${target.pid ?? 0})`
+          ? `${target.name ?? t("status.unknownTarget")} (${target.pid ?? 0})`
           : connected
-            ? "Ready"
-            : "Disconnected"}
+            ? t("status.ready")
+            : t("status.disconnected")}
       </span>
 
       <div className="spacer" />
@@ -86,17 +88,17 @@ export default function StatusBar() {
             className="status-pill console-switch"
             aria-haspopup="menu"
             aria-expanded={consoleMenu}
-            data-tip="Saved consoles: quick switch"
+            data-tip={t("status.consoleSwitch")}
             onClick={() => setConsoleMenu((v) => !v)}
           >
             <span className="dot" data-state={activeConsole === "" ? "idle" : "ok"} aria-hidden />
-            {activeConsole === "" ? "No console" : activeConsole}
+            {activeConsole === "" ? t("status.noConsole") : activeConsole}
           </button>
           {consoleMenu && (
             <div
               className="menu-pop up"
               role="menu"
-              aria-label="Consoles"
+              aria-label={t("status.consoles")}
               onClick={() => setConsoleMenu(false)}
             >
               {consoles.map((c) => (
@@ -111,7 +113,7 @@ export default function StatusBar() {
                   <span>{c.name}</span>
                   <span className="faint">
                     {c.host}:{c.port}
-                    {c.last_fw !== "" ? ` · fw ${c.last_fw}` : ""}
+                    {c.last_fw !== "" ? t("status.fw", { fw: c.last_fw }) : ""}
                   </span>
                   {c.name === activeConsole && <span className="faint">●</span>}
                 </button>
@@ -121,45 +123,51 @@ export default function StatusBar() {
         </div>
       )}
 
-      <Pill label={`Backend: ${backend.badge}`} state={backend.ps4 ? "ok" : "idle"} />
+      <Pill
+        label={t("status.backend", { badge: backend.badge })}
+        state={backend.ps4 ? "ok" : "idle"}
+      />
       <Pill
         label={engineLabel}
         state={connected ? "ok" : crash !== null && crash.retry_in_ms !== null ? "busy" : "bad"}
       />
       <Pill
-        label={target.attached ? "Memory: Ready" : "Memory: Idle"}
+        label={target.attached ? t("status.memoryReady") : t("status.memoryIdle")}
         state={target.attached ? "ok" : "idle"}
       />
       <Pill
         label={
           image.ready
-            ? `Image: ${image.name ?? "?"}${image.format !== undefined ? ` (${formatLabel(image.format)})` : ""}`
-            : "Image: none"
+            ? t("status.image", { name: image.name ?? "?" }) +
+              (image.format !== undefined
+                ? t("status.imageFormat", { format: formatLabel(image.format) })
+                : "")
+            : t("status.imageNone")
         }
         state={image.ready ? "ok" : "idle"}
       />
       <Pill
         label={
           hype.running
-            ? `Analysis: ${Math.round(hype.progress * 100)}%`
+            ? t("status.analysisProgress", { percent: Math.round(hype.progress * 100) })
             : hype.ready
-              ? "Analysis: Ready"
-              : "Analysis: Idle"
+              ? t("status.analysisReady")
+              : t("status.analysisIdle")
         }
         state={analysis}
       />
 
       <div className="status-actions">
-        <IconButton tip="Command palette (Ctrl+K)" onClick={() => setPaletteOpen(true)}>
+        <IconButton tip={t("status.paletteTip")} onClick={() => setPaletteOpen(true)}>
           <Command size={14} />
         </IconButton>
-        <IconButton tip={`Theme: ${theme}`} onClick={cycleTheme}>
+        <IconButton tip={t("status.themeTip", { theme })} onClick={cycleTheme}>
           <SunMoon size={14} />
         </IconButton>
-        <IconButton tip="Scripts" onClick={() => setRail("scripts")}>
+        <IconButton tip={t("rail.scripts")} onClick={() => setRail("scripts")}>
           <MonitorCog size={14} />
         </IconButton>
-        <IconButton tip="Settings" onClick={openSettings}>
+        <IconButton tip={t("common.settings")} onClick={openSettings}>
           <Settings2 size={14} />
         </IconButton>
       </div>

@@ -2,13 +2,14 @@
 // motion preference, the os reduced motion setting is the default not the law
 
 import { create } from "zustand";
+import type { Key } from "@/i18n/en";
 
 export type MotionPref = "on" | "auto" | "off";
 
-export const kMotionOptions: readonly { id: MotionPref; label: string; hint: string }[] = [
-  { id: "on", label: "On", hint: "always animate" },
-  { id: "auto", label: "Auto", hint: "follow the Windows animation setting" },
-  { id: "off", label: "Off", hint: "no animation" },
+export const kMotionOptions: readonly { id: MotionPref; labelKey: Key; hintKey: Key }[] = [
+  { id: "on", labelKey: "motion.on", hintKey: "motion.onHint" },
+  { id: "auto", labelKey: "motion.auto", hintKey: "motion.autoHint" },
+  { id: "off", labelKey: "motion.off", hintKey: "motion.offHint" },
 ];
 
 const kStorageKey = "reverse-slop.motion";

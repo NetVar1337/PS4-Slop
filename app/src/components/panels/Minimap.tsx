@@ -5,6 +5,7 @@
 // single element instead of the strip.
 
 import { memo, useMemo, useRef } from "react";
+import { useT } from "@/i18n";
 import type { Insn } from "@/store/disasm";
 
 /** Bars in the strip; a function of any size folds down to this many. */
@@ -46,6 +47,7 @@ type Props = {
 };
 
 function Minimap({ insns, first, last, onJump }: Props) {
+  const t = useT();
   const buckets = useMemo(() => bucketize(insns), [insns]);
   const dragging = useRef(false);
   const n = insns.length;
@@ -64,7 +66,7 @@ function Minimap({ insns, first, last, onJump }: Props) {
     <div
       className="minimap"
       role="scrollbar"
-      aria-label="Function overview"
+      aria-label={t("disasm.overview")}
       aria-orientation="vertical"
       aria-valuemin={1}
       aria-valuemax={n}

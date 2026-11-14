@@ -1,6 +1,7 @@
 // app/src/lib/format.ts
 // display helpers shared by the views: addresses, image formats, escaped text
 
+import { t } from "@/i18n";
 import type { ImageFormat } from "./events";
 
 export function hex(va: number, pad = 16): string {
@@ -42,13 +43,13 @@ export function formatLabel(format: ImageFormat | undefined, pe32plus?: boolean)
     case "pe":
       return pe32plus === undefined ? "PE" : pe32plus ? "PE32+" : "PE32";
     default:
-      return "Image";
+      return t("format.image");
   }
 }
 
 /** Title of the image-browser tab for the loaded format. */
 export function browserLabel(format: ImageFormat | undefined): string {
-  return format === undefined ? "Image Browser" : `${formatLabel(format)} Browser`;
+  return t("format.browser", { format: formatLabel(format) });
 }
 
 const kEscapes: Record<string, string> = {

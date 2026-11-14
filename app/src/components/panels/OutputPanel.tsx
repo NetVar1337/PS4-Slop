@@ -6,6 +6,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown, Eraser, Trash2 } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import Tabs, { panelId, tabId } from "@/components/Tabs";
+import { useT } from "@/i18n";
 import { call } from "@/lib/rpc";
 import { useOutput } from "@/store/output";
 import { useUi, type OutputTab } from "@/store/ui";
@@ -21,6 +22,7 @@ const timeFormat = new Intl.DateTimeFormat(undefined, {
 const clock = (ms: number) => timeFormat.format(ms);
 
 export default function OutputPanel() {
+  const t = useT();
   const tab = useUi((s) => s.outputTab);
   const setTab = useUi((s) => s.setOutputTab);
   const [diag, setDiag] = useState<DiagEntry[]>([]);
@@ -100,27 +102,27 @@ export default function OutputPanel() {
       <div className="tabs">
         <Tabs<OutputTab>
           items={[
-            { id: "output", label: "Output" },
-            { id: "log", label: "Log" },
+            { id: "output", label: t("output.output") },
+            { id: "log", label: t("output.log") },
           ]}
           active={tab}
           onChange={setTab}
-          label="Output panes"
+          label={t("output.panes")}
           idPrefix="output"
         />
         <div className="spacer" />
         <div className="tab-actions">
           <IconButton
-            tip={tab === "output" ? "Clear output" : "Clear log view"}
+            tip={tab === "output" ? t("output.clear") : t("output.clearLog")}
             onClick={() => void (tab === "output" ? clear() : setDiag([]))}
           >
             <Trash2 size={14} />
           </IconButton>
-          <IconButton tip="Clear engine output ring" onClick={() => void clear()}>
+          <IconButton tip={t("output.clearRing")} onClick={() => void clear()}>
             <Eraser size={14} />
           </IconButton>
           <IconButton
-            tip={follow ? "Following output" : "Scroll locked"}
+            tip={follow ? t("output.following") : t("output.locked")}
             pressed={follow}
             style={{ color: follow ? "var(--accent)" : undefined }}
             onClick={() => setFollow((v) => !v)}

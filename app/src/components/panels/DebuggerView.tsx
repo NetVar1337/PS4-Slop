@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import { Ban, FolderOpen, Gamepad2, Play, Plus, StepForward, Timer } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { isTauri } from "@/lib/endpoint";
 import { hex, parseAddress } from "@/lib/format";
 import { showInDisassembly } from "@/lib/navigate";
@@ -31,6 +32,7 @@ const kWaitMs = 5000;
 const kFallbackPollMs = 15_000;
 
 export default function DebuggerView() {
+  const t = useT();
   const target = useEngine((s) => s.target);
   const backend = useEngine((s) => s.backend);
   const setRail = useUi((s) => s.setRail);
@@ -105,13 +107,10 @@ export default function DebuggerView() {
         <div className="empty-glyph">
           <Gamepad2 size={28} strokeWidth={1.5} />
         </div>
-        <div className="empty-title">No PS4 console connected.</div>
-        <div className="empty-hint">
-          Connect one from the Targets panel, or over MCP with target.ps4_auto. This view then
-          drives the live ps4debug-NG session on the console.
-        </div>
+        <div className="empty-title">{t("debugger.noConsole")}</div>
+        <div className="empty-hint">{t("debugger.noConsoleHint")}</div>
         <button type="button" className="row-action" onClick={() => setRail("targets")}>
-          Open Targets
+          {t("debugger.openTargets")}
         </button>
       </div>
     );
@@ -121,7 +120,7 @@ export default function DebuggerView() {
   const addrOf = (text: string, what: string): number | null => {
     const a = parseAddress(text);
     if (a === null || a === 0) {
-      setInputError(`${what}: "${text}" is not a hex address`);
+      setInputError(t("debugger.badAddress", { what, text }));
       return null;
     }
     setInputError(null);
@@ -129,14 +128,14 @@ export default function DebuggerView() {
   };
 
   const addBp = () => {
-    const a = addrOf(bpAddr, "breakpoint");
+    const a = addrOf(bpAddr, t("debugger.breakpoint"));
     if (a !== null) {
       void bpSet(a);
       setBpAddr("");
     }
   };
   const addWp = () => {
-    const a = addrOf(wpAddr, "watchpoint");
+    const a = addrOf(wpAddr, t("debugger.watchpoint"));
     if (a !== null) {
       void wpSet(a, wpType, wpLen);
       setWpAddr("");
@@ -149,7 +148,7 @@ export default function DebuggerView() {
   const pickDumpPath = async () => {
     if (!isTauri()) return;
     const picked = await save({
-      title: `Dump ${dumpName}`,
+      title: t("modules.dumpTitle", { name: dumpName }),
       defaultPath: `${dumpName}.elf`,
       filters: [{ name: "ELF", extensions: ["elf", "bin", "prx"] }],
     });
@@ -163,20 +162,24 @@ export default function DebuggerView() {
           className="pill"
           style={{ color: status.debug_attached ? "var(--success)" : undefined }}
         >
-          {status.debug_attached ? `debug attached pid ${status.debug_pid}` : "debug not attached"}
+          {status.debug_attached
+            ? t("debugger.attached", { pid: status.debug_pid })
+            : t("debugger.notAttached")}
         </span>
         {status.ps4_connected && (
           <span className="faint mono" style={{ fontSize: 11 }}>
-            ps4{status.fw !== undefined && status.fw !== "" ? ` · fw ${status.fw}` : ""} · pending{" "}
-            {status.pending_events}
+            {t("debugger.ps4", {
+              fw:
+                status.fw !== undefined && status.fw !== ""
+                  ? t("debugger.fw", { fw: status.fw })
+                  : "",
+              pending: status.pending_events,
+            })}
           </span>
         )}
         {(status.events_dropped ?? 0) > 0 && (
-          <span
-            className="pill warn-pill"
-            data-tip="The engine's stop-event queue overflowed; older events were discarded"
-          >
-            {status.events_dropped} events dropped
+          <span className="pill warn-pill" data-tip={t("debugger.droppedTip")}>
+            {t("debugger.dropped", { count: status.events_dropped ?? 0 })}
           </span>
         )}
 
@@ -189,15 +192,20 @@ export default function DebuggerView() {
             disabled={pid === 0 || busy}
             onClick={() => pid !== 0 && void attach(pid)}
           >
-            {pid === 0 ? "Attach a process first" : "Attach debugger (ps4debug)"}
+            {pid === 0 ? t("debugger.attachFirst") : t("debugger.attach")}
           </button>
         ) : (
           <>
-            <IconButton tip="Continue" variant="row" disabled={busy} onClick={() => void cont()}>
+            <IconButton
+              tip={t("debugger.continue")}
+              variant="row"
+              disabled={busy}
+              onClick={() => void cont()}
+            >
               <Play size={11} />
             </IconButton>
             <IconButton
-              tip="Step one lwp (empty = the thread that last stopped)"
+              tip={t("debugger.step")}
               variant="row"
               disabled={busy}
               onClick={() => void step(lwpNum)}
@@ -205,7 +213,7 @@ export default function DebuggerView() {
               <StepForward size={11} />
             </IconButton>
             <IconButton
-              tip={`Wait for a stop event (${kWaitMs / 1000}s)`}
+              tip={t("debugger.wait", { seconds: kWaitMs / 1000 })}
               variant="row"
               disabled={busy}
               onClick={() => void waitHalt(kWaitMs)}
@@ -213,7 +221,7 @@ export default function DebuggerView() {
               <Timer size={11} />
             </IconButton>
             <button type="button" className="row-action" onClick={() => void detach()}>
-              <Ban size={11} aria-hidden /> Detach
+              <Ban size={11} aria-hidden /> {t("debugger.detach")}
             </button>
           </>
         )}
@@ -236,14 +244,14 @@ export default function DebuggerView() {
       <div className="dbg">
         <div className="dbg-col">
           <div className="dbg-head">
-            Registers
+            {t("debugger.registers")}
             <div className="spacer" />
             <input
               className="addr-input mono"
               style={{ width: 64 }}
-              aria-label="Thread (lwpid) for step"
+              aria-label={t("debugger.thread")}
               value={lwp}
-              placeholder="lwpid"
+              placeholder={t("debugger.lwpidPlaceholder")}
               onChange={(e) => setLwp(e.target.value)}
             />
           </div>
@@ -251,16 +259,18 @@ export default function DebuggerView() {
             {regs === null ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
                 {status.debug_attached
-                  ? "stop the target (bp / wait) to read registers."
-                  : "not attached."}
+                  ? t("debugger.registersHint")
+                  : t("debugger.registersNotAttached")}
               </div>
             ) : (
               <table className="table">
-                <caption className="faint table-caption">lwp {regsLwpid}</caption>
+                <caption className="faint table-caption">
+                  {t("debugger.lwp", { lwpid: regsLwpid })}
+                </caption>
                 <thead className="sr-only">
                   <tr>
-                    <th scope="col">Register</th>
-                    <th scope="col">Value</th>
+                    <th scope="col">{t("debugger.register")}</th>
+                    <th scope="col">{t("debugger.value")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -273,7 +283,7 @@ export default function DebuggerView() {
                         <button
                           type="button"
                           className="mono link"
-                          data-tip="show in disassembly"
+                          data-tip={t("debugger.showInDisasm")}
                           onClick={() => showInDisassembly(regs[name] ?? 0)}
                         >
                           {hex(regs[name] ?? 0)}
@@ -285,14 +295,14 @@ export default function DebuggerView() {
               </table>
             )}
           </div>
-          <div className="dbg-head">Call stack</div>
+          <div className="dbg-head">{t("debugger.callStack")}</div>
           <div className="panel-body">
             {frames.length === 0 ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                no frames.
+                {t("debugger.noFrames")}
               </div>
             ) : (
-              <ol className="plain-list" aria-label="Call stack">
+              <ol className="plain-list" aria-label={t("debugger.callStack")}>
                 {frames.map((f, i) => (
                   <li key={i}>
                     <button
@@ -308,7 +318,7 @@ export default function DebuggerView() {
                       <span className="fn-name mono">{hex(f.ret_addr ?? 0)}</span>
                       {f.scanned === true && (
                         <span className="faint" style={{ fontSize: 10 }}>
-                          scan
+                          {t("debugger.scanMarker")}
                         </span>
                       )}
                     </button>
@@ -321,31 +331,31 @@ export default function DebuggerView() {
 
         <div className="dbg-col">
           <div className="dbg-head">
-            Breakpoints
+            {t("debugger.breakpoints")}
             <div className="spacer" />
             <input
               className="addr-input mono"
               style={{ width: 110 }}
-              aria-label="Breakpoint address"
+              aria-label={t("debugger.bpAddress")}
               value={bpAddr}
-              placeholder="address"
+              placeholder={t("debugger.addressPlaceholder")}
               onChange={(e) => setBpAddr(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && addBp()}
             />
-            <IconButton tip="Set breakpoint" onClick={addBp} disabled={!status.debug_attached}>
+            <IconButton tip={t("debugger.setBp")} onClick={addBp} disabled={!status.debug_attached}>
               <Plus size={13} />
             </IconButton>
           </div>
           <div className="panel-body">
             {breakpoints.length === 0 ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                none set.
+                {t("debugger.noneSet")}
               </div>
             ) : (
               breakpoints.map((b) => (
                 <div className="fn-row" style={{ position: "static", height: 20 }} key={b.addr}>
                   <span className="faint" style={{ width: 44 }}>
-                    slot {b.index}
+                    {t("debugger.slot", { index: b.index })}
                   </span>
                   <span className="fn-name mono">{hex(b.addr)}</span>
                   {(b.count ?? 0) > 0 && (
@@ -354,8 +364,8 @@ export default function DebuggerView() {
                       style={{ fontSize: 10 }}
                       data-tip={
                         b.hits !== undefined && b.hits > 0
-                          ? `stops on hit ${b.hits} (${b.hit_mode ?? "eq"})`
-                          : "stops on every hit"
+                          ? t("debugger.hitOn", { hits: b.hits, mode: b.hit_mode ?? "eq" })
+                          : t("debugger.hitEvery")
                       }
                     >
                       {b.count}
@@ -363,12 +373,12 @@ export default function DebuggerView() {
                     </span>
                   )}
                   {b.owner !== undefined && b.owner !== "" && (
-                    <span className="faint" style={{ fontSize: 10 }} data-tip="owning client">
+                    <span className="faint" style={{ fontSize: 10 }} data-tip={t("debugger.owner")}>
                       {b.owner}
                     </span>
                   )}
                   <IconButton
-                    tip={`Clear breakpoint ${hex(b.addr, 1)}`}
+                    tip={t("debugger.clearBp", { addr: hex(b.addr, 1) })}
                     onClick={() => void bpClear(b.addr)}
                   >
                     <Ban size={11} />
@@ -377,32 +387,32 @@ export default function DebuggerView() {
               ))
             )}
             <div className="dbg-head" style={{ marginTop: "var(--pad-sm)" }}>
-              Watchpoints (DR)
+              {t("debugger.watchpoints")}
               <div className="spacer" />
               <input
                 className="addr-input mono"
                 style={{ width: 110 }}
-                aria-label="Watchpoint address"
+                aria-label={t("debugger.wpAddress")}
                 value={wpAddr}
-                placeholder="address"
+                placeholder={t("debugger.addressPlaceholder")}
                 onChange={(e) => setWpAddr(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && addWp()}
               />
               <select
                 className="addr-input"
                 style={{ width: 64 }}
-                aria-label="Watchpoint type"
+                aria-label={t("debugger.wpType")}
                 value={wpType}
                 onChange={(e) => setWpType(Number(e.target.value))}
               >
-                <option value={0}>exec</option>
-                <option value={1}>write</option>
-                <option value={3}>rdwr</option>
+                <option value={0}>{t("debugger.wpExec")}</option>
+                <option value={1}>{t("debugger.wpWrite")}</option>
+                <option value={3}>{t("debugger.wpRdwr")}</option>
               </select>
               <select
                 className="addr-input"
                 style={{ width: 44 }}
-                aria-label="Watchpoint length"
+                aria-label={t("debugger.wpLength")}
                 value={wpLen}
                 onChange={(e) => setWpLen(Number(e.target.value))}
               >
@@ -412,23 +422,27 @@ export default function DebuggerView() {
                   </option>
                 ))}
               </select>
-              <IconButton tip="Set watchpoint" onClick={addWp} disabled={!status.debug_attached}>
+              <IconButton
+                tip={t("debugger.setWp")}
+                onClick={addWp}
+                disabled={!status.debug_attached}
+              >
                 <Plus size={13} />
               </IconButton>
             </div>
             {watchpoints.length === 0 ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                none set.
+                {t("debugger.noneSet")}
               </div>
             ) : (
               watchpoints.map((w) => (
                 <div className="fn-row" style={{ position: "static", height: 20 }} key={w.addr}>
                   <span className="faint" style={{ width: 44 }}>
-                    DR{w.index}
+                    {t("debugger.dr", { index: w.index })}
                   </span>
                   <span className="fn-name mono">{hex(w.addr)}</span>
                   <IconButton
-                    tip={`Clear watchpoint ${hex(w.addr, 1)}`}
+                    tip={t("debugger.clearWp", { addr: hex(w.addr, 1) })}
                     onClick={() => void wpClear(w.addr)}
                   >
                     <Ban size={11} />
@@ -441,7 +455,7 @@ export default function DebuggerView() {
 
         <div className="dbg-col">
           <div className="dbg-head">
-            Console scan (on-device)
+            {t("debugger.consoleScan")}
             <div className="spacer" />
             <button
               type="button"
@@ -449,7 +463,7 @@ export default function DebuggerView() {
               disabled={busy}
               onClick={() => void scanReset()}
             >
-              reset
+              {t("debugger.reset")}
             </button>
           </div>
           <div className="panel-body">
@@ -457,22 +471,22 @@ export default function DebuggerView() {
               <input
                 className="addr-input mono"
                 style={{ width: 100 }}
-                aria-label="Scan start address"
+                aria-label={t("debugger.scanAddr")}
                 value={scAddr}
-                placeholder="addr"
+                placeholder={t("debugger.addrPlaceholder")}
                 onChange={(e) => setScAddr(e.target.value)}
               />
               <input
                 className="addr-input mono"
                 style={{ width: 64 }}
-                aria-label="Scan length"
+                aria-label={t("debugger.scanLen")}
                 value={scLen}
-                placeholder="len"
+                placeholder={t("debugger.lenPlaceholder")}
                 onChange={(e) => setScLen(e.target.value)}
               />
               <select
                 className="addr-input"
-                aria-label="Scan value type"
+                aria-label={t("debugger.scanType")}
                 value={scType}
                 onChange={(e) => setScType(e.target.value)}
               >
@@ -484,7 +498,7 @@ export default function DebuggerView() {
               </select>
               <select
                 className="addr-input"
-                aria-label="Scan comparison"
+                aria-label={t("debugger.scanCompare")}
                 value={scCmp}
                 onChange={(e) => setScCmp(e.target.value)}
               >
@@ -497,9 +511,9 @@ export default function DebuggerView() {
               <input
                 className="addr-input mono"
                 style={{ width: 80 }}
-                aria-label="Scan value"
+                aria-label={t("debugger.scanValue")}
                 value={scVal}
-                placeholder="value"
+                placeholder={t("debugger.valuePlaceholder")}
                 onChange={(e) => setScVal(e.target.value)}
               />
               <button
@@ -507,7 +521,7 @@ export default function DebuggerView() {
                 className="row-action"
                 disabled={busy || !scAddr || !scVal}
                 onClick={() => {
-                  const a = addrOf(scAddr, "scan start");
+                  const a = addrOf(scAddr, t("debugger.scanStart"));
                   const l = parseAddress(scLen);
                   if (a === null || l === null) return;
                   const v = scVal.trim();
@@ -521,7 +535,7 @@ export default function DebuggerView() {
                   });
                 }}
               >
-                scan
+                {t("debugger.scan")}
               </button>
               <button
                 type="button"
@@ -534,16 +548,16 @@ export default function DebuggerView() {
                   )
                 }
               >
-                rescan
+                {t("debugger.rescan")}
               </button>
             </div>
             <div className="dbg-form">
               <input
                 className="addr-input mono"
                 style={{ flex: 1 }}
-                aria-label="AOB pattern"
+                aria-label={t("debugger.aobPattern")}
                 value={scAob}
-                placeholder="aob pattern: 48 8B ?? ?? 90 (scan range above)"
+                placeholder={t("debugger.aobPlaceholder")}
                 onChange={(e) => setScAob(e.target.value)}
               />
               <button
@@ -551,23 +565,26 @@ export default function DebuggerView() {
                 className="row-action"
                 disabled={busy || !scAddr || !scAob}
                 onClick={() => {
-                  const a = addrOf(scAddr, "scan start");
+                  const a = addrOf(scAddr, t("debugger.scanStart"));
                   const l = parseAddress(scLen);
                   if (a !== null && l !== null) void scanAob(a, l, scAob);
                 }}
               >
-                aob
+                {t("debugger.aob")}
               </button>
             </div>
             {scan === null || !scan.used ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                no native scan running - ps4_scan runs on the console (auth unlocked on connect).
+                {t("debugger.noNativeScan")}
               </div>
             ) : (
               <>
                 <div className="faint mono" style={{ padding: "2px var(--pad-md)", fontSize: 11 }}>
-                  base {scan.base_hex ?? hex(scan.base ?? 0)} · {scan.count ?? 0} hits
-                  {scan.truncated === true ? " (capped)" : ""}
+                  {t("debugger.scanBase", {
+                    base: scan.base_hex ?? hex(scan.base ?? 0),
+                    count: scan.count ?? 0,
+                  })}
+                  {scan.truncated === true ? t("debugger.capped") : ""}
                 </div>
                 {(scan.hits ?? []).slice(0, 100).map((h, i) => (
                   <div className="fn-row" style={{ position: "static", height: 20 }} key={i}>
@@ -586,22 +603,27 @@ export default function DebuggerView() {
               </>
             )}
           </div>
-          <div className="dbg-head">Console</div>
+          <div className="dbg-head">{t("debugger.console")}</div>
           <div className="panel-body">
             <div className="faint" style={{ padding: "2px var(--pad-md)", fontSize: 11 }}>
               {app === null
-                ? "foreground app unknown"
+                ? t("debugger.appUnknown")
                 : app.running === false || app.pid === 0
-                  ? "no game in foreground"
-                  : `foreground: ${app.name ?? "?"} ${app.titleid ?? ""} v${app.app_ver ?? "?"} (pid ${app.pid})`}
+                  ? t("debugger.noForeground")
+                  : t("debugger.foreground", {
+                      name: app.name ?? "?",
+                      titleid: app.titleid ?? "",
+                      version: app.app_ver ?? "?",
+                      pid: app.pid,
+                    })}
             </div>
             <div className="dbg-form">
               <input
                 className="addr-input"
                 style={{ flex: 1 }}
-                aria-label="Notification text"
+                aria-label={t("debugger.notification")}
                 value={notifyMsg}
-                placeholder="notification text for the PS4 UI"
+                placeholder={t("debugger.notificationPlaceholder")}
                 onChange={(e) => setNotifyMsg(e.target.value)}
               />
               <button
@@ -613,27 +635,27 @@ export default function DebuggerView() {
                   setNotifyMsg("");
                 }}
               >
-                notify
+                {t("debugger.notify")}
               </button>
             </div>
             <div className="dbg-form">
               <input
                 className="addr-input mono"
                 style={{ width: 90 }}
-                aria-label="Module to dump"
+                aria-label={t("debugger.moduleToDump")}
                 value={dumpName}
                 onChange={(e) => setDumpName(e.target.value)}
               />
               <input
                 className="addr-input mono"
                 style={{ flex: 1 }}
-                aria-label="Dump output path"
+                aria-label={t("debugger.dumpPath")}
                 value={dumpPath}
-                placeholder="output file (Browse…)"
+                placeholder={t("debugger.dumpPathPlaceholder")}
                 onChange={(e) => setDumpPath(e.target.value)}
               />
               {isTauri() && (
-                <IconButton tip="Browse for the output file" onClick={() => void pickDumpPath()}>
+                <IconButton tip={t("debugger.browse")} onClick={() => void pickDumpPath()}>
                   <FolderOpen size={12} />
                 </IconButton>
               )}
@@ -642,19 +664,19 @@ export default function DebuggerView() {
                 className="row-action"
                 disabled={busy || !dumpName || !dumpPath}
                 onClick={() => void dumpModule(dumpName, dumpPath, true)}
-                data-tip="dump the module's memory over the wire and load the ELF into disasm"
+                data-tip={t("debugger.dumpLoadTip")}
               >
-                dump+load
+                {t("debugger.dumpLoad")}
               </button>
             </div>
           </div>
         </div>
 
         <div className="dbg-col">
-          <div className="dbg-head">Events</div>
+          <div className="dbg-head">{t("debugger.events")}</div>
           <div className="panel-body">
             {logs.length > 0 && (
-              <ol className="plain-list" aria-label="Log breakpoint lines, newest first">
+              <ol className="plain-list" aria-label={t("debugger.logLines")}>
                 {logs.slice(0, 20).map((line, i) => (
                   <li
                     className="log-row mono"
@@ -668,10 +690,10 @@ export default function DebuggerView() {
             )}
             {events.length === 0 ? (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                no stop events yet - arm a bp, continue, wait.
+                {t("debugger.noEvents")}
               </div>
             ) : (
-              <ol className="plain-list" aria-label="Stop events, newest first">
+              <ol className="plain-list" aria-label={t("debugger.stopEvents")}>
                 {events.slice(0, 40).map((e, i) => (
                   <li
                     className="log-row mono"
@@ -679,15 +701,17 @@ export default function DebuggerView() {
                     style={{ padding: "1px var(--pad-md)", fontSize: 11 }}
                   >
                     <span className="faint">
-                      lwp {e.lwpid}
-                      {e.thread !== undefined && e.thread !== "" ? ` (${e.thread})` : ""}
+                      {t("debugger.lwp", { lwpid: e.lwpid })}
+                      {e.thread !== undefined && e.thread !== ""
+                        ? t("debugger.eventThread", { thread: e.thread })
+                        : ""}
                     </span>
                     <span
                       style={{
                         color: e.signal !== 0 && e.signal !== 5 ? "var(--danger)" : undefined,
                       }}
                     >
-                      sig {e.signal}
+                      {t("debugger.signal", { signal: e.signal })}
                     </span>
                     {e.rip !== undefined && (
                       <button

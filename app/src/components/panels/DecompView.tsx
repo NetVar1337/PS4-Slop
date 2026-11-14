@@ -8,6 +8,7 @@ import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { Network } from "lucide-react";
 import CfgGraph from "@/components/CfgGraph";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { on } from "@/lib/events";
 import { hex, parseAddress } from "@/lib/format";
 import { showInDisassembly } from "@/lib/navigate";
@@ -169,40 +170,41 @@ async function goToFunction(name: string): Promise<void> {
 }
 
 function Tokens({ text }: { text: string }) {
+  const t = useT();
   const selectedType = useDecomp((s) => s.selectedType);
   const selectType = useDecomp((s) => s.selectType);
   return (
     <>
-      {tokenize(text).map((t, i) => {
-        if (t.kind === "ws") return t.text;
-        if (t.kind === "fn")
+      {tokenize(text).map((token, i) => {
+        if (token.kind === "ws") return token.text;
+        if (token.kind === "fn")
           return (
             <button
               key={i}
               type="button"
               className="decomp-fn"
-              aria-label={`go to ${t.text}`}
-              onClick={() => void goToFunction(t.text)}
+              aria-label={t("decomp.goTo", { name: token.text })}
+              onClick={() => void goToFunction(token.text)}
             >
-              {t.text}
+              {token.text}
             </button>
           );
-        if (t.kind === "type")
+        if (token.kind === "type")
           return (
             <button
               key={i}
               type="button"
               className="decomp-type"
-              aria-pressed={selectedType === t.text}
-              aria-label={`select type ${t.text}`}
-              onClick={() => selectType(selectedType === t.text ? null : t.text)}
+              aria-pressed={selectedType === token.text}
+              aria-label={t("decomp.selectType", { name: token.text })}
+              onClick={() => selectType(selectedType === token.text ? null : token.text)}
             >
-              {t.text}
+              {token.text}
             </button>
           );
         return (
-          <span key={i} className={`decomp-${t.kind}`}>
-            {t.text}
+          <span key={i} className={`decomp-${token.kind}`}>
+            {token.text}
           </span>
         );
       })}
@@ -222,6 +224,7 @@ function Line({ line }: { line: DecompLine }) {
 }
 
 export default function DecompView(): ReactNode {
+  const t = useT();
   const selected = useDisasm((s) => s.selected);
   const selectedFn = useDisasm((s) => s.selectedFn);
   const va = useDecomp((s) => s.va);
@@ -262,19 +265,19 @@ export default function DecompView(): ReactNode {
         <form className="decomp-goto" onSubmit={submit}>
           <input
             className="decomp-input mono"
-            aria-label="Function address"
-            placeholder="address…"
+            aria-label={t("decomp.address")}
+            placeholder={t("decomp.addressPlaceholder")}
             value={text}
             onChange={(e) => setText(e.target.value)}
           />
           <button type="submit" className="row-action">
-            Decompile
+            {t("decomp.decompile")}
           </button>
         </form>
         <span className="decomp-title mono">
-          {va === null ? "no function" : name !== null ? functionLabel(name) : hex(va, 8)}
+          {va === null ? t("decomp.noFunction") : name !== null ? functionLabel(name) : hex(va, 8)}
         </span>
-        <IconButton tip="Control-flow graph" pressed={split} onClick={() => setSplit(!split)}>
+        <IconButton tip={t("decomp.cfgTip")} pressed={split} onClick={() => setSplit(!split)}>
           <Network size={14} />
         </IconButton>
       </div>
@@ -286,13 +289,11 @@ export default function DecompView(): ReactNode {
       )}
 
       <div className="decomp-body" data-split={split}>
-        <div className="decomp-pane" role="region" aria-label="Pseudocode">
+        <div className="decomp-pane" role="region" aria-label={t("decomp.pseudocode")}>
           {va === null ? (
             <div className="empty">
-              <div className="empty-title">No function selected.</div>
-              <div className="empty-hint">
-                Pick a function in the disassembly, or type its address above.
-              </div>
+              <div className="empty-title">{t("decomp.noFunctionSelected")}</div>
+              <div className="empty-hint">{t("decomp.noFunctionHint")}</div>
             </div>
           ) : (
             <>
@@ -301,10 +302,12 @@ export default function DecompView(): ReactNode {
               </div>
               <div className="decomp-meta mono">
                 {callconv !== "" && <span>{callconv}</span>}
-                <span>{insnCount} insns</span>
-                <span>{callSites.length} call sites</span>
-                {typesGeneration !== null && <span>types gen {typesGeneration}</span>}
-                {busy && <span className="faint">decompiling…</span>}
+                <span>{t("decomp.insns", { count: insnCount })}</span>
+                <span>{t("decomp.callSites", { count: callSites.length })}</span>
+                {typesGeneration !== null && (
+                  <span>{t("decomp.typesGen", { gen: typesGeneration })}</span>
+                )}
+                {busy && <span className="faint">{t("decomp.decompiling")}</span>}
               </div>
               <div className="decomp-code">
                 {lines.map((line, i) => (
@@ -318,7 +321,7 @@ export default function DecompView(): ReactNode {
                       key={c.va}
                       type="button"
                       className="decomp-call mono"
-                      aria-label={`call site ${hex(c.va, 8)}`}
+                      aria-label={t("decomp.callSite", { addr: hex(c.va, 8) })}
                       onClick={() => showInDisassembly(c.va)}
                     >
                       {hex(c.va, 8)} {c.arg_types.join(", ")}

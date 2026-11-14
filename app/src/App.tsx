@@ -20,6 +20,7 @@ import ScriptsPanel from "@/components/panels/ScriptsPanel";
 import TargetsPanel from "@/components/panels/TargetsPanel";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
 import { panelId, tabId } from "@/components/Tabs";
+import { useT } from "@/i18n";
 import { useShortcuts } from "@/lib/shortcuts";
 import { openPath } from "@/lib/shell";
 import { useEngine } from "@/store/engine";
@@ -30,6 +31,7 @@ import { useWatch } from "@/store/watch";
 
 /** Post-boot failures (snapshot, engine crash) surface here, not on the splash. */
 function EngineBanner() {
+  const t = useT();
   const startupError = useEngine((s) => s.startupError);
   const crash = useEngine((s) => s.crash);
   const retry = useEngine((s) => s.retry);
@@ -38,26 +40,29 @@ function EngineBanner() {
   const text =
     crash !== null
       ? crash.retry_in_ms === null
-        ? `Engine crashed and was not restarted: ${crash.reason}`
-        : `Engine crashed (${crash.reason}); restarting in ${Math.ceil(crash.retry_in_ms / 1000)}s…`
-      : `Engine error: ${startupError}`;
+        ? t("app.crashStopped", { reason: crash.reason })
+        : t("app.crashRestarting", {
+            reason: crash.reason,
+            seconds: Math.ceil(crash.retry_in_ms / 1000),
+          })
+      : t("app.engineError", { error: startupError ?? "" });
   return (
     <div className="engine-banner" role="alert">
       <span>
         {text}
-        {crash !== null && crash.log_path !== "" ? ` · log: ${crash.log_path}` : ""}
+        {crash !== null && crash.log_path !== "" ? t("app.logPath", { path: crash.log_path }) : ""}
       </span>
       <div className="spacer" />
       {crash !== null && crash.log_path !== "" && (
         <button type="button" className="row-action" onClick={() => void openPath(crash.log_path)}>
-          <FolderOpen size={11} aria-hidden /> Open log folder
+          <FolderOpen size={11} aria-hidden /> {t("app.openLogFolder")}
         </button>
       )}
       <button type="button" className="row-action" onClick={() => void retry()}>
-        <RotateCcw size={11} aria-hidden /> Retry
+        <RotateCcw size={11} aria-hidden /> {t("common.retry")}
       </button>
       {crash === null && (
-        <IconButton tip="Dismiss" onClick={dismiss}>
+        <IconButton tip={t("common.dismiss")} onClick={dismiss}>
           <X size={13} />
         </IconButton>
       )}
@@ -67,6 +72,7 @@ function EngineBanner() {
 
 /** Update check, download and restart, surfaced above the workspace. */
 function UpdateBanner() {
+  const t = useT();
   const phase = useUpdater((s) => s.phase);
   const version = useUpdater((s) => s.version);
   const progress = useUpdater((s) => s.progress);
@@ -79,12 +85,12 @@ function UpdateBanner() {
   if (phase === "available") {
     return (
       <div className="engine-banner update-banner" role="status">
-        <span>Update v{version} is available.</span>
+        <span>{t("app.updateAvailable", { version: version ?? "" })}</span>
         <div className="spacer" />
         <button type="button" className="row-action" onClick={() => void install()}>
-          Install &amp; restart
+          {t("app.installRestart")}
         </button>
-        <IconButton tip="Dismiss" onClick={dismiss}>
+        <IconButton tip={t("common.dismiss")} onClick={dismiss}>
           <X size={13} />
         </IconButton>
       </div>
@@ -95,7 +101,10 @@ function UpdateBanner() {
     return (
       <div className="engine-banner update-banner" role="status">
         <span>
-          Downloading update v{version}…{pct === null ? "" : ` ${pct}%`}
+          {t("app.updateDownloading", {
+            version: version ?? "",
+            percent: pct === null ? "" : ` ${pct}%`,
+          })}
         </span>
         <div className="update-progress" aria-hidden>
           <span style={{ width: pct === null ? "100%" : `${pct}%` }} />
@@ -106,18 +115,18 @@ function UpdateBanner() {
   if (phase === "ready") {
     return (
       <div className="engine-banner update-banner" role="status">
-        <span>Update installed. Restarting…</span>
+        <span>{t("app.updateInstalled")}</span>
       </div>
     );
   }
   return (
     <div className="engine-banner update-banner" role="alert">
-      <span>Update failed: {error}</span>
+      <span>{t("app.updateFailed", { error: error ?? "" })}</span>
       <div className="spacer" />
       <button type="button" className="row-action" onClick={() => void check(true)}>
-        <RotateCcw size={11} aria-hidden /> Retry
+        <RotateCcw size={11} aria-hidden /> {t("common.retry")}
       </button>
-      <IconButton tip="Dismiss" onClick={dismiss}>
+      <IconButton tip={t("common.dismiss")} onClick={dismiss}>
         <X size={13} />
       </IconButton>
     </div>
@@ -125,6 +134,7 @@ function UpdateBanner() {
 }
 
 export default function App() {
+  const t = useT();
   const rail = useUi((s) => s.rail);
   const setRail = useUi((s) => s.setRail);
   const settingsOpen = useUi((s) => s.settingsOpen);
@@ -211,7 +221,7 @@ export default function App() {
               target={appRef}
               min={200}
               max={620}
-              label="Resize side panel"
+              label={t("app.resizeSidePanel")}
             />
 
             <div className="center-col">
@@ -223,7 +233,7 @@ export default function App() {
                   target={appRef}
                   min={220}
                   max={620}
-                  label="Resize scanner"
+                  label={t("app.resizeScanner")}
                 />
                 <WorkspacePanel />
               </div>
@@ -234,7 +244,7 @@ export default function App() {
                 min={100}
                 max={640}
                 invert
-                label="Resize output panel"
+                label={t("app.resizeOutput")}
               />
               <OutputPanel />
             </div>
@@ -248,7 +258,7 @@ export default function App() {
                   min={220}
                   max={620}
                   invert
-                  label="Resize inspector"
+                  label={t("app.resizeInspector")}
                 />
                 <InspectorPanel />
               </>

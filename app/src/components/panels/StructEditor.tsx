@@ -8,6 +8,7 @@
 import { useEffect, useState } from "react";
 import { Braces, Pencil, Plus, RefreshCw, Save, Trash2 } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { parseAddress } from "@/lib/format";
 import { parseEnumValues, useTypes } from "@/store/types";
 
@@ -27,6 +28,7 @@ const kPrimitiveTypes = [
 ];
 
 export default function StructEditor() {
+  const t = useT();
   const {
     structs,
     enums,
@@ -106,15 +108,15 @@ export default function StructEditor() {
     <div className="types">
       <div className="types-list">
         <div className="view-bar" style={{ padding: "var(--pad-sm)" }}>
-          <span className="panel-title">Types</span>
+          <span className="panel-title">{t("types.title")}</span>
           <div className="spacer" />
-          <IconButton tip="Reload catalog" onClick={() => void load()}>
+          <IconButton tip={t("types.reload")} onClick={() => void load()}>
             <RefreshCw size={13} />
           </IconButton>
         </div>
         <div className="panel-body">
-          <div className="types-group">Structs</div>
-          {structs.length === 0 && <div className="faint types-hint">no structs yet</div>}
+          <div className="types-group">{t("types.structs")}</div>
+          {structs.length === 0 && <div className="faint types-hint">{t("types.noStructs")}</div>}
           {structs.map((s) => (
             <button
               type="button"
@@ -132,8 +134,8 @@ export default function StructEditor() {
             <input
               className="addr-input"
               style={{ width: "100%" }}
-              aria-label="New struct name"
-              placeholder="New struct…"
+              aria-label={t("types.newStructName")}
+              placeholder={t("types.newStructPlaceholder")}
               value={newStruct}
               onChange={(e) => setNewStruct(e.target.value)}
               onKeyDown={(e) => {
@@ -142,7 +144,7 @@ export default function StructEditor() {
               }}
             />
             <IconButton
-              tip="Create struct"
+              tip={t("types.createStruct")}
               disabled={busy || newStruct.trim() === ""}
               onClick={() =>
                 void createStruct(newStruct.trim()).then((ok) => ok && setNewStruct(""))
@@ -152,8 +154,8 @@ export default function StructEditor() {
             </IconButton>
           </div>
 
-          <div className="types-group">Enums</div>
-          {enums.length === 0 && <div className="faint types-hint">no enums yet</div>}
+          <div className="types-group">{t("types.enums")}</div>
+          {enums.length === 0 && <div className="faint types-hint">{t("types.noEnums")}</div>}
           {enums.map((e) => (
             <button
               type="button"
@@ -173,7 +175,7 @@ export default function StructEditor() {
               onClick={() => selectEnum(null)}
               disabled={busy}
             >
-              <Plus size={11} /> new enum
+              <Plus size={11} /> {t("types.newEnum")}
             </button>
           </div>
         </div>
@@ -181,10 +183,12 @@ export default function StructEditor() {
 
       <div className="stack">
         <div className="view-bar">
-          <span className="panel-title">{def ? `struct ${def.name}` : "Struct editor"}</span>
+          <span className="panel-title">
+            {def ? t("types.structTitle", { name: def.name }) : t("types.editor")}
+          </span>
           {def && (
             <IconButton
-              tip={`Delete struct ${def.name}`}
+              tip={t("types.deleteStruct", { name: def.name })}
               disabled={busy}
               onClick={() => void deleteStruct(def.name)}
             >
@@ -193,10 +197,10 @@ export default function StructEditor() {
           )}
           <div className="spacer" />
           <label className="view-label">
-            addr
+            {t("types.addr")}
             <input
               className="addr-input mono"
-              aria-label="Address for live values"
+              aria-label={t("types.addrAria")}
               placeholder="0x400000"
               value={addr}
               aria-invalid={!addrOk && addr !== ""}
@@ -204,7 +208,7 @@ export default function StructEditor() {
               onKeyDown={(e) => e.key === "Enter" && void readValues()}
             />
           </label>
-          <IconButton tip="Re-read values" disabled={!addrOk} onClick={() => void readValues()}>
+          <IconButton tip={t("types.reread")} disabled={!addrOk} onClick={() => void readValues()}>
             <RefreshCw size={13} />
           </IconButton>
         </div>
@@ -216,18 +220,18 @@ export default function StructEditor() {
             </div>
           )}
           {def === undefined ? (
-            <div className="faint types-hint">Select a struct, or create one on the left.</div>
+            <div className="faint types-hint">{t("types.selectHint")}</div>
           ) : (
             <>
               <table className="table types-table">
                 <thead>
                   <tr>
-                    <th>offset</th>
-                    <th>size</th>
-                    <th>type</th>
-                    <th>name</th>
-                    <th>value</th>
-                    <th aria-label="actions" />
+                    <th>{t("types.offset")}</th>
+                    <th>{t("types.size")}</th>
+                    <th>{t("types.type")}</th>
+                    <th>{t("types.name")}</th>
+                    <th>{t("types.value")}</th>
+                    <th aria-label={t("types.actions")} />
                   </tr>
                 </thead>
                 <tbody>
@@ -244,7 +248,7 @@ export default function StructEditor() {
                           {renaming === f.name ? (
                             <input
                               className="addr-input mono"
-                              aria-label={`Rename ${f.name}`}
+                              aria-label={t("types.rename", { name: f.name })}
                               autoFocus
                               value={renameText}
                               onChange={(e) => setRenameText(e.target.value)}
@@ -269,7 +273,7 @@ export default function StructEditor() {
                         </td>
                         <td className="types-actions">
                           <IconButton
-                            tip={`Rename member ${f.name}`}
+                            tip={t("types.renameMember", { name: f.name })}
                             disabled={busy}
                             onClick={() => {
                               setRenaming(f.name);
@@ -279,7 +283,7 @@ export default function StructEditor() {
                             <Pencil size={12} />
                           </IconButton>
                           <IconButton
-                            tip={`Remove member ${f.name}`}
+                            tip={t("types.removeMember", { name: f.name })}
                             disabled={busy}
                             onClick={() => void removeMember(f.name)}
                           >
@@ -295,21 +299,21 @@ export default function StructEditor() {
               <div className="types-create">
                 <input
                   className="addr-input mono"
-                  aria-label="Member type"
+                  aria-label={t("types.memberType")}
                   list="types-member-types"
-                  placeholder="type"
+                  placeholder={t("types.typePlaceholder")}
                   value={fieldType}
                   onChange={(e) => setFieldType(e.target.value)}
                 />
                 <datalist id="types-member-types">
-                  {typeNames.map((t) => (
-                    <option key={t} value={t} />
+                  {typeNames.map((typeName) => (
+                    <option key={typeName} value={typeName} />
                   ))}
                 </datalist>
                 <input
                   className="addr-input mono"
-                  aria-label="Member name"
-                  placeholder="name"
+                  aria-label={t("types.memberName")}
+                  placeholder={t("types.namePlaceholder")}
                   value={fieldName}
                   onChange={(e) => setFieldName(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && void submitField()}
@@ -317,8 +321,8 @@ export default function StructEditor() {
                 <input
                   className="addr-input mono"
                   style={{ width: 56 }}
-                  aria-label="Array count"
-                  placeholder="count"
+                  aria-label={t("types.arrayCount")}
+                  placeholder={t("types.countPlaceholder")}
                   value={fieldCount}
                   onChange={(e) => setFieldCount(e.target.value)}
                 />
@@ -328,43 +332,45 @@ export default function StructEditor() {
                   disabled={busy || fieldName.trim() === ""}
                   onClick={() => void submitField()}
                 >
-                  <Plus size={11} /> add member
+                  <Plus size={11} /> {t("types.addMember")}
                 </button>
               </div>
 
               {invalidated > 0 && (
                 <div className="types-note" role="status">
-                  decompiler cache invalidated ({invalidated} edit{invalidated === 1 ? "" : "s"}) ·
-                  functions re-render on the next decompile
+                  {t("types.invalidated", {
+                    count: invalidated,
+                    s: invalidated === 1 ? "" : "s",
+                  })}
                 </div>
               )}
             </>
           )}
 
           <div className="types-enum">
-            <div className="types-group">Enum</div>
+            <div className="types-group">{t("types.enum")}</div>
             <div className="types-create">
               <input
                 className="addr-input mono"
-                aria-label="Enum name"
-                placeholder="name"
+                aria-label={t("types.enumName")}
+                placeholder={t("types.namePlaceholder")}
                 value={enumName}
                 onChange={(e) => setEnumName(e.target.value)}
               />
               <select
                 className="select"
-                aria-label="Enum underlying type"
+                aria-label={t("types.enumUnderlying")}
                 value={underlying}
                 onChange={(e) => setUnderlying(e.target.value)}
               >
-                {["u8", "u16", "u32", "u64", "i32"].map((t) => (
-                  <option key={t} value={t}>
-                    {t}
+                {["u8", "u16", "u32", "u64", "i32"].map((typeName) => (
+                  <option key={typeName} value={typeName}>
+                    {typeName}
                   </option>
                 ))}
               </select>
               <IconButton
-                tip="Save enum"
+                tip={t("types.saveEnum")}
                 disabled={
                   busy || enumName.trim() === "" || parseEnumValues(enumValues).length === 0
                 }
@@ -380,7 +386,7 @@ export default function StructEditor() {
               </IconButton>
               {selectedEnum !== null && (
                 <IconButton
-                  tip={`Delete enum ${selectedEnum}`}
+                  tip={t("types.deleteEnum", { name: selectedEnum })}
                   disabled={busy}
                   onClick={() => void deleteEnum(selectedEnum)}
                 >
@@ -390,8 +396,8 @@ export default function StructEditor() {
             </div>
             <textarea
               className="types-enum-values mono"
-              aria-label="Enum values"
-              placeholder="NAME=1, OTHER=0x10"
+              aria-label={t("types.enumValues")}
+              placeholder={t("types.enumValuesPlaceholder")}
               value={enumValues}
               onChange={(e) => setEnumValues(e.target.value)}
             />

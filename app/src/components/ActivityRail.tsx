@@ -5,14 +5,15 @@
 import { Boxes, ScrollText, Settings, Target } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import Tabs from "@/components/Tabs";
+import { useT } from "@/i18n";
 import type { RailView } from "@/store/ui";
 
 export type { RailView };
 
 const kItems = [
-  { id: "targets", label: "Targets", Icon: Target },
-  { id: "modules", label: "Modules", Icon: Boxes },
-  { id: "scripts", label: "Scripts", Icon: ScrollText },
+  { id: "targets", labelKey: "rail.targets", Icon: Target },
+  { id: "modules", labelKey: "rail.modules", Icon: Boxes },
+  { id: "scripts", labelKey: "rail.scripts", Icon: ScrollText },
 ] as const;
 
 type Props = {
@@ -22,18 +23,19 @@ type Props = {
 };
 
 export default function ActivityRail({ active, onSelect, onSettings }: Props) {
+  const t = useT();
   return (
-    <nav className="rail" aria-label="Activity">
+    <nav className="rail" aria-label={t("rail.activity")}>
       <Tabs<RailView>
-        items={kItems.map(({ id, label, Icon }) => ({
+        items={kItems.map(({ id, labelKey, Icon }) => ({
           id,
           label: <Icon size={18} strokeWidth={1.75} aria-hidden />,
-          ariaLabel: label,
-          tip: label,
+          ariaLabel: t(labelKey),
+          tip: t(labelKey),
         }))}
         active={active}
         onChange={onSelect}
-        label="Side panel"
+        label={t("rail.sidePanel")}
         idPrefix="rail"
         orientation="vertical"
         tabClassName="rail-button"
@@ -41,7 +43,12 @@ export default function ActivityRail({ active, onSelect, onSettings }: Props) {
 
       <div className="rail-spacer" />
 
-      <IconButton tip="Settings" variant="bare" className="rail-button" onClick={onSettings}>
+      <IconButton
+        tip={t("common.settings")}
+        variant="bare"
+        className="rail-button"
+        onClick={onSettings}
+      >
         <Settings size={18} strokeWidth={1.75} aria-hidden />
       </IconButton>
     </nav>

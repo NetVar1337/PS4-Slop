@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Play, RefreshCw, Undo2 } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { hex, parseAddress } from "@/lib/format";
 import { call, errorText } from "@/lib/rpc";
 import { useDisasm } from "@/store/disasm";
@@ -46,6 +47,7 @@ type RunResult = {
 const kMethods = ["auto", "xor_single", "xor_multi", "xor_rolling"];
 
 export default function UnpackerView() {
+  const t = useT();
   const image = useDisasm((s) => s.image);
   const [packer, setPacker] = useState<PackerVerdict | null>(null);
   const [journal, setJournal] = useState<JournalRec[]>([]);
@@ -94,7 +96,7 @@ export default function UnpackerView() {
   const run = async (action: "unpack_xor" | "decode_strings" | "full_pass") => {
     const va = parseAddress(addr);
     if (va === null) {
-      setError("bad address");
+      setError(t("unpacker.badAddress"));
       return;
     }
     const before = total;
@@ -117,7 +119,12 @@ export default function UnpackerView() {
       const res = await call<RunResult>("patch", action, params);
       setLast(res);
       setNote(
-        `${action}: ${res.bytes_changed} bytes changed · journal ${before} → ${res.journal_total}`,
+        t("unpacker.note", {
+          action,
+          bytes: res.bytes_changed,
+          before,
+          after: res.journal_total,
+        }),
       );
       await loadJournal();
     } catch (e) {
@@ -135,7 +142,7 @@ export default function UnpackerView() {
     setLast(null);
     try {
       const res = await call<RunResult>("patch", "revert_all");
-      setNote(`revert_all: restored ${res.bytes_changed} bytes · journal ${before} → 0`);
+      setNote(t("unpacker.reverted", { bytes: res.bytes_changed, before }));
       await loadJournal();
     } catch (e) {
       setError(errorText(e));
@@ -148,26 +155,27 @@ export default function UnpackerView() {
     <div className="unpacker">
       <div className="stack">
         <div className="view-bar">
-          <span className="panel-title">Packer</span>
+          <span className="panel-title">{t("unpacker.packer")}</span>
           <div className="spacer" />
-          <IconButton tip="Re-run packer analysis" onClick={() => void loadPacker()}>
+          <IconButton tip={t("unpacker.rerun")} onClick={() => void loadPacker()}>
             <RefreshCw size={13} />
           </IconButton>
         </div>
         <div className="panel-body unpacker-verdict">
           {packer === null ? (
-            <div className="faint">analyzing…</div>
+            <div className="faint">{t("unpacker.analyzing")}</div>
           ) : (
             <>
               <div>
                 <span className={packer.packed ? "unpacker-packed" : "unpacker-clean"}>
-                  {packer.packed ? "packed" : "not packed"}
+                  {packer.packed ? t("unpacker.packed") : t("unpacker.notPacked")}
                 </span>
                 <span className="faint">
-                  {" "}
-                  · {packer.family || "unknown family"} · confidence{" "}
-                  {(packer.confidence * 100).toFixed(0)}% · file entropy{" "}
-                  {packer.file_entropy.toFixed(2)}
+                  {t("unpacker.verdict", {
+                    family: packer.family || t("unpacker.unknownFamily"),
+                    percent: (packer.confidence * 100).toFixed(0),
+                    entropy: packer.file_entropy.toFixed(2),
+                  })}
                 </span>
               </div>
               {packer.detections.map((d) => (
@@ -191,7 +199,7 @@ export default function UnpackerView() {
                 {packer.sections
                   .filter((s) => s.entropy > 7)
                   .map((s) => `${s.name} entropy ${s.entropy.toFixed(2)}`)
-                  .join(" · ") || "no high-entropy sections"}
+                  .join(" · ") || t("unpacker.noHighEntropy")}
               </div>
             </>
           )}
@@ -200,7 +208,7 @@ export default function UnpackerView() {
 
       <div className="stack">
         <div className="view-bar">
-          <span className="panel-title">Passes</span>
+          <span className="panel-title">{t("unpacker.passes")}</span>
           <div className="spacer" />
           <button
             type="button"
@@ -208,35 +216,35 @@ export default function UnpackerView() {
             disabled={busy || total === 0}
             onClick={() => void revert()}
           >
-            <Undo2 size={11} /> revert all
+            <Undo2 size={11} /> {t("unpacker.revertAll")}
           </button>
         </div>
         <div className="panel-body unpacker-options">
           <label className="view-label">
-            addr
+            {t("unpacker.addr")}
             <input
               className="addr-input mono"
-              aria-label="Pass address"
+              aria-label={t("unpacker.passAddr")}
               placeholder="0x400000"
               value={addr}
               onChange={(e) => setAddr(e.target.value)}
             />
           </label>
           <label className="view-label">
-            size
+            {t("unpacker.size")}
             <input
               className="addr-input mono"
               style={{ width: 76 }}
-              aria-label="XOR region size"
+              aria-label={t("unpacker.xorSize")}
               value={size}
               onChange={(e) => setSize(e.target.value)}
             />
           </label>
           <label className="view-label">
-            method
+            {t("unpacker.method")}
             <select
               className="select"
-              aria-label="XOR method"
+              aria-label={t("unpacker.xorMethod")}
               value={method}
               onChange={(e) => setMethod(e.target.value)}
             >
@@ -248,10 +256,10 @@ export default function UnpackerView() {
             </select>
           </label>
           <label className="view-label">
-            key
+            {t("unpacker.key")}
             <input
               className="addr-input mono"
-              aria-label="XOR key hex"
+              aria-label={t("unpacker.xorKey")}
               placeholder="auto"
               value={keyHex}
               onChange={(e) => setKeyHex(e.target.value)}
@@ -260,11 +268,11 @@ export default function UnpackerView() {
           <label className="view-label">
             <input
               type="checkbox"
-              aria-label="Dry run"
+              aria-label={t("unpacker.dryRun")}
               checked={dryRun}
               onChange={(e) => setDryRun(e.target.checked)}
             />
-            dry run
+            {t("unpacker.dryRunLabel")}
           </label>
           <div className="unpacker-buttons">
             <button
@@ -273,7 +281,7 @@ export default function UnpackerView() {
               disabled={busy}
               onClick={() => void run("unpack_xor")}
             >
-              <Play size={11} /> unpack xor
+              <Play size={11} /> {t("unpacker.unpackXor")}
             </button>
             <button
               type="button"
@@ -281,7 +289,7 @@ export default function UnpackerView() {
               disabled={busy}
               onClick={() => void run("decode_strings")}
             >
-              <Play size={11} /> decode strings
+              <Play size={11} /> {t("unpacker.decodeStrings")}
             </button>
             <button
               type="button"
@@ -289,7 +297,7 @@ export default function UnpackerView() {
               disabled={busy}
               onClick={() => void run("full_pass")}
             >
-              <Play size={11} /> full pass
+              <Play size={11} /> {t("unpacker.fullPass")}
             </button>
           </div>
           {error !== null && (
@@ -308,13 +316,15 @@ export default function UnpackerView() {
                 <div key={s.step} className="unpacker-row">
                   <span className="mono">{s.step}</span>
                   <span className={s.success ? "unpacker-clean" : "error-text"}>
-                    {s.success ? "ok" : "failed"}
+                    {s.success ? t("unpacker.ok") : t("unpacker.failed")}
                   </span>
                   <span className="faint">{s.note}</span>
                 </div>
               ))}
               {last.score_reduction !== undefined && (
-                <div className="faint">obfuscation score reduced by {last.score_reduction}</div>
+                <div className="faint">
+                  {t("unpacker.scoreReduced", { score: last.score_reduction })}
+                </div>
               )}
             </div>
           )}
@@ -323,15 +333,15 @@ export default function UnpackerView() {
 
       <div className="stack">
         <div className="view-bar">
-          <span className="panel-title">Journal</span>
+          <span className="panel-title">{t("unpacker.journal")}</span>
           <div className="spacer" />
           <span className="faint">{total}</span>
-          <IconButton tip="Reload journal" onClick={() => void loadJournal()}>
+          <IconButton tip={t("unpacker.reloadJournal")} onClick={() => void loadJournal()}>
             <RefreshCw size={13} />
           </IconButton>
         </div>
         <div className="panel-body mono unpacker-journal">
-          {journal.length === 0 && <div className="faint">no edits recorded</div>}
+          {journal.length === 0 && <div className="faint">{t("unpacker.noEdits")}</div>}
           {journal.map((p) => (
             <div key={p.va} className="unpacker-row">
               <span className="insn-va">{hex(p.va, 12)}</span>
@@ -341,7 +351,9 @@ export default function UnpackerView() {
             </div>
           ))}
           {total > journal.length && (
-            <div className="faint">… {total - journal.length} older edits</div>
+            <div className="faint">
+              {t("unpacker.olderEdits", { count: total - journal.length })}
+            </div>
           )}
         </div>
       </div>

@@ -2066,6 +2066,32 @@ fieldset.settings-group {
   border-radius: var(--radius-sm);
 }
 
+/* Theme editor: one swatch + token name per palette entry */
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: var(--pad-xs) var(--pad-md);
+  margin-top: var(--pad-sm);
+}
+
+.theme-token {
+  display: flex;
+  align-items: center;
+  gap: var(--pad-sm);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.theme-token input[type="color"] {
+  width: 26px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  cursor: pointer;
+}
+
 /* --- command palette (cmdk) ---------------------------------------------- */
 
 .palette-scrim {

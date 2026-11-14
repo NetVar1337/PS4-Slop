@@ -1,7 +1,7 @@
 // app/src/components/SettingsModal.tsx
-// App settings. Theme and motion are local; everything under "Engine" is
-// engine-side state, read and written over /api (app.settings_get/_set) the
-// same way an agent would
+// App settings. Language, theme, theme editor and motion are local; everything
+// under "Engine" is engine-side state, read and written over /api
+// (app.settings_get/_set) the same way an agent would
 
 import { useEffect, useRef, useState } from "react";
 import { Check, Copy, KeyRound } from "lucide-react";
@@ -9,6 +9,7 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import logoUrl from "@/assets/reverse-slop-icon.png";
 import IconButton from "@/components/IconButton";
 import Modal from "@/components/Modal";
+import { kLanguages, useI18n, useT } from "@/i18n";
 import { call, getEndpoint } from "@/lib/rpc";
 import { copyText } from "@/lib/clipboard";
 import { isTauri } from "@/lib/endpoint";
@@ -16,19 +17,20 @@ import { readLayoutFile, saveLayoutFile } from "@/lib/layoutFile";
 import { useEngine } from "@/store/engine";
 import { kMotionOptions, osPrefersReduced, useMotion } from "@/store/motion";
 import { useSettings } from "@/store/settings";
-import { kThemes, useTheme } from "@/store/theme";
+import { kThemeTokens, kThemes, useTheme, type ThemeColors, type ThemeName } from "@/store/theme";
 import { layoutChanges, layoutFile, parseLayoutFile, useUi } from "@/store/ui";
 import { useUpdater } from "@/store/updater";
 
 type Props = { onClose: () => void };
 
 function CopyButton({ text, tip }: { text: string; tip: string }) {
+  const t = useT();
   const [copied, setCopied] = useState(false);
   const reset = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => () => clearTimeout(reset.current), []);
   return (
     <IconButton
-      tip={copied ? "Copied" : tip}
+      tip={copied ? t("settings.copied") : tip}
       onClick={() => {
         void copyText(text).then(() => {
           setCopied(true);
@@ -71,7 +73,176 @@ function Toggle({
   );
 }
 
+/** Current palette values as hex, so the color inputs start on the live theme. */
+function readColors(): ThemeColors {
+  const style = getComputedStyle(document.documentElement);
+  const out: ThemeColors = {};
+  for (const { id } of kThemeTokens) {
+    const value = style.getPropertyValue(id).trim();
+    if (/^#[0-9a-f]{6}$/i.test(value)) out[id] = value;
+  }
+  return out;
+}
+
+/** Base palette, per-token color inputs with live preview, named saves and a
+ *  JSON round-trip. Overrides are inline custom properties on <html>. */
+function ThemeEditor() {
+  const t = useT();
+  const theme = useTheme((s) => s.theme);
+  const customThemes = useTheme((s) => s.customThemes);
+  const activeCustom = useTheme((s) => s.activeCustom);
+  const setTheme = useTheme((s) => s.setTheme);
+  const previewColors = useTheme((s) => s.previewColors);
+  const saveCustom = useTheme((s) => s.saveCustom);
+  const applyCustom = useTheme((s) => s.applyCustom);
+  const deleteCustom = useTheme((s) => s.deleteCustom);
+  const exportCustom = useTheme((s) => s.exportCustom);
+  const importCustom = useTheme((s) => s.importCustom);
+  const [base, setBase] = useState<ThemeName>(theme);
+  const [colors, setColors] = useState<ThemeColors>(readColors);
+  const [name, setName] = useState("");
+  const [json, setJson] = useState("");
+  const [note, setNote] = useState<string | null>(null);
+
+  const pickBase = (next: ThemeName) => {
+    setBase(next);
+    setTheme(next);
+    setColors(readColors());
+  };
+
+  const editColor = (token: keyof ThemeColors, value: string) => {
+    const next = { ...colors, [token]: value };
+    setColors(next);
+    previewColors(next);
+  };
+
+  const save = () => {
+    const saved = saveCustom(name, base, colors);
+    if (saved === null) return;
+    setName("");
+    setNote(t("settings.themeSaved", { name: saved.name }));
+  };
+
+  const importJson = () => {
+    const imported = importCustom(json);
+    setNote(
+      imported === null
+        ? t("settings.importFailed")
+        : t("settings.themeSaved", { name: imported.name }),
+    );
+  };
+
+  return (
+    <>
+      <fieldset className="settings-group">
+        <legend className="settings-label">{t("settings.themeEditor")}</legend>
+        <div className="settings-choices">
+          {kThemes.map((th) => (
+            <button
+              type="button"
+              key={th.id}
+              className="row-action"
+              data-active={base === th.id}
+              aria-pressed={base === th.id}
+              onClick={() => pickBase(th.id)}
+            >
+              {t(th.labelKey)}
+            </button>
+          ))}
+        </div>
+        <div className="theme-grid">
+          {kThemeTokens.map((token) => (
+            <label className="theme-token" key={token.id}>
+              <input
+                type="color"
+                aria-label={t(token.labelKey)}
+                value={colors[token.id] ?? "#000000"}
+                onChange={(e) => editColor(token.id, e.target.value)}
+              />
+              <span>{t(token.labelKey)}</span>
+            </label>
+          ))}
+        </div>
+        <div className="settings-choices">
+          <input
+            className="addr-input"
+            aria-label={t("settings.themeName")}
+            placeholder={t("settings.themeNamePlaceholder")}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+          />
+          <button type="button" className="row-action" disabled={name.trim() === ""} onClick={save}>
+            {t("settings.saveTheme")}
+          </button>
+          <button type="button" className="row-action" onClick={() => previewColors(null)}>
+            {t("settings.previewReset")}
+          </button>
+        </div>
+        <div className="settings-rows">
+          <div className="faint">{t("settings.customThemes")}</div>
+          {customThemes.length === 0 ? (
+            <div className="faint">{t("settings.noCustomThemes")}</div>
+          ) : (
+            customThemes.map((custom) => (
+              <div className="settings-copy-row" key={custom.name}>
+                <span className="settings-copy-text" data-active={custom.name === activeCustom}>
+                  {custom.name}
+                </span>
+                <button
+                  type="button"
+                  className="row-action"
+                  onClick={() => applyCustom(custom.name)}
+                >
+                  {t("settings.applyTheme")}
+                </button>
+                <button
+                  type="button"
+                  className="row-action"
+                  onClick={() => setJson(exportCustom(custom.name) ?? "")}
+                >
+                  {t("settings.exportTheme")}
+                </button>
+                <IconButton
+                  tip={t("settings.deleteTheme", { name: custom.name })}
+                  onClick={() => deleteCustom(custom.name)}
+                >
+                  <KeyRound size={11} />
+                </IconButton>
+              </div>
+            ))
+          )}
+        </div>
+        <label className="settings-field">
+          <span>{t("settings.themeJson")}</span>
+          <textarea
+            className="code-area mono settings-textarea"
+            aria-label={t("settings.themeJson")}
+            value={json}
+            rows={4}
+            spellCheck={false}
+            onChange={(e) => setJson(e.target.value)}
+          />
+        </label>
+        <div className="settings-choices">
+          <button
+            type="button"
+            className="row-action"
+            disabled={json.trim() === ""}
+            onClick={importJson}
+          >
+            {t("settings.importTheme")}
+          </button>
+        </div>
+        {note !== null && <div className="settings-status mono">{note}</div>}
+      </fieldset>
+    </>
+  );
+}
+
 export default function SettingsModal({ onClose }: Props) {
+  const t = useT();
+  const language = useI18n((s) => s.language);
+  const setLanguage = useI18n((s) => s.setLanguage);
   const theme = useTheme((s) => s.theme);
   const setTheme = useTheme((s) => s.setTheme);
   const motion = useMotion((s) => s.motion);
@@ -137,16 +308,18 @@ export default function SettingsModal({ onClose }: Props) {
     settings?.mcp_token === "set" ? "set" : settings?.mcp_token === "unset" ? "unset" : "unknown";
   const updateStatus =
     updatePhase === "checking"
-      ? "Checking…"
+      ? t("settings.updateChecking")
       : updatePhase === "available"
-        ? `v${updateVersion} is available.`
+        ? t("settings.updateAvailable", { version: updateVersion ?? "" })
         : updatePhase === "downloading"
-          ? `Downloading…${updateProgress >= 0 ? ` ${Math.round(updateProgress * 100)}%` : ""}`
+          ? t("settings.updateDownloading", {
+              percent: updateProgress >= 0 ? ` ${Math.round(updateProgress * 100)}%` : "",
+            })
           : updatePhase === "ready"
-            ? "Installing; the app will restart."
+            ? t("settings.updateInstalling")
             : updatePhase === "error"
-              ? `Update failed: ${updateError}`
-              : "Up to date.";
+              ? t("settings.updateFailed", { error: updateError ?? "" })
+              : t("settings.updateUpToDate");
 
   const saveAllowlist = () => {
     const hosts = allowlist
@@ -172,9 +345,11 @@ export default function SettingsModal({ onClose }: Props) {
   const exportLayout = async () => {
     try {
       const path = await saveLayoutFile(`${JSON.stringify(layoutFile(), null, 2)}\n`);
-      if (path !== null) setLayoutStatus(`Exported to ${path}`);
+      if (path !== null) setLayoutStatus(t("settings.exportedTo", { path }));
     } catch (e) {
-      setLayoutStatus(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
+      setLayoutStatus(
+        t("settings.layoutExportFailed", { error: e instanceof Error ? e.message : String(e) }),
+      );
     }
   };
 
@@ -186,10 +361,14 @@ export default function SettingsModal({ onClose }: Props) {
       const changes = layoutChanges(layoutFile(), file);
       useUi.getState().importLayout(file);
       setLayoutStatus(
-        changes.length === 0 ? "Imported: nothing changed." : `Imported: ${changes.join(", ")}`,
+        changes.length === 0
+          ? t("settings.importedNothing")
+          : t("settings.imported", { changes: changes.join(", ") }),
       );
     } catch (e) {
-      setLayoutStatus(`Import failed: ${e instanceof Error ? e.message : String(e)}`);
+      setLayoutStatus(
+        t("settings.layoutImportFailed", { error: e instanceof Error ? e.message : String(e) }),
+      );
     }
   };
 
@@ -205,7 +384,7 @@ export default function SettingsModal({ onClose }: Props) {
       });
       if (path === null) return;
       await call("app", "diag_bundle", { path });
-      setDiag(`Saved ${path}`);
+      setDiag(t("settings.saved", { path }));
     } catch (e) {
       setDiag(e instanceof Error ? e.message : String(e));
     } finally {
@@ -213,36 +392,56 @@ export default function SettingsModal({ onClose }: Props) {
     }
   };
   return (
-    <Modal title="Settings" onClose={onClose}>
+    <Modal title={t("settings.title")} onClose={onClose}>
       <div className="modal-body">
         <div className="settings-brand">
           <img src={logoUrl} alt="" draggable={false} />
           <div className="settings-brand-name">SlopStation</div>
           <div className="settings-brand-sub">
-            v{appVersion || "dev"} · {backend.badge} engine
+            {t("settings.brand", { version: appVersion || "dev", badge: backend.badge })}
           </div>
         </div>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">Theme</legend>
+          <legend className="settings-label">{t("settings.language")}</legend>
           <div className="settings-choices">
-            {kThemes.map((t) => (
+            {kLanguages.map((l) => (
               <button
                 type="button"
-                key={t.id}
+                key={l.id}
                 className="row-action"
-                data-active={theme === t.id}
-                aria-pressed={theme === t.id}
-                onClick={() => setTheme(t.id)}
+                data-active={language === l.id}
+                aria-pressed={language === l.id}
+                onClick={() => setLanguage(l.id)}
               >
-                {t.label}
+                {l.label}
               </button>
             ))}
           </div>
         </fieldset>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">Motion</legend>
+          <legend className="settings-label">{t("settings.theme")}</legend>
+          <div className="settings-choices">
+            {kThemes.map((th) => (
+              <button
+                type="button"
+                key={th.id}
+                className="row-action"
+                data-active={theme === th.id}
+                aria-pressed={theme === th.id}
+                onClick={() => setTheme(th.id)}
+              >
+                {t(th.labelKey)}
+              </button>
+            ))}
+          </div>
+        </fieldset>
+
+        <ThemeEditor />
+
+        <fieldset className="settings-group">
+          <legend className="settings-label">{t("settings.motion")}</legend>
           <div className="settings-choices">
             {kMotionOptions.map((o) => (
               <button
@@ -251,34 +450,26 @@ export default function SettingsModal({ onClose }: Props) {
                 className="row-action"
                 data-active={motion === o.id}
                 aria-pressed={motion === o.id}
-                data-tip={o.hint}
+                data-tip={t(o.hintKey)}
                 onClick={() => setMotion(o.id)}
               >
-                {o.label}
+                {t(o.labelKey)}
               </button>
             ))}
           </div>
-          {osPrefersReduced() && (
-            <div className="settings-rows">
-              Windows currently has animation effects switched off. “Auto” follows that and disables
-              transitions; “On” overrides it.
-            </div>
-          )}
+          {osPrefersReduced() && <div className="settings-rows">{t("settings.motionOs")}</div>}
         </fieldset>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">Layout</legend>
+          <legend className="settings-label">{t("settings.layout")}</legend>
           <div className="settings-rows">
-            <div className="faint">
-              Panels, splitter sizes, active tab, theme and motion in one JSON file, for a support
-              hand-off or a second machine.
-            </div>
+            <div className="faint">{t("settings.layoutHint")}</div>
             <div className="settings-choices">
               <button type="button" className="row-action" onClick={() => void exportLayout()}>
-                Export layout…
+                {t("settings.exportLayout")}
               </button>
               <button type="button" className="row-action" onClick={() => void importLayout()}>
-                Import layout…
+                {t("settings.importLayout")}
               </button>
             </div>
             {layoutStatus !== null && (
@@ -290,38 +481,40 @@ export default function SettingsModal({ onClose }: Props) {
         </fieldset>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">Target</legend>
+          <legend className="settings-label">{t("settings.target")}</legend>
           <div className="settings-rows mono">
             <div>
-              backend: {backend.badge}
-              {backend.ps4 ? " (ps4 console)" : ""}
+              {t("settings.backend", { badge: backend.badge })}
+              {backend.ps4 ? t("settings.backendPs4") : ""}
             </div>
             <div>
-              ps4:{" "}
-              {backend.ps4
-                ? "connected - connect another from the Targets panel or MCP target.ps4_auto"
-                : "not connected - use the Targets panel (ps4 connect) or MCP target.ps4_auto with a host"}
+              ps4: {backend.ps4 ? t("settings.ps4Connected") : t("settings.ps4Disconnected")}
             </div>
             <div>
-              target:{" "}
-              {target.attached ? `attached pid ${target.pid ?? 0} (${target.name ?? "?"})` : "none"}
+              {t("settings.targetValue", {
+                value: target.attached
+                  ? t("settings.attached", {
+                      pid: target.pid ?? 0,
+                      name: target.name ?? "?",
+                    })
+                  : t("common.none"),
+              })}
             </div>
           </div>
         </fieldset>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">Engine</legend>
+          <legend className="settings-label">{t("settings.engine")}</legend>
           <div className="settings-rows mono">
-            <div>api: http://127.0.0.1:{endpoint.port}/api/v1</div>
+            <div>{t("settings.api", { port: endpoint.port })}</div>
             <div className="settings-copy-row">
-              <span className="settings-copy-text">mcp: {mcpUrl}</span>
-              <CopyButton text={mcpUrl} tip="Copy MCP URL" />
+              <span className="settings-copy-text">{t("settings.mcp", { url: mcpUrl })}</span>
+              <CopyButton text={mcpUrl} tip={t("settings.copyMcp")} />
             </div>
             <div>
-              ui auth:{" "}
-              {endpoint.token === ""
-                ? "none (browser dev mode; start the engine with --insecure-dev)"
-                : "bearer token"}
+              {t("settings.uiAuth", {
+                value: endpoint.token === "" ? t("settings.authNone") : t("settings.authBearer"),
+              })}
             </div>
           </div>
           <div className="settings-choices">
@@ -329,19 +522,19 @@ export default function SettingsModal({ onClose }: Props) {
               type="button"
               className="row-action"
               disabled={!isTauri() || diagBusy}
-              data-tip="Zip with the engine log tail, redacted settings, versions and the console status"
+              data-tip={t("settings.diagnosticsTip")}
               onClick={() => void copyDiagnostics()}
             >
-              {diagBusy ? "Bundling…" : "Copy diagnostics"}
+              {diagBusy ? t("settings.bundling") : t("settings.copyDiagnostics")}
             </button>
           </div>
           {diag !== null && <div className="settings-status mono">{diag}</div>}
         </fieldset>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">Updates</legend>
+          <legend className="settings-label">{t("settings.updates")}</legend>
           <div className="settings-rows">
-            <div>version: {appVersion || "dev"}</div>
+            <div>{t("settings.version", { version: appVersion || "dev" })}</div>
             <div>{updateStatus}</div>
             <div className="settings-choices">
               <button
@@ -350,11 +543,13 @@ export default function SettingsModal({ onClose }: Props) {
                 disabled={updatePhase === "checking" || updatePhase === "downloading"}
                 onClick={() => void checkUpdates(true)}
               >
-                {updatePhase === "checking" ? "Checking…" : "Check for updates"}
+                {updatePhase === "checking"
+                  ? t("settings.updateChecking")
+                  : t("settings.checkUpdates")}
               </button>
               {updatePhase === "available" && (
                 <button type="button" className="row-action" onClick={() => void installUpdate()}>
-                  Install v{updateVersion} &amp; restart
+                  {t("settings.installRestart", { version: updateVersion ?? "" })}
                 </button>
               )}
             </div>
@@ -362,28 +557,25 @@ export default function SettingsModal({ onClose }: Props) {
         </fieldset>
 
         <fieldset className="settings-group">
-          <legend className="settings-label">MCP token</legend>
+          <legend className="settings-label">{t("settings.mcpToken")}</legend>
           <div className="settings-rows">
             <div>
-              External MCP clients authenticate with this token. It is{" "}
-              <strong>
-                {tokenState === "unknown" ? "unknown (engine not reachable)" : tokenState}
-              </strong>
-              ; the engine never returns its value.
+              {t("settings.mcpTokenIntro")}{" "}
+              <strong>{tokenState === "unknown" ? t("settings.tokenUnknown") : tokenState}</strong>
+              {t("settings.mcpTokenOutro")}
             </div>
             <div className="settings-copy-row">
               <span className="settings-copy-text mono">{setxCommand}</span>
-              <CopyButton text={setxCommand} tip="Copy setx command" />
+              <CopyButton text={setxCommand} tip={t("settings.copySetx")} />
             </div>
             <div className="faint">
-              Client configs reference <code>${"${SLOP_MCP_TOKEN}"}</code>; set that user
-              environment variable once with the command above (it is not set for you) and restart
-              the client.
+              {t("settings.tokenEnvIntro")} <code>${"${SLOP_MCP_TOKEN}"}</code>
+              {t("settings.tokenEnvOutro")}
             </div>
             {plaintextConfigs.length > 0 && (
               <div className="settings-status" role="alert">
-                Plaintext token in: {plaintextConfigs.join(", ")}. Regenerate the token, or turn off
-                “Write the token into client configs” and restart the engine.
+                {t("settings.plaintext", { list: plaintextConfigs.join(", ") })}{" "}
+                {t("settings.plaintextHint")}
               </div>
             )}
             {revealedToken !== null && (
@@ -391,21 +583,21 @@ export default function SettingsModal({ onClose }: Props) {
                 <span className="settings-copy-text" data-testid="revealed-token">
                   {revealedToken}
                 </span>
-                <CopyButton text={revealedToken} tip="Copy new token" />
+                <CopyButton text={revealedToken} tip={t("settings.copyNewToken")} />
               </div>
             )}
             {revealedToken === null && clientsUpdated.length > 0 && (
-              <div>Rotated. Updated client configs: {clientsUpdated.join(", ")}.</div>
+              <div>{t("settings.rotated", { list: clientsUpdated.join(", ") })}</div>
             )}
             {revealedToken !== null && (
               <div className="faint">
-                Shown once. Onboarded clients: {clientsUpdated.join(", ") || "none"}.
+                {t("settings.shownOnce", { list: clientsUpdated.join(", ") || t("common.none") })}
               </div>
             )}
             <div className="settings-choices">
               {confirmRotate ? (
                 <>
-                  <span>Existing MCP clients will need the new token.</span>
+                  <span>{t("settings.rotateWarning")}</span>
                   <button
                     type="button"
                     className="row-action"
@@ -414,19 +606,19 @@ export default function SettingsModal({ onClose }: Props) {
                       void rotateToken();
                     }}
                   >
-                    Confirm regenerate
+                    {t("settings.confirmRegenerate")}
                   </button>
                   <button
                     type="button"
                     className="row-action"
                     onClick={() => setConfirmRotate(false)}
                   >
-                    Cancel
+                    {t("common.cancel")}
                   </button>
                 </>
               ) : (
                 <button type="button" className="row-action" onClick={() => setConfirmRotate(true)}>
-                  <KeyRound size={11} aria-hidden /> Regenerate token…
+                  <KeyRound size={11} aria-hidden /> {t("settings.regenerate")}
                 </button>
               )}
             </div>
@@ -434,21 +626,21 @@ export default function SettingsModal({ onClose }: Props) {
         </fieldset>
 
         <fieldset className="settings-group" disabled={settings === null}>
-          <legend className="settings-label">Engine policy</legend>
+          <legend className="settings-label">{t("settings.enginePolicy")}</legend>
           <Toggle
-            label="Unsafe Lua scripts"
-            hint="Give script.run the full Lua stdlib (os.execute, io.popen). Off = sandboxed."
+            label={t("settings.unsafeLabel")}
+            hint={t("settings.unsafeHint")}
             checked={settings?.script_unsafe === true}
             onChange={(v) => void setValue("script_unsafe", v)}
           />
           <Toggle
-            label="Allow private network fetches"
-            hint="Let web.fetch / web.post reach loopback, link-local and private addresses."
+            label={t("settings.privateLabel")}
+            hint={t("settings.privateHint")}
             checked={settings?.web_allow_private === true}
             onChange={(v) => void setValue("web_allow_private", v)}
           />
           <label className="settings-field">
-            <span>Web allowlist (one host per line; private hosts listed here are allowed)</span>
+            <span>{t("settings.allowlistLabel")}</span>
             <textarea
               className="code-area mono settings-textarea"
               value={allowlist}
@@ -459,7 +651,7 @@ export default function SettingsModal({ onClose }: Props) {
             />
           </label>
           <label className="settings-field">
-            <span>Proxy token (clients of the HTTP proxy must send it)</span>
+            <span>{t("settings.proxyLabel")}</span>
             <input
               className="addr-input mono"
               style={{ width: "100%" }}
@@ -475,16 +667,13 @@ export default function SettingsModal({ onClose }: Props) {
             />
           </label>
           <Toggle
-            label="Write the token into client configs"
-            hint="Off: configs reference ${SLOP_MCP_TOKEN}. On: the literal bearer is written to every onboarded client config."
+            label={t("settings.writeTokenLabel")}
+            hint={t("settings.writeTokenHint")}
             checked={settings?.mcp_token_in_configs === true}
             onChange={(v) => void setValue("mcp_token_in_configs", v)}
           />
           <label className="settings-field">
-            <span>
-              Onboarding clients (one per line; empty = auto: Tern when installed, else every known
-              client)
-            </span>
+            <span>{t("settings.onboardLabel")}</span>
             <textarea
               className="code-area mono settings-textarea"
               value={onboardClients}
@@ -496,7 +685,7 @@ export default function SettingsModal({ onClose }: Props) {
           </label>
           {restartRequired.length > 0 && (
             <div className="settings-status">
-              Restart the engine to apply: {restartRequired.join(", ")}
+              {t("settings.restartRequired", { keys: restartRequired.join(", ") })}
             </div>
           )}
         </fieldset>

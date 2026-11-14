@@ -4,6 +4,7 @@
 
 import { useEffect, useState } from "react";
 import Tabs, { panelId, tabId } from "@/components/Tabs";
+import { useT } from "@/i18n";
 import { formatLabel } from "@/lib/format";
 import { showInDisassembly } from "@/lib/navigate";
 import { hex, useDisasm } from "@/store/disasm";
@@ -12,6 +13,7 @@ import { usePe } from "@/store/pe";
 type Sub = "sections" | "imports" | "exports";
 
 export default function PeView() {
+  const t = useT();
   const { pe, loading, error, load } = usePe();
   const image = useDisasm((s) => s.image);
   const [sub, setSub] = useState<Sub>("sections");
@@ -41,21 +43,24 @@ export default function PeView() {
             id: s,
             label: (
               <>
-                {s}
+                {t(`pe.${s}`)}
                 <span className="faint">{counts[s]}</span>
               </>
             ),
           }))}
           active={sub}
           onChange={setSub}
-          label="Image metadata"
+          label={t("pe.metadata")}
           idPrefix="image"
         />
         <div className="spacer" />
         <span className="faint mono" style={{ fontSize: 11 }}>
-          {formatLabel(format, isPe ? pe.pe32plus : undefined)}
-          {arch !== undefined ? ` · ${arch}` : ""} · base {hex(base)} · entry{" "}
-          {hex(image.entry_va ?? base + (pe.entry_rva ?? 0))}
+          {t("pe.meta", {
+            format: formatLabel(format, isPe ? pe.pe32plus : undefined),
+            arch: arch !== undefined ? t("pe.metaArch", { arch }) : "",
+            base: hex(base),
+            entry: hex(image.entry_va ?? base + (pe.entry_rva ?? 0)),
+          })}
         </span>
       </div>
 
@@ -73,31 +78,33 @@ export default function PeView() {
         )}
         {loading && (
           <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-            reading image metadata…
+            {t("pe.reading")}
           </div>
         )}
 
         {sub === "sections" && (
           <table className="table">
-            <caption className="sr-only">{formatLabel(format)} sections</caption>
+            <caption className="sr-only">
+              {t("pe.sectionsCaption", { format: formatLabel(format) })}
+            </caption>
             <thead>
               <tr>
                 <th scope="col" style={{ width: 90 }}>
-                  Name
+                  {t("pe.name")}
                 </th>
                 <th scope="col" style={{ width: 130 }}>
-                  VA
+                  {t("pe.va")}
                 </th>
                 <th scope="col" style={{ width: 90 }}>
-                  RVA
+                  {t("pe.rva")}
                 </th>
                 <th scope="col" style={{ width: 90 }}>
-                  Virtual
+                  {t("pe.virtual")}
                 </th>
                 <th scope="col" style={{ width: 90 }}>
-                  Raw
+                  {t("pe.raw")}
                 </th>
-                <th scope="col">Flags</th>
+                <th scope="col">{t("pe.flags")}</th>
               </tr>
             </thead>
             <tbody>
@@ -119,8 +126,8 @@ export default function PeView() {
                   <td className="mono faint">0x{s.vsize.toString(16).toUpperCase()}</td>
                   <td className="mono faint">0x{s.raw_size.toString(16).toUpperCase()}</td>
                   <td>
-                    {s.exec && <span className="pill">exec</span>}{" "}
-                    {s.writable && <span className="pill">write</span>}{" "}
+                    {s.exec && <span className="pill">{t("pe.exec")}</span>}{" "}
+                    {s.writable && <span className="pill">{t("pe.write")}</span>}{" "}
                     {(isPe || isElf) && s.characteristics !== 0 && (
                       <span className="faint mono" style={{ fontSize: 11 }}>
                         0x{s.characteristics.toString(16).toUpperCase()}
@@ -139,11 +146,14 @@ export default function PeView() {
               <details key={d.dll} className="tree">
                 <summary>
                   <span className="mono">
-                    {d.dll === "" ? (isPe ? "(unnamed)" : "(self / dynamic lookup)") : d.dll}
+                    {d.dll === "" ? (isPe ? t("pe.unnamed") : t("pe.dynamic")) : d.dll}
                   </span>
                   <span className="faint">{d.functions.length}</span>
                 </summary>
-                <ul className="plain-list" aria-label={`Imports from ${d.dll || importGroup}`}>
+                <ul
+                  className="plain-list"
+                  aria-label={t("pe.importsFrom", { group: d.dll || importGroup })}
+                >
                   {d.functions.map((fn, i) => (
                     <li className="tree-leaf mono" key={`${d.dll}-${i}`}>
                       {fn}
@@ -154,7 +164,7 @@ export default function PeView() {
             ))}
             {pe.imports.length === 0 && !loading && (
               <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-                no imports.
+                {t("pe.noImports")}
               </div>
             )}
           </div>
@@ -162,18 +172,20 @@ export default function PeView() {
 
         {sub === "exports" && (
           <table className="table">
-            <caption className="sr-only">{formatLabel(format)} exports</caption>
+            <caption className="sr-only">
+              {t("pe.exportsCaption", { format: formatLabel(format) })}
+            </caption>
             <thead>
               <tr>
                 {isPe && (
                   <th scope="col" style={{ width: 70 }}>
-                    Ordinal
+                    {t("pe.ordinal")}
                   </th>
                 )}
                 <th scope="col" style={{ width: 130 }}>
-                  VA
+                  {t("pe.va")}
                 </th>
-                <th scope="col">Name</th>
+                <th scope="col">{t("pe.name")}</th>
               </tr>
             </thead>
             <tbody>

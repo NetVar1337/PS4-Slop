@@ -3,20 +3,21 @@
 // shortcut advertised in a menu or tooltip actually does something
 
 import { useEffect } from "react";
+import type { Key } from "@/i18n/en";
 import { openBinary } from "@/lib/openBinary";
 import { useUi, type WorkspaceTab } from "@/store/ui";
 
-export type Shortcut = { keys: string; label: string };
+export type Shortcut = { keys: string; labelKey: Key };
 
 /** What the Help menu lists; keep in sync with `handle` below. */
 export const kShortcuts: readonly Shortcut[] = [
-  { keys: "Ctrl+K", label: "Command palette" },
-  { keys: "Ctrl+Shift+P", label: "Command palette" },
-  { keys: "Ctrl+G", label: "Go to address / function" },
-  { keys: "Ctrl+O", label: "Open binary" },
-  { keys: "Ctrl+,", label: "Settings" },
-  { keys: "Ctrl+1…5", label: "Disassembly / Strings / Memory / Debugger / Image browser" },
-  { keys: "Ctrl+Alt+I", label: "Toggle inspector" },
+  { keys: "Ctrl+K", labelKey: "shortcut.commandPalette" },
+  { keys: "Ctrl+Shift+P", labelKey: "shortcut.commandPalette" },
+  { keys: "Ctrl+G", labelKey: "shortcut.goto" },
+  { keys: "Ctrl+O", labelKey: "shortcut.openBinary" },
+  { keys: "Ctrl+,", labelKey: "shortcut.settings" },
+  { keys: "Ctrl+1…5", labelKey: "shortcut.tabs" },
+  { keys: "Ctrl+Alt+I", labelKey: "shortcut.inspector" },
 ];
 
 const kTabByDigit: Record<string, WorkspaceTab> = {

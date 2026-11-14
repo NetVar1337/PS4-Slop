@@ -7,6 +7,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Download, Eye, Plus, RotateCcw, Search, Snowflake, Upload, X } from "lucide-react";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { isTauri } from "@/lib/endpoint";
 import { hex, parseAddress } from "@/lib/format";
 import { useEngine } from "@/store/engine";
@@ -34,6 +35,7 @@ async function pickOpenPath(title: string): Promise<string | null> {
 
 /** Inline add-watch row: validated address, width and optional label. */
 function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidth: string }) {
+  const t = useT();
   const add = useWatch((s) => s.add);
   const [addr, setAddr] = useState("");
   const [width, setWidth] = useState(
@@ -57,7 +59,7 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
   return (
     <form
       className="watch-add"
-      aria-label="Add watch"
+      aria-label={t("scanner.addWatch")}
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
@@ -68,9 +70,9 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
         className="addr-input mono"
         style={{ width: 110 }}
         autoFocus
-        aria-label="Watch address (hex)"
+        aria-label={t("scanner.watchAddress")}
         aria-invalid={invalid}
-        placeholder="address (hex)"
+        placeholder={t("scanner.addressPlaceholder")}
         value={addr}
         onChange={(e) => {
           setAddr(e.target.value);
@@ -79,7 +81,7 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
       />
       <select
         className="select"
-        aria-label="Watch width"
+        aria-label={t("scanner.watchWidth")}
         value={width}
         onChange={(e) => setWidth(e.target.value)}
       >
@@ -92,24 +94,24 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
       <input
         className="addr-input"
         style={{ flex: 1, minWidth: 60 }}
-        aria-label="Watch label"
-        placeholder="label"
+        aria-label={t("scanner.watchLabel")}
+        placeholder={t("scanner.labelPlaceholder")}
         value={label}
         onChange={(e) => setLabel(e.target.value)}
       />
       <input
         className="addr-input mono"
         style={{ width: 52 }}
-        aria-label="Watch interval (ms)"
-        title="Service rate in milliseconds (freeze write-back included)"
+        aria-label={t("scanner.watchInterval")}
+        title={t("scanner.watchIntervalTip")}
         inputMode="numeric"
         value={intervalMs}
         onChange={(e) => setIntervalMs(e.target.value)}
       />
       <button type="submit" className="row-action" disabled={addr.trim() === ""}>
-        Add
+        {t("common.add")}
       </button>
-      <IconButton tip="Cancel" onClick={onDone}>
+      <IconButton tip={t("common.cancel")} onClick={onDone}>
         <X size={12} />
       </IconButton>
     </form>
@@ -117,6 +119,7 @@ function AddWatchRow({ onDone, defaultWidth }: { onDone: () => void; defaultWidt
 }
 
 export default function ScannerPanel() {
+  const t = useT();
   const attached = useEngine((s) => s.target.attached);
   const scanner = useScanner();
   const {
@@ -159,7 +162,7 @@ export default function ScannerPanel() {
       <div className="panel-head scanner-head">
         <select
           className="select"
-          aria-label="Value width"
+          aria-label={t("scanner.valueWidth")}
           value={scanner.width}
           onChange={(e) => scanner.set({ width: e.target.value })}
         >
@@ -171,7 +174,7 @@ export default function ScannerPanel() {
         </select>
         <select
           className="select"
-          aria-label="Scan kind"
+          aria-label={t("scanner.scanKind")}
           value={kinds.includes(scanner.kind as never) ? scanner.kind : kinds[0]}
           onChange={(e) => scanner.set({ kind: e.target.value })}
         >
@@ -185,9 +188,9 @@ export default function ScannerPanel() {
           <input
             className="addr-input mono"
             style={{ width: 76 }}
-            aria-label="Value"
+            aria-label={t("scanner.value")}
             value={scanner.value}
-            placeholder="value"
+            placeholder={t("scanner.valuePlaceholder")}
             onChange={(e) => scanner.set({ value: e.target.value })}
             onKeyDown={(e) => e.key === "Enter" && void scanner.scan(scanner.hasState)}
           />
@@ -196,9 +199,9 @@ export default function ScannerPanel() {
           <input
             className="addr-input mono"
             style={{ width: 76 }}
-            aria-label="Upper bound"
+            aria-label={t("scanner.upperBound")}
             value={scanner.value2}
-            placeholder="to"
+            placeholder={t("scanner.toPlaceholder")}
             onChange={(e) => scanner.set({ value2: e.target.value })}
           />
         )}
@@ -208,10 +211,11 @@ export default function ScannerPanel() {
           disabled={!attached || scanner.busy}
           onClick={() => void scanner.scan(scanner.hasState)}
         >
-          <Search size={11} aria-hidden /> {scanner.hasState ? "Next" : "First"}
+          <Search size={11} aria-hidden />{" "}
+          {scanner.hasState ? t("scanner.next") : t("scanner.first")}
         </button>
         {scanner.hasState && (
-          <IconButton tip="Reset scan" onClick={() => void scanner.reset()}>
+          <IconButton tip={t("scanner.reset")} onClick={() => void scanner.reset()}>
             <RotateCcw size={13} />
           </IconButton>
         )}
@@ -219,17 +223,17 @@ export default function ScannerPanel() {
 
       <div className="scanner-body">
         <div className="dbg-head">
-          Results
+          {t("scanner.results")}
           <div className="spacer" />
           <span className="faint" style={{ fontSize: 11 }} aria-live="polite">
-            {scanner.busy ? "scanning…" : `${scanner.total}`}
+            {scanner.busy ? t("scanner.scanning") : `${scanner.total}`}
           </span>
           <IconButton
-            tip="Export results as CSV"
+            tip={t("scanner.exportCsvTip")}
             disabled={scanner.total === 0}
             onClick={() => {
               void (async () => {
-                const path = await pickSavePath("Export scan results", "scan-results.csv");
+                const path = await pickSavePath(t("scanner.exportCsvTitle"), "scan-results.csv");
                 if (path) await scanner.exportCsv(path);
               })();
             }}
@@ -250,11 +254,11 @@ export default function ScannerPanel() {
           )}
           {!attached ? (
             <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-              attach a target first.
+              {t("scanner.attachFirst")}
             </div>
           ) : scanner.hits.length === 0 ? (
             <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-              {scanner.busy ? "" : "no results yet, run a scan."}
+              {scanner.busy ? "" : t("scanner.noResults")}
             </div>
           ) : (
             <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
@@ -269,7 +273,10 @@ export default function ScannerPanel() {
                     <span className="insn-va">{hex(h.addr, 12)}</span>
                     <span className="insn-text">{h.formatted}</span>
                     <span className="faint">{h.type}</span>
-                    <IconButton tip="Add to watchlist" onClick={() => void add(h.addr, h.type)}>
+                    <IconButton
+                      tip={t("scanner.addToWatchlist")}
+                      onClick={() => void add(h.addr, h.type)}
+                    >
                       <Eye size={11} />
                     </IconButton>
                   </div>
@@ -280,13 +287,13 @@ export default function ScannerPanel() {
         </div>
 
         <div className="dbg-head" style={{ borderTop: "1px solid var(--border-soft)" }}>
-          Watchlist
+          {t("scanner.watchlist")}
           <div className="spacer" />
           <IconButton
-            tip="Import a Cheat Engine .CT table"
+            tip={t("scanner.importCtTip")}
             onClick={() => {
               void (async () => {
-                const path = await pickOpenPath("Import Cheat Engine table");
+                const path = await pickOpenPath(t("scanner.importCtTitle"));
                 if (path) await importCt(path);
               })();
             }}
@@ -294,11 +301,11 @@ export default function ScannerPanel() {
             <Upload size={12} />
           </IconButton>
           <IconButton
-            tip="Export the watchlist as a .CT table"
+            tip={t("scanner.exportCtTip")}
             disabled={entries.length === 0}
             onClick={() => {
               void (async () => {
-                const path = await pickSavePath("Export watchlist", "watchlist.CT");
+                const path = await pickSavePath(t("scanner.exportCtTitle"), "watchlist.CT");
                 if (path) await exportCt(path);
               })();
             }}
@@ -306,7 +313,7 @@ export default function ScannerPanel() {
             <Download size={12} />
           </IconButton>
           <IconButton
-            tip="Add address"
+            tip={t("scanner.addAddress")}
             pressed={adding}
             disabled={!attached}
             onClick={() => setAdding((v) => !v)}
@@ -314,7 +321,7 @@ export default function ScannerPanel() {
             <Plus size={13} />
           </IconButton>
           {entries.length > 0 && (
-            <IconButton tip="Clear all watches" onClick={() => void clear()}>
+            <IconButton tip={t("scanner.clearWatches")} onClick={() => void clear()}>
               <X size={13} />
             </IconButton>
           )}
@@ -335,19 +342,19 @@ export default function ScannerPanel() {
           )}
           {entries.length === 0 ? (
             <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-              {attached ? "no watches." : "no target."}
+              {attached ? t("scanner.noWatches") : t("scanner.noTarget")}
             </div>
           ) : (
             <table className="table watch-table">
-              <caption className="sr-only">Watched addresses</caption>
+              <caption className="sr-only">{t("scanner.watchedAddresses")}</caption>
               <thead className="sr-only">
                 <tr>
-                  <th scope="col">Label</th>
-                  <th scope="col">Address</th>
-                  <th scope="col">Width</th>
-                  <th scope="col">Value</th>
-                  <th scope="col">Freeze</th>
-                  <th scope="col">Remove</th>
+                  <th scope="col">{t("scanner.colLabel")}</th>
+                  <th scope="col">{t("scanner.colAddress")}</th>
+                  <th scope="col">{t("scanner.colWidth")}</th>
+                  <th scope="col">{t("scanner.colValue")}</th>
+                  <th scope="col">{t("scanner.colFreeze")}</th>
+                  <th scope="col">{t("scanner.colRemove")}</th>
                 </tr>
               </thead>
               <tbody>
@@ -369,7 +376,9 @@ export default function ScannerPanel() {
                           <input
                             className="addr-input mono"
                             style={{ width: 70 }}
-                            aria-label={`New value for ${e.label || hex(e.addr, 12)}`}
+                            aria-label={t("scanner.newValue", {
+                              label: e.label || hex(e.addr, 12),
+                            })}
                             autoFocus
                             defaultValue={v?.text ?? ""}
                             onBlur={() => setEditing(null)}
@@ -390,7 +399,7 @@ export default function ScannerPanel() {
                       </td>
                       <td style={{ width: 26 }}>
                         <IconButton
-                          tip={e.freeze ? "Unfreeze" : "Freeze"}
+                          tip={e.freeze ? t("scanner.unfreeze") : t("scanner.freeze")}
                           pressed={e.freeze}
                           style={{ color: e.freeze ? "var(--accent)" : undefined }}
                           onClick={() => void setFreeze(e.id, !e.freeze)}
@@ -399,7 +408,10 @@ export default function ScannerPanel() {
                         </IconButton>
                       </td>
                       <td style={{ width: 24 }}>
-                        <IconButton tip="Remove watch" onClick={() => void remove(e.id)}>
+                        <IconButton
+                          tip={t("scanner.removeWatch")}
+                          onClick={() => void remove(e.id)}
+                        >
                           <X size={11} />
                         </IconButton>
                       </td>

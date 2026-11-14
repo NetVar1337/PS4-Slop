@@ -5,6 +5,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Search } from "lucide-react";
+import { useT } from "@/i18n";
 import { escapeControl } from "@/lib/format";
 import { showInDisassembly } from "@/lib/navigate";
 import { hex, useDisasm } from "@/store/disasm";
@@ -12,6 +13,7 @@ import { hex, useDisasm } from "@/store/disasm";
 const kRow = 20;
 
 export default function StringsView() {
+  const t = useT();
   const { strings, stringsTruncated, loadStrings, busy } = useDisasm();
   const [minChars, setMinChars] = useState(4);
   const [includeExec, setIncludeExec] = useState(false);
@@ -42,13 +44,13 @@ export default function StringsView() {
           <Search size={13} aria-hidden />
           <input
             value={filter}
-            aria-label="Filter strings"
-            placeholder={`Filter ${strings.length} strings…`}
+            aria-label={t("strings.filter")}
+            placeholder={t("strings.filterPlaceholder", { count: strings.length })}
             onChange={(e) => setFilter(e.target.value)}
           />
         </div>
         <label className="view-label">
-          min
+          {t("strings.min")}
           <select
             className="select"
             value={minChars}
@@ -67,15 +69,15 @@ export default function StringsView() {
             checked={includeExec}
             onChange={(e) => setIncludeExec(e.target.checked)}
           />
-          exec sections
+          {t("strings.exec")}
         </label>
-        {stringsTruncated && <span className="pill">truncated</span>}
+        {stringsTruncated && <span className="pill">{t("common.truncated")}</span>}
       </div>
 
       <div className="panel-body" ref={scrollRef}>
         {rows.length === 0 ? (
           <div className="empty-hint" style={{ padding: "var(--pad-md)" }}>
-            {busy ? "scanning…" : "no strings matched."}
+            {busy ? t("strings.scanning") : t("strings.empty")}
           </div>
         ) : (
           <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
@@ -91,8 +93,8 @@ export default function StringsView() {
                     type="button"
                     className="insn-va link"
                     onClick={() => showInDisassembly(s.va)}
-                    data-tip="follow in disassembly"
-                    aria-label={`follow ${hex(s.va)} in disassembly`}
+                    data-tip={t("strings.follow")}
+                    aria-label={t("strings.followAria", { addr: hex(s.va) })}
                   >
                     {hex(s.va)}
                   </button>

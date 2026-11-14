@@ -6,6 +6,7 @@
 // Nodes are HTML buttons (keyboard reachable, data-tip works on them); edges
 // are SVG, dashed for fallthrough, solid with an arrowhead for a branch
 
+import { useT } from "@/i18n";
 import { hex } from "@/lib/format";
 import { kMaxCfgBlocks, type CfgGraphData, type CfgNode } from "@/store/decomp";
 
@@ -99,21 +100,20 @@ type Props = {
 };
 
 export default function CfgGraph({ graph, entry, onPick }: Props) {
+  const t = useT();
   if (graph === null || graph.nodes.length === 0) {
     return (
       <div className="empty">
-        <div className="empty-title">No control-flow graph.</div>
-        <div className="empty-hint">Decompile a function to see its blocks.</div>
+        <div className="empty-title">{t("cfg.empty")}</div>
+        <div className="empty-hint">{t("cfg.emptyHint")}</div>
       </div>
     );
   }
   if (graph.nodes.length > kMaxCfgBlocks) {
     return (
       <div className="empty" role="status">
-        <div className="empty-title">Too many blocks ({graph.nodes.length}).</div>
-        <div className="empty-hint">
-          The graph stops at {kMaxCfgBlocks} blocks; follow this function in the listing.
-        </div>
+        <div className="empty-title">{t("cfg.tooMany", { count: graph.nodes.length })}</div>
+        <div className="empty-hint">{t("cfg.tooManyHint", { max: kMaxCfgBlocks })}</div>
       </div>
     );
   }
@@ -123,7 +123,7 @@ export default function CfgGraph({ graph, entry, onPick }: Props) {
   const edges = graph.edges.filter((e) => at.has(e.from) && at.has(e.to));
 
   return (
-    <div className="cfg" role="group" aria-label="Control-flow graph">
+    <div className="cfg" role="group" aria-label={t("cfg.group")}>
       <div className="cfg-viewport">
         <div className="cfg-canvas" style={{ width, height }}>
           <svg className="cfg-edges" width={width} height={height} aria-hidden="true">
@@ -157,9 +157,13 @@ export default function CfgGraph({ graph, entry, onPick }: Props) {
             })}
           </svg>
           {placed.map(({ node, x, y, h }) => {
-            const tip = `${hex(node.start, 8)}–${hex(node.end, 8)} · ${node.insn_count} insns${
-              node.summary !== undefined && node.summary !== "" ? ` · ${node.summary}` : ""
-            }`;
+            const tip = t("cfg.blockTip", {
+              start: hex(node.start, 8),
+              end: hex(node.end, 8),
+              count: node.insn_count,
+              summary:
+                node.summary !== undefined && node.summary !== "" ? ` · ${node.summary}` : "",
+            });
             return (
               <button
                 key={node.id}
@@ -167,12 +171,15 @@ export default function CfgGraph({ graph, entry, onPick }: Props) {
                 className="cfg-node"
                 style={{ left: x, top: y, width: kNodeW, height: h }}
                 data-tip={tip}
-                aria-label={`block ${hex(node.start, 8)} · ${node.insn_count} instructions`}
+                aria-label={t("cfg.blockAria", {
+                  addr: hex(node.start, 8),
+                  count: node.insn_count,
+                })}
                 onClick={() => onPick(node.start)}
               >
                 <span className="cfg-node-va mono">{hex(node.start, 8)}</span>
                 <span className="cfg-node-sum mono">
-                  {node.summary ?? `${node.insn_count} insns`}
+                  {node.summary ?? t("cfg.insns", { count: node.insn_count })}
                 </span>
               </button>
             );

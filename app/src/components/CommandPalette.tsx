@@ -5,6 +5,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Command } from "cmdk";
+import { useT } from "@/i18n";
+import type { Key } from "@/i18n/en";
 import { openBinary } from "@/lib/openBinary";
 import { browserLabel, hex, parseAddress } from "@/lib/format";
 import { loadHelpIndex, openHelp, searchHelp, type HelpEntry } from "@/lib/help";
@@ -17,7 +19,7 @@ import { useUi, type RailView, type WorkspaceTab } from "@/store/ui";
 
 type Action = {
   id: string;
-  group: "Navigate" | "Actions" | "Theme";
+  group: "navigate" | "actions" | "theme";
   label: string;
   hint?: string;
   run: () => void;
@@ -28,7 +30,14 @@ const kSearchLimit = 50;
 const kSearchDebounceMs = 120;
 const kHelpLimit = 8;
 
+const kGroupLabels: Record<Action["group"], Key> = {
+  navigate: "palette.navigate",
+  actions: "palette.actions",
+  theme: "palette.theme",
+};
+
 export default function CommandPalette() {
+  const t = useT();
   const open = useUi((s) => s.paletteOpen);
   const setOpen = useUi((s) => s.setPaletteOpen);
   const setWorkspaceTab = useUi((s) => s.setWorkspaceTab);
@@ -94,78 +103,93 @@ export default function CommandPalette() {
 
   const actions: Action[] = useMemo(
     () => [
-      { id: "tab-disassembly", group: "Navigate", label: "Disassembly", run: tab("disassembly") },
-      { id: "tab-decomp", group: "Navigate", label: "Pseudocode", run: tab("decomp") },
+      {
+        id: "tab-disassembly",
+        group: "navigate",
+        label: t("workspace.disassembly"),
+        run: tab("disassembly"),
+      },
+      { id: "tab-decomp", group: "navigate", label: t("workspace.decomp"), run: tab("decomp") },
       {
         id: "show-pseudocode",
-        group: "Navigate",
-        label: "Show pseudocode",
+        group: "navigate",
+        label: t("palette.showPseudocode"),
         enabled: image.ready,
         run: showDecomp(false),
       },
       {
         id: "show-cfg",
-        group: "Navigate",
-        label: "Show CFG",
+        group: "navigate",
+        label: t("palette.showCfg"),
         enabled: image.ready,
         run: showDecomp(true),
       },
-      { id: "tab-strings", group: "Navigate", label: "Strings", run: tab("strings") },
-      { id: "tab-memory", group: "Navigate", label: "Memory", run: tab("memory") },
-      { id: "tab-debugger", group: "Navigate", label: "Debugger", run: tab("debugger") },
-      { id: "tab-pe", group: "Navigate", label: browserLabel(image.format), run: tab("pe") },
+      { id: "tab-strings", group: "navigate", label: t("workspace.strings"), run: tab("strings") },
+      { id: "tab-memory", group: "navigate", label: t("workspace.memory"), run: tab("memory") },
       {
-        id: "tab-xray",
-        group: "Navigate",
-        label: "X-ray",
-        enabled: image.ready,
-        run: tab("xray"),
+        id: "tab-debugger",
+        group: "navigate",
+        label: t("workspace.debugger"),
+        run: tab("debugger"),
+      },
+      { id: "tab-pe", group: "navigate", label: browserLabel(image.format), run: tab("pe") },
+      {
+        id: "rail-targets",
+        group: "navigate",
+        label: t("palette.targetsPanel"),
+        run: rail("targets"),
       },
       {
-        id: "tab-patch",
-        group: "Navigate",
-        label: "Patches",
-        enabled: image.ready,
-        run: tab("patch"),
+        id: "rail-modules",
+        group: "navigate",
+        label: t("palette.modulesPanel"),
+        run: rail("modules"),
       },
-      { id: "tab-network", group: "Navigate", label: "Network", run: tab("network") },
-      { id: "tab-emulate", group: "Navigate", label: "Emulator", run: tab("emulate") },
-      { id: "rail-targets", group: "Navigate", label: "Targets panel", run: rail("targets") },
-      { id: "rail-modules", group: "Navigate", label: "Modules panel", run: rail("modules") },
-      { id: "rail-scripts", group: "Navigate", label: "Scripts panel", run: rail("scripts") },
+      {
+        id: "rail-scripts",
+        group: "navigate",
+        label: t("palette.scriptsPanel"),
+        run: rail("scripts"),
+      },
       {
         id: "open",
-        group: "Actions",
-        label: "Open binary…",
+        group: "actions",
+        label: t("common.openBinary"),
         hint: "Ctrl+O",
         run: () => void openBinary(),
       },
       {
         id: "close",
-        group: "Actions",
-        label: "Close binary",
+        group: "actions",
+        label: t("palette.closeBinary"),
         enabled: image.ready,
         run: () => void useDisasm.getState().unload(),
       },
-      { id: "settings", group: "Actions", label: "Settings…", hint: "Ctrl+,", run: openSettings },
+      {
+        id: "settings",
+        group: "actions",
+        label: t("titlebar.settings"),
+        hint: "Ctrl+,",
+        run: openSettings,
+      },
       {
         id: "inspector",
-        group: "Actions",
-        label: inspectorOpen ? "Hide inspector" : "Show inspector",
+        group: "actions",
+        label: t(inspectorOpen ? "titlebar.hideInspector" : "titlebar.showInspector"),
         run: () => setInspectorOpen(!inspectorOpen),
       },
-      { id: "layout", group: "Actions", label: "Reset layout", run: resetLayout },
+      { id: "layout", group: "actions", label: t("titlebar.resetLayout"), run: resetLayout },
       {
         id: "reload",
-        group: "Actions",
-        label: "Reload interface",
+        group: "actions",
+        label: t("titlebar.reload"),
         run: () => window.location.reload(),
       },
-      ...kThemes.map((t): Action => ({
-        id: `theme-${t.id}`,
-        group: "Theme",
-        label: `Theme: ${t.label}`,
-        run: () => setTheme(t.id),
+      ...kThemes.map((th): Action => ({
+        id: `theme-${th.id}`,
+        group: "theme",
+        label: t("palette.themeItem", { theme: t(th.labelKey) }),
+        run: () => setTheme(th.id),
       })),
     ],
     // tab/rail are stable closures over stable setters
@@ -178,6 +202,7 @@ export default function CommandPalette() {
       setInspectorOpen,
       resetLayout,
       setTheme,
+      t,
     ],
   );
 
@@ -191,7 +216,7 @@ export default function CommandPalette() {
     <Command.Dialog
       open={open}
       onOpenChange={setOpen}
-      label="Command palette"
+      label={t("palette.label")}
       className="palette"
       overlayClassName="palette-scrim"
       contentClassName="palette-content"
@@ -200,13 +225,13 @@ export default function CommandPalette() {
         className="palette-input"
         value={query}
         onValueChange={setQuery}
-        placeholder="Type a command, function name or address…"
+        placeholder={t("palette.placeholder")}
       />
       <Command.List className="palette-list">
-        <Command.Empty className="palette-empty">No matches.</Command.Empty>
+        <Command.Empty className="palette-empty">{t("palette.noMatches")}</Command.Empty>
 
         {addr !== null && (
-          <Command.Group heading="Go to address">
+          <Command.Group heading={t("palette.gotoAddress")}>
             {image.ready && (
               <Command.Item
                 value={`goto-disasm ${query}`}
@@ -215,7 +240,7 @@ export default function CommandPalette() {
                   void useDisasm.getState().gotoAddress(addr);
                 })}
               >
-                Disassembly at {hex(addr, 1)}
+                {t("palette.disasmAt", { addr: hex(addr, 1) })}
               </Command.Item>
             )}
             {image.ready && (
@@ -226,7 +251,7 @@ export default function CommandPalette() {
                   void useDecomp.getState().load(addr);
                 })}
               >
-                Pseudocode at {hex(addr, 1)}
+                {t("palette.pseudocodeAt", { addr: hex(addr, 1) })}
               </Command.Item>
             )}
             {attached && (
@@ -237,14 +262,14 @@ export default function CommandPalette() {
                   useMemory.getState().goto(addr);
                 })}
               >
-                Memory at {hex(addr, 1)}
+                {t("palette.memoryAt", { addr: hex(addr, 1) })}
               </Command.Item>
             )}
           </Command.Group>
         )}
 
         {found.length > 0 && (
-          <Command.Group heading="Functions">
+          <Command.Group heading={t("palette.functions")}>
             {found.map((fn) => (
               <Command.Item
                 key={fn.va}
@@ -263,7 +288,7 @@ export default function CommandPalette() {
         )}
 
         {helpHits.length > 0 && (
-          <Command.Group heading="Help">
+          <Command.Group heading={t("palette.help")}>
             {helpHits.map((e) => (
               <Command.Item
                 key={`${e.path}#${e.anchor}`}
@@ -279,8 +304,8 @@ export default function CommandPalette() {
           </Command.Group>
         )}
 
-        {(["Navigate", "Actions", "Theme"] as const).map((group) => (
-          <Command.Group heading={group} key={group}>
+        {(["navigate", "actions", "theme"] as const).map((group) => (
+          <Command.Group heading={t(kGroupLabels[group])} key={group}>
             {actions
               .filter((a) => a.group === group && a.enabled !== false)
               .map((a) => (

@@ -1,4 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { t, translate, useI18n } from "@/i18n";
+import { de } from "@/i18n/de";
+import { en } from "@/i18n/en";
 import { backendFrom, useEngine } from "@/store/engine";
 import { useDebugger } from "@/store/debugger";
 import { functionLabel, kFilterDebounceMs, rowAt, useDisasm } from "@/store/disasm";
@@ -537,5 +540,81 @@ describe("struct catalog store (item 114)", () => {
     expect(
       calls.some((c) => c.action === "declare" && c.params.decl === "struct Player { u32 mp; };"),
     ).toBe(true);
+  });
+});
+
+describe("i18n catalog (audit 86)", () => {
+  it("has every English key in every locale", () => {
+    const keys = Object.keys(en).sort();
+    expect(Object.keys(de).sort()).toEqual(keys);
+    for (const key of keys as (keyof typeof en)[]) {
+      expect(en[key].length).toBeGreaterThan(0);
+      expect(de[key].length).toBeGreaterThan(0);
+    }
+  });
+
+  it("keeps the placeholders of a translation aligned with English", () => {
+    const holes = (text: string) => (text.match(/\{\w+\}/g) ?? []).sort();
+    for (const key of Object.keys(en) as (keyof typeof en)[]) {
+      expect(holes(de[key])).toEqual(holes(en[key]));
+    }
+  });
+
+  it("interpolates params and leaves unknown placeholders verbatim", () => {
+    expect(translate("en", "status.image", { name: "eboot.bin" })).toBe("Image: eboot.bin");
+    expect(translate("en", "app.engineError", {})).toBe("Engine error: {error}");
+    expect(translate("de", "settings.title")).toBe("Einstellungen");
+  });
+
+  it("keeps the English output the component tests assert", () => {
+    expect(translate("en", "settings.title")).toBe("Settings");
+    expect(translate("en", "common.openBinary")).toBe("Open binary…");
+    expect(translate("en", "workspace.views")).toBe("Workspace views");
+    expect(translate("en", "workspace.decomp")).toBe("Pseudocode");
+    expect(translate("en", "scripts.luaScript")).toBe("Lua script");
+    expect(translate("en", "scanner.exportCsvTip")).toBe("Export results as CSV");
+    expect(translate("en", "debugger.noConsole")).toBe("No PS4 console connected.");
+    expect(translate("en", "targets.connectConsole")).toBe("Connect a console");
+    expect(translate("en", "targets.connectForm")).toBe("Connect to a PS4");
+    expect(translate("en", "format.browser", { format: "ELF" })).toBe("ELF Browser");
+  });
+
+  it("switches the active language and the document lang", () => {
+    useI18n.getState().setLanguage("de");
+    expect(t("settings.title")).toBe("Einstellungen");
+    expect(document.documentElement.lang).toBe("de");
+    useI18n.getState().setLanguage("en");
+    expect(t("settings.title")).toBe("Settings");
+    expect(document.documentElement.lang).toBe("en");
+  });
+});
+
+describe("custom themes (audit 87)", () => {
+  it("saves, applies, exports, imports and deletes a theme", () => {
+    const theme = useTheme.getState();
+    const saved = theme.saveCustom("midnight", "obsidian", { "--accent": "#123456" });
+    expect(saved?.name).toBe("midnight");
+
+    theme.applyCustom("midnight");
+    expect(useTheme.getState().activeCustom).toBe("midnight");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
+
+    const json = theme.exportCustom("midnight");
+    expect(json).not.toBeNull();
+    theme.deleteCustom("midnight");
+    expect(useTheme.getState().customThemes).toHaveLength(0);
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("");
+
+    const imported = theme.importCustom(json ?? "");
+    expect(imported?.colors["--accent"]).toBe("#123456");
+    expect(useTheme.getState().customThemes.map((item) => item.name)).toEqual(["midnight"]);
+    useTheme.getState().deleteCustom("midnight");
+  });
+
+  it("rejects a malformed theme JSON", () => {
+    expect(useTheme.getState().importCustom("{not json")).toBeNull();
+    expect(
+      useTheme.getState().importCustom(JSON.stringify({ name: "x", base: "nope" })),
+    ).toBeNull();
   });
 });

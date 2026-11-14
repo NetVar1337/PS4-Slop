@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { escapeControl, hex, parseAddress } from "@/lib/format";
 import { call, errorText } from "@/lib/rpc";
 import { byteAt, kHexCols, kHexRowPx, kWindowBytes, protectName, useMemory } from "@/store/memory";
@@ -39,15 +40,19 @@ interface DissectRow {
 
 function describe(r: DissectRow): string {
   if (r.target) {
-    const t = r.target;
-    const what = t.text !== undefined ? `"${t.text}"` : (t.vtable_symbol ?? t.symbol ?? "");
-    return `→ ${t.kind}${what ? ` ${what}` : ""}`;
+    const target = r.target;
+    const what =
+      target.text !== undefined
+        ? `"${target.text}"`
+        : (target.vtable_symbol ?? target.symbol ?? "");
+    return `→ ${target.kind}${what ? ` ${what}` : ""}`;
   }
   return r.value === undefined ? "" : JSON.stringify(r.value);
 }
 
 // one row per 8-byte slot from memory.dissect: a first draft of a struct
 function DissectPane({ addr, onClose }: { addr: number; onClose: () => void }) {
+  const t = useT();
   const [rows, setRows] = useState<DissectRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
@@ -60,9 +65,9 @@ function DissectPane({ addr, onClose }: { addr: number; onClose: () => void }) {
   return (
     <div className="stack" style={{ maxHeight: "40%", borderTop: "1px solid var(--border)" }}>
       <div className="view-bar">
-        <span className="panel-title">Dissect {hex(addr, 12)}</span>
+        <span className="panel-title">{t("memory.dissect", { addr: hex(addr, 12) })}</span>
         <div className="spacer" />
-        <IconButton tip="Close dissect" onClick={onClose}>
+        <IconButton tip={t("memory.closeDissect")} onClick={onClose}>
           <X size={13} />
         </IconButton>
       </div>
@@ -72,7 +77,7 @@ function DissectPane({ addr, onClose }: { addr: number; onClose: () => void }) {
             {error}
           </div>
         )}
-        {rows === null && error === null && <div className="faint">reading…</div>}
+        {rows === null && error === null && <div className="faint">{t("memory.reading")}</div>}
         {rows?.map((r) => (
           <div key={r.offset} style={{ display: "flex", gap: 12 }}>
             <span className="faint">+{r.offset.toString(16).toUpperCase().padStart(3, "0")}</span>
@@ -120,6 +125,7 @@ function interpret(bytes: Uint8Array): { label: string; text: string }[] {
 
 /** Side pane: interpreted caret value, plus the selected struct rendered there. */
 function CaretInspector({ addr }: { addr: number }) {
+  const t = useT();
   const structType = useTypes((s) => s.selected);
   const [bytes, setBytes] = useState<Uint8Array | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -163,7 +169,7 @@ function CaretInspector({ addr }: { addr: number }) {
   return (
     <div className="mem-inspect">
       <div className="view-bar" style={{ padding: "var(--pad-sm)" }}>
-        <span className="panel-title">Caret</span>
+        <span className="panel-title">{t("memory.caret")}</span>
         <div className="spacer" />
         <span className="faint mono">{hex(addr, 12)}</span>
       </div>
@@ -198,6 +204,7 @@ function SnapshotPane({
   onDiff: (diff: { base: number; ranges: DiffRange[] } | null) => void;
   onClose: () => void;
 }) {
+  const t = useT();
   const [snaps, setSnaps] = useState<SnapshotRec[]>([]);
   const [a, setA] = useState<number | null>(null);
   const [b, setB] = useState<number | null>(null);
@@ -246,10 +253,10 @@ function SnapshotPane({
   return (
     <div className="stack mem-snap">
       <div className="view-bar">
-        <span className="panel-title">Snapshot diff</span>
+        <span className="panel-title">{t("memory.snapshotDiff")}</span>
         <select
           className="select"
-          aria-label="Snapshot A"
+          aria-label={t("memory.snapshotA")}
           value={a ?? ""}
           onChange={(e) => setA(Number(e.target.value))}
         >
@@ -262,7 +269,7 @@ function SnapshotPane({
         </select>
         <select
           className="select"
-          aria-label="Snapshot B"
+          aria-label={t("memory.snapshotB")}
           value={b ?? ""}
           onChange={(e) => setB(Number(e.target.value))}
         >
@@ -279,18 +286,16 @@ function SnapshotPane({
           disabled={a === null || b === null || a === b}
           onClick={() => void compare()}
         >
-          compare
+          {t("memory.compare")}
         </button>
-        <IconButton
-          tip="Capture snapshot of this window"
-          disabled={size === 0}
-          onClick={() => void capture()}
-        >
+        <IconButton tip={t("memory.capture")} disabled={size === 0} onClick={() => void capture()}>
           <Camera size={13} />
         </IconButton>
         <div className="spacer" />
-        {ranges !== null && <span className="faint">{ranges.length} changed ranges</span>}
-        <IconButton tip="Close snapshot diff" onClick={onClose}>
+        {ranges !== null && (
+          <span className="faint">{t("memory.changedRanges", { count: ranges.length })}</span>
+        )}
+        <IconButton tip={t("memory.closeSnapshot")} onClick={onClose}>
           <X size={13} />
         </IconButton>
       </div>
@@ -300,11 +305,11 @@ function SnapshotPane({
             {error}
           </div>
         )}
-        {snaps.length === 0 && <div className="faint">no snapshots yet, capture one above</div>}
+        {snaps.length === 0 && <div className="faint">{t("memory.noSnapshots")}</div>}
         {ranges?.map((r) => (
           <div key={r.offset}>
             <span className="faint">+{r.offset.toString(16).toUpperCase().padStart(4, "0")}</span>{" "}
-            <span>{r.length} bytes</span>
+            <span>{t("memory.bytes", { count: r.length })}</span>
           </div>
         ))}
       </div>
@@ -313,6 +318,7 @@ function SnapshotPane({
 }
 
 function RegionList() {
+  const t = useT();
   const regions = useMemory((s) => s.regions);
   const cursor = useMemory((s) => s.cursor);
   const loadRegions = useMemory((s) => s.loadRegions);
@@ -329,12 +335,12 @@ function RegionList() {
   return (
     <div className="mem-regions">
       <div className="view-bar" style={{ padding: "var(--pad-sm)" }}>
-        <span className="panel-title">Regions</span>
+        <span className="panel-title">{t("memory.regions")}</span>
         <div className="spacer" />
         <span className="faint" style={{ fontSize: 11 }}>
           {regions.length}
         </span>
-        <IconButton tip="Refresh regions" onClick={() => void loadRegions()}>
+        <IconButton tip={t("memory.refreshRegions")} onClick={() => void loadRegions()}>
           <RefreshCw size={13} />
         </IconButton>
       </div>
@@ -350,7 +356,7 @@ function RegionList() {
                 data-selected={cursor >= r.base && cursor < r.base + r.size}
                 style={{ top: v.start, height: kRow }}
                 onClick={() => goto(r.base)}
-                data-tip={`${r.size} bytes · ${protectName(r.protect)}`}
+                data-tip={t("memory.regionTip", { size: r.size, protect: protectName(r.protect) })}
               >
                 <span className="fn-name">{hex(r.base, 12)}</span>
                 <span className="faint" style={{ fontSize: 10 }}>
@@ -366,6 +372,7 @@ function RegionList() {
 }
 
 export default function MemoryView() {
+  const t = useT();
   const regions = useMemory((s) => s.regions);
   const cursor = useMemory((s) => s.cursor);
   const windowBase = useMemory((s) => s.windowBase);
@@ -453,7 +460,7 @@ export default function MemoryView() {
       <div className="stack">
         <div className="view-bar">
           <label className="view-label">
-            goto
+            {t("memory.goto")}
             <input
               className="addr-input mono"
               value={gotoText}
@@ -466,18 +473,18 @@ export default function MemoryView() {
               onKeyDown={(e) => e.key === "Enter" && jump()}
             />
           </label>
-          <IconButton tip="Go to address" variant="row" onClick={jump}>
+          <IconButton tip={t("memory.gotoTip")} variant="row" onClick={jump}>
             <ArrowRight size={11} />
           </IconButton>
           <span className="faint mono" style={{ fontSize: 11 }}>
             {windowSize > 0
               ? `${hex(windowBase, 12)}–${hex(windowBase + windowSize, 12)}`
-              : "no region"}
-            {loading ? " · reading…" : ""}
+              : t("memory.noRegion")}
+            {loading ? t("memory.readingWindow") : ""}
           </span>
           <div className="spacer" />
           <IconButton
-            tip="Snapshot diff"
+            tip={t("memory.snapshotTip")}
             pressed={snapOpen}
             onClick={() => {
               setSnapOpen((v) => !v);
@@ -487,30 +494,30 @@ export default function MemoryView() {
             <GitCompare size={13} />
           </IconButton>
           <IconButton
-            tip="Dissect the structure at the cursor"
+            tip={t("memory.dissectTip")}
             disabled={windowSize === 0}
             onClick={() => setDissectAt(cursor)}
           >
             <Microscope size={13} />
           </IconButton>
-          <IconButton tip="Re-read" onClick={reload}>
+          <IconButton tip={t("memory.reread")} onClick={reload}>
             <RefreshCw size={13} />
           </IconButton>
           <IconButton
-            tip="Previous window"
+            tip={t("memory.previous")}
             variant="row"
             disabled={windowBase === 0}
             onClick={() => goto(Math.max(0, windowBase - kWindowBytes / 2))}
           >
-            <ChevronLeft size={11} /> prev
+            <ChevronLeft size={11} /> {t("memory.prev")}
           </IconButton>
           <IconButton
-            tip="Next window"
+            tip={t("memory.next")}
             variant="row"
             disabled={windowSize === 0}
             onClick={() => goto(windowBase + windowSize)}
           >
-            next <ChevronRight size={11} />
+            {t("memory.nextShort")} <ChevronRight size={11} />
           </IconButton>
         </div>
 
@@ -548,7 +555,7 @@ export default function MemoryView() {
                         <input
                           key={i}
                           className="hex-edit mono"
-                          aria-label={`Byte at ${hex(addr, 12)}`}
+                          aria-label={t("memory.byteAria", { addr: hex(addr, 12) })}
                           autoFocus
                           maxLength={2}
                           defaultValue={b === undefined ? "" : text}
@@ -567,12 +574,19 @@ export default function MemoryView() {
                           data-unread={b === undefined}
                           data-diff={changed?.[i] === 1}
                           disabled={b === undefined}
-                          aria-label={`${hex(addr, 12)} = ${text}${changed?.[i] === 1 ? " (changed)" : ""}`}
+                          aria-label={
+                            t("memory.cellAria", { addr: hex(addr, 12), text }) +
+                            (changed?.[i] === 1 ? t("memory.changed") : "")
+                          }
                           onClick={() => {
                             setCursor(addr);
                             setEdit(addr);
                           }}
-                          data-tip={b === undefined ? undefined : `${hex(addr, 12)} = ${b}`}
+                          data-tip={
+                            b === undefined
+                              ? undefined
+                              : t("memory.cellTip", { addr: hex(addr, 12), value: b })
+                          }
                         >
                           {text}
                         </button>

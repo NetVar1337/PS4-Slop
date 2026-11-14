@@ -5,6 +5,7 @@
 // over MCP shows up here without the user doing anything
 
 import { create } from "zustand";
+import type { Key } from "@/i18n/en";
 import * as events from "@/lib/events";
 import { call, errorText } from "@/lib/rpc";
 import {
@@ -66,12 +67,12 @@ type EngineStore = {
  * Engine boot stages (src/core/infra/lifecycle.hpp, kStageCount = 5). Labels
  * are only the fallback: the engine sends its own with every boot.stage.
  */
-export const kStageLabels = [
-  "runtime pool & job queue",
-  "process / target services",
-  "settings & session store",
-  "mcp server",
-  "interface",
+export const kStageLabels: readonly Key[] = [
+  "splash.stageRuntime",
+  "splash.stageTargets",
+  "splash.stageSettings",
+  "splash.stageMcp",
+  "splash.stageInterface",
 ];
 
 const kInitialBoot: BootStage = {

@@ -2,11 +2,13 @@
 // boot checklist fed by boot.stage events so the uac pause doesnt look like a hang
 
 import { RotateCcw } from "lucide-react";
+import { useT } from "@/i18n";
 import { kStageLabels, useEngine } from "@/store/engine";
 import { useOutput } from "@/store/output";
 import logoUrl from "@/assets/reverse-slop-icon.png";
 
 export default function Splash() {
+  const t = useT();
   const boot = useEngine((s) => s.boot);
   const stageLabels = useEngine((s) => s.stageLabels);
   const connected = useEngine((s) => s.connected);
@@ -18,7 +20,9 @@ export default function Splash() {
   // One row per stage the engine counts, labelled as the engine reports them
   const rows = Array.from(
     { length: Math.max(1, boot.total) },
-    (_, i) => stageLabels[i] ?? kStageLabels[i] ?? `stage ${i + 1}`,
+    (_, i) =>
+      stageLabels[i] ??
+      (kStageLabels[i] !== undefined ? t(kStageLabels[i]) : t("splash.stage", { n: i + 1 })),
   );
   const failed = startupError !== null || (crash !== null && crash.retry_in_ms === null);
 
@@ -28,10 +32,10 @@ export default function Splash() {
         <img className="splash-logo" src={logoUrl} alt="SlopStation" draggable={false} />
         <div className="splash-title">SlopStation</div>
         <div className="faint" style={{ fontSize: "var(--type-small)" }}>
-          ps4 reverse-engineering workbench, booting
+          {t("splash.tagline")}
         </div>
 
-        <ol className="splash-rows" aria-label="Startup stages">
+        <ol className="splash-rows" aria-label={t("splash.stages")}>
           {rows.map((label, i) => {
             const status = i < boot.stage ? "ok" : i === boot.stage ? "run" : "wait";
             const marker = status === "ok" ? "[ ok ]" : status === "run" ? "[ .. ]" : "[    ]";
@@ -56,7 +60,7 @@ export default function Splash() {
         <div
           className="progress"
           role="progressbar"
-          aria-label="Startup progress"
+          aria-label={t("splash.progress")}
           aria-valuemin={0}
           aria-valuemax={boot.total}
           aria-valuenow={boot.stage}
@@ -70,19 +74,23 @@ export default function Splash() {
           {failed ? (
             <div className="splash-error" role="alert">
               <span>
-                Startup failed: {startupError ?? crash?.reason ?? "engine exited"}
-                {crash !== null && crash.log_path !== "" ? ` (log: ${crash.log_path})` : ""}
+                {t("splash.failed", {
+                  reason: startupError ?? crash?.reason ?? t("splash.exited"),
+                })}
+                {crash !== null && crash.log_path !== ""
+                  ? t("splash.log", { path: crash.log_path })
+                  : ""}
               </span>
               <button type="button" className="row-action" onClick={() => void retry()}>
-                <RotateCcw size={11} aria-hidden /> Retry
+                <RotateCcw size={11} aria-hidden /> {t("common.retry")}
               </button>
             </div>
           ) : crash !== null ? (
-            `engine crashed (${crash.reason}), restarting…`
+            t("splash.crashed", { reason: crash.reason })
           ) : connected ? (
-            "tip: connect a ps4 (ps4debug-ng) from the targets panel to start live debugging"
+            t("splash.tip")
           ) : (
-            "waiting for the engine to accept connections…"
+            t("splash.waiting")
           )}
         </div>
       </div>

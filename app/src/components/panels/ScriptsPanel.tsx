@@ -7,6 +7,8 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import { Play, Save, Trash2 } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
+import type { Key } from "@/i18n/en";
 import { call, errorText } from "@/lib/rpc";
 
 const kScriptTimeoutMs = 10_000;
@@ -22,9 +24,9 @@ end
 `;
 
 /** Built-in examples (audit 68): the four workflows the docs promise. */
-export const kExamples: readonly { name: string; code: string }[] = [
+export const kExamples: readonly { nameKey: Key; code: string }[] = [
   {
-    name: "find value",
+    nameKey: "scripts.exampleFindValue",
     code: `-- first scan for a 4-byte value, then narrow it
 local hits = slop.mem.scan({ kind = "exact", width = "i32", value = 100, alignment = 4 })
 print("hits:", #hits)
@@ -32,7 +34,7 @@ for i = 1, math.min(#hits, 20) do print(string.format("0x%X", hits[i])) end
 `,
   },
   {
-    name: "dump module",
+    nameKey: "scripts.exampleDumpModule",
     code: `-- load the attached process's main module into the shared session
 slop.image.load_from_target()
 local st = slop.image.status()
@@ -42,7 +44,7 @@ print("functions:", slop.image.status().functions)
 `,
   },
   {
-    name: "decompile top functions",
+    nameKey: "scripts.exampleDecompile",
     code: `-- largest functions of the loaded image, decompiled
 slop.image.wait_ready(30000)
 local fns = slop.disasm.functions(4000)
@@ -57,7 +59,7 @@ end
 `,
   },
   {
-    name: "bp + wait",
+    nameKey: "scripts.exampleBpWait",
     code: `-- console breakpoint + wait (slop.debugger, not slop.ps4)
 local st = slop.target.status()
 slop.debugger.attach(st.pid)
@@ -84,6 +86,7 @@ function tokenAt(text: string, caret: number): { token: string; start: number } 
 }
 
 export default function ScriptsPanel() {
+  const t = useT();
   const [code, setCode] = useState(kSampleScript);
   const [runs, setRuns] = useState<Run[]>([]);
   const [busy, setBusy] = useState(false);
@@ -222,32 +225,32 @@ export default function ScriptsPanel() {
   return (
     <div className="panel">
       <div className="panel-head">
-        <span className="panel-title">Scripts</span>
+        <span className="panel-title">{t("scripts.title")}</span>
         <div className="spacer" />
         <label
           className="faint"
           style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 11 }}
-          title="Runs this script with the full standard library and host-file actions. Consent lasts one run."
+          title={t("scripts.unsafeTip")}
         >
           <input
             type="checkbox"
-            aria-label="Allow unsafe for this run"
+            aria-label={t("scripts.unsafeAria")}
             checked={unsafe}
             onChange={(e) => setUnsafe(e.target.checked)}
           />
-          unsafe
+          {t("scripts.unsafe")}
         </label>
-        <IconButton tip="Clear output" onClick={() => setRuns([])}>
+        <IconButton tip={t("scripts.clearOutput")} onClick={() => setRuns([])}>
           <Trash2 size={14} />
         </IconButton>
-        <IconButton tip="Run (Ctrl+Enter)" disabled={busy} onClick={() => void run()}>
+        <IconButton tip={t("scripts.run")} disabled={busy} onClick={() => void run()}>
           <Play size={14} />
         </IconButton>
       </div>
 
       <div style={{ display: "flex", minHeight: 0 }}>
         <aside
-          aria-label="Snippets"
+          aria-label={t("scripts.snippets")}
           style={{
             width: 170,
             flex: "0 0 auto",
@@ -258,24 +261,24 @@ export default function ScriptsPanel() {
           }}
         >
           <div className="faint" style={{ marginBottom: 4 }}>
-            Examples
+            {t("scripts.examples")}
           </div>
           {kExamples.map((ex) => (
             <button
-              key={ex.name}
+              key={ex.nameKey}
               type="button"
               className="row-action"
               style={{ display: "block", width: "100%", textAlign: "left" }}
               onClick={() => setCode(ex.code)}
             >
-              {ex.name}
+              {t(ex.nameKey)}
             </button>
           ))}
           <div className="faint" style={{ margin: "var(--pad-sm) 0 4px" }}>
-            Saved
+            {t("scripts.saved")}
           </div>
           {snippets.length === 0 ? (
-            <div className="faint">none yet</div>
+            <div className="faint">{t("scripts.noneYet")}</div>
           ) : (
             snippets.map((s) => (
               <div key={s.name} style={{ display: "flex", alignItems: "center", gap: 2 }}>
@@ -292,7 +295,10 @@ export default function ScriptsPanel() {
                 >
                   {s.name}
                 </button>
-                <IconButton tip={`Delete ${s.name}`} onClick={() => deleteSnippet(s.name)}>
+                <IconButton
+                  tip={t("scripts.delete", { name: s.name })}
+                  onClick={() => deleteSnippet(s.name)}
+                >
                   <Trash2 size={12} />
                 </IconButton>
               </div>
@@ -300,13 +306,13 @@ export default function ScriptsPanel() {
           )}
           <div style={{ display: "flex", gap: 2, marginTop: "var(--pad-sm)" }}>
             <input
-              aria-label="Snippet name"
-              placeholder="name"
+              aria-label={t("scripts.snippetName")}
+              placeholder={t("scripts.namePlaceholder")}
               value={snippetName}
               onChange={(e) => setSnippetName(e.target.value)}
               style={{ minWidth: 0, flex: 1 }}
             />
-            <IconButton tip="Save snippet" onClick={saveSnippet}>
+            <IconButton tip={t("scripts.saveSnippet")} onClick={saveSnippet}>
               <Save size={12} />
             </IconButton>
           </div>
@@ -317,7 +323,7 @@ export default function ScriptsPanel() {
             <textarea
               ref={areaRef}
               className="code-area mono"
-              aria-label="Lua script"
+              aria-label={t("scripts.luaScript")}
               value={code}
               spellCheck={false}
               onChange={(e) => {
@@ -330,7 +336,7 @@ export default function ScriptsPanel() {
             {suggest && (
               <div
                 role="listbox"
-                aria-label="slop completions"
+                aria-label={t("scripts.completions")}
                 style={{
                   position: "absolute",
                   left: 8,
@@ -368,20 +374,20 @@ export default function ScriptsPanel() {
             )}
           </div>
           <div className="dbg-head" style={{ borderTop: "1px solid var(--border-soft)" }}>
-            Output
+            {t("scripts.output")}
             <div className="spacer" />
             <span className="faint" style={{ fontSize: 11 }}>
-              {busy ? "running…" : `${runs.length} runs`}
+              {busy ? t("scripts.running") : t("scripts.runs", { count: runs.length })}
             </span>
           </div>
           <div className="panel-body log" aria-live="polite">
             {runs.length === 0 ? (
-              <div className="empty-hint">Ctrl+Enter to run.</div>
+              <div className="empty-hint">{t("scripts.runHint")}</div>
             ) : (
               runs.map((r, i) => (
                 <div key={i} style={{ marginBottom: "var(--pad-sm)" }}>
                   <div className="log-row faint">
-                    <span>{r.ok ? "ok" : "error"}</span>
+                    <span>{r.ok ? t("scripts.ok") : t("scripts.error")}</span>
                     <span>{r.ms}ms</span>
                   </div>
                   {r.output !== "" && <div className="log-row">{r.output}</div>}

@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Pencil, Search } from "lucide-react";
+import { useT } from "@/i18n";
 import { functionLabel, hex, rowAt, useDisasm, type FunctionRow } from "@/store/disasm";
 import Minimap from "@/components/panels/Minimap";
 
@@ -26,6 +27,7 @@ function flowColor(flow: string): string | undefined {
 }
 
 function FunctionList() {
+  const t = useT();
   const pages = useDisasm((s) => s.pages);
   const total = useDisasm((s) => s.total);
   const matched = useDisasm((s) => s.matched);
@@ -64,13 +66,13 @@ function FunctionList() {
         <Search size={13} aria-hidden />
         <input
           value={filter}
-          aria-label="Filter functions by name or address"
-          placeholder={`Filter ${total} functions…`}
+          aria-label={t("disasm.filter")}
+          placeholder={t("disasm.filterPlaceholder", { total })}
           onChange={(e) => setFilter(e.target.value)}
         />
         {filter !== "" && <span className="faint fn-count">{matched}</span>}
       </div>
-      <div className="panel-body" ref={scrollRef} role="listbox" aria-label="Functions">
+      <div className="panel-body" ref={scrollRef} role="listbox" aria-label={t("disasm.functions")}>
         <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
           {items.map((v) => {
             const fn = rowAt({ pages }, v.index);
@@ -100,12 +102,16 @@ function FunctionList() {
                   if (e.key === "F2") setEditing(fn.va);
                 }}
                 onDoubleClick={() => setEditing(fn.va)}
-                data-tip={`${hex(fn.va)} · ${fn.size} bytes${fn.callconv ? ` · ${fn.callconv}` : ""}`}
+                data-tip={t("disasm.rowTip", {
+                  addr: hex(fn.va),
+                  size: fn.size,
+                  callconv: fn.callconv ? t("disasm.callconv", { callconv: fn.callconv }) : "",
+                })}
               >
                 {editing === fn.va ? (
                   <input
                     className="fn-rename mono"
-                    aria-label={`Rename ${functionLabel(fn)}`}
+                    aria-label={t("disasm.rename", { name: functionLabel(fn) })}
                     autoFocus
                     defaultValue={functionLabel(fn)}
                     onBlur={(e) => void commit(fn, e.target.value)}
@@ -118,8 +124,10 @@ function FunctionList() {
                 ) : (
                   <>
                     <span className="fn-name">{functionLabel(fn)}</span>
-                    {fn.noreturn === true && <span className="pill">noret</span>}
-                    {fn.blocks !== undefined && <span className="faint">{fn.blocks}bb</span>}
+                    {fn.noreturn === true && <span className="pill">{t("disasm.noret")}</span>}
+                    {fn.blocks !== undefined && (
+                      <span className="faint">{t("disasm.blocks", { count: fn.blocks })}</span>
+                    )}
                     <Pencil className="fn-edit" size={11} aria-hidden />
                   </>
                 )}
@@ -133,6 +141,7 @@ function FunctionList() {
 }
 
 function Listing() {
+  const t = useT();
   const insns = useDisasm((s) => s.insns);
   const selected = useDisasm((s) => s.selected);
   const fn = useDisasm((s) => s.selectedFn);
@@ -162,24 +171,25 @@ function Listing() {
           <>
             <span style={{ color: "var(--accent)" }}>{functionLabel(fn)}</span>
             <span className="faint">
-              {hex(fn.va)} · {fn.size} bytes · {insns.length} insns
-              {fn.callconv ? ` · ${fn.callconv}` : ""}
+              {t("disasm.head", {
+                addr: hex(fn.va),
+                size: fn.size,
+                count: insns.length,
+                callconv: fn.callconv ? t("disasm.callconv", { callconv: fn.callconv }) : "",
+              })}
             </span>
             {linear && (
-              <span
-                className="pill"
-                data-tip="the function index under-reported this range, so the listing is a linear sweep past its end"
-              >
-                linear
+              <span className="pill" data-tip={t("disasm.linearTip")}>
+                {t("disasm.linear")}
               </span>
             )}
           </>
         ) : selected !== null ? (
           <span className="faint">
-            {hex(selected)} · {insns.length} insns (no function at this address)
+            {t("disasm.noFunctionAt", { addr: hex(selected), count: insns.length })}
           </span>
         ) : (
-          <span className="faint">no function selected</span>
+          <span className="faint">{t("disasm.noSelection")}</span>
         )}
       </div>
       {/* Keyed on the selection so picking a new function fades its listing in
@@ -203,8 +213,8 @@ function Listing() {
                       type="button"
                       className="insn-target"
                       onClick={() => void gotoAddress(target)}
-                      data-tip={`follow ${hex(target)}`}
-                      aria-label={`follow ${hex(target)}`}
+                      data-tip={t("disasm.follow", { addr: hex(target) })}
+                      aria-label={t("disasm.follow", { addr: hex(target) })}
                     >
                       → {hex(target, 8)}
                     </button>

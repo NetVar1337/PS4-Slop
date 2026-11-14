@@ -8,6 +8,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { Download, RefreshCw, Search } from "lucide-react";
 import { save } from "@tauri-apps/plugin-dialog";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 import { isTauri } from "@/lib/endpoint";
 import { call, errorText } from "@/lib/rpc";
 import { hex, useDisasm } from "@/store/disasm";
@@ -33,6 +34,7 @@ function dumpFileName(name: string, base: number, ps4: boolean): string {
 }
 
 export default function ModulesPanel() {
+  const t = useT();
   const target = useEngine((s) => s.target);
   const ps4 = useEngine((s) => s.backend.ps4);
   // The engine store refreshes this list on every target.changed
@@ -58,16 +60,19 @@ export default function ModulesPanel() {
   const dump = async (base: number, name: string) => {
     let path: string | null;
     if (isTauri()) {
-      path = await save({ title: `Dump ${name}`, defaultPath: dumpFileName(name, base, ps4) });
+      path = await save({
+        title: t("modules.dumpTitle", { name }),
+        defaultPath: dumpFileName(name, base, ps4),
+      });
     } else {
       // Browser dev mode has no native dialog
-      path = window.prompt(`Output path for ${name}`, dumpFileName(name, base, ps4));
+      path = window.prompt(t("modules.dumpPrompt", { name }), dumpFileName(name, base, ps4));
     }
     if (path === null || path.trim() === "") {
       setStatus(null);
       return;
     }
-    setStatus(`dumping ${name}…`);
+    setStatus(t("modules.dumping", { name }));
     try {
       // strict=false so a packed image with unreadable spans still produces a
       // file; the engine zero-fills those and reports complete=false
@@ -85,14 +90,17 @@ export default function ModulesPanel() {
             { timeoutMs: 600_000 },
           );
       const size =
-        res.bytes_written !== undefined ? ` · ${Math.round(res.bytes_written / 1024)} KiB` : "";
-      const partial = res.complete === false ? " (partial, unreadable spans zero-filled)" : "";
+        res.bytes_written !== undefined
+          ? t("modules.size", { kib: Math.round(res.bytes_written / 1024) })
+          : "";
+      const partial = res.complete === false ? t("modules.partial") : "";
       const warn =
         res.warnings !== undefined && res.warnings.length > 0
-          ? ` · ${res.warnings.length} warning(s): ${res.warnings[0]}`
+          ? t("modules.warnings", { count: res.warnings.length, first: res.warnings[0] })
           : "";
-      const sections = res.sections !== undefined ? ` · ${res.sections} sections` : "";
-      setStatus(`dumped ${name}${size}${sections}${partial}${warn}`);
+      const sections =
+        res.sections !== undefined ? t("modules.sections", { count: res.sections }) : "";
+      setStatus(t("modules.dumped", { name, size, sections, partial, warn }));
       await refreshLoaded();
     } catch (e) {
       setStatus(errorText(e));
@@ -103,10 +111,10 @@ export default function ModulesPanel() {
     return (
       <div className="panel">
         <div className="panel-head">
-          <span className="panel-title">Modules</span>
+          <span className="panel-title">{t("modules.title")}</span>
         </div>
         <div className="empty">
-          <div className="empty-hint">Attach to a process to list its modules.</div>
+          <div className="empty-hint">{t("modules.empty")}</div>
         </div>
       </div>
     );
@@ -115,12 +123,12 @@ export default function ModulesPanel() {
   return (
     <div className="panel">
       <div className="panel-head">
-        <span className="panel-title">Modules</span>
+        <span className="panel-title">{t("modules.title")}</span>
         <div className="spacer" />
         <span className="faint" style={{ fontSize: 11 }}>
           {modules.length}
         </span>
-        <IconButton tip="Refresh modules" onClick={() => void refreshModules()}>
+        <IconButton tip={t("modules.refresh")} onClick={() => void refreshModules()}>
           <RefreshCw size={14} />
         </IconButton>
       </div>
@@ -130,8 +138,8 @@ export default function ModulesPanel() {
           <Search size={13} aria-hidden />
           <input
             value={filter}
-            aria-label="Filter modules"
-            placeholder="Filter modules…"
+            aria-label={t("modules.filter")}
+            placeholder={t("modules.filterPlaceholder")}
             onChange={(e) => setFilter(e.target.value)}
           />
         </div>
@@ -152,7 +160,7 @@ export default function ModulesPanel() {
                     {hex(m.base, 12)}
                   </span>
                   <IconButton
-                    tip={`Dump + analyze ${m.name}`}
+                    tip={t("modules.dump", { name: m.name })}
                     onClick={() => void dump(m.base, m.name)}
                   >
                     <Download size={11} />

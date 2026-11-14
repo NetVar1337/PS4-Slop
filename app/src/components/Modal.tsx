@@ -6,6 +6,7 @@
 import { useEffect, useId, useRef, type KeyboardEvent, type ReactNode } from "react";
 import { X } from "lucide-react";
 import IconButton from "@/components/IconButton";
+import { useT } from "@/i18n";
 
 type Props = {
   title: string;
@@ -19,6 +20,7 @@ const kFocusable =
   'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 export default function Modal({ title, onClose, children, className }: Props) {
+  const t = useT();
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const titleId = useId();
@@ -72,7 +74,7 @@ export default function Modal({ title, onClose, children, className }: Props) {
             {title}
           </span>
           <div className="spacer" />
-          <IconButton ref={closeRef} tip="Close" onClick={onClose}>
+          <IconButton ref={closeRef} tip={t("common.close")} onClick={onClose}>
             <X size={14} />
           </IconButton>
         </div>

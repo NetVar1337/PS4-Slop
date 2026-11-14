@@ -10,6 +10,7 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Gamepad2, RefreshCw, Search, ShieldAlert, Unplug } from "lucide-react";
 import IconButton from "@/components/IconButton";
 import ProcessIcon from "@/components/ProcessIcon";
+import { useT } from "@/i18n";
 import { isTauri } from "@/lib/endpoint";
 import { call } from "@/lib/rpc";
 import { payloadDownload, payloadLatest, payloadSave, payloadStatus } from "@/lib/ps4debug";
@@ -34,6 +35,7 @@ function ConnectForm({
   onHost: (v: string) => void;
   onPort: (v: number) => void;
 }) {
+  const t = useT();
   const connectPs4 = useTargets((s) => s.connectPs4);
   const saveConsole = useTargets((s) => s.saveConsole);
   const [busy, setBusy] = useState(false);
@@ -45,7 +47,7 @@ function ConnectForm({
   const saveEndpoint = async (ip: string) => {
     setDiscoverError(null);
     if (!(await saveConsole({ name: ip, host: ip, port })))
-      setDiscoverError(`Could not save ${ip}.`);
+      setDiscoverError(t("targets.saveFailed", { ip }));
   };
 
   const submit = async () => {
@@ -69,7 +71,7 @@ function ConnectForm({
       const ips = (res.consoles ?? []).map((c) => c.ip).filter((ip) => ip !== "");
       setFound(ips);
       if (ips.length > 0) onHost(ips[0]);
-      else setDiscoverError("No console answered the discovery probe.");
+      else setDiscoverError(t("targets.discoverFailed"));
     } catch (e) {
       setDiscoverError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -80,7 +82,7 @@ function ConnectForm({
   return (
     <form
       className={compact ? "connect-bar" : "connect-form"}
-      aria-label="Connect to a PS4"
+      aria-label={t("targets.connectForm")}
       onSubmit={(e) => {
         e.preventDefault();
         void submit();
@@ -88,15 +90,15 @@ function ConnectForm({
     >
       <input
         className="addr-input"
-        aria-label="PS4 IP address"
-        placeholder="PS4 IP, e.g. 192.168.1.20"
+        aria-label={t("targets.ip")}
+        placeholder={t("targets.ipPlaceholder")}
         value={host}
         onChange={(e) => onHost(e.target.value)}
       />
       <input
         className="addr-input"
         style={{ width: 64 }}
-        aria-label="ps4debug port"
+        aria-label={t("targets.port")}
         type="number"
         min={1}
         max={65535}
@@ -104,7 +106,7 @@ function ConnectForm({
         onChange={(e) => onPort(Number(e.target.value) || kDefaultPs4Port)}
       />
       <button type="submit" className="row-action" disabled={host.trim() === "" || busy}>
-        {busy ? "Connecting…" : "Connect"}
+        {busy ? t("targets.connecting") : t("targets.connect")}
       </button>
       <button
         type="button"
@@ -112,16 +114,16 @@ function ConnectForm({
         disabled={discovering}
         onClick={() => void discover()}
       >
-        {discovering ? "Searching…" : "Discover"}
+        {discovering ? t("targets.searching") : t("targets.discover")}
       </button>
       <button
         type="button"
         className="row-action"
         disabled={host.trim() === ""}
-        data-tip="Keep this endpoint in the console list without connecting"
+        data-tip={t("targets.saveEndpointTip")}
         onClick={() => void saveEndpoint(host.trim())}
       >
-        Save endpoint
+        {t("targets.saveEndpoint")}
       </button>
       {found.length > 1 &&
         found.map((ip) => (
@@ -155,6 +157,7 @@ const kEmptyConsoleForm: ConsoleForm = {
 /** Saved endpoints: add/edit/remove, connect or quick-switch, with the
  *  firmware/caps the engine recorded on the last connection. */
 function ConsolesCard() {
+  const t = useT();
   const consoles = useTargets((s) => s.consoles);
   const activeConsole = useTargets((s) => s.activeConsole);
   const saveConsole = useTargets((s) => s.saveConsole);
@@ -200,8 +203,8 @@ function ConsolesCard() {
   return (
     <div className="consoles-card">
       <div className="payload-head">
-        <span className="payload-title">Consoles</span>
-        <span className="faint">{consoles.length} saved</span>
+        <span className="payload-title">{t("targets.consoles")}</span>
+        <span className="faint">{t("targets.saved", { count: consoles.length })}</span>
         <div className="spacer" />
         <button
           type="button"
@@ -211,7 +214,7 @@ function ConsolesCard() {
             setOpen((v) => !v);
           }}
         >
-          {open ? "Cancel" : "Add"}
+          {open ? t("common.cancel") : t("common.add")}
         </button>
       </div>
       {consoles.length > 0 && (
@@ -223,7 +226,9 @@ function ConsolesCard() {
                 {c.host}:{c.port}
               </span>
               <span className="faint">
-                {c.last_fw !== "" ? `fw ${c.last_fw}` : "never connected"}
+                {c.last_fw !== ""
+                  ? t("targets.fw", { fw: c.last_fw })
+                  : t("targets.neverConnected")}
                 {c.last_seen_ms > 0 ? ` · ${new Date(c.last_seen_ms).toLocaleDateString()}` : ""}
               </span>
               {c.last_caps !== "" && <span className="pill">{c.last_caps}</span>}
@@ -235,17 +240,17 @@ function ConsolesCard() {
                 data-active={c.name === activeConsole}
                 onClick={() => void switchConsole(c.name)}
               >
-                {c.name === activeConsole ? "Reconnect" : "Switch"}
+                {c.name === activeConsole ? t("targets.reconnect") : t("targets.switch")}
               </button>
               <button type="button" className="link-button" onClick={() => edit(c)}>
-                Edit
+                {t("common.edit")}
               </button>
               <button
                 type="button"
                 className="link-button"
                 onClick={() => void removeConsole(c.name)}
               >
-                Remove
+                {t("common.remove")}
               </button>
             </div>
           ))}
@@ -254,7 +259,7 @@ function ConsolesCard() {
       {open && (
         <form
           className="console-form"
-          aria-label="Save console"
+          aria-label={t("targets.saveConsoleForm")}
           onSubmit={(e) => {
             e.preventDefault();
             void submit();
@@ -262,22 +267,22 @@ function ConsolesCard() {
         >
           <input
             className="addr-input"
-            aria-label="Console name"
-            placeholder="Name"
+            aria-label={t("targets.consoleName")}
+            placeholder={t("targets.namePlaceholder")}
             value={form.name}
             onChange={(e) => setForm({ ...form, name: e.target.value })}
           />
           <input
             className="addr-input"
-            aria-label="Console host"
-            placeholder="PS4 IP"
+            aria-label={t("targets.consoleHost")}
+            placeholder={t("targets.hostPlaceholder")}
             value={form.host}
             onChange={(e) => setForm({ ...form, host: e.target.value })}
           />
           <input
             className="addr-input"
             style={{ width: 64 }}
-            aria-label="Console port"
+            aria-label={t("targets.consolePort")}
             type="number"
             min={1}
             max={65535}
@@ -287,7 +292,7 @@ function ConsolesCard() {
           <input
             className="addr-input"
             style={{ width: 70 }}
-            aria-label="Default pid"
+            aria-label={t("targets.defaultPid")}
             type="number"
             min={0}
             value={form.default_pid}
@@ -295,14 +300,14 @@ function ConsolesCard() {
           />
           <input
             className="addr-input"
-            aria-label="Watchlist set"
-            placeholder="Watchlist set"
+            aria-label={t("targets.watchlistSet")}
+            placeholder={t("targets.watchlistSet")}
             value={form.watchlist}
             onChange={(e) => setForm({ ...form, watchlist: e.target.value })}
           />
           <select
             className="addr-input"
-            aria-label="Scan width"
+            aria-label={t("targets.scanWidth")}
             value={form.scan_width}
             onChange={(e) => setForm({ ...form, scan_width: e.target.value })}
           >
@@ -317,7 +322,7 @@ function ConsolesCard() {
             className="row-action"
             disabled={busy || form.name.trim() === "" || form.host.trim() === ""}
           >
-            {busy ? "Saving…" : "Save console"}
+            {busy ? t("targets.saving") : t("targets.saveConsole")}
           </button>
         </form>
       )}
@@ -326,6 +331,7 @@ function ConsolesCard() {
 }
 
 function PayloadCard({ host }: { host: string }) {
+  const t = useT();
   const [status, setStatus] = useState<PayloadStatus | null>(null);
   const [latest, setLatest] = useState<PayloadInfo | null>(null);
   const [busy, setBusy] = useState<"check" | "download" | "save" | null>(null);
@@ -401,14 +407,18 @@ function PayloadCard({ host }: { host: string }) {
   return (
     <div className="payload-card">
       <div className="payload-head">
-        <span className="payload-title">ps4debug-NG payload</span>
-        <span className="faint">{installed === null ? "not bundled" : `v${installed.tag}`}</span>
+        <span className="payload-title">{t("targets.payloadTitle")}</span>
+        <span className="faint">
+          {installed === null
+            ? t("targets.notBundled")
+            : t("targets.payloadVersion", { tag: installed.tag })}
+        </span>
       </div>
       <div className="payload-hint">
         {installed === null
-          ? "Download the latest release, then send it with your console loader."
-          : `Bundled from ${installed.source}. Send it with BinLoader/FTP.`}
-        {latest !== null ? ` · latest v${latest.tag}` : ""}
+          ? t("targets.payloadMissing")
+          : t("targets.payloadBundled", { source: installed.source })}
+        {latest !== null ? t("targets.payloadLatest", { tag: latest.tag }) : ""}
       </div>
       <div className="payload-actions">
         <button
@@ -417,7 +427,7 @@ function PayloadCard({ host }: { host: string }) {
           disabled={busy !== null}
           onClick={() => void check()}
         >
-          {busy === "check" ? "Checking…" : "Check latest"}
+          {busy === "check" ? t("targets.checking") : t("targets.checkLatest")}
         </button>
         {newer && (
           <button
@@ -426,7 +436,9 @@ function PayloadCard({ host }: { host: string }) {
             disabled={busy !== null}
             onClick={() => void download()}
           >
-            {busy === "download" ? "Downloading…" : `Download v${latest?.tag ?? ""}`}
+            {busy === "download"
+              ? t("targets.downloading")
+              : t("targets.download", { tag: latest?.tag ?? "" })}
           </button>
         )}
         {installed !== null && (
@@ -436,13 +448,13 @@ function PayloadCard({ host }: { host: string }) {
             disabled={busy !== null}
             onClick={() => void save()}
           >
-            {busy === "save" ? "Saving…" : "Save payload…"}
+            {busy === "save" ? t("targets.saving") : t("targets.savePayload")}
           </button>
         )}
         <input
           className="addr-input"
           style={{ width: 70 }}
-          aria-label="Payload loader port"
+          aria-label={t("targets.loaderPort")}
           type="number"
           min={1}
           max={65535}
@@ -455,12 +467,12 @@ function PayloadCard({ host }: { host: string }) {
           disabled={installed === null || host.trim() === "" || sending}
           onClick={() => void send()}
         >
-          {sending ? "Sending…" : "Send to console"}
+          {sending ? t("targets.sending") : t("targets.send")}
         </button>
       </div>
       {sent !== null && (
         <div className="payload-hint">
-          Sent {sent} bytes to {host}:{loaderPort}.
+          {t("targets.sent", { bytes: sent, host, port: loaderPort })}
         </div>
       )}
       {sendError !== null && (
@@ -687,6 +699,7 @@ function Ps5Card() {
 }
 
 export default function TargetsPanel() {
+  const t = useT();
   const {
     processes,
     filter,
@@ -738,7 +751,7 @@ export default function TargetsPanel() {
       </span>
       <div className="spacer" />
       <button type="button" className="row-action" onClick={() => void disconnectPs4()}>
-        Disconnect
+        {t("targets.detach")}
       </button>
     </div>
   ) : showConnect && showHost ? (
@@ -749,22 +762,29 @@ export default function TargetsPanel() {
     <div className="panel targets-panel">
       <div className="panel-head">
         <span className="panel-title">
-          {backend.ps4 ? "PS4 processes" : showHost ? "Host processes (this PC)" : "Targets"}
+          {backend.ps4
+            ? t("targets.ps4Processes")
+            : showHost
+              ? t("targets.hostProcesses")
+              : t("targets.title")}
         </span>
         <div className="spacer" />
         {listing && (
           <span className="faint" style={{ fontSize: "var(--type-small)" }}>
-            {processes.length} processes
+            {t("targets.processCount", { count: processes.length })}
           </span>
         )}
         {target.attached && (
-          <IconButton tip={`Detach ${target.name ?? ""}`} onClick={() => void detach()}>
+          <IconButton
+            tip={t("targets.detachNamed", { name: target.name ?? "" })}
+            onClick={() => void detach()}
+          >
             <Unplug size={14} />
           </IconButton>
         )}
         {!backend.ps4 && showHost && (
           <IconButton
-            tip="Connect to a PS4 running ps4debug-NG"
+            tip={t("targets.connectTip")}
             pressed={showConnect}
             onClick={() => setShowConnect((v) => !v)}
           >
@@ -772,7 +792,7 @@ export default function TargetsPanel() {
           </IconButton>
         )}
         {listing && (
-          <IconButton tip="Refresh" onClick={() => void refresh()}>
+          <IconButton tip={t("targets.refresh")} onClick={() => void refresh()}>
             <RefreshCw size={14} className={loading ? "spin" : undefined} />
           </IconButton>
         )}
@@ -791,11 +811,8 @@ export default function TargetsPanel() {
           <div className="empty-glyph">
             <Gamepad2 size={28} strokeWidth={1.5} />
           </div>
-          <div className="empty-title">Connect a console</div>
-          <div className="empty-hint">
-            Run the ps4debug-NG payload on the PS4 and enter its address. Processes, modules and the
-            debugger then come from the console.
-          </div>
+          <div className="empty-title">{t("targets.connectConsole")}</div>
+          <div className="empty-hint">{t("targets.connectHint")}</div>
           <ConnectForm compact={false} host={host} port={port} onHost={setHost} onPort={setPort} />
           <PayloadCard host={host} />
           {error !== null && (
@@ -804,7 +821,7 @@ export default function TargetsPanel() {
             </div>
           )}
           <button type="button" className="link-button" onClick={() => setShowHost(true)}>
-            List this PC&apos;s processes instead
+            {t("targets.listHost")}
           </button>
         </div>
       ) : (
@@ -813,13 +830,13 @@ export default function TargetsPanel() {
             <Search size={13} aria-hidden />
             <input
               value={filter}
-              aria-label="Filter processes"
-              placeholder="Filter processes…"
+              aria-label={t("targets.filter")}
+              placeholder={t("targets.filterPlaceholder")}
               onChange={(e) => setFilter(e.target.value)}
             />
             {!backend.ps4 && (
               <button type="button" className="link-button" onClick={() => setShowHost(false)}>
-                hide host list
+                {t("targets.hideHost")}
               </button>
             )}
           </div>
@@ -836,19 +853,19 @@ export default function TargetsPanel() {
           <div className="panel-body" ref={scrollRef}>
             <table className="table">
               <caption className="sr-only">
-                {backend.ps4 ? "Processes on the connected PS4" : "Processes on this PC"}
+                {backend.ps4 ? t("targets.captionPs4") : t("targets.captionHost")}
               </caption>
               <thead>
                 <tr>
                   <th scope="col" style={{ width: 58 }}>
-                    PID
+                    {t("targets.colPid")}
                   </th>
-                  <th scope="col">Name</th>
+                  <th scope="col">{t("targets.colName")}</th>
                   <th scope="col" style={{ width: 44 }}>
-                    Arch
+                    {t("targets.colArch")}
                   </th>
                   <th scope="col" style={{ width: 60 }}>
-                    Action
+                    {t("targets.colAction")}
                   </th>
                 </tr>
               </thead>
@@ -885,8 +902,8 @@ export default function TargetsPanel() {
                               data-elevation={p.elevation}
                               data-tip={
                                 p.elevation === "system"
-                                  ? "Runs as SYSTEM / kernel privileges"
-                                  : "Elevated (administrator) process"
+                                  ? t("targets.systemTip")
+                                  : t("targets.adminTip")
                               }
                             >
                               <ShieldAlert size={10} aria-hidden /> {elevated}
@@ -909,7 +926,7 @@ export default function TargetsPanel() {
                             data-active="true"
                             onClick={() => void detach()}
                           >
-                            Detach
+                            {t("targets.detach")}
                           </button>
                         ) : (
                           <button
@@ -917,7 +934,7 @@ export default function TargetsPanel() {
                             className="row-action"
                             onClick={() => void attach(p.pid)}
                           >
-                            Attach
+                            {t("targets.attach")}
                           </button>
                         )}
                       </td>

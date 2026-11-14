@@ -10,8 +10,8 @@ import StatusBar from "@/components/StatusBar";
 import Tabs from "@/components/Tabs";
 import DebuggerView from "@/components/panels/DebuggerView";
 import DecompView from "@/components/panels/DecompView";
-import DisassemblyView from "@/components/panels/DisassemblyView";
 import EmulatorPanel from "@/components/panels/EmulatorPanel";
+import DisassemblyView from "@/components/panels/DisassemblyView";
 import InspectorPanel from "@/components/panels/InspectorPanel";
 import MemoryView from "@/components/panels/MemoryView";
 import { bucketize, kBuckets } from "@/components/panels/Minimap";
@@ -25,6 +25,7 @@ import TargetsPanel from "@/components/panels/TargetsPanel";
 import UnpackerView from "@/components/panels/UnpackerView";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
 import XrayPanel from "@/components/panels/XrayPanel";
+import { useI18n } from "@/i18n";
 import { hex } from "@/lib/format";
 import { setEndpoint } from "@/lib/rpc";
 import { readLayoutFile, saveLayoutFile } from "@/lib/layoutFile";
@@ -37,7 +38,7 @@ import { useMemory } from "@/store/memory";
 import { useNetwork } from "@/store/network";
 import { useSettings } from "@/store/settings";
 import { useTargets } from "@/store/targets";
-import { useTheme } from "@/store/theme";
+import { kThemeTokens, useTheme } from "@/store/theme";
 import { useTypes } from "@/store/types";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
@@ -112,9 +113,10 @@ beforeEach(() => {
   useDecomp.setState(initial.decomp, true);
   useSettings.setState(initial.settings, true);
   useTypes.setState(initial.types, true);
-  useXray.setState(initial.xray, true);
-  useNetwork.setState(initial.network, true);
-  useEmulator.setState(initial.emulator, true);
+  useI18n.setState({ language: "en" });
+  document.documentElement.lang = "en";
+  useTheme.setState({ theme: "obsidian", customThemes: [], activeCustom: null });
+  for (const { id } of kThemeTokens) document.documentElement.style.removeProperty(id);
   setEndpoint({ port: 8765, token: "" });
 });
 
@@ -985,6 +987,50 @@ describe("memory caret inspector (item 83)", () => {
     await screen.findByText("ABCD");
     expect(screen.getByText("u32").closest(".mem-value")?.textContent).toContain("1145258561");
     expect(await screen.findByText("Player { hp: 65 }")).toBeInTheDocument();
+  });
+});
+describe("localization (audit 86)", () => {
+  it("switches a visible label and the document language", async () => {
+    mockApi(() => ({}));
+    render(<SettingsModal onClose={() => undefined} />);
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Deutsch" }));
+    expect(screen.getByRole("dialog", { name: "Einstellungen" })).toBeInTheDocument();
+    expect(screen.getByText("Sprache")).toBeInTheDocument();
+    expect(document.documentElement.lang).toBe("de");
+    await userEvent.click(screen.getByRole("button", { name: "English" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeInTheDocument();
+  });
+});
+
+describe("theme editor (audit 87)", () => {
+  it("round-trips a custom theme through save, apply, export, import and delete", async () => {
+    mockApi(() => ({}));
+    render(<SettingsModal onClose={() => undefined} />);
+
+    await userEvent.type(screen.getByRole("textbox", { name: "Theme name" }), "midnight");
+    fireEvent.change(screen.getByLabelText("Accent"), { target: { value: "#123456" } });
+    // live preview writes the override on <html>
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
+
+    await userEvent.click(screen.getByRole("button", { name: "Save theme" }));
+    expect(useTheme.getState().customThemes.map((theme) => theme.name)).toEqual(["midnight"]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+    expect(useTheme.getState().activeCustom).toBe("midnight");
+    expect(document.documentElement.style.getPropertyValue("--accent")).toBe("#123456");
+
+    await userEvent.click(screen.getByRole("button", { name: "Export" }));
+    const json = screen.getByRole("textbox", { name: "Theme JSON" }) as HTMLTextAreaElement;
+    expect(json.value).toContain("midnight");
+    expect(json.value).toContain("#123456");
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete midnight" }));
+    expect(useTheme.getState().customThemes).toHaveLength(0);
+
+    await userEvent.click(screen.getByRole("button", { name: "Import" }));
+    expect(useTheme.getState().customThemes.map((theme) => theme.name)).toEqual(["midnight"]);
+    expect(useTheme.getState().customThemes[0].colors["--accent"]).toBe("#123456");
   });
 });
 
