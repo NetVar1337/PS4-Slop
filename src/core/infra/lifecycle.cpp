@@ -154,9 +154,17 @@ void start_mcp() {
     state_t& s = st();
     if (!settings::mcp_enabled()) return;
 
+    bool onboard = false, insecure_dev = false;
+    {
+        std::lock_guard lk(s.mu);
+        onboard      = s.cfg.mcp_onboarding;
+        insecure_dev = s.cfg.insecure_dev;
+    }
+
     mcp::server_config_t cfg;
     cfg.port  = settings::mcp_port();
     cfg.token = settings::mcp_token();
+    cfg.insecure_dev = insecure_dev;
     if (const char* env_port = std::getenv("SLOP_MCP_PORT")) {
         const int p = std::atoi(env_port);
         if (p > 0 && p < 65536) cfg.port = static_cast<uint16_t>(p);
@@ -201,11 +209,6 @@ void start_mcp() {
                 std::to_string(mcp::port()) + "/mcp");
     write_endpoint(mcp::port(), cfg.token);
 
-    bool onboard = false;
-    {
-        std::lock_guard lk(s.mu);
-        onboard = s.cfg.mcp_onboarding;
-    }
     if (!onboard || ephemeral) return;
 
     // first run registers everywhere; later runs only refresh entries we already
@@ -222,8 +225,11 @@ void start_mcp() {
     }
     if (first) {
         settings::set_mcp_onboarded(true);
-        bus::output("note: client configs now hold the mcp bearer token; do not sync them "
-                    "to public dotfile repos");
+        bus::output(settings::mcp_token_in_configs()
+                        ? "note: client configs now hold the mcp bearer token; do not sync "
+                          "them to public dotfile repos"
+                        : "note: client configs reference ${SLOP_MCP_TOKEN}; set that user "
+                          "env var to the token shown in Settings");
     }
 }
 

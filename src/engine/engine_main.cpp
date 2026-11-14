@@ -13,6 +13,10 @@
 // stdin line is POSTed to the engine's own /mcp (or the running engine's) with
 // a per-process token; each reply is one stdout line. Everything else that
 // would reach stdout (handshake, logs) is moved to stderr.
+//
+// --insecure-dev: accept tokenless loopback requests so `npm run dev` in the
+// browser can talk to this engine. Off by default: without it every request
+// needs the bearer token, loopback included (audit 103).
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -25,7 +29,6 @@
 #include <cstring>
 #include <io.h>
 #include <iostream>
-#include <random>
 #include <string>
 #include <thread>
 
@@ -48,6 +51,7 @@ struct options_t {
     bool     quiet          = false;   // quiet the mirrored output
     uint32_t parent_pid     = 0;       // watch this pid and exit when it dies
     bool     stdio          = false;   // MCP over stdin/stdout
+    bool     insecure_dev   = false;   // accept tokenless loopback requests (browser dev mode)
 };
 
 FILE* g_rpc_out = nullptr;   // the real stdout in --stdio mode, nullptr otherwise
@@ -90,14 +94,8 @@ void claim_stdout_for_rpc() {
 }
 
 std::string random_token() {
-    std::random_device rd;   // MSVC: rand_s, a CSPRNG
-    std::string t;
-    for (int i = 0; i < 4; ++i) {
-        char b[9];
-        std::snprintf(b, sizeof(b), "%08x", rd());
-        t += b;
-    }
-    return t;
+    // same BCryptGenRandom source as the persisted token (audit 107)
+    return slop::core::infra::settings::generate_token();
 }
 
 // one JSON-RPC message per stdin line -> POST /mcp -> one reply line (none
@@ -136,6 +134,7 @@ options_t parse_args(int argc, char** argv) {
         const char* a = argv[i];
         if (std::strcmp(a, "--no-onboard") == 0)  o.mcp_onboarding = false;
         else if (std::strcmp(a, "--quiet") == 0)       o.quiet = true;
+        else if (std::strcmp(a, "--insecure-dev") == 0) o.insecure_dev = true;
         else if (std::strcmp(a, "--port") == 0 && i + 1 < argc)
             ::_putenv_s("SLOP_MCP_PORT", argv[++i]); // CRT getenv() does not see SetEnvironmentVariable
         else if (std::strcmp(a, "--parent-pid") == 0 && i + 1 < argc)
@@ -200,6 +199,7 @@ int main(int argc, char** argv) {
 
     lifecycle::config_t cfg;
     cfg.mcp_onboarding = opts.mcp_onboarding;
+    cfg.insecure_dev   = opts.insecure_dev;
     lifecycle::begin(std::move(cfg));
 
     // mirror the boot story to stderr so it never collides with the stdout handshake

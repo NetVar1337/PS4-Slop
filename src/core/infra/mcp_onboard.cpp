@@ -11,12 +11,14 @@
 
 #include "core/infra/mcp_onboard.hpp"
 #include "core/infra/paths.hpp"
+#include "core/infra/settings.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <windows.h>
 #include <shlobj.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -68,14 +70,36 @@ bool write_json_file(const std::string& path, const json& j) {
 
 constexpr const char* kServerName = "slopstation";
 
+// Configs reference the env var by default so a rotated token never leaves
+// plaintext behind in a dotfile repo; mcp_token_in_configs opts into plaintext
+// for clients that cannot expand ${VAR}.
+constexpr const char* kTokenEnvRef = "Bearer ${SLOP_MCP_TOKEN}";
+
+std::string auth_header(const std::string& token) {
+    return infra::settings::mcp_token_in_configs() && !token.empty()
+               ? "Bearer " + token
+               : std::string(kTokenEnvRef);
+}
+
 // bare url entry, no "transport" key since nobody reads one
 json make_mcp_entry(uint16_t port, const std::string& token) {
     json entry;
     entry["url"] = "http://127.0.0.1:" + std::to_string(port) + "/mcp";
-    if (!token.empty()) {
-        entry["headers"] = json::object({{"Authorization", "Bearer " + token}});
-    }
+    entry["headers"] = json::object({{"Authorization", auth_header(token)}});
     return entry;
+}
+
+// Tern keeps every MCP server centrally in one array and always gets the env
+// reference: its config is the one users share/sync most
+std::string tern_path() { return appdata() + "\\tern\\settings.json"; }
+
+json make_tern_entry(uint16_t port) {
+    return {{"name", kServerName},
+            {"transport", "http"},
+            {"url", "http://127.0.0.1:" + std::to_string(port) + "/mcp"},
+            {"headers", json::object({{"Authorization", kTokenEnvRef}})},
+            {"agents", json::array()},
+            {"enabled", true}};
 }
 
 // per client installers
@@ -240,6 +264,67 @@ install_result_t do_opencode(uint16_t port, const std::string& token, bool updat
                              port, token, /*with_type=*/false, update_only);
 }
 
+// Tern: agents.mcp is an array of flat entries, matched by name. "agents" is
+// the user's scope choice, so it is written once and never refreshed.
+constexpr const char* kTernOwnedKeys[] = {"name", "transport", "url", "headers", "enabled"};
+
+bool tern_entry_current(const json& existing, const json& wanted) {
+    if (!existing.is_object()) return false;
+    for (const char* k : kTernOwnedKeys) {
+        const bool has_w = wanted.contains(k);
+        const bool has_e = existing.contains(k);
+        if (has_w != has_e) return false;
+        if (has_w && existing.at(k) != wanted.at(k)) return false;
+    }
+    return true;
+}
+
+install_result_t do_tern(uint16_t port, bool update_only) {
+    const std::string path = tern_path();
+    json cfg;
+    switch (read_json_file(path, cfg)) {
+    case read_t::missing:
+        // only users who already run Tern get an entry; never create %APPDATA%\tern
+        return {"Tern", false, path, ""};
+    case read_t::corrupt:
+        return {"Tern", false, path, "config unparseable, left untouched"};
+    default:
+        break;
+    }
+    if (!cfg.is_object())
+        return {"Tern", false, path, "config root is not an object, left untouched"};
+
+    // a non-object agents / non-array mcp is the user's business, never overwrite it
+    if (!cfg.contains("agents")) {
+        if (update_only) return {"Tern", false, path, ""};
+        cfg["agents"] = json::object();
+    }
+    if (!cfg.at("agents").is_object())
+        return {"Tern", false, path, "\"agents\" is not an object, left untouched"};
+    json& agents = cfg["agents"];
+    if (!agents.contains("mcp")) {
+        if (update_only) return {"Tern", false, path, ""};
+        agents["mcp"] = json::array();
+    }
+    if (!agents.at("mcp").is_array())
+        return {"Tern", false, path, "agents.mcp is not an array, left untouched"};
+
+    json& servers = agents["mcp"];
+    json entry = make_tern_entry(port);
+    for (auto& e : servers) {
+        if (!e.is_object() || e.value("name", std::string{}) != kServerName) continue;
+        if (tern_entry_current(e, entry)) return {"Tern", false, path, ""};
+        // keep user additions (a scoped agents list, extra keys) and refresh ours
+        for (const char* k : kTernOwnedKeys) e[k] = entry.at(k);
+        if (!write_json_file(path, cfg)) return {"Tern", false, path, "write failed"};
+        return {"Tern", true, path, ""};
+    }
+    if (update_only) return {"Tern", false, path, ""};
+    servers.push_back(std::move(entry));
+    if (!write_json_file(path, cfg)) return {"Tern", false, path, "write failed"};
+    return {"Tern", true, path, ""};
+}
+
 } // namespace
 
 // public api
@@ -260,15 +345,30 @@ install_result_t guarded(const char* client, Fn&& fn) {
 
 std::vector<install_result_t> sweep(uint16_t port, const std::string& token, bool update_only) {
     std::vector<install_result_t> results;
-    results.reserve(6);
-    results.push_back(guarded("Claude Code (global)",
-                              [&] { return do_claude_code_global(port, token, update_only); }));
-    if (!update_only)
-        results.push_back(guarded("Claude Desktop", [&] { return do_claude_desktop(port, token); }));
-    results.push_back(guarded("Cursor", [&] { return do_cursor(port, token, update_only); }));
-    results.push_back(guarded("Windsurf", [&] { return do_windsurf(port, token, update_only); }));
-    results.push_back(guarded("VS Code", [&] { return do_vscode(port, token, update_only); }));
-    results.push_back(guarded("OpenCode", [&] { return do_opencode(port, token, update_only); }));
+    std::vector<std::string> clients = infra::settings::mcp_onboard_clients();
+    if (clients.empty()) clients = default_clients();
+    results.reserve(clients.size());
+    for (const std::string& client : clients) {
+        const char* c = client.c_str();
+        if (client == "Tern") {
+            results.push_back(guarded(c, [&] { return do_tern(port, update_only); }));
+        } else if (client == "Claude Code (global)") {
+            results.push_back(guarded(c, [&] {
+                return do_claude_code_global(port, token, update_only);
+            }));
+        } else if (client == "Claude Desktop") {
+            if (!update_only)
+                results.push_back(guarded(c, [&] { return do_claude_desktop(port, token); }));
+        } else if (client == "Cursor") {
+            results.push_back(guarded(c, [&] { return do_cursor(port, token, update_only); }));
+        } else if (client == "Windsurf") {
+            results.push_back(guarded(c, [&] { return do_windsurf(port, token, update_only); }));
+        } else if (client == "VS Code") {
+            results.push_back(guarded(c, [&] { return do_vscode(port, token, update_only); }));
+        } else if (client == "OpenCode") {
+            results.push_back(guarded(c, [&] { return do_opencode(port, token, update_only); }));
+        }
+    }
     return results;
 }
 
@@ -333,7 +433,97 @@ std::vector<install_result_t> uninstall_all() {
     remove_key("OpenCode",
                userprofile() + "\\.config\\opencode\\config.json", "mcpServers");
 
+    // Tern keeps servers in an array, so it needs its own removal
+    {
+        const std::string path = tern_path();
+        json cfg;
+        switch (read_json_file(path, cfg)) {
+        case read_t::missing:
+            results.push_back({"Tern", false, path, "file not found"});
+            break;
+        case read_t::corrupt:
+            results.push_back({"Tern", false, path, "config unparseable, left untouched"});
+            break;
+        default:
+            if (!cfg.is_object() || !cfg.contains("agents") || !cfg.at("agents").is_object() ||
+                !cfg.at("agents").contains("mcp") || !cfg.at("agents").at("mcp").is_array()) {
+                results.push_back({"Tern", false, path, ""});
+                break;
+            }
+            {
+                json& servers = cfg["agents"]["mcp"];
+                const size_t before = servers.size();
+                servers.erase(std::remove_if(servers.begin(), servers.end(),
+                                             [](const json& e) {
+                                                 return e.is_object() &&
+                                                        e.value("name", std::string{}) ==
+                                                            kServerName;
+                                             }),
+                              servers.end());
+                if (servers.size() == before)
+                    results.push_back({"Tern", false, path, ""});
+                else if (write_json_file(path, cfg))
+                    results.push_back({"Tern", true, path, ""});
+                else
+                    results.push_back({"Tern", false, path, "write failed"});
+            }
+            break;
+        }
+    }
+
     return results;
+}
+
+std::vector<std::string> default_clients() {
+    std::error_code ec;
+    if (fs::exists(tern_path(), ec) && !ec) return {"Tern"};
+    return {"Claude Code (global)", "Claude Desktop", "Cursor", "Windsurf", "VS Code", "OpenCode"};
+}
+
+std::vector<std::string> plaintext_token_clients() {
+    std::vector<std::string> out;
+
+    // a literal bearer is anything that is not the ${SLOP_MCP_TOKEN} reference
+    auto literal = [](const json& entry) {
+        if (!entry.is_object() || !entry.contains("headers") || !entry.at("headers").is_object())
+            return false;
+        const json& h = entry.at("headers");
+        if (!h.contains("Authorization") || !h.at("Authorization").is_string()) return false;
+        return h.at("Authorization").get<std::string>().find("${") == std::string::npos;
+    };
+
+    auto check = [&](const char* client, const std::string& path, const char* servers_key,
+                     const char* parent_key = nullptr) {
+        json cfg;
+        if (read_json_file(path, cfg) != read_t::ok || !cfg.is_object()) return;
+        const json* container = &cfg;
+        if (parent_key) {
+            if (!cfg.contains(parent_key) || !cfg.at(parent_key).is_object()) return;
+            container = &cfg.at(parent_key);
+        }
+        if (!container->contains(servers_key) || !(*container)[servers_key].is_object()) return;
+        const json& servers = (*container)[servers_key];
+        if (servers.contains(kServerName) && literal(servers.at(kServerName)))
+            out.push_back(client);
+    };
+
+    check("Claude Code (global)", userprofile() + "\\.claude.json", "mcpServers");
+    check("Cursor", userprofile() + "\\.cursor\\mcp.json", "mcpServers");
+    check("Windsurf", userprofile() + "\\.codeium\\windsurf\\mcp_config.json", "mcpServers");
+    check("VS Code", appdata() + "\\Code\\User\\settings.json", "servers", "mcp");
+    check("OpenCode", userprofile() + "\\.config\\opencode\\config.json", "mcpServers");
+
+    json tern;
+    if (read_json_file(tern_path(), tern) == read_t::ok && tern.is_object() &&
+        tern.contains("agents") && tern.at("agents").is_object() &&
+        tern.at("agents").contains("mcp") && tern.at("agents").at("mcp").is_array()) {
+        for (const auto& e : tern.at("agents").at("mcp"))
+            if (e.is_object() && e.value("name", std::string{}) == kServerName && literal(e)) {
+                out.push_back("Tern");
+                break;
+            }
+    }
+    return out;
 }
 
 } // namespace slop::core::infra::mcp_onboard

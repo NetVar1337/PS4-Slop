@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include <nlohmann/json.hpp>
 
@@ -55,6 +56,13 @@ std::string generate_token();           // 32 random bytes as 64 hex chars
 // first run registration into ai clients
 bool mcp_onboarded();
 void set_mcp_onboarded(bool v);
+
+// which clients the onboarder touches; empty = auto (Tern when installed,
+// else every known client)
+std::vector<std::string> mcp_onboard_clients();
+// false (default): client configs reference ${SLOP_MCP_TOKEN} instead of the
+// plaintext bearer
+bool mcp_token_in_configs();
 
 // MCP audit trail + confirm gate (ps4debug-mcp safety model): every tool call
 // is appended as one JSONL line to mcp_audit_path(); when mcp_require_confirm

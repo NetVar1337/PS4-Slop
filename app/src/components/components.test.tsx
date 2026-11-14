@@ -240,6 +240,16 @@ describe("settings modal (items 92, settings API)", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it("warns when a client config still holds a plaintext token (item 72)", async () => {
+    mockApi(({ action }) =>
+      action === "settings_get"
+        ? { mcp_token: "set", mcp_plaintext_configs: ["Cursor"], mcp_token_in_configs: false }
+        : {},
+    );
+    render(<SettingsModal onClose={() => undefined} />);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Cursor");
+  });
+
   it("writes engine settings and reveals a rotated token once", async () => {
     const newToken = "ab".repeat(32);
     const { calls } = mockApi(({ action }) => {

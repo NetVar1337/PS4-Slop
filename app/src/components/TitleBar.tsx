@@ -180,7 +180,7 @@ export default function TitleBar() {
         <span
           className="insecure-badge"
           role="status"
-          data-tip="Browser dev mode: connected to whatever listens on 127.0.0.1:8765 with no token or handshake"
+          data-tip="Browser dev mode: connected to whatever listens on 127.0.0.1:8765; the engine must run with --insecure-dev to accept tokenless requests"
         >
           insecure dev mode
         </span>

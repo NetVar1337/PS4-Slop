@@ -141,6 +141,12 @@ bool mcp_onboarded() { return get<bool>("mcp_onboarded", false); }
 
 void set_mcp_onboarded(bool v) { set("mcp_onboarded", v); }
 
+std::vector<std::string> mcp_onboard_clients() {
+    return get<std::vector<std::string>>("mcp_onboard_clients", {});
+}
+
+bool mcp_token_in_configs() { return get<bool>("mcp_token_in_configs", false); }
+
 bool mcp_audit_enabled() { return get<bool>("mcp_audit_enabled", true); }
 
 std::string mcp_audit_path() {

@@ -32,15 +32,15 @@ void validate_setting(const std::string& key, const json& v) {
         fail("app.settings_set: mcp_token is not settable, use app.rotate_token");
     if (v.is_null()) return;   // erase
     if (key == "mcp_enabled" || key == "mcp_onboarded" || key == "script_unsafe" ||
-        key == "web_allow_private") {
+        key == "web_allow_private" || key == "mcp_token_in_configs") {
         if (!v.is_boolean()) fail("app.settings_set: " + key + " must be a boolean");
     } else if (key == "mcp_port") {
         if (!v.is_number_integer() || v.get<int64_t>() < 1 || v.get<int64_t>() > 65535)
             fail("app.settings_set: mcp_port must be an integer in 1..65535");
-    } else if (key == "web_allowlist") {
-        if (!v.is_array()) fail("app.settings_set: web_allowlist must be an array of strings");
+    } else if (key == "web_allowlist" || key == "mcp_onboard_clients") {
+        if (!v.is_array()) fail("app.settings_set: " + key + " must be an array of strings");
         for (const auto& e : v)
-            if (!e.is_string()) fail("app.settings_set: web_allowlist must be an array of strings");
+            if (!e.is_string()) fail("app.settings_set: " + key + " must be an array of strings");
     } else if (key == "proxy_token") {
         if (!v.is_string()) fail("app.settings_set: proxy_token must be a string");
     }
@@ -52,6 +52,8 @@ json redacted_settings() {
     s["mcp_token"] = tok.empty() ? "unset" : "set";
     if (s.contains("proxy_token") && s.at("proxy_token").is_string())
         s["proxy_token"] = s.at("proxy_token").get_ref<const std::string&>().empty() ? "unset" : "set";
+    // audit 72: the UI warns when a client config still carries a literal token
+    s["mcp_plaintext_configs"] = infra::mcp_onboard::plaintext_token_clients();
     return s;
 }
 
@@ -129,7 +131,9 @@ json tool_app(const json& args) {
         if (!infra::settings::set(key, value))
             fail("app.settings_set: could not write " + infra::settings::file());
         json out = {{"ok", true}, {"key", key}, {"value", value}};
-        if (key == "mcp_port" || key == "mcp_enabled") out["restart_required"] = true;
+        if (key == "mcp_port" || key == "mcp_enabled" || key == "mcp_onboard_clients" ||
+            key == "mcp_token_in_configs")
+            out["restart_required"] = true;
         if (key == "proxy_token" && value.is_string()) out["value"] = "set";
         return out;
     }

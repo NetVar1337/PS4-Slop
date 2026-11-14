@@ -13,6 +13,12 @@ export type EngineSettings = Record<string, unknown> & {
   web_allow_private?: boolean;
   web_allowlist?: string[];
   proxy_token?: string;
+  /** Clients the onboarder writes into; empty/absent = auto. */
+  mcp_onboard_clients?: string[];
+  /** Write the bearer token into client configs instead of ${SLOP_MCP_TOKEN}. */
+  mcp_token_in_configs?: boolean;
+  /** Client configs that still hold a literal bearer token (audit 72). */
+  mcp_plaintext_configs?: string[];
 };
 
 type RotateReply = { rotated: boolean; clients_updated?: string[]; token?: string };

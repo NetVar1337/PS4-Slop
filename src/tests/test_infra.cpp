@@ -29,6 +29,7 @@
 #include <string>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <vector>
@@ -527,8 +528,13 @@ TEST_CASE(infra_settings_corrupt_or_non_object_file_is_backed_up) {
 
 TEST_CASE(infra_onboard_survives_non_object_mcp_and_refreshes_stale_entries) {
     namespace onboard = slop::core::infra::mcp_onboard;
+    namespace settings = slop::core::infra::settings;
     scratch_dir_t tmp;
     env_sandbox_t env(tmp.str());
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+    // this case covers the plaintext rewrite path; the env reference is the default
+    REQUIRE(settings::set("mcp_token_in_configs", true));
     const fs::path vscode = tmp.dir / "appdata" / "Code" / "User" / "settings.json";
     const fs::path cursor = tmp.dir / "profile" / ".cursor" / "mcp.json";
     spit(vscode, R"({"mcp": true, "editor.fontSize": 14})");
@@ -560,6 +566,137 @@ TEST_CASE(infra_onboard_survives_non_object_mcp_and_refreshes_stale_entries) {
     REQUIRE_STR_EQ(njson::parse(slurp(cursor)).at("mcpServers").at("slopstation")
                        .at("url").get<std::string>().c_str(),
                    "http://127.0.0.1:9000/mcp");
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(infra_onboard_tern_entry_insert_update_and_preserve_others) {
+    namespace onboard = slop::core::infra::mcp_onboard;
+    namespace settings = slop::core::infra::settings;
+    scratch_dir_t tmp;
+    env_sandbox_t env(tmp.str());
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+
+    const fs::path tern = tmp.dir / "appdata" / "tern" / "settings.json";
+    spit(tern, R"({"theme":"dark","agents":{"mcp":[{"name":"other","transport":"stdio","command":"x"}]}})");
+
+    // Tern installed -> the auto policy targets Tern alone
+    const auto auto_clients = onboard::default_clients();
+    REQUIRE_EQ(auto_clients.size(), 1u);
+    REQUIRE_STR_EQ(auto_clients.at(0).c_str(), "Tern");
+
+    const auto first = onboard::install_all(8765, "tok");
+    REQUIRE_EQ(first.size(), 1u);
+    REQUIRE(first.at(0).installed);
+    // the other clients were not touched
+    REQUIRE(!fs::exists(tmp.dir / "profile" / ".cursor" / "mcp.json"));
+
+    njson cfg = njson::parse(slurp(tern));
+    REQUIRE_STR_EQ(cfg.at("theme").get<std::string>().c_str(), "dark");
+    const njson& arr = cfg.at("agents").at("mcp");
+    REQUIRE_EQ(arr.size(), 2u);
+    REQUIRE_STR_EQ(arr.at(0).at("name").get<std::string>().c_str(), "other");
+    const njson& ours = arr.at(1);
+    REQUIRE_STR_EQ(ours.at("name").get<std::string>().c_str(), "slopstation");
+    REQUIRE_STR_EQ(ours.at("transport").get<std::string>().c_str(), "http");
+    REQUIRE_STR_EQ(ours.at("url").get<std::string>().c_str(), "http://127.0.0.1:8765/mcp");
+    // Tern always gets the env reference, even with plaintext opted in
+    REQUIRE_STR_EQ(ours.at("headers").at("Authorization").get<std::string>().c_str(),
+                   "Bearer ${SLOP_MCP_TOKEN}");
+    REQUIRE(ours.at("enabled") == true);
+    REQUIRE(ours.at("agents").is_array());
+    REQUIRE(ours.at("agents").empty());
+
+    // a user key on our entry survives a port change, and nothing duplicates
+    cfg["agents"]["mcp"][1]["custom"] = 7;
+    spit(tern, cfg.dump(2));
+    const auto second = onboard::install_all(9000, "tok2");
+    REQUIRE(second.at(0).installed);
+    cfg = njson::parse(slurp(tern));
+    REQUIRE_EQ(cfg.at("agents").at("mcp").size(), 2u);
+    REQUIRE_STR_EQ(cfg.at("agents").at("mcp").at(1).at("url").get<std::string>().c_str(),
+                   "http://127.0.0.1:9000/mcp");
+    REQUIRE_EQ(cfg.at("agents").at("mcp").at(1).at("custom").get<int>(), 7);
+
+    // uninstall removes only our entry
+    bool removed = false;
+    for (const auto& r : onboard::uninstall_all())
+        if (r.client == "Tern") removed = r.installed;
+    REQUIRE(removed);
+    cfg = njson::parse(slurp(tern));
+    REQUIRE_EQ(cfg.at("agents").at("mcp").size(), 1u);
+    REQUIRE_STR_EQ(cfg.at("agents").at("mcp").at(0).at("name").get<std::string>().c_str(),
+                   "other");
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(infra_onboard_tern_unparseable_file_left_untouched) {
+    namespace onboard = slop::core::infra::mcp_onboard;
+    scratch_dir_t tmp;
+    env_sandbox_t env(tmp.str());
+    const fs::path tern = tmp.dir / "appdata" / "tern" / "settings.json";
+    spit(tern, "{not json");
+
+    const auto results = onboard::install_all(8765, "tok");
+    REQUIRE_EQ(results.size(), 1u);
+    REQUIRE(!results.at(0).installed);
+    REQUIRE(!results.at(0).error.empty());
+    REQUIRE_STR_EQ(slurp(tern).c_str(), "{not json");
+}
+
+TEST_CASE(infra_onboard_client_and_token_policy) {
+    namespace onboard = slop::core::infra::mcp_onboard;
+    namespace settings = slop::core::infra::settings;
+    scratch_dir_t tmp;
+    env_sandbox_t env(tmp.str());
+    settings::set_file_for_testing(tmp.str("settings.json"));
+    settings::load();
+
+    // no Tern -> every known client; an explicit list wins over the auto policy
+    REQUIRE(onboard::default_clients().size() > 1u);
+    REQUIRE(settings::set("mcp_onboard_clients", njson::array({"Cursor"})));
+    auto results = onboard::install_all(8765, "tok");
+    REQUIRE_EQ(results.size(), 1u);
+    REQUIRE_STR_EQ(results.at(0).client.c_str(), "Cursor");
+    const fs::path cursor = tmp.dir / "profile" / ".cursor" / "mcp.json";
+    REQUIRE(fs::exists(cursor));
+    REQUIRE(!fs::exists(tmp.dir / "profile" / ".codeium" / "windsurf" / "mcp_config.json"));
+
+    // default policy: env reference, no plaintext anywhere
+    REQUIRE(!settings::mcp_token_in_configs());
+    REQUIRE_STR_EQ(njson::parse(slurp(cursor)).at("mcpServers").at("slopstation")
+                       .at("headers").at("Authorization").get<std::string>().c_str(),
+                   "Bearer ${SLOP_MCP_TOKEN}");
+    REQUIRE(onboard::plaintext_token_clients().empty());
+
+    // opting into plaintext rewrites in place and is reported for the warning banner
+    REQUIRE(settings::set("mcp_token_in_configs", true));
+    results = onboard::install_all(8765, "tok");
+    REQUIRE(results.at(0).installed);
+    REQUIRE_STR_EQ(njson::parse(slurp(cursor)).at("mcpServers").at("slopstation")
+                       .at("headers").at("Authorization").get<std::string>().c_str(),
+                   "Bearer tok");
+    const auto flagged = onboard::plaintext_token_clients();
+    REQUIRE_EQ(flagged.size(), 1u);
+    REQUIRE_STR_EQ(flagged.at(0).c_str(), "Cursor");
+
+    // back to the reference clears the warning
+    REQUIRE(settings::set("mcp_token_in_configs", false));
+    onboard::install_all(8765, "tok");
+    REQUIRE(onboard::plaintext_token_clients().empty());
+    settings::set_file_for_testing({});
+}
+
+TEST_CASE(infra_token_generation_is_32_bytes_of_csprng_and_differs) {
+    namespace settings = slop::core::infra::settings;
+    std::vector<std::string> seen;
+    for (int i = 0; i < 16; ++i) {
+        const std::string t = settings::generate_token();
+        REQUIRE_EQ(t.size(), 64u);   // 32 random bytes, hex encoded
+        REQUIRE(t.find_first_not_of("0123456789abcdef") == std::string::npos);
+        REQUIRE(std::find(seen.begin(), seen.end(), t) == seen.end());
+        seen.push_back(t);
+    }
 }
 
 // === concurrency regressions ===

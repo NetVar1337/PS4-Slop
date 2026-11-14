@@ -47,6 +47,10 @@ std::mutex               g_tok_mu;
 std::string              g_primary_token;
 std::vector<std::string> g_extra_tokens;
 
+// --insecure-dev: a tokenless request from a loopback browser is accepted.
+// Off by default, so any local process still needs the bearer token.
+std::atomic<bool> g_insecure_dev{false};
+
 // server issued Mcp-Session-Id values, oldest evicted past the cap
 constexpr size_t                kMaxSessions = 1024;
 std::mutex                      g_sess_mu;
@@ -138,6 +142,10 @@ auth_t check_token(std::string_view presented) {
 
 auth_t authorize(const httplib::Request& req) {
     const std::string auth = req.get_header_value("Authorization");
+    // audit 103: loopback is not proof of identity, so a tokenless request is
+    // accepted only when the engine was started with --insecure-dev. A wrong
+    // bearer is still rejected in that mode.
+    if (auth.empty() && g_insecure_dev.load()) return auth_t::open;
     std::string_view presented;
     if (auth.size() > 7 && lower(std::string_view(auth).substr(0, 7)) == "bearer ")
         presented = std::string_view(auth).substr(7);
@@ -469,6 +477,7 @@ bool start(const server_config_t& cfg) {
         for (const auto& t : cfg.extra_tokens)
             if (!t.empty()) g_extra_tokens.push_back(t);
     }
+    g_insecure_dev = cfg.insecure_dev;
     g_max_streams = std::max<size_t>(1, cfg.max_streams);
     auto srv = std::make_unique<httplib::Server>();
     // httplib's default SO_REUSEADDR lets a second process bind the same

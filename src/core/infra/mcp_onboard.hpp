@@ -18,7 +18,8 @@ struct install_result_t {
 };
 
 // runs the whole sweep, one result per client; an existing entry with a stale
-// url/token is rewritten in place (user added keys are kept)
+// url/token is rewritten in place (user added keys are kept). The client list
+// comes from mcp_onboard_clients, or default_clients() when that is unset
 std::vector<install_result_t> install_all(uint16_t port, const std::string& token);
 
 // only refreshes entries we already wrote (port/token changed), never adds new ones
@@ -26,5 +27,13 @@ std::vector<install_result_t> refresh_existing(uint16_t port, const std::string&
 
 // removes everything we wrote, for an uninstall button
 std::vector<install_result_t> uninstall_all();
+
+// auto policy: Tern alone when its settings.json exists (it keeps every other
+// MCP server centrally), else every client we know about
+std::vector<std::string> default_clients();
+
+// clients whose config still carries a literal bearer token instead of the
+// ${SLOP_MCP_TOKEN} reference (audit item 72, shown as a warning in Settings)
+std::vector<std::string> plaintext_token_clients();
 
 } // namespace slop::core::infra::mcp_onboard

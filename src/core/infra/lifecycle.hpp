@@ -29,6 +29,8 @@ const char* stage_status(stage_t row) noexcept;
 struct config_t {
     // register the mcp endpoint into ai clients on first run
     bool mcp_onboarding = true;
+    // --insecure-dev: accept tokenless loopback requests (browser dev mode)
+    bool insecure_dev = false;
 };
 
 struct boot_result_t {

@@ -1954,6 +1954,31 @@ TEST_CASE(mcp_auth_rejects_missing_or_bad_tokens_with_rpc_shape) {
     REQUIRE_EQ(health->status, 200);
 }
 
+TEST_CASE(mcp_insecure_dev_allows_tokenless_loopback_only_with_flag) {
+    slop::core::mcp::server_config_t cfg = token_cfg();
+    cfg.insecure_dev = true;
+    server_fixture_t fx(cfg);
+    const std::string body = rpc_body("ping").dump();
+
+    // audit 103: the flag, and only the flag, opens tokenless loopback access
+    auto none = fx.cli_->Post("/mcp", body, "application/json");
+    REQUIRE(none);
+    REQUIRE_EQ(none->status, 200);
+    // a wrong bearer is still refused in dev mode
+    auto bad = fx.cli_->Post("/mcp", bearer(std::string(64, 'c')), body, "application/json");
+    REQUIRE(bad);
+    REQUIRE_EQ(bad->status, 401);
+    // the real token keeps working
+    auto good = fx.cli_->Post("/mcp", bearer(kTok), body, "application/json");
+    REQUIRE(good);
+    REQUIRE_EQ(good->status, 200);
+    // /api is gated by the same rule
+    const json api = {{"tool", "app"}, {"action", "status"}};
+    auto api_none = fx.cli_->Post("/api", api.dump(), "application/json");
+    REQUIRE(api_none);
+    REQUIRE_EQ(api_none->status, 200);
+}
+
 TEST_CASE(mcp_host_and_origin_guard_and_cors) {
     server_fixture_t fx;
     const std::string body = rpc_body("ping").dump();
@@ -2192,11 +2217,24 @@ TEST_CASE(mcp_app_settings_api_redacts_and_validates) {
 
     json got = fx.api("app", "settings_get").at("data");
     REQUIRE_STR_EQ(got.at("mcp_token").get<std::string>().c_str(), "set");
+    REQUIRE(got.contains("mcp_plaintext_configs"));
 
     REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_token"}, {"value", "x"}})
                  .value("ok", true));
     REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_port"}, {"value", 70000}})
                  .value("ok", true));
+    // the onboarding policy keys are typed too
+    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_token_in_configs"}, {"value", "x"}})
+                 .value("ok", true));
+    REQUIRE(!fx.api("app", "settings_set", {{"key", "mcp_onboard_clients"}, {"value", "Tern"}})
+                 .value("ok", true));
+    REQUIRE(fx.api("app", "settings_set",
+                   {{"key", "mcp_onboard_clients"}, {"value", json::array({"Tern"})}})
+                .value("ok", false));
+    REQUIRE(fx.api("app", "settings_set", {{"key", "mcp_token_in_configs"}, {"value", true}})
+                .value("ok", false));
+    REQUIRE(slop::core::infra::settings::mcp_token_in_configs());
+    REQUIRE_EQ(slop::core::infra::settings::mcp_onboard_clients().size(), 1u);
     json set = fx.api("app", "settings_set", {{"key", "script_unsafe"}, {"value", true}})
                    .at("data");
     REQUIRE(set.value("ok", false));
@@ -2251,6 +2289,54 @@ TEST_CASE(mcp_rotate_token_applies_live) {
     auto with_new = fx.cli_->Post("/mcp", bearer(std::string(64, 'd')), rpc_body("ping").dump(),
                                   "application/json");
     REQUIRE_EQ(with_new->status, 200);
+}
+
+TEST_CASE(mcp_rotate_token_respects_config_token_policy) {
+    scratch_settings_t scratch;
+    namespace settings = slop::core::infra::settings;
+    const auto cursor = scratch.dir / "profile" / ".cursor" / "mcp.json";
+    std::filesystem::create_directories(cursor.parent_path());
+    {
+        std::ofstream f(cursor);
+        f << R"({"mcpServers":{"slopstation":{"url":"http://127.0.0.1:1/mcp","headers":{"Authorization":"Bearer old"}}}})";
+    }
+    REQUIRE(settings::set("mcp_onboard_clients", json::array({"Cursor"})));
+    REQUIRE(!settings::mcp_token_in_configs());
+
+    slop::core::mcp::server_config_t cfg;
+    cfg.token = settings::mcp_token();
+    cfg.extra_tokens = {kExtra};
+    server_fixture_t fx(cfg);
+    const json req = {{"tool", "app"}, {"action", "rotate_token"}};
+
+    auto res = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
+    REQUIRE(res);
+    const json out = json::parse(res->body).at("data");
+    REQUIRE(out.value("rotated", false));
+    const std::string fresh = out.at("token").get<std::string>();
+
+    auto read_cursor = [&] {
+        std::ifstream f(cursor);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        return ss.str();
+    };
+    // policy off: the config gets the env reference, never the new plaintext
+    std::string text = read_cursor();
+    REQUIRE_STR_EQ(json::parse(text).at("mcpServers").at("slopstation").at("headers")
+                       .at("Authorization").get<std::string>().c_str(),
+                   "Bearer ${SLOP_MCP_TOKEN}");
+    REQUIRE(text.find(fresh) == std::string::npos);
+
+    // policy on: the rotated token is written through
+    REQUIRE(settings::set("mcp_token_in_configs", true));
+    auto res2 = fx.cli_->Post("/api", bearer(kExtra), req.dump(), "application/json");
+    REQUIRE(res2);
+    const std::string fresh2 = json::parse(res2->body).at("data").at("token").get<std::string>();
+    text = read_cursor();
+    REQUIRE_STR_EQ(json::parse(text).at("mcpServers").at("slopstation").at("headers")
+                       .at("Authorization").get<std::string>().c_str(),
+                   ("Bearer " + fresh2).c_str());
 }
 
 TEST_CASE(mcp_fs_read_file_pages) {

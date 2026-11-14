@@ -20,6 +20,7 @@ struct server_config_t {
     uint16_t    port  = 8765;
     std::string token;                        // primary bearer (settings mcp_token); empty = no auth
     std::vector<std::string> extra_tokens;    // also accepted, e.g. the supervisor's per-launch token
+    bool        insecure_dev = false;         // --insecure-dev only: accept tokenless loopback requests
     size_t      worker_threads = 48;          // http workers; sse streams are capped well below this
     size_t      max_streams    = 16;          // concurrent GET /mcp + GET /events streams
 };

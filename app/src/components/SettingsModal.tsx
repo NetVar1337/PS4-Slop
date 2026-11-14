@@ -88,6 +88,7 @@ export default function SettingsModal({ onClose }: Props) {
   } = useSettings();
   const [allowlist, setAllowlist] = useState("");
   const [proxyToken, setProxyToken] = useState("");
+  const [onboardClients, setOnboardClients] = useState("");
   const [confirmRotate, setConfirmRotate] = useState(false);
   const [appVersion, setAppVersion] = useState("");
   const endpoint = getEndpoint();
@@ -120,7 +121,8 @@ export default function SettingsModal({ onClose }: Props) {
   useEffect(() => {
     setAllowlist((settings?.web_allowlist ?? []).join("\n"));
     setProxyToken(typeof settings?.proxy_token === "string" ? settings.proxy_token : "");
-  }, [settings?.web_allowlist, settings?.proxy_token]);
+    setOnboardClients((settings?.mcp_onboard_clients ?? []).join("\n"));
+  }, [settings?.web_allowlist, settings?.proxy_token, settings?.mcp_onboard_clients]);
 
   // The MCP endpoint is the one value here a user needs outside the app,
   // wiring an MCP client by hand, so it gets a copy affordance
@@ -147,6 +149,17 @@ export default function SettingsModal({ onClose }: Props) {
       .filter((h) => h !== "");
     void setValue("web_allowlist", hosts);
   };
+
+  const saveOnboardClients = () => {
+    const clients = onboardClients
+      .split(/[\n,]+/)
+      .map((c) => c.trim())
+      .filter((c) => c !== "");
+    void setValue("mcp_onboard_clients", clients);
+  };
+
+  const plaintextConfigs = settings?.mcp_plaintext_configs ?? [];
+  const setxCommand = 'setx SLOP_MCP_TOKEN "<engine token>"';
 
   return (
     <Modal title="Settings" onClose={onClose}>
@@ -230,7 +243,12 @@ export default function SettingsModal({ onClose }: Props) {
               <span className="settings-copy-text">mcp: {mcpUrl}</span>
               <CopyButton text={mcpUrl} tip="Copy MCP URL" />
             </div>
-            <div>ui auth: {endpoint.token === "" ? "none (browser dev mode)" : "bearer token"}</div>
+            <div>
+              ui auth:{" "}
+              {endpoint.token === ""
+                ? "none (browser dev mode; start the engine with --insecure-dev)"
+                : "bearer token"}
+            </div>
           </div>
         </fieldset>
 
@@ -267,6 +285,21 @@ export default function SettingsModal({ onClose }: Props) {
               </strong>
               ; the engine never returns its value.
             </div>
+            <div className="settings-copy-row">
+              <span className="settings-copy-text mono">{setxCommand}</span>
+              <CopyButton text={setxCommand} tip="Copy setx command" />
+            </div>
+            <div className="faint">
+              Client configs reference <code>${"${SLOP_MCP_TOKEN}"}</code>; set that user
+              environment variable once with the command above (it is not set for you) and
+              restart the client.
+            </div>
+            {plaintextConfigs.length > 0 && (
+              <div className="settings-status" role="alert">
+                Plaintext token in: {plaintextConfigs.join(", ")}. Regenerate the token, or
+                turn off “Write the token into client configs” and restart the engine.
+              </div>
+            )}
             {revealedToken !== null && (
               <div className="settings-copy-row mono">
                 <span className="settings-copy-text" data-testid="revealed-token">
@@ -353,6 +386,26 @@ export default function SettingsModal({ onClose }: Props) {
                 if (proxyToken !== (settings?.proxy_token ?? ""))
                   void setValue("proxy_token", proxyToken);
               }}
+            />
+          </label>
+          <Toggle
+            label="Write the token into client configs"
+            hint="Off: configs reference ${SLOP_MCP_TOKEN}. On: the literal bearer is written to every onboarded client config."
+            checked={settings?.mcp_token_in_configs === true}
+            onChange={(v) => void setValue("mcp_token_in_configs", v)}
+          />
+          <label className="settings-field">
+            <span>
+              Onboarding clients (one per line; empty = auto: Tern when installed, else every
+              known client)
+            </span>
+            <textarea
+              className="code-area mono settings-textarea"
+              value={onboardClients}
+              rows={3}
+              spellCheck={false}
+              onChange={(e) => setOnboardClients(e.target.value)}
+              onBlur={saveOnboardClients}
             />
           </label>
           {restartRequired.length > 0 && (
