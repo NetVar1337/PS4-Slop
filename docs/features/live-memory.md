@@ -8,7 +8,12 @@ The `memory` tool works on the console session and on a local Windows process al
 - AOB wildcard search, pointer-chain scans and verification, signature generation, live
   crypto-constant search.
 - Memory snapshots with compare/list/free; `scan_save`/`scan_load` persist an address-list
-  scan across restarts.
+  scan across restarts, and `scan_export {path}` writes the current hit set as
+  `address,type,value` CSV.
+- `dissect {addr, size}` classifies what each 8-byte slot of an unknown object is: pointer
+  to code, object or string, float, double, integer, or text.
+- `watch_export_ct {path}` / `watch_import_ct {path}` move the watchlist to and from a
+  Cheat Engine `.CT` table.
 - `offsets_verify`: fingerprint-gated offset manifests. A manifest pins the build (title
   ID, app version, SHA-256 of the module's executable segment) and gives every offset an
   anchor signature that must match exactly once; any mismatch returns no addresses at all.
@@ -68,7 +73,18 @@ explicit chains (or the last pointerscan of this target) against the current ses
 { "tool": "memory", "action": "snapshots", "params": {} }
 ```
 
-`diff` takes two snapshot ids and returns the changed `offset`/`length` ranges.
+`diff` takes two snapshot ids and returns the changed `offset`/`length` ranges;
+`snapshot_free {id}` releases one, and `snapshots` lists what is held.
+
+## Dissecting an unknown object
+
+```json
+{ "tool": "memory", "action": "dissect", "params": { "addr": "0x2004A0000", "size": 256 } }
+```
+
+`size` defaults to 256 bytes and is capped at 4096; the reply labels every 8-byte slot as a
+pointer to code, object or string, a float, a double, an integer or text, so an unknown
+structure can be mapped before `types.declare` describes it.
 
 ## Offsets that survive a game update
 

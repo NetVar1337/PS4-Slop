@@ -53,6 +53,9 @@ order. `SUMMARY.md` itself is not indexed.
 ## Notes for the consuming UI
 
 - The index is static: rebuild it when the docs change (the `docs` workflow does).
+- The Tauri app consumes it: `npm run help:index` (in `app/`) writes
+  `src/generated/help-index.json`, which the command palette loads lazily for its **Help**
+  results. `predev`/`prebuild` run it, so a fresh checkout needs no extra step.
 - Anchors are generated the way mdBook generates them (lowercase, punctuation dropped,
   spaces to `-`, `-1`, `-2`… for duplicates). If a heading is renamed, the anchor changes —
   treat `url` as opaque.

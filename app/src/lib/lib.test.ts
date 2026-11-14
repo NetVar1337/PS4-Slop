@@ -8,6 +8,7 @@ import {
   parseAddress,
 } from "@/lib/format";
 import { batch, call, TimeoutError, ToolError } from "@/lib/rpc";
+import { searchHelp } from "@/lib/help";
 import { handleShortcut } from "@/lib/shortcuts";
 import { useUi } from "@/store/ui";
 import { mockApi } from "@/test/api";
@@ -109,5 +110,37 @@ describe("shortcuts (item 91)", () => {
 
   it("ignores plain keys", () => {
     expect(handleShortcut(new KeyboardEvent("keydown", { key: "k" }))).toBe(false);
+  });
+});
+
+describe("help search (item 85)", () => {
+  const entries = [
+    {
+      title: "Live memory",
+      anchor: "live-memory",
+      section: "Live memory",
+      text: "Read and write console memory; hex, UTF-8, integer and float.",
+      url: "features/live-memory.html#live-memory",
+      path: "features/live-memory.md",
+    },
+    {
+      title: "Breakpoints",
+      anchor: "breakpoints",
+      section: "Breakpoints",
+      text: "Hardware and software breakpoints on the live memory of the console.",
+      url: "features/live-debugging.html#breakpoints",
+      path: "features/live-debugging.md",
+    },
+  ];
+
+  it("ranks a title hit above a body hit and needs every term", () => {
+    expect(searchHelp(entries, "memory").map((e) => e.title)).toEqual([
+      "Live memory",
+      "Breakpoints",
+    ]);
+    expect(searchHelp(entries, "memory breakpoints").map((e) => e.title)).toEqual(["Breakpoints"]);
+    expect(searchHelp(entries, "  ")).toEqual([]);
+    expect(searchHelp(entries, "nonexistent")).toEqual([]);
+    expect(searchHelp(entries, "memory", 1)).toHaveLength(1);
   });
 });

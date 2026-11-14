@@ -7,6 +7,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Command } from "cmdk";
 import { openBinary } from "@/lib/openBinary";
 import { browserLabel, hex, parseAddress } from "@/lib/format";
+import { loadHelpIndex, openHelp, searchHelp, type HelpEntry } from "@/lib/help";
 import { functionLabel, useDisasm, type FunctionRow } from "@/store/disasm";
 import { useDecomp } from "@/store/decomp";
 import { useEngine } from "@/store/engine";
@@ -25,6 +26,7 @@ type Action = {
 
 const kSearchLimit = 50;
 const kSearchDebounceMs = 120;
+const kHelpLimit = 8;
 
 export default function CommandPalette() {
   const open = useUi((s) => s.paletteOpen);
@@ -41,10 +43,24 @@ export default function CommandPalette() {
   const setTheme = useTheme((s) => s.setTheme);
   const [query, setQuery] = useState("");
   const [found, setFound] = useState<FunctionRow[]>([]);
+  const [help, setHelp] = useState<HelpEntry[]>([]);
 
   useEffect(() => {
     if (!open) setQuery("");
   }, [open]);
+
+  // The docs index is a generated chunk: load it the first time the palette
+  // opens, never at startup
+  useEffect(() => {
+    if (!open) return;
+    let alive = true;
+    void loadHelpIndex().then((entries) => alive && setHelp(entries));
+    return () => {
+      alive = false;
+    };
+  }, [open]);
+
+  const helpHits = useMemo(() => searchHelp(help, query.trim(), kHelpLimit), [help, query]);
 
   // Function search is server-side: the list can hold far more functions
   // than the UI ever loads
@@ -225,6 +241,23 @@ export default function CommandPalette() {
               >
                 <span className="mono">{functionLabel(fn)}</span>
                 <span className="palette-hint mono">{hex(fn.va, 1)}</span>
+              </Command.Item>
+            ))}
+          </Command.Group>
+        )}
+
+        {helpHits.length > 0 && (
+          <Command.Group heading="Help">
+            {helpHits.map((e) => (
+              <Command.Item
+                key={`${e.path}#${e.anchor}`}
+                // cmdk filters on `value`, so the excerpt has to be in it or a
+                // body-text match from searchHelp would be dropped again
+                value={`help ${e.title} ${e.section} ${e.path} ${e.text}`}
+                onSelect={runAndClose(() => void openHelp(e.url))}
+              >
+                <span>{e.title}</span>
+                <span className="palette-hint">{e.path.replace(/\.md$/, "")}</span>
               </Command.Item>
             ))}
           </Command.Group>

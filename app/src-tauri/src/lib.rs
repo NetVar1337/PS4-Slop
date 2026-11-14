@@ -59,6 +59,34 @@ fn open_path(path: String) -> Result<(), String> {
         .map_err(|e| format!("cannot open {path}: {e}"))
 }
 
+/// Open an http(s) URL in the default browser (the command palette's help
+/// results). Only http(s) is accepted: a docs result must never hand the shell
+/// an arbitrary scheme.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) URLs can be opened".into());
+    }
+    std::process::Command::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", &url])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("cannot open {url}: {e}"))
+}
+
+/// Write a UTF-8 text file the user picked in a save dialog (Settings layout
+/// export). The dialog owns the path choice; this only does the write.
+#[tauri::command]
+fn write_text_file(path: String, text: String) -> Result<(), String> {
+    std::fs::write(&path, text).map_err(|e| format!("cannot write {path}: {e}"))
+}
+
+/// Read a UTF-8 text file the user picked in an open dialog (layout import).
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))
+}
+
 /// where the engine binary lives: next to us once installed; debug builds
 /// check the cmake tree first on purpose, tauri copies the resource engine at
 /// cargo build time and a stale copy cost an afternoon of debugging once
@@ -215,6 +243,9 @@ pub fn run() {
             engine_status,
             restart_engine,
             open_path,
+            open_url,
+            write_text_file,
+            read_text_file,
             payload::ps4debug_payload,
             payload::ps4debug_payload_latest,
             payload::ps4debug_payload_download,

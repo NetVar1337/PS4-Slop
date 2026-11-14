@@ -5,8 +5,9 @@ import { functionLabel, kFilterDebounceMs, rowAt, useDisasm } from "@/store/disa
 import { useMemory } from "@/store/memory";
 import { kFlushMs, useOutput } from "@/store/output";
 import { readShowHost, useTargets } from "@/store/targets";
-import { kThemes } from "@/store/theme";
-import { parseLayout, useUi } from "@/store/ui";
+import { kThemes, useTheme } from "@/store/theme";
+import { useMotion } from "@/store/motion";
+import { layoutChanges, layoutFile, parseLayout, parseLayoutFile, useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import * as events from "@/lib/events";
 import { flushPromises, mockApi } from "@/test/api";
@@ -431,6 +432,42 @@ describe("layout + themes (items 107, 116, 117)", () => {
     expect(parseLayout(JSON.stringify({ rail: "bogus", sizes: { "--left-w": -5 } })).sizes).toEqual(
       {},
     );
+    useUi.getState().resetLayout();
+  });
+
+  it("round-trips a layout file and refuses a bad one (item 90)", () => {
+    useUi.getState().setSize("--left-w", 420);
+    useUi.getState().setRail("modules");
+    useUi.getState().setWorkspaceTab("memory");
+    useTheme.getState().setTheme("daylight");
+    useMotion.getState().setMotion("off");
+    const file = layoutFile();
+
+    useUi.getState().resetLayout();
+    useTheme.getState().setTheme("obsidian");
+    useMotion.getState().setMotion("auto");
+    const parsed = parseLayoutFile(JSON.stringify(file));
+    expect(layoutChanges(layoutFile(), parsed)).toEqual(
+      expect.arrayContaining(["theme obsidian → daylight", "rail targets → modules"]),
+    );
+
+    useUi.getState().importLayout(parsed);
+    expect(useUi.getState().rail).toBe("modules");
+    expect(useUi.getState().workspaceTab).toBe("memory");
+    expect(useUi.getState().sizes["--left-w"]).toBe(420);
+    expect(useTheme.getState().theme).toBe("daylight");
+    expect(useMotion.getState().motion).toBe("off");
+    // the import persists like any other layout change
+    expect(parseLayout(localStorage.getItem("reverse-slop.layout")).rail).toBe("modules");
+
+    expect(() => parseLayoutFile(JSON.stringify({ ...file, version: 99 }))).toThrow(/version/);
+    expect(() => parseLayoutFile(JSON.stringify({ ...file, theme: "neon" }))).toThrow(/theme/);
+    expect(() => parseLayoutFile(JSON.stringify({ ...file, rail: "bogus" }))).toThrow(/rail/);
+    expect(() => parseLayoutFile("{oops")).toThrow(/JSON/);
+    expect(useUi.getState().rail).toBe("modules");
+
+    useTheme.getState().setTheme("obsidian");
+    useMotion.getState().setMotion("auto");
     useUi.getState().resetLayout();
   });
 

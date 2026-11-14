@@ -12,10 +12,12 @@ import Modal from "@/components/Modal";
 import { call, getEndpoint } from "@/lib/rpc";
 import { copyText } from "@/lib/clipboard";
 import { isTauri } from "@/lib/endpoint";
+import { readLayoutFile, saveLayoutFile } from "@/lib/layoutFile";
 import { useEngine } from "@/store/engine";
 import { kMotionOptions, osPrefersReduced, useMotion } from "@/store/motion";
 import { useSettings } from "@/store/settings";
 import { kThemes, useTheme } from "@/store/theme";
+import { layoutChanges, layoutFile, parseLayoutFile, useUi } from "@/store/ui";
 import { useUpdater } from "@/store/updater";
 
 type Props = { onClose: () => void };
@@ -94,6 +96,7 @@ export default function SettingsModal({ onClose }: Props) {
   const [appVersion, setAppVersion] = useState("");
   const [diag, setDiag] = useState<string | null>(null);
   const [diagBusy, setDiagBusy] = useState(false);
+  const [layoutStatus, setLayoutStatus] = useState<string | null>(null);
   const endpoint = getEndpoint();
   const updatePhase = useUpdater((s) => s.phase);
   const updateVersion = useUpdater((s) => s.version);
@@ -164,6 +167,31 @@ export default function SettingsModal({ onClose }: Props) {
 
   const plaintextConfigs = settings?.mcp_plaintext_configs ?? [];
   const setxCommand = 'setx SLOP_MCP_TOKEN "<engine token>"';
+
+  // Support hand-off: one JSON file carries the shell layout, theme and motion
+  const exportLayout = async () => {
+    try {
+      const path = await saveLayoutFile(`${JSON.stringify(layoutFile(), null, 2)}\n`);
+      if (path !== null) setLayoutStatus(`Exported to ${path}`);
+    } catch (e) {
+      setLayoutStatus(`Export failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const importLayout = async () => {
+    try {
+      const raw = await readLayoutFile();
+      if (raw === null) return;
+      const file = parseLayoutFile(raw);
+      const changes = layoutChanges(layoutFile(), file);
+      useUi.getState().importLayout(file);
+      setLayoutStatus(
+        changes.length === 0 ? "Imported: nothing changed." : `Imported: ${changes.join(", ")}`,
+      );
+    } catch (e) {
+      setLayoutStatus(`Import failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
 
   // one zip a user can attach to a bug report: engine log tail, redacted
   // settings, versions and the console status (engine side: app.diag_bundle)
@@ -236,6 +264,29 @@ export default function SettingsModal({ onClose }: Props) {
               transitions; “On” overrides it.
             </div>
           )}
+        </fieldset>
+
+        <fieldset className="settings-group">
+          <legend className="settings-label">Layout</legend>
+          <div className="settings-rows">
+            <div className="faint">
+              Panels, splitter sizes, active tab, theme and motion in one JSON file, for a support
+              hand-off or a second machine.
+            </div>
+            <div className="settings-choices">
+              <button type="button" className="row-action" onClick={() => void exportLayout()}>
+                Export layout…
+              </button>
+              <button type="button" className="row-action" onClick={() => void importLayout()}>
+                Import layout…
+              </button>
+            </div>
+            {layoutStatus !== null && (
+              <div className="settings-status mono" role="status">
+                {layoutStatus}
+              </div>
+            )}
+          </div>
         </fieldset>
 
         <fieldset className="settings-group">

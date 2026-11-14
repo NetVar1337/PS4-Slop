@@ -37,6 +37,13 @@ sees the same functions, names, comments and patches.
 `load` takes `base` (rebase the image to a runtime base, 0 keeps its own) and `relocate`
 (default true; pass `false` for memory dumps, whose bytes are already relocated). Poll
 `loaded` until `image.hype.ready` before using the decompiler or the analyzer database.
+`analyze_stop` cancels a background analysis cooperatively (it returns fast when the
+analysis already finished), and `unload` drops the session.
+
+`load_self {path, decrypted_dump?}` inspects a PS4 SELF: retail `eboot.bin`/`.sprx`
+segments are encrypted with keys that never leave the console, so the action either loads
+the decrypted dump you point it at or explains how to get one
+(`target.ps4_dump_module` from live memory, or fpkg tooling).
 
 In the app, opening a file is the same call. The **Image Browser** tab shows sections,
 imports and exports.
@@ -56,6 +63,22 @@ imports and exports.
 | `globals`, `vtables` | analyzer databases |
 | `pe`, `managed` | headers/imports/exports, .NET metadata |
 | `disassemble {addr, count}`, `assemble {asm, base, syntax}` | instruction text both ways |
+
+## Annotations and structs
+
+`notes.set_comment`/`notes.get_comment`/`notes.comments` and
+`notes.bookmark_toggle`/`notes.bookmarks` hold the analyst layer; `notes.export {path}` and
+`notes.import {path, merge}` move it as `symbols/<hash>.json` between machines
+(`merge` is `ours`, `theirs` or `union`). `types.declare`, `types.create_struct`,
+`types.add_member`, `types.remove_struct`, `types.create_enum`/`types.remove_enum`,
+`types.read_field` and `types.format_at` describe and read your own structures.
+
+## Binary diff jobs
+
+`analyze.diff {path_a, path_b}` runs two full Hyperion analyses synchronously and can take
+a while on large binaries. `analyze.diff_start {path_a, path_b}` returns a job id instead;
+poll `analyze.diff_job {id}` for `stage`/`progress` and stop it with
+`analyze.diff_cancel {id}`. Up to 32 jobs are tracked.
 
 ## Patching
 

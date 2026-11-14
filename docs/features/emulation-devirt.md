@@ -18,7 +18,36 @@
 The code source is `hex`, `file_addr` (an address in the loaded image) or `target_addr`
 (live memory, with `code_len`); `entry` overrides the start address, `count` caps
 instructions, `until` stops at an address, and `page_in` (default true) faults pages in from
-the image or the target on demand.
+the image or the target on demand. `arch` accepts `x64`/`x86_64`/`amd64` or
+`arm64`/`aarch64`, and `orbis_syscalls:true` services PS4 syscalls.
+
+### Slices from a recorded trace
+
+```json
+{ "tool": "emulate", "action": "slice",
+  "params": { "trace_id": 1, "reg": "rax", "at": "0x140001020" } }
+```
+
+`run` with `trace:true` returns a `trace_id` (the last eight traces stay addressable).
+`slice` walks that trace backwards from `at` (or from the instruction that last wrote
+`reg`, or from `addr`) and returns the instructions that produced the value.
+
+### Persistent sessions
+
+```json
+{ "tool": "emulate", "action": "session_create",
+  "params": { "file_addr": "0x140001000", "count": 0 } }
+{ "tool": "emulate", "action": "session_run", "params": { "session": 1, "count": 500 } }
+{ "tool": "emulate", "action": "session_step", "params": { "session": 1 } }
+{ "tool": "emulate", "action": "snapshot", "params": { "session": 1 } }
+{ "tool": "emulate", "action": "restore", "params": { "session": 1 } }
+{ "tool": "emulate", "action": "session_destroy", "params": { "session": 1 } }
+```
+
+A session keeps the VM between calls: `session_step` runs one instruction, `session_run`
+runs `count` (0 = until a stop condition, 5 s default budget), and every reply carries the
+register state. `snapshot` checkpoints the pages written so far and `restore` returns to the
+newest checkpoint; up to eight sessions are live at once.
 
 ## Devirtualization
 

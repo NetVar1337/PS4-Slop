@@ -19,6 +19,7 @@ import TargetsPanel from "@/components/panels/TargetsPanel";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
 import { hex } from "@/lib/format";
 import { setEndpoint } from "@/lib/rpc";
+import { readLayoutFile, saveLayoutFile } from "@/lib/layoutFile";
 import { useDebugger } from "@/store/debugger";
 import { useDecomp } from "@/store/decomp";
 import { useDisasm } from "@/store/disasm";
@@ -26,6 +27,7 @@ import { useEngine } from "@/store/engine";
 import { useMemory } from "@/store/memory";
 import { useSettings } from "@/store/settings";
 import { useTargets } from "@/store/targets";
+import { useTheme } from "@/store/theme";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { mockApi } from "@/test/api";
@@ -44,6 +46,32 @@ vi.mock("@/lib/endpoint", async (importOriginal) => {
   const actual = await importOriginal<Record<string, unknown>>();
   return { ...actual, isTauri: () => true };
 });
+
+// the help index is a generated build artifact and the layout file goes
+// through the native dialogs; both are pinned so the tests stay deterministic
+const helpMock = vi.hoisted(() => ({
+  entries: [
+    {
+      title: "Live memory",
+      anchor: "live-memory",
+      section: "Live memory",
+      text: "Read and write console memory.",
+      url: "features/live-memory.html#live-memory",
+      path: "features/live-memory.md",
+    },
+  ],
+  openHelp: vi.fn(async () => undefined),
+}));
+
+vi.mock("@/lib/help", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return { ...actual, loadHelpIndex: async () => helpMock.entries, openHelp: helpMock.openHelp };
+});
+
+vi.mock("@/lib/layoutFile", () => ({
+  saveLayoutFile: vi.fn(async () => "C:\\tmp\\slopstation-layout.json"),
+  readLayoutFile: vi.fn(async () => null),
+}));
 
 const initial = {
   engine: useEngine.getState(),
@@ -424,6 +452,34 @@ describe("settings modal (items 92, settings API)", () => {
     await userEvent.click(screen.getByRole("button", { name: "Confirm regenerate" }));
     expect(await screen.findByTestId("revealed-token")).toHaveTextContent(newToken);
   });
+
+  it("exports the shell layout and applies an imported one (item 90)", async () => {
+    mockApi(() => ({}));
+    useTheme.getState().setTheme("obsidian");
+    useUi.getState().setSize("--left-w", 340);
+    render(<SettingsModal onClose={() => undefined} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Export layout…" }));
+    expect(await screen.findByRole("status")).toHaveTextContent("slopstation-layout.json");
+    const text = vi.mocked(saveLayoutFile).mock.calls[0]?.[0] ?? "";
+    const exported = JSON.parse(text) as Record<string, unknown>;
+    expect(exported).toMatchObject({ version: 1, rail: "targets", theme: "obsidian" });
+    expect(exported.sizes).toEqual({ "--left-w": 340 });
+
+    vi.mocked(readLayoutFile).mockResolvedValueOnce(
+      JSON.stringify({ ...exported, rail: "modules", theme: "daylight" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Import layout…" }));
+    await waitFor(() => expect(useUi.getState().rail).toBe("modules"));
+    expect(useTheme.getState().theme).toBe("daylight");
+    expect(screen.getByRole("status")).toHaveTextContent("theme obsidian → daylight");
+
+    // a file from another build is refused and nothing is applied
+    vi.mocked(readLayoutFile).mockResolvedValueOnce('{"version":1,"rail":"bogus"}');
+    await userEvent.click(screen.getByRole("button", { name: "Import layout…" }));
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("Import failed"));
+    expect(useUi.getState().rail).toBe("modules");
+    useTheme.getState().setTheme("obsidian");
+  });
 });
 
 describe("splash (items 97, 101)", () => {
@@ -523,6 +579,17 @@ describe("command palette (item 123)", () => {
     await userEvent.click(item);
     expect(calls.find((c) => c.action === "functions")?.params.filter).toBe("Player");
     await waitFor(() => expect(useDisasm.getState().selected).toBe(0x4dda48));
+  });
+
+  it("searches the generated docs index and opens the page (item 85)", async () => {
+    mockApi(() => ({}));
+    render(<CommandPalette />);
+    act(() => useUi.getState().setPaletteOpen(true));
+    await userEvent.type(await screen.findByPlaceholderText(/Type a command/), "live memory");
+    const item = await screen.findByText("Live memory");
+    expect(screen.getByText("features/live-memory")).toBeInTheDocument();
+    await userEvent.click(item);
+    expect(helpMock.openHelp).toHaveBeenCalledWith("features/live-memory.html#live-memory");
   });
 });
 

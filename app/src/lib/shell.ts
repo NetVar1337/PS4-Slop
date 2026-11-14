@@ -10,3 +10,12 @@ export async function openPath(path: string): Promise<void> {
   if (!isTauri() || path === "") return;
   await invoke("open_path", { path });
 }
+
+/** Open an http(s) URL in the default browser; a new tab in browser dev. */
+export async function openUrl(url: string): Promise<void> {
+  if (!isTauri()) {
+    window.open(url, "_blank", "noopener");
+    return;
+  }
+  await invoke("open_url", { url });
+}
