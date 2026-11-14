@@ -1,0 +1,281 @@
+name: release
+
+# Tag releases reuse the artifacts from the successful main build of the same
+# commit, so a release is packaging + publishing only (~2-3 min) instead of a
+# full rebuild. The main build already ran the tests and the frontend gate.
+on:
+  push:
+    tags: ['v*', '[0-9]*']
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
+  CARGO_PROFILE_RELEASE_LTO: false
+  CARGO_PROFILE_RELEASE_STRIP: true
+  CARGO_NET_RETRY: 10
+  CMAKE_DISABLE_FIND_PACKAGE_PkgConfig: TRUE
+  CMAKE_DISABLE_FIND_PACKAGE_Doxygen: TRUE
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: check versions
+        shell: pwsh
+        run: ./tools/sync_version.ps1 -Check -Tag ${{ github.ref_name }}
+
+  bundle:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    needs: version
+    env:
+      SIGNING_ENABLED: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_TENANT_ID != '' && secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_SIGNING_ENDPOINT != '' && secrets.AZURE_SIGNING_ACCOUNT != '' && secrets.AZURE_SIGNING_PROFILE != '' }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: setup node with npm cache
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: cache node_modules (exact lockfile only)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: app/node_modules
+          key: node-v2-${{ runner.os }}-22-${{ hashFiles('app/package-lock.json') }}
+
+      - name: cache tauri bundler tooling (NSIS)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~\AppData\Local\tauri\NSIS
+          key: tauri-nsis-v1
+
+      - name: cache magicmida (unpacker zips)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/AppData/Local/reverse-slop/tools/magicmida
+          key: magicmida-${{ hashFiles('tools/magicmida-version.txt') }}
+
+      # The tag points at a main commit that already built these artifacts.
+      # Wait for that run if the tag was pushed immediately after the merge.
+      - name: fetch the main-run artifacts
+        shell: pwsh
+        run: |
+          $sha = $env:GITHUB_SHA
+          $run = $null
+          for ($i = 0; $i -lt 60; $i++) {
+            $runs = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs?head_sha=$sha&per_page=30" | ConvertFrom-Json
+            $match = @($runs.workflow_runs | Where-Object {
+              $_.name -eq 'build' -and $_.event -eq 'push' -and $_.conclusion -eq 'success'
+            } | Select-Object -First 1)
+            if ($match.Count -eq 1) { $run = $match[0]; break }
+            Start-Sleep -Seconds 10
+          }
+          if ($null -eq $run) { throw "no successful build run for $sha after 10 minutes" }
+          Write-Host "using build run $($run.id)"
+          gh run download $run.id -n cxx-artifacts -D _staging/cxx
+          gh run download $run.id -n frontend-binary -D app/src-tauri/target/release
+          Get-ChildItem _staging/cxx -Recurse -File | Select-Object FullName
+          Get-ChildItem app/src-tauri/target/release -File | Select-Object Name
+
+      - name: stage build tree for tauri resource map
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path build/src/engine | Out-Null
+          $f = @(Get-ChildItem -Path _staging/cxx -Recurse -Filter 'reverse-slop-engine.exe' -File)
+          if ($f.Count -ne 1) { throw "expected exactly one staged reverse-slop-engine.exe, found $($f.Count)" }
+          Copy-Item -LiteralPath $f[0].FullName -Destination build/src/engine/reverse-slop-engine.exe -Force
+          Get-ChildItem build/src/engine
+
+      - name: fetch the latest ps4debug-NG payload
+        shell: pwsh
+        run: ./tools/fetch_ps4debug.ps1
+
+      - name: sign engine
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\build\src\engine\reverse-slop-engine.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: embed the engine into the app exe (single-file portable)
+        shell: pwsh
+        run: |
+          $app = 'app/src-tauri/target/release/reverse-slop-ui.exe'
+          $eng = 'build/src/engine/reverse-slop-engine.exe'
+          $bytes = [IO.File]::ReadAllBytes($eng)
+          $appLen = (Get-Item -LiteralPath $app).Length
+          $fs = [IO.File]::Open($app, 'Append')
+          try {
+            $fs.Write($bytes, 0, $bytes.Length)
+            $bw = [IO.BinaryWriter]::new($fs)
+            $bw.Write([Text.Encoding]::ASCII.GetBytes('SLOPENG1'))
+            $bw.Write([uint64]$appLen)
+            $bw.Write([uint64]$bytes.Length)
+            $bw.Flush()
+          } finally { $fs.Close() }
+          Write-Host "embedded $($bytes.Length) engine bytes at offset $appLen"
+
+      - name: sign frontend binary
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\app\src-tauri\target\release\reverse-slop-ui.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: bundle precompiled frontend and native artifacts
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -FrontendOnly -BundleOnly -FastBundle -Full -OnlineWebview
+
+      - name: resolve the installer
+        id: setup
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION -TotalCount 1).Trim()
+          $all = @(Get-ChildItem app/src-tauri/target/release/bundle/nsis -Filter '*-setup.exe' -File)
+          $match = @($all | Where-Object Name -Like "*_${version}_*")
+          if ($match.Count -ne 1) { throw "expected one installer for $version, found: $($all.Name -join ', ')" }
+          "path=$($match[0].FullName)" >> $env:GITHUB_OUTPUT
+          $sig = "$($match[0].FullName).sig"
+          if (-not (Test-Path -LiteralPath $sig)) { throw "updater signature missing: $sig (set TAURI_SIGNING_PRIVATE_KEY)" }
+          "sig=$sig" >> $env:GITHUB_OUTPUT
+
+      - name: sign the installer
+        if: env.SIGNING_ENABLED == 'true'
+        uses: azure/trusted-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files: ${{ steps.setup.outputs.path }}
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: re-sign the installer for the updater
+        if: env.TAURI_SIGNING_PRIVATE_KEY != ''
+        shell: pwsh
+        working-directory: app
+        run: node node_modules/@tauri-apps/cli/tauri.js signer sign "${{ steps.setup.outputs.path }}"
+
+      - name: verify signatures
+        if: env.SIGNING_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          foreach ($f in @('dist/SlopStation/SlopStation.exe', 'build/src/engine/reverse-slop-engine.exe', '${{ steps.setup.outputs.path }}')) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $f
+            if ($sig.Status -ne 'Valid') { throw "$f signature status: $($sig.Status)" }
+            Write-Host "signed: $f ($($sig.SignerCertificate.Subject))"
+          }
+
+      - name: release files + SHA256SUMS
+        shell: pwsh
+        run: |
+          $out = New-Item -ItemType Directory -Force -Path _release
+          $ref = $env:GITHUB_REF_NAME
+          Compress-Archive -Path dist/SlopStation -DestinationPath (Join-Path $out "SlopStation-portable-$ref.zip")
+          Copy-Item -LiteralPath '${{ steps.setup.outputs.path }}' -Destination $out
+          Copy-Item -LiteralPath '${{ steps.setup.outputs.sig }}' -Destination $out
+          Push-Location $out
+          Get-ChildItem -File | Where-Object Name -NE 'SHA256SUMS' | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content -LiteralPath SHA256SUMS -Encoding ascii
+          Get-Content SHA256SUMS
+          Pop-Location
+
+      - name: upload release files (zip, installer, signature, SHA256SUMS)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: reverse-slop-release
+          compression-level: 0
+          path: _release/*
+
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: bundle
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: download release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: reverse-slop-release
+          path: _release
+
+      - name: verify SHA256SUMS
+        working-directory: _release
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: publish the github release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && index($0, "## [") == 1 { exit }
+            on && /^\[[^]]*\]: / { exit }
+            on { print }' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md has no entry for [$version]" >&2
+            exit 1
+          fi
+          setup=$(cd _release && ls *-setup.exe | head -1)
+          sig=$(cat "_release/${setup}.sig")
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${setup}"
+          jq -n --arg v "$version" --arg notes "$(cat notes.md)" \
+                --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                --arg sig "$sig" --arg url "$url" \
+            '{version:$v, notes:$notes, pub_date:$date,
+              platforms:{"windows-x86_64":{signature:$sig, url:$url}}}' \
+            > _release/latest.json
+          cat _release/latest.json
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --generate-notes --verify-tag
+          fi
+          gh release upload "$TAG" _release/* --clobber
