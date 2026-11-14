@@ -1,0 +1,8 @@
+# Line coverage of src/core, measured by the nightly coverage lane
+# (tools/coverage_ratchet.ps1 over the OpenCppCoverage Cobertura report).
+# A run fails when the value drops more than 0.5 points below this one;
+# raise it with -Update after an intentional improvement.
+#
+# 0 = not measured yet: the lane reports the measured value and does not gate
+# until this line carries a real number (seed it with one -Update run).
+core_line_coverage = 0.0

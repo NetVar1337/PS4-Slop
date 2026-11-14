@@ -8,7 +8,7 @@ TEST_CASE(ps4_status_console_info_and_mcp_reconnect) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     bool e = false;
     auto call = [&](const char* tool, const json& a) {
         return slop::core::mcp::call_tool(tool, a, e);
@@ -60,7 +60,7 @@ TEST_CASE(ps4_dump_module_rebuilds_elf_for_headerless_image) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     // no ELF header in console memory (the SELF loader does not map it);
     // distinct bytes per segment so the file layout can be checked
     const uint8_t text[8] = {0x55, 0x48, 0x89, 0xE5, 0x31, 0xC0, 0x5D, 0xC3};   // push rbp..ret
@@ -145,7 +145,7 @@ TEST_CASE(ps4_heartbeat_tolerates_misses_and_debug_sessions) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(proc::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     proc::target_set_heartbeat_interval_ms(0);
     struct restore_t { ~restore_t() { slop::core::process::target_set_heartbeat_interval_ms(1000); } } restore;
 
@@ -184,14 +184,14 @@ TEST_CASE(ps4_backend_swap_detaches_session) {
     server_guard_t b2;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(proc::target_connect_ps4("127.0.0.1", a.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(a.srv, kFakePid, err));
     auto held = proc::active_session();   // e.g. a long scan still holding it
     REQUIRE(held && held->valid());
     uint8_t v = 0x5A;
     REQUIRE(held->write(0x7FFF00000040ull, &v, 1).ok);
 
     // switching consoles detaches the session first ...
-    REQUIRE(rt::registry_connect_ps4("127.0.0.1", b2.srv.port, err));
+    REQUIRE(connect_fake_registry(b2.srv, err));
     CHECK(proc::active_session() == nullptr);
     // ... and the old handle can never reach the new console
     uint8_t got = 0;
@@ -207,7 +207,9 @@ TEST_CASE(ps4_backend_swap_detaches_session) {
 namespace {
 
 // a local process running an endless call loop we can debug: cmd.exe-free
-// shellcode in a PING.EXE that idles for two minutes
+// shellcode in a PING.EXE that idles until it is killed. `-t` (not `-n N`)
+// keeps the debuggee alive past any test duration: the old two-minute budget
+// expired under a loaded full-suite run and took the whole test down with it
 struct loop_target_t {
     PROCESS_INFORMATION pi{};
     uint64_t base = 0;
@@ -234,7 +236,7 @@ struct loop_target_t {
     }
 
     loop_target_t() {
-        wchar_t cmd[] = L"C:\\Windows\\System32\\PING.EXE -n 120 127.0.0.1";
+        wchar_t cmd[] = L"C:\\Windows\\System32\\PING.EXE -t 127.0.0.1";
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         si.dwFlags = STARTF_USESTDHANDLES;
@@ -381,7 +383,7 @@ TEST_CASE(ps4_write_multi_bulk_poke) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     CHECK(b.ps4_capability_level() == "1.1");
 
     std::vector<backend_ps4_t::ps4_write_entry_t> w(3);
@@ -431,7 +433,7 @@ TEST_CASE(ps4_turbo_scan_backend) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     REQUIRE(b.ps4_authed());
 
     backend_ps4_t::ps4_turbo_caps_t caps;
@@ -571,8 +573,8 @@ TEST_CASE(ps4_turbo_scan_mcp) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_registry(g.srv, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto dbg = [&](const json& a, bool& is_err) {
         return slop::core::mcp::call_tool("debugger", a, is_err);
     };
@@ -672,7 +674,7 @@ TEST_CASE(ps4_fork_modules_snapshot_and_errors) {
         stack2.prot = ps4::kVmProtRead | ps4::kVmProtWrite;
         g.srv.maps.push_back(stack2);
     }
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     CHECK(b.ps4_fork_extensions() == -1);
 
     // server-side module list
@@ -738,7 +740,7 @@ TEST_CASE(ps4_upstream_payload_fallback_and_reconnect) {
     g.srv.fork_ext = false;   // behave like Pharaoh2k upstream
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
 
@@ -777,8 +779,8 @@ TEST_CASE(ps4_fork_mcp_actions) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_registry(g.srv, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto dbg = [&](const json& a, bool& is_err) {
         return slop::core::mcp::call_tool("debugger", a, is_err);
     };
@@ -891,7 +893,7 @@ TEST_CASE(ps4_gdb_rsp_bridge) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
 
     // seed memory so the RSP 'm' read has known content (done before the
     // debug attach: the lazy handle attach used here is not the debug session)

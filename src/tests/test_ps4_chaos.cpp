@@ -23,7 +23,7 @@ TEST_CASE(ps4_chaos_fragmented_replies_still_work) {
     g.srv.chaos.fragment = true;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     CHECK(b.fw_string() == "11.00");
     CHECK(b.ps4_authed());
     auto procs = b.enum_processes();
@@ -45,7 +45,7 @@ TEST_CASE(ps4_chaos_peer_close_drops_socket_and_reconnect_restores) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
@@ -111,7 +111,7 @@ TEST_CASE(ps4_chaos_stall_hits_idle_timeout) {
     backend_ps4_t b;
     b.set_timeouts(250, 2000, 2000);
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
     g.srv.chaos.stall_cmd = ps4::CMD_PROC_WRITE;   // the payload never answers
@@ -135,7 +135,7 @@ TEST_CASE(ps4_chaos_dribble_hits_command_deadline) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
     b.set_timeouts(250, 600, 600);
@@ -160,7 +160,7 @@ TEST_CASE(ps4_chaos_garbage_status_is_protocol_error) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
     // a word that is no status at all means the stream is misaligned
@@ -184,7 +184,7 @@ TEST_CASE(ps4_disasm_region_drains_to_sentinel) {
     g.srv.chaos.disasm_extra = 50;   // the payload streams past max_entries
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     std::vector<backend_ps4_t::ps4_disasm_entry_t> out;
     bool truncated = false;
     auto io = b.ps4_disasm_region(kFakePid, 0x400000, 0x100, 10, out, &truncated);
@@ -205,7 +205,7 @@ TEST_CASE(ps4_read_stack_truncated_bundle_reports_error) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     // two-frame chain at 0x7FFF00007FF0 -> 0x7FFF00008100 -> 0
     uint64_t v = 0x7FFF00008100ull;
     g.srv.mem_write(0x7FFF00007FF0ull, reinterpret_cast<uint8_t*>(&v), 8);
@@ -230,7 +230,7 @@ TEST_CASE(ps4_threads_info_is_pipelined_with_names) {
     g.srv.chaos.thread_count = 150;   // three THREAD_INFO batches
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto thr = b.enum_threads(kFakePid);
     REQUIRE(thr.ok);
     REQUIRE(thr.items.size() == 150u);
@@ -246,7 +246,7 @@ TEST_CASE(ps4_scan_next_crosses_chunk_boundaries) {
     g.srv.add_map("", 0x10000000ull, 0x10040000ull, ps4::kVmProtRead | ps4::kVmProtWrite);
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     REQUIRE(b.ps4_authed());
 
     // unknown-initial-value seed scan: every aligned u32 of 256 KiB
@@ -328,7 +328,7 @@ TEST_CASE(ps4_events_fragmented_on_the_wire) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
     std::vector<uint8_t> wire;
     for (uint32_t i = 0; i < 3; ++i) {
@@ -353,7 +353,7 @@ TEST_CASE_TIMEOUT(ps4_event_queue_drop_is_counted, 120) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
     constexpr uint32_t kTotal = 5000;
     std::vector<uint8_t> wire;
@@ -380,7 +380,7 @@ TEST_CASE(ps4_debug_session_end_clears_slots) {
     server_guard_t other;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
 
     // 1) the payload closes the event channel (debuggee gone)
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
@@ -426,7 +426,7 @@ TEST_CASE(ps4_slot_arming_reuses_and_reserves) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     uint32_t idx = 0;
     // not attached: nothing is reserved
     CHECK(b.ps4_bp_arm(0x400500, backend_ps4_t::kAutoSlot, idx).error == ps4::kErrNotAttached);
@@ -458,7 +458,7 @@ TEST_CASE(ps4_detach_refused_reports_both_pids) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
     g.srv.chaos.refuse_detach = true;
     std::string aerr;
@@ -492,7 +492,7 @@ TEST_CASE(ps4_debug_port_in_use_names_owner) {
     b.set_event_port(port);
     g.srv.event_port = port;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     std::string aerr;
     CHECK(!b.ps4_debug_attach(kFakePid, aerr));
     CHECK(aerr.find("already in use by pid " + std::to_string(GetCurrentProcessId())) != std::string::npos);
@@ -506,7 +506,7 @@ TEST_CASE(ps4_composites_on_console_debugger) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto dbg = [](const json& a, bool& is_err) {
         return slop::core::mcp::call_tool("debugger", a, is_err);
     };

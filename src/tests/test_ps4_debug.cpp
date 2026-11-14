@@ -8,7 +8,7 @@ TEST_CASE(ps4_debug_control_and_events) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
 
     // explicit debug attach (starts the 755 listener, connects the fake back)
     REQUIRE(b.ps4_debug_attach(kFakePid, err));
@@ -99,7 +99,7 @@ TEST_CASE(ps4_remote_call) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
 
     uint64_t stub = 0;
     REQUIRE(b.ps4_install(kFakePid, stub).ok);
@@ -130,7 +130,7 @@ TEST_CASE(ps4_mcp_debugger_flow) {
     ps4_disconnect_guard_t guard;
 
     std::string err;
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto s = slop::core::process::active_session();
     REQUIRE(s && s->valid());
 
@@ -266,7 +266,7 @@ TEST_CASE(ps4_power_actions_ps4_auto_and_guide) {
     ps4_disconnect_guard_t guard;
 
     std::string err;
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto s = slop::core::process::active_session();
     REQUIRE(s && s->valid());
 
@@ -391,7 +391,7 @@ TEST_CASE(ps4_auth_and_native_scan) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));   // auto-auth runs on connect
+    REQUIRE(connect_fake(b, g.srv, err));   // auto-auth runs on connect
     CHECK(b.ps4_authed());
     CHECK(g.srv.auth_attempts >= 1);
     CHECK(g.srv.auth_ok);
@@ -445,8 +445,8 @@ TEST_CASE(ps4_mcp_console_side_tooling) {
     server_guard_t g;
     ps4_disconnect_guard_t guard;
     std::string err;
-    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_registry(g.srv, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto dbg = [&](const json& a, bool& is_err) {
         return slop::core::mcp::call_tool("debugger", a, is_err);
     };

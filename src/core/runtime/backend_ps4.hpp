@@ -70,6 +70,12 @@ struct ps4_module_t {
 // between do not break the run, a different name does)
 std::vector<ps4_module_t> ps4_coalesce_modules(std::vector<ps4_segment_t> maps);
 
+// decode a CMD_PROC_LIST reply body: `len` bytes of packed proc_list_entry_t
+// (the count word is consumed by the caller). A trailing partial entry is
+// ignored. Pure: no socket, no connection state, so the fuzz target in
+// src/fuzz/fuzz_ps4.cpp can drive it directly
+std::vector<process_info_t> ps4_parse_proc_list(const uint8_t* data, size_t len);
+
 class backend_ps4_t final : public backend_t {
 public:
     backend_ps4_t();

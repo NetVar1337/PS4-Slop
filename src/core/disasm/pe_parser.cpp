@@ -79,11 +79,14 @@ pe_image_t pe_parse(const uint8_t* d, size_t len) {
     if (len < 0x40 || d[0] != 'M' || d[1] != 'Z') return img;
     uint32_t e_lfanew = 0;
     if (!read_at(d, len, 0x3C, e_lfanew)) return img;
-    if (e_lfanew == 0 || e_lfanew + 0x18 > len) return img;
+    // size_t: `e_lfanew + 0x18` wraps in uint32_t for a crafted header
+    // (0xFFFFFFF0 + 0x18 == 8), which let the signature compare below read at
+    // a wild address. Found by src/fuzz/fuzz_pe.cpp.
+    if (e_lfanew == 0 || static_cast<size_t>(e_lfanew) + 0x18 > len) return img;
 
     // PE signature + COFF
     if (std::memcmp(d + e_lfanew, "PE\0\0", 4) != 0) return img;
-    const size_t coff = e_lfanew + 4;
+    const size_t coff = static_cast<size_t>(e_lfanew) + 4;
     if (coff + 20 > len) return img;
     img.machine = rd16(d + coff);
 

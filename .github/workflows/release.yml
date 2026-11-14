@@ -113,6 +113,12 @@ jobs:
           Copy-Item -LiteralPath $f[0].FullName -Destination build/src/engine/reverse-slop-engine.exe -Force
           Get-ChildItem build/src/engine
 
+      # Hardening gate on the artifact that actually ships: mitigation flags,
+      # and no import/section the build does not expect (tools/check_binaries.ps1).
+      - name: check engine binary hardening
+        shell: pwsh
+        run: ./tools/check_binaries.ps1 -Path build\src\engine\reverse-slop-engine.exe
+
       - name: fetch the latest ps4debug-NG payload
         shell: pwsh
         run: ./tools/fetch_ps4debug.ps1

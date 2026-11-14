@@ -763,6 +763,24 @@ std::vector<ps4_module_t> ps4_coalesce_modules(std::vector<ps4_segment_t> maps) 
     return out;
 }
 
+std::vector<process_info_t> ps4_parse_proc_list(const uint8_t* data, size_t len) {
+    std::vector<process_info_t> out;
+    if (!data) return out;
+    const size_t count = len / sizeof(ps4::proc_list_entry_t);
+    out.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        ps4::proc_list_entry_t e{};
+        std::memcpy(&e, data + i * sizeof(e), sizeof(e));
+        process_info_t p;
+        p.pid       = static_cast<uint32_t>(e.pid);
+        p.name      = fixed_str(e.p_comm, sizeof(e.p_comm));
+        p.arch      = arch_t::x64;   // Orbis userland is x86-64
+        p.elevation = elevation_t::system;
+        out.push_back(std::move(p));
+    }
+    return out;
+}
+
 namespace ps4 {
 
 std::string io_error_str(uint32_t code) {
@@ -2061,15 +2079,8 @@ enum_result_t<process_info_t> backend_ps4_t::enum_processes() {
         res.error = c.last_err;
         return res;
     }
-    res.items.reserve(num);
-    for (const auto& e : ents) {
-        process_info_t p;
-        p.pid       = static_cast<uint32_t>(e.pid);
-        p.name      = fixed_str(e.p_comm, sizeof(e.p_comm));
-        p.arch      = arch_t::x64;   // Orbis userland is x86-64
-        p.elevation = elevation_t::system;
-        res.items.push_back(std::move(p));
-    }
+    res.items = ps4_parse_proc_list(reinterpret_cast<const uint8_t*>(ents.data()),
+                                    ents.size() * sizeof(ps4::proc_list_entry_t));
     res.ok = true;
     return res;
 }

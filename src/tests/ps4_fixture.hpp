@@ -60,6 +60,29 @@ wsa_init_t& wsa() {
     return w;
 }
 
+// A free loopback port for the payload's debug-event callback. The protocol
+// port (755) is machine-global: a concurrent test process, another checkout's
+// suite or a real payload holding it makes the backend's listener bind fail,
+// which is what made the debug-session tests flaky. Every fake payload takes
+// its own ephemeral port instead and the backend is pointed at it.
+inline uint16_t ephemeral_port() {
+    wsa();
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = 0;
+    uint16_t port = 0;
+    if (bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) {
+        int len = sizeof(a);
+        getsockname(s, reinterpret_cast<sockaddr*>(&a), &len);
+        port = ntohs(a.sin_port);
+    }
+    closesocket(s);
+    return port;
+}
+
 // fault injection for the fake payload's replies (server thread only):
 // fragmented / dribbled sends and a byte budget after which the connection
 // is cut mid-reply
@@ -152,7 +175,7 @@ struct fake_ps4_server_t {
     std::map<uint32_t, ps4::reg64_t> thread_regs;
     std::vector<ps4::vm_map_entry_t> maps;
     chaos_t chaos;
-    uint16_t event_port = ps4::kDebugPort;   // where the debug channel connects back
+    uint16_t event_port = ephemeral_port();   // where the debug channel connects back
     int connections = 0;                     // accepted command connections
     int detach_count = 0;
 
@@ -1778,6 +1801,28 @@ struct ps4_disconnect_guard_t {
         slop::core::process::target_disconnect_ps4();
     }
 };
+
+// Connect a backend to the fake payload with the payload's per-test debug-event
+// port wired in, so ps4_debug_attach never competes for the machine-global 755.
+inline bool connect_fake(backend_ps4_t& b, fake_ps4_server_t& srv, std::string& err) {
+    b.set_event_port(srv.event_port);
+    return b.connect("127.0.0.1", srv.port, err);
+}
+
+// Same for the process-wide console session (target_connect_ps4 / the MCP
+// target.ps4_connect path): the registry backend gets the per-test port.
+inline bool connect_fake_target(fake_ps4_server_t& srv, uint32_t pid, std::string& err) {
+    if (!slop::core::process::target_connect_ps4("127.0.0.1", srv.port, pid, err)) return false;
+    if (auto* p = slop::core::runtime::registry_ps4()) p->set_event_port(srv.event_port);
+    return true;
+}
+
+// registry-only variant (connect without attaching a process)
+inline bool connect_fake_registry(fake_ps4_server_t& srv, std::string& err) {
+    if (!slop::core::runtime::registry_connect_ps4("127.0.0.1", srv.port, err)) return false;
+    if (auto* p = slop::core::runtime::registry_ps4()) p->set_event_port(srv.event_port);
+    return true;
+}
 
 } // namespace
 

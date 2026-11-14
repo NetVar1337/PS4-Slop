@@ -54,6 +54,21 @@
       "cacheVariables": {
         "SLOP_ANALYZE": "ON"
       }
+    },
+    {
+      "name": "ninja-msvc-fuzz",
+      "inherits": "base",
+      "displayName": "Ninja + MSVC libFuzzer",
+      "description": "RelWithDebInfo + /fsanitize=address + /fsanitize=fuzzer on the src/fuzz targets (no engine, no UI, no tests)",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "SLOP_SANITIZE": "address",
+        "SLOP_BUILD_FUZZ": "ON",
+        "SLOP_BUILD_TESTS": "OFF",
+        "SLOP_BUILD_TEST_TARGET": "OFF",
+        "SLOP_BUILD_UI": "OFF",
+        "SLOP_BUILD_ENGINE": "OFF"
+      }
     }
   ],
   "buildPresets": [
@@ -76,6 +91,11 @@
       "name": "ninja-msvc-analyze",
       "displayName": "Ninja + MSVC /analyze",
       "configurePreset": "ninja-msvc-analyze"
+    },
+    {
+      "name": "ninja-msvc-fuzz",
+      "displayName": "Ninja + MSVC libFuzzer",
+      "configurePreset": "ninja-msvc-fuzz"
     }
   ],
   "testPresets": [

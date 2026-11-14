@@ -38,7 +38,7 @@ TEST_CASE(ps4_backend_handshake_and_enums) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     if (!err.empty()) std::printf("  connect err: %s\n", err.c_str());
     CHECK(b.connected());
     CHECK(b.ping());
@@ -122,7 +122,7 @@ TEST_CASE(ps4_backend_memory_rw_protect_alloc) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
 
@@ -180,7 +180,7 @@ TEST_CASE(ps4_backend_threads_and_regs) {
     server_guard_t g;
     backend_ps4_t b;
     std::string err;
-    REQUIRE(b.connect("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake(b, g.srv, err));
     auto h = b.attach(kFakePid);
     REQUIRE(h.valid());
 
@@ -219,7 +219,7 @@ TEST_CASE(ps4_registry_session_and_mcp_tool) {
     ps4_disconnect_guard_t guard;   // leaves the registry clean on REQUIRE failure
 
     std::string err;
-    REQUIRE(slop::core::runtime::registry_connect_ps4("127.0.0.1", g.srv.port, err));
+    REQUIRE(connect_fake_registry(g.srv, err));
     CHECK(slop::core::runtime::registry_ps4_active());
     CHECK(slop::core::runtime::active_kind() == backend_kind_t::ps4);
     REQUIRE_STR_EQ(slop::core::runtime::active_badge(), "PS4");
@@ -228,7 +228,7 @@ TEST_CASE(ps4_registry_session_and_mcp_tool) {
     CHECK(slop::core::runtime::registry_ps4_branding().find("ps4debug-NG") != std::string::npos);
 
     // attach a session through the normal target service path
-    REQUIRE(slop::core::process::target_connect_ps4("127.0.0.1", g.srv.port, kFakePid, err));
+    REQUIRE(connect_fake_target(g.srv, kFakePid, err));
     auto s = slop::core::process::active_session();
     REQUIRE(s && s->valid());
     CHECK(s->pid() == kFakePid);
@@ -486,6 +486,11 @@ TEST_CASE(ps4_consoles_switch_between_two_consoles_restores_profile) {
     REQUIRE(!e);
     CHECK(st.value("console", "") == "devkit-a");
 
+    // the fake payload connects its debug channel back to the fixture's own
+    // ephemeral port, not the machine-global 755
+    REQUIRE(slop::core::runtime::registry_ps4() != nullptr);
+    slop::core::runtime::registry_ps4()->set_event_port(a.srv.event_port);
+
     // a watch entry and an armed breakpoint belong to A
     slop::core::mcp::call_tool(
         "memory", {{"action", "watch_add"}, {"addr", 0x400200}, {"width", "u32"}}, e);
@@ -546,4 +551,40 @@ TEST_CASE(ps4_consoles_switch_between_two_consoles_restores_profile) {
     CHECK(e);
     CHECK(slop::core::runtime::registry_ps4_active());
     CHECK(slop::core::process::active_session() != nullptr);
+}
+
+// The CMD_PROC_LIST reply body decoder is pure (no socket), so it is also the
+// ps4debug-NG reply parser the fuzz target drives. A short or garbage body
+// must never read past the buffer.
+TEST_CASE(ps4_parse_proc_list_body) {
+    std::vector<uint8_t> body;
+    const auto append = [&body](const char* name, int32_t pid) {
+        ps4::proc_list_entry_t e{};
+        std::strncpy(e.p_comm, name, sizeof(e.p_comm) - 1);
+        e.pid = pid;
+        const auto* p = reinterpret_cast<const uint8_t*>(&e);
+        body.insert(body.end(), p, p + sizeof(e));
+    };
+    append("eboot.bin", 1234);
+    append("SceShellUI", 42);
+
+    auto procs = slop::core::runtime::ps4_parse_proc_list(body.data(), body.size());
+    REQUIRE(procs.size() == 2u);
+    CHECK(procs[0].pid == 1234u);
+    REQUIRE_STR_EQ(procs[0].name, "eboot.bin");
+    CHECK(procs[0].arch == slop::core::runtime::arch_t::x64);
+    CHECK(procs[1].pid == 42u);
+    REQUIRE_STR_EQ(procs[1].name, "SceShellUI");
+
+    // a trailing partial entry is ignored, not decoded from a short read
+    body.push_back(0xAA);
+    CHECK(slop::core::runtime::ps4_parse_proc_list(body.data(), body.size()).size() == 2u);
+    CHECK(slop::core::runtime::ps4_parse_proc_list(body.data(), 0).empty());
+    CHECK(slop::core::runtime::ps4_parse_proc_list(nullptr, 0).empty());
+
+    // an unterminated p_comm stops at the field boundary
+    std::vector<uint8_t> full(sizeof(ps4::proc_list_entry_t), 'A');
+    procs = slop::core::runtime::ps4_parse_proc_list(full.data(), full.size());
+    REQUIRE(procs.size() == 1u);
+    REQUIRE(procs[0].name.size() == sizeof(ps4::proc_list_entry_t::p_comm));
 }

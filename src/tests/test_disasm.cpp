@@ -27,6 +27,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <cstring>
 #include <vector>
 
 using namespace slop::core::disasm;
@@ -119,6 +120,27 @@ TEST_CASE(pe_parse_slop_target_headers) {
 
     // Entry point must map back into the file
     REQUIRE(pe.rva_to_offset(pe.entry_rva).has_value());
+}
+
+// Regression: a crafted e_lfanew near 4 GiB wrapped in uint32_t arithmetic
+// (0xFFFFFFF0 + 0x18 == 8), so the "PE\0\0" signature compare read at a wild
+// address. Found by src/fuzz/fuzz_pe.cpp.
+TEST_CASE(pe_parse_rejects_wrapping_e_lfanew) {
+    std::vector<uint8_t> bytes(0x40, 0);
+    bytes[0] = 'M';
+    bytes[1] = 'Z';
+    for (uint32_t e_lfanew : {0xFFFFFFF0u, 0xFFFFFFFFu, 0xFFFFFFF8u}) {
+        std::memcpy(bytes.data() + 0x3C, &e_lfanew, sizeof(e_lfanew));
+        auto pe = pe_parse(bytes.data(), bytes.size());
+        CHECK(!pe.ok);
+    }
+    // one byte short of the 0x18 the signature compare needs
+    std::vector<uint8_t> tight(0x3C + 4 + 0x17, 0);
+    tight[0] = 'M';
+    tight[1] = 'Z';
+    const uint32_t e_lfanew = 0x3C + 4;
+    std::memcpy(tight.data() + 0x3C, &e_lfanew, sizeof(e_lfanew));
+    CHECK(!pe_parse(tight.data(), tight.size()).ok);
 }
 
 TEST_CASE(pe_parse_slop_target_sections_roundtrip) {

@@ -40,6 +40,7 @@ option(SLOP_BUILD_TESTS "Build the core logic test harness" ON)
 option(SLOP_BUILD_ENGINE "Build the headless engine host (Tauri front end backend)" ON)
 option(SLOP_BUILD_UI "Build the legacy ImGui shell (reverse-slop.exe)" ON)
 option(SLOP_ANALYZE "Run MSVC /analyze on first-party targets" OFF)
+option(SLOP_BUILD_FUZZ "Build the libFuzzer targets in src/fuzz (needs SLOP_SANITIZE=address)" OFF)
 set(SLOP_SANITIZE "" CACHE STRING "Sanitizer for every target: empty or 'address'")
 set_property(CACHE SLOP_SANITIZE PROPERTY STRINGS "" "address")
 
@@ -57,6 +58,12 @@ if(MSVC)
         /DYNAMICBASE
         /HIGHENTROPYVA
         /NXCOMPAT
+        # CFG needs the linker switch as well as the /guard:cf compile flag;
+        # without it the final image carries no guard table at all
+        /GUARD:CF
+        # marks the image CET compatible (shadow-stack aware). tools/check_binaries.ps1
+        # verifies all five on the release artifacts, see SECURITY.md
+        /CETCOMPAT
     )
 endif()
 
@@ -140,6 +147,10 @@ endif()
 
 if(SLOP_BUILD_TESTS)
     add_subdirectory(src/tests)
+endif()
+
+if(SLOP_BUILD_FUZZ)
+    add_subdirectory(src/fuzz)
 endif()
 
 add_subdirectory(src/live)

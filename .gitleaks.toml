@@ -1,0 +1,34 @@
+# .gitleaks.toml
+# Secret scanning config for the `secrets` job in .github/workflows/build.yml.
+# The default ruleset stays on; the allowlist covers the places where fake
+# credentials and hash strings are the point of the file.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "test fixtures, fake payloads and pinned hashes"
+
+# The fake ps4debug payload, the MCP/HTTP tests and the frontend tests build
+# bearer tokens, passwords and keys in memory on purpose.
+paths = [
+  '''^src/tests/''',
+  '''^app/src/.*\.test\.(ts|tsx)$''',
+  '''^app/e2e/''',
+  # pinned dependency hashes (URL_HASH SHA256, action SHAs) are not secrets
+  '''^cmake/deps\.cmake$''',
+  '''^tools/licenses/''',
+  '''^THIRD_PARTY_NOTICES\.md$''',
+  '''^app/package-lock\.json$''',
+  '''^app/src-tauri/Cargo\.lock$''',
+  # documentation examples
+  '''^docs/''',
+  '''^CHANGELOG\.md$''',
+]
+
+# Values the tests and docs use as obvious placeholders.
+regexes = [
+  '''(?i)(fake|dummy|example|placeholder|redacted)[-_ ]?(token|secret|password|passwd|key|apikey)''',
+  '''(?i)AZURE_CLIENT_SECRET''',
+  '''(?i)TAURI_SIGNING_PRIVATE_KEY''',
+]

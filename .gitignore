@@ -26,6 +26,9 @@ app/src-tauri/target-*/
 
 # Tool output
 mcp_live_results.json
+coverage.xml
+analyze.log
+fuzz-artifacts/
 __pycache__/
 *.pyc
 /build/

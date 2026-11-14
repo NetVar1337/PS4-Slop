@@ -1,0 +1,16 @@
+# MSVC /analyze findings accepted at the time of writing, one per line:
+#   <warning code> <message>
+# tools/analyze_ratchet.ps1 fails the nightly lane on any finding that is
+# not listed here. Regenerate with -Update after fixing or accepting one.
+
+C28020 The expression '*_Param_(2)>=sizeof(MIB_TCPTABLE)' is not true at this call.: Lines: 402, 403
+C6031 Return value ignored: 'NCryptSetProperty'.
+C6031 Return value ignored: 'WSAStartup'.
+C6031 Return value ignored: '_dup2'.
+C6031 Return value ignored: 'sscanf'.
+C6262 Function uses '16688' bytes of stack. Consider moving some data to heap.
+C6262 Function uses '32780' bytes of stack. Consider moving some data to heap.
+C6262 Function uses '32788' bytes of stack. Consider moving some data to heap.
+C6262 Function uses '32836' bytes of stack. Consider moving some data to heap.
+C6297 Arithmetic overflow. Results might not be an expected value.
+C6385 Reading invalid data from 'out.operands': the readable size is '320' bytes, but 'out.operand_count++' bytes may be read.: Lines: 45, 46, 47, 51, 52, 59, 53, 60, 70, 71, 74, 75, 76, 77, 78, 79, 80, 84, 94, 87, 96, 97, 99, 100, 148, 175, 176, 186

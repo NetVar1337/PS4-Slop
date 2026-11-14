@@ -79,6 +79,58 @@ jobs:
               - 'app/**'
               - '.github/workflows/build.yml'
 
+  # A PR that changes shipped code must say what changed: CHANGELOG.md gets an
+  # Unreleased entry, unless the PR carries the `no-changelog` label (docs,
+  # CI-only or dependency-only changes).
+  changelog:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: require a CHANGELOG.md entry
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          if [[ ",$LABELS," == *",no-changelog,"* ]]; then
+            echo "skipped: the no-changelog label is set"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE" HEAD)
+          if ! grep -qE '^(src|app/src)/' <<<"$changed"; then
+            echo "no shipped code changed"
+            exit 0
+          fi
+          if ! grep -qx 'CHANGELOG.md' <<<"$changed"; then
+            echo "::error::this PR changes shipped code but not CHANGELOG.md; add an Unreleased entry or the no-changelog label"
+            exit 1
+          fi
+          echo "CHANGELOG.md updated"
+
+  # Secret scanning (gitleaks, config in .gitleaks.toml) on every PR and on
+  # main. The action scans the PR's commit range, or the push range on main.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # the action comments its findings on the PR (the workflow default is
+    # contents: read only)
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # GITLEAKS_LICENSE is only needed for organization-owned repositories;
+      # the action runs unlicensed on a personal/public repository.
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+
   # Every test area registered with CTest (one entry per src/tests/test_*.cpp),
   # plus the shipped engine artifact and the legacy ImGui shell compile check.
   tests:
@@ -240,6 +292,55 @@ jobs:
             '```' | Add-Content $env:GITHUB_STEP_SUMMARY
           }
 
+      # Ratchet: a finding that is not in docs/analyze-baseline.txt fails the
+      # lane (the standing backlog is accepted, new defects are not).
+      - name: /analyze ratchet (fail on new findings)
+        shell: pwsh
+        run: ./tools/analyze_ratchet.ps1 -Log analyze.log
+
+  # libFuzzer targets (src/fuzz, preset ninja-msvc-fuzz) over the parsers that
+  # consume untrusted input. Nightly and manual: each target runs for the
+  # configured time, and a crash fails the lane with the reproducer uploaded.
+  fuzz:
+    needs: changes
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    env:
+      CMAKE_C_COMPILER_LAUNCHER: sccache
+      CMAKE_CXX_COMPILER_LAUNCHER: sccache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: sccache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+
+      - name: cache deps sources (fuzz tree)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build-ninja-msvc-fuzz/_deps/*-src
+          key: fuzz-deps-v1-${{ runner.os }}-${{ hashFiles('cmake/deps.cmake') }}
+          restore-keys: |
+            fuzz-deps-v1-${{ runner.os }}-
+
+      - name: build the fuzz targets
+        shell: pwsh
+        run: powershell -NoProfile -File tools\build.ps1 -Preset ninja-msvc-fuzz -NoFrontend -Targets "fuzz_elf,fuzz_pe,fuzz_macho,fuzz_ipa,fuzz_zip,fuzz_ps4,fuzz_dotnet"
+
+      - name: run every fuzzer (60 s each)
+        shell: pwsh
+        run: ./tools/run_fuzzers.ps1 -Preset ninja-msvc-fuzz -Seconds 60 -ArtifactDir fuzz-artifacts
+
+      - name: upload crash reproducers
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crashes
+          path: fuzz-artifacts
+          if-no-files-found: ignore
+
   # CodeQL: C++ traced through a real build (no sccache: it hides the
   # compiler from the tracer), TypeScript and the workflows themselves.
   # Nightly and manual only.
@@ -298,7 +399,7 @@ jobs:
   # a Cobertura artifact plus a total in the run summary. Nightly and manual.
   coverage:
     needs: changes
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.changes.outputs.cpp == 'true')
     runs-on: windows-2022
     timeout-minutes: 90
     env:
@@ -344,6 +445,12 @@ jobs:
           [xml]$c = Get-Content coverage.xml
           $pct = [math]::Round([double]$c.coverage.'line-rate' * 100, 1)
           "### C++ line coverage: $pct% (src/, tests excluded)" | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      # Ratchet: fails when src/core line coverage drops more than 0.5 points
+      # below docs/coverage-baseline.txt (re-baseline with -Update).
+      - name: coverage ratchet (src/core)
+        shell: pwsh
+        run: ./tools/coverage_ratchet.ps1 -Cobertura coverage.xml
 
       - name: upload coverage
         if: always()
