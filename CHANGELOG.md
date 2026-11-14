@@ -5,6 +5,14 @@ All notable changes to SlopStation are documented here. The format follows
 [Semantic Versioning](https://semver.org/). The release job publishes the
 section matching the pushed tag as the GitHub release notes.
 
+## [0.2.2] - 2026-11-14
+
+### Fixed
+
+- The workspace now fills the window when neither the engine nor the update
+  banner is visible; the main grid row was landing in the banner's auto row,
+  leaving the lower half black.
+
 ## [0.2.1] - 2026-11-14
 
 ### Fixed

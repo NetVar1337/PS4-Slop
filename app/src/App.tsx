@@ -182,8 +182,12 @@ export default function App() {
         <Splash />
       ) : (
         <div className="app-shell">
-          <EngineBanner />
-          <UpdateBanner />
+          {/* Always present: with no banner the main would land in the auto
+              row and the 1fr row would stay empty (black lower half). */}
+          <div className="banner-slot">
+            <EngineBanner />
+            <UpdateBanner />
+          </div>
           <main className="app-body" data-inspector={inspectorOpen ? "open" : "closed"}>
             <ActivityRail active={rail} onSelect={setRail} onSettings={openSettings} />
 
