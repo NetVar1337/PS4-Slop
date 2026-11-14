@@ -9,6 +9,9 @@
 #include "core/emu/taint.hpp"
 #include "core/mcp/mcp_tools.hpp"
 
+#include "elf_fixture.hpp"
+#include "macho_fixture.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <Zydis/Zydis.h>
@@ -616,15 +619,24 @@ nlohmann::json emulate_call(const nlohmann::json& args, bool& is_error) {
 
 } // namespace
 
-TEST_CASE(emu_tool_hex_rejects_non_x64_arch) {
+TEST_CASE(emu_tool_hex_arch_selection) {
     bool is_error = false;
-    auto out = emulate_call({{"action", "run"}, {"hex", "90c3"}, {"arch", "arm64"}}, is_error);
+    auto out = emulate_call({{"action", "run"}, {"hex", "90c3"}, {"arch", "vax"}}, is_error);
     REQUIRE(is_error);
-    REQUIRE(out.value("error", "").find("x86-64") != std::string::npos);
 
     out = emulate_call({{"action", "run"}, {"hex", "90c3"}, {"arch", "x64"}}, is_error);
     REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("arch", "").c_str(), "x64");
     REQUIRE_STR_EQ(out.value("stopped_reason", "").c_str(), "return");
+
+    // arm64 raw bytes: mov w0,#7 / ret
+    out = emulate_call({{"action", "run"}, {"hex", "e0008052c0035fd6"}, {"arch", "arm64"}},
+                       is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("arch", "").c_str(), "arm64");
+    REQUIRE_STR_EQ(out.value("abi", "").c_str(), "aapcs64");
+    REQUIRE_STR_EQ(out.value("stopped_reason", "").c_str(), "return");
+    REQUIRE_EQ(out.at("regs").value("x0", 0ull), 7ull);
 }
 
 TEST_CASE(emu_tool_abi_selection_and_syscall_log) {
@@ -669,4 +681,290 @@ TEST_CASE(emu_tool_abi_selection_and_syscall_log) {
     REQUIRE(is_error);
     out = emulate_call({{"action", "run"}, {"hex", code}, {"abi", "vax"}}, is_error);
     REQUIRE(is_error);
+}
+
+// === snapshot/restore + persistent sessions (audit 54) ======================
+
+namespace {
+
+// inc dword [0x500000] / mov eax,[0x500000] / jmp 0x400000
+run_request_t counter_req() {
+    auto req = base_req({0xFF, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00,
+                         0x8B, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00,
+                         0xEB, 0xF0});
+    emu_mem_region_t data;
+    data.addr = 0x500000;
+    data.bytes.assign(0x10, 0);
+    req.maps.push_back(data);
+    return req;
+}
+
+std::string lower_copy(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return s;
+}
+
+} // namespace
+
+TEST_CASE(emu_session_snapshot_restore_is_deterministic) {
+    std::string err;
+    auto s = emulation_session_t::create(counter_req(), &err);
+    REQUIRE(s != nullptr);
+    REQUIRE(s->step(6, 1000, {}, &err));   // two loop iterations
+    REQUIRE_EQ(s->state().regs.at("rax"), 2u);
+    REQUIRE(s->snapshot(&err));
+    REQUIRE_EQ(s->snapshot_pages(), 1u);   // the counter page
+
+    REQUIRE(s->step(6, 1000, {}, &err));
+    REQUIRE_EQ(s->state().regs.at("rax"), 4u);
+    REQUIRE(s->restore(&err));
+    REQUIRE_EQ(s->state().regs.at("rax"), 2u);
+    REQUIRE(s->step(6, 1000, {}, &err));
+    REQUIRE_EQ(s->state().regs.at("rax"), 4u);
+
+    // a second cycle lands on the same state again
+    REQUIRE(s->snapshot(&err));
+    REQUIRE(s->step(3, 1000, {}, &err));
+    REQUIRE_EQ(s->state().regs.at("rax"), 5u);
+    REQUIRE(s->restore(&err));
+    REQUIRE(s->step(3, 1000, {}, &err));
+    REQUIRE_EQ(s->state().regs.at("rax"), 5u);
+}
+
+TEST_CASE(emu_tool_session_actions) {
+    bool is_error = false;
+    auto out = emulate_call({{"action", "session_create"},
+                             {"hex", "ff0425000050008b042500005000ebf0"},
+                             {"maps", nlohmann::json::array(
+                                          {nlohmann::json{{"addr", 0x500000},
+                                                          {"hex", "0000000000000000"}}})}},
+                            is_error);
+    REQUIRE_FALSE(is_error);
+    const uint64_t id = out.value("session", 0ull);
+    REQUIRE(id != 0);
+    REQUIRE(out.contains("regs"));
+
+    out = emulate_call({{"action", "session_step"}, {"session", id}, {"count", 6}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_EQ(out.at("regs").value("rax", 0ull), 2ull);
+
+    out = emulate_call({{"action", "snapshot"}, {"session", id}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_EQ(out.value("pages", 0ull), 1ull);
+
+    out = emulate_call({{"action", "session_step"}, {"session", id}, {"count", 6}}, is_error);
+    REQUIRE_EQ(out.at("regs").value("rax", 0ull), 4ull);
+
+    out = emulate_call({{"action", "restore"}, {"session", id}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_EQ(out.at("regs").value("rax", 0ull), 2ull);
+
+    out = emulate_call({{"action", "session_destroy"}, {"session", id}}, is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE(out.value("destroyed", false));
+    out = emulate_call({{"action", "session_step"}, {"session", id}, {"count", 1}}, is_error);
+    REQUIRE(is_error);
+}
+
+// === dynamic backward slicing (audit 55) ====================================
+
+TEST_CASE(emu_backward_slice_registers) {
+    // mov eax,1 / mov esi,7 / mov ecx,2 / add eax,ecx / ret
+    auto req = base_req({0xB8, 0x01, 0x00, 0x00, 0x00,
+                         0xBE, 0x07, 0x00, 0x00, 0x00,
+                         0xB9, 0x02, 0x00, 0x00, 0x00,
+                         0x01, 0xC8,
+                         0xC3});
+    req.trace = true;
+    req.record_slice = true;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_EQ(r.trace.size(), 5u);
+
+    slice_request_t s;
+    s.reg = "rax";
+    auto sl = emulate_slice(r, s);
+    REQUIRE(sl.ok);
+    REQUIRE_EQ(sl.indices.size(), 3u);
+    REQUIRE_EQ(sl.indices[0], 0u);   // mov eax,1
+    REQUIRE_EQ(sl.indices[1], 2u);   // mov ecx,2
+    REQUIRE_EQ(sl.indices[2], 3u);   // add eax,ecx
+    REQUIRE_EQ(sl.insns.back().ip, 0x40000Full);
+
+    // at the add: only the mov eax,1 defines the value there
+    s.at = 0x40000F;
+    sl = emulate_slice(r, s);
+    REQUIRE(sl.ok);
+    REQUIRE_EQ(sl.indices.size(), 1u);
+    REQUIRE_EQ(sl.indices[0], 0u);
+
+    // an unknown target register is an error, not an empty slice
+    s = {};
+    s.reg = "notareg";
+    sl = emulate_slice(r, s);
+    REQUIRE_FALSE(sl.ok);
+}
+
+TEST_CASE(emu_backward_slice_memory) {
+    // mov eax,5 / mov [0x500000],eax / ret
+    auto req = base_req({0xB8, 0x05, 0x00, 0x00, 0x00,
+                         0x89, 0x04, 0x25, 0x00, 0x00, 0x50, 0x00,
+                         0xC3});
+    emu_mem_region_t data;
+    data.addr = 0x500000;
+    data.bytes.assign(0x10, 0);
+    req.maps.push_back(data);
+    req.trace = true;
+    req.record_slice = true;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+
+    slice_request_t s;
+    s.addr = 0x500000;
+    s.len  = 4;
+    auto sl = emulate_slice(r, s);
+    REQUIRE(sl.ok);
+    REQUIRE_EQ(sl.indices.size(), 2u);
+    REQUIRE_EQ(sl.indices[0], 0u);
+    REQUIRE_EQ(sl.indices[1], 1u);
+}
+
+TEST_CASE(emu_tool_trace_and_slice) {
+    bool is_error = false;
+    auto out = emulate_call({{"action", "run"},
+                             {"hex", "b801000000be07000000b90200000001c8c3"},
+                             {"trace", true}},
+                            is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE(out.contains("trace_id"));
+    const uint64_t id = out.value("trace_id", 0ull);
+    REQUIRE(id != 0);
+
+    auto sl = emulate_call({{"action", "slice"}, {"trace_id", id}, {"reg", "rax"}},
+                           is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_EQ(sl.value("count", 0ull), 3ull);
+    const auto& insns = sl.at("instructions");
+    REQUIRE_EQ(insns.at(0).value("ip", 0ull), 0x400000ull);
+    REQUIRE_EQ(insns.at(1).value("ip", 0ull), 0x40000Aull);
+    REQUIRE_EQ(insns.at(2).value("ip", 0ull), 0x40000Full);
+
+    sl = emulate_call({{"action", "slice"}, {"trace_id", 999999}, {"reg", "rax"}},
+                      is_error);
+    REQUIRE(is_error);
+}
+
+// === Orbis syscall emulation on a synthetic PS4 ELF (audit 56) ==============
+
+TEST_CASE(emu_orbis_syscalls_on_ps4_elf) {
+    namespace bs = slop::core::disasm::binary_state;
+    bs::unload();
+    auto elf = elf_fixture::build_ps4_elf();
+    const uint64_t base = 0x10000000;
+    const uint64_t str_va = base + elf_fixture::ps4_layout::kString;
+
+    std::vector<uint8_t> code;
+    auto b = [&](std::initializer_list<uint8_t> v) { code.insert(code.end(), v); };
+    auto d32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i) code.push_back(static_cast<uint8_t>(v >> (8 * i)));
+    };
+    b({0xB8}); d32(4);                          // mov eax,4 (write)
+    b({0x8B, 0x0C, 0x25}); d32(static_cast<uint32_t>(str_va));  // mov ecx,[str]
+    b({0xBF}); d32(1);                          // mov edi,1
+    b({0xBE}); d32(static_cast<uint32_t>(str_va));
+    b({0xBA}); d32(5);                          // mov edx,5
+    b({0x0F, 0x05});                            // syscall
+    b({0xB8}); d32(20);                         // getpid
+    b({0x0F, 0x05});
+    b({0xB8}); d32(477);                        // mmap
+    b({0x31, 0xFF});                            // xor edi,edi
+    b({0xBE}); d32(0x2000);                     // len
+    b({0xBA}); d32(3);                          // prot rw
+    b({0x41, 0xBA}); d32(0x1002);               // MAP_ANON|MAP_PRIVATE
+    b({0x49, 0xC7, 0xC0}); d32(0xFFFFFFFF);     // mov r8,-1
+    b({0x45, 0x31, 0xC9});                      // xor r9d,r9d
+    b({0x0F, 0x05});
+    b({0xB8}); d32(5);                          // open -> ENOSYS
+    b({0x0F, 0x05});
+    b({0xB8}); d32(1);                          // exit(7)
+    b({0xBF}); d32(7);
+    b({0x0F, 0x05});
+
+    std::memcpy(elf.data() + elf_fixture::ps4_layout::file_off(elf_fixture::ps4_layout::kEntry),
+                code.data(), code.size());
+    elf_fixture::temp_file_t tf(elf, "emu_orbis");
+    REQUIRE(bs::load_file(tf.path.string(), base));
+
+    bool is_error = false;
+    auto out = emulate_call({{"action", "run"},
+                             {"file_addr", base + elf_fixture::ps4_layout::kEntry},
+                             {"entry", base + elf_fixture::ps4_layout::kEntry},
+                             {"code_len", code.size()},
+                             {"abi", "sysv"},
+                             {"orbis_syscalls", true},
+                             {"trace", true}},
+                            is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("stopped_reason", "").c_str(), "exit");
+    REQUIRE_EQ(out.value("stdout", ""), std::string("hello"));
+    REQUIRE_EQ(out.value("exit_code", 0ull), 7ull);
+    REQUIRE_EQ(out.value("syscall_enosys", 0ull), 1ull);
+    REQUIRE_EQ(out.value("total_syscalls", 0ull), 5ull);
+
+    const auto& sc = out.at("syscalls");
+    REQUIRE_STR_EQ(sc.at(0).value("name", "").c_str(), "write");
+    REQUIRE_EQ(sc.at(0).value("ret", 0ull), 5ull);
+    REQUIRE_STR_EQ(sc.at(1).value("name", "").c_str(), "getpid");
+    REQUIRE_EQ(sc.at(1).value("ret", 0ull), 1000ull);
+    REQUIRE_STR_EQ(sc.at(2).value("name", "").c_str(), "mmap");
+    REQUIRE_GE(sc.at(2).value("ret", 0ull), 0x700000000000ull);
+    REQUIRE(sc.at(3).value("enosys", false));
+    REQUIRE_EQ(sc.at(3).value("ret", 0ull), 78ull);
+    REQUIRE_STR_EQ(sc.at(4).value("name", "").c_str(), "exit");
+    bs::unload();
+}
+
+// === arm64 emulation (audit 49) =============================================
+
+TEST_CASE(emu_arm64_blob_runs_and_returns) {
+    // mov w0,#7 / ret
+    run_request_t req;
+    req.arch = arch_t::arm64;
+    req.code = {0xE0, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6};
+    req.code_base = 0x400000;
+    req.trace = true;
+    auto r = emulate_run(req);
+    REQUIRE(r.ok);
+    REQUIRE_STR_EQ(r.stopped_reason.c_str(), "return");
+    REQUIRE_EQ(r.regs.at("x0"), 7u);
+    REQUIRE_EQ(r.trace.size(), 2u);
+    REQUIRE(lower_copy(r.trace[0].text).find("mov") != std::string::npos);
+    REQUIRE(lower_copy(r.trace[1].text).find("ret") != std::string::npos);
+}
+
+TEST_CASE(emu_arm64_macho_function_with_stub_logging) {
+    namespace bs = slop::core::disasm::binary_state;
+    bs::unload();
+    elf_fixture::temp_file_t tf(slop_test::macho::build_arm64_exe(), "emu_macho");
+    REQUIRE(bs::load_file(tf.path.string()));
+    const auto& L = slop_test::macho::exe_layout;
+
+    bool is_error = false;
+    auto out = emulate_call({{"action", "run"},
+                             {"file_addr", L.main_va},
+                             {"entry", L.main_va},
+                             {"code_len", 0x40},
+                             {"trace", true}},
+                            is_error);
+    REQUIRE_FALSE(is_error);
+    REQUIRE_STR_EQ(out.value("arch", "").c_str(), "arm64");
+    REQUIRE_STR_EQ(out.value("stopped_reason", "").c_str(), "return");
+    REQUIRE_EQ(out.value("total_api_calls", 0ull), 1ull);
+    const auto& call = out.at("api_calls").at(0);
+    REQUIRE(call.value("name", "").find("puts") != std::string::npos);
+    REQUIRE_EQ(call.value("ret", 0ull), L.main_va + 0x14);
+    // main returns 0 after helper() -> mov w0,#0
+    REQUIRE_EQ(out.at("regs").value("x0", 0ull), 0ull);
+    bs::unload();
 }

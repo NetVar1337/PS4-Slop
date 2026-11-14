@@ -5,6 +5,9 @@
 
 #include "core/analysis/ps4_syscalls.hpp"
 
+#include <memory>
+#include <mutex>
+
 namespace slop::core::mcp::detail {
 
 namespace {
@@ -143,15 +146,14 @@ std::string lower_ascii(std::string s) {
     return s;
 }
 
-// IAT slots of a PE32+ image, for the emulator's import stubs. returns maps
-// lowercase "func" or "dll!func" to a per-import return value; matched keys
-// are removed so the caller can report the rest
+// IAT slots of a PE32+ image, or the GOT / pointer slots the ELF and Mach-O
+// loaders report for their imports; the stub mechanism is format agnostic
+// and works for x86-64 and arm64 (the stub RET is arch specific)
 std::vector<emu::import_slot_t> image_import_slots(const ds::binary_t& bin,
                                                    std::map<std::string, uint64_t>& returns) {
     std::vector<emu::import_slot_t> out;
-    // PE IAT slots, or the GOT / pointer slots the ELF and Mach-O loaders
-    // report for their imports; the stub mechanism is format agnostic
-    if (bin.arch != disasm::image_arch_t::x64) return out;
+    if (bin.arch != disasm::image_arch_t::x64 && bin.arch != disasm::image_arch_t::arm64)
+        return out;
     std::vector<std::string> used;
     for (const auto& dll : bin.pe.imports) {
         for (const auto& fn : dll.functions) {
@@ -176,11 +178,25 @@ std::vector<emu::import_slot_t> image_import_slots(const ds::binary_t& bin,
     return out;
 }
 
-// unicorn runs in x86-64 long mode only, every code source is checked
-void require_x64_image(const ds::binary_t& bin) {
-    if (bin.arch == disasm::image_arch_t::x64) return;
-    fail(std::string("emulate.run executes x86-64 code only; the loaded image is ") +
-         disasm::image_arch_name(bin.arch) + " (" + disasm::image_format_name(bin.format) + ")");
+// "x64" | "x86_64" | "amd64" | "arm64" | "aarch64"; nullopt means derive
+std::optional<emu::arch_t> requested_arch(const json& args) {
+    const auto it = args.find("arch");
+    if (it == args.end() || it->is_null()) return std::nullopt;
+    if (!it->is_string()) fail("arch must be \"x64\" or \"arm64\"");
+    const std::string a = lower_ascii(it->get<std::string>());
+    if (a == "x64" || a == "x86_64" || a == "amd64") return emu::arch_t::x86_64;
+    if (a == "arm64" || a == "aarch64") return emu::arch_t::arm64;
+    fail("arch must be \"x64\" or \"arm64\"");
+}
+
+void require_image_arch(const ds::binary_t& bin, emu::arch_t arch) {
+    const auto want = arch == emu::arch_t::arm64 ? disasm::image_arch_t::arm64
+                                                 : disasm::image_arch_t::x64;
+    if (bin.arch == want) return;
+    fail(std::string("emulate executes ") +
+         (arch == emu::arch_t::arm64 ? "arm64" : "x86-64") +
+         " code only; the loaded image is " + disasm::image_arch_name(bin.arch) +
+         " (" + disasm::image_format_name(bin.format) + ")");
 }
 
 void require_x64_target(runtime::session_t& s) {
@@ -233,12 +249,22 @@ uint64_t syscall_number_key(const std::string& key) {
     fail("syscall_returns: '" + key + "' is neither a number nor a PS4 syscall name");
 }
 
-} // namespace
+const char* abi_label(const emu::run_request_t& req) {
+    return req.arch == emu::arch_t::arm64 ? "aapcs64" : emu::abi_name(req.abi);
+}
 
-json tool_emulate(const json& args, infra::cancel_token_t cancel) {
-    const std::string action = require_action(args);
-    if (action != "run") fail("emulate: unknown action");
+// === request building ======================================================
+// Shared by emulate.run and emulate.session_create: everything that reads the
+// shared image or the attached target happens under g_tool_mu, the run itself
+// never does
 
+struct parsed_request_t {
+    emu::run_request_t req;
+    bool ps4_env = false;
+    std::vector<std::string> unmatched_api_returns;
+};
+
+parsed_request_t build_request(const json& args, infra::cancel_token_t cancel) {
     // Input bounds: these all run before unicorn's timer starts (stack commit,
     // per-byte taint marking, trace growth), so an unbounded value hangs the
     // request regardless of timeout_ms
@@ -247,7 +273,8 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
     constexpr size_t   kMaxTraceMax  = 16384;
     constexpr size_t   kMaxDumpLen   = 1u << 20;
 
-    emu::run_request_t req;
+    parsed_request_t out;
+    emu::run_request_t& req = out.req;
     req.cancel = cancel;
     const bool page_in = args.value("page_in", true);
 
@@ -266,21 +293,18 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
     std::unique_lock tool_lk(g_tool_mu);
 
     const auto abi_req = requested_abi(args);
+    const auto arch_req = requested_arch(args);
+    emu::arch_t arch = arch_req.value_or(emu::arch_t::x86_64);
     emu::abi_t auto_abi = emu::abi_t::win64;
     bool ps4_env = false;   // name syscalls from the Orbis table
 
     // hex wins over file_addr wins over target_addr, code runs at its real va unless base says otherwise
     bool have_code = false;
     if (args.contains("hex") && args.at("hex").is_string()) {
-        // raw bytes carry no architecture of their own; only x86-64 runs
-        if (auto it = args.find("arch"); it != args.end() && !it->is_null()) {
-            const std::string a = it->is_string() ? lower_ascii(it->get<std::string>()) : "";
-            if (a != "x64" && a != "x86_64" && a != "amd64")
-                fail("emulate.run executes x86-64 code only (arch must be \"x64\")");
-        }
+        // raw bytes carry no architecture of their own; x64 unless arch says otherwise
         req.code = hex_decode(args.at("hex").get<std::string>());
         have_code = !req.code.empty();
-        if (have_code) {
+        if (have_code && arch == emu::arch_t::x86_64) {
             // a console session or a loaded PS4/ELF image means PS4 code
             if (runtime::active_kind() == runtime::backend_kind_t::ps4) {
                 auto_abi = emu::abi_t::sysv;
@@ -299,7 +323,10 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         std::lock_guard lk(ds::state_mutex());
         auto& bin = ds::get();
         if (!bin.ready) fail("no image loaded in reverse-slop (see disasm.loaded)");
-        require_x64_image(bin);
+        if (arch_req) arch = *arch_req;
+        else arch = bin.arch == disasm::image_arch_t::arm64 ? emu::arch_t::arm64
+                                                           : emu::arch_t::x86_64;
+        require_image_arch(bin, arch);
         const uint64_t addr = parse_addr(args, "file_addr");
         uint64_t len = args.contains("code_len") ? parse_addr(args, "code_len") : 64;
         if (len == 0 || len > (1ull << 20)) fail("bad code_len");
@@ -313,8 +340,9 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         view->read(bin, addr - bin.base, req.code.size(), req.code.data());
         req.code_base  = addr;
         req.image_base = bin.base;
-        if (is_sysv_format(bin.format)) auto_abi = emu::abi_t::sysv;
-        ps4_env = is_ps4_format(bin.format);
+        if (arch == emu::arch_t::x86_64 && is_sysv_format(bin.format))
+            auto_abi = emu::abi_t::sysv;
+        ps4_env = arch == emu::arch_t::x86_64 && is_ps4_format(bin.format);
         if (page_in) req.page_in = image_page_source(std::move(view));
         if (args.value("stub_imports", true))
             req.imports = image_import_slots(bin, api_returns);
@@ -324,6 +352,9 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         auto s = process::active_session();
         if (!s || !s->valid()) fail("no target attached for target_addr");
         require_x64_target(*s);
+        if (arch_req && *arch_req != emu::arch_t::x86_64)
+            fail("emulate can only read x86-64 code from an attached target");
+        arch = emu::arch_t::x86_64;
         if (runtime::active_kind() == runtime::backend_kind_t::ps4) {
             auto_abi = emu::abi_t::sysv;
             ps4_env = true;
@@ -349,8 +380,9 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
     if (!have_code)
         fail("no code source: pass 'hex', 'file_addr' or 'target_addr'");
 
+    req.arch = arch;
     req.abi = abi_req.value_or(auto_abi);
-    if (req.abi == emu::abi_t::sysv && (ps4_env || abi_req)) {
+    if (req.arch == emu::arch_t::x86_64 && req.abi == emu::abi_t::sysv && (ps4_env || abi_req)) {
         // an explicit sysv run on a non-Mach-O source is treated as PS4 code
         const bool macho_image = [&] {
             if (!args.contains("file_addr") || args.contains("hex")) return false;
@@ -359,6 +391,7 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         }();
         if (!macho_image) req.syscall_name = analysis::ps4_syscall_name;
     }
+    out.ps4_env = ps4_env;
 
     if (args.contains("base")) req.code_base = parse_addr(args, "base");
     const uint64_t start_va = args.contains("entry")
@@ -413,6 +446,14 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
     if (args.contains("trace_max"))
         req.trace_max = static_cast<size_t>(
             std::min<uint64_t>(parse_addr(args, "trace_max"), kMaxTraceMax));
+    // a trace is the raw material of a backward slice, so record the bytes and
+    // the memory reads with it; record_slice forces the trace on
+    if (args.contains("record_slice") && args.value("record_slice", false)) {
+        req.record_slice = true;
+        req.trace = true;
+    } else if (req.trace) {
+        req.record_slice = true;
+    }
 
     if (auto it = args.find("taint"); it != args.end() && it->is_array()) {
         uint64_t taint_total = 0;
@@ -460,112 +501,324 @@ json tool_emulate(const json& args, infra::cancel_token_t cancel) {
         for (auto r = it->begin(); r != it->end(); ++r)
             req.syscall_returns[syscall_number_key(r.key())] = parse_api_value(r.value(), r.key());
     }
-    tool_lk.unlock();
+    // Orbis syscall emulation is opt-in: it serves the numbers that have no
+    // explicit syscall_returns entry, so a fixed return still wins
+    if (args.value("orbis_syscalls", false)) {
+        if (req.arch != emu::arch_t::x86_64)
+            fail("orbis_syscalls are x86-64 only");
+        req.orbis_syscalls = true;
+        if (args.contains("pid")) req.orbis.pid = parse_addr(args, "pid");
+    }
+    for (const auto& [key, value] : api_returns) out.unmatched_api_returns.push_back(key);
+    return out;
+}
 
-    auto r = emu::emulate_run(req);
-    if (!r.ok && !r.error.empty()) fail(r.error);
+// === trace store (for emulate.slice) ======================================
 
-    json out = {{"ok", r.ok},
-                {"stopped_reason", r.stopped_reason},
+struct trace_store_t {
+    std::mutex mu;
+    std::map<uint64_t, emu::run_result_t> entries;
+    uint64_t next = 1;
+};
+
+trace_store_t& trace_store() {
+    static trace_store_t s;
+    return s;
+}
+
+uint64_t store_trace(emu::run_result_t run) {
+    auto& s = trace_store();
+    std::lock_guard lk(s.mu);
+    constexpr size_t kMaxTraces = 8;
+    while (s.entries.size() >= kMaxTraces) s.entries.erase(s.entries.begin());
+    const uint64_t id = s.next++;
+    s.entries.emplace(id, std::move(run));
+    return id;
+}
+
+// === persistent session store =============================================
+
+struct session_store_t {
+    std::mutex mu;
+    std::map<uint64_t, std::shared_ptr<emu::emulation_session_t>> entries;
+    uint64_t next = 1;
+};
+
+session_store_t& session_store() {
+    static session_store_t s;
+    return s;
+}
+
+constexpr size_t kMaxSessions = 8;
+
+json regs_json(const std::map<std::string, uint64_t>& regs) {
+    json out = json::object();
+    for (const auto& [name, value] : regs) out[name] = value;
+    return out;
+}
+
+json session_state_json(const emu::emulation_session_t& session) {
+    const auto& r = session.state();
+    json out = {{"ok", true},
+                {"arch", emu::arch_name(session.arch())},
                 {"instructions", r.instructions},
-                {"abi", emu::abi_name(req.abi)}};
-    if (r.teb_mapped) out["teb_mapped"] = true;
-    if (r.tls_mapped) out["tls_mapped"] = true;
-    if (!r.error.empty()) out["error"] = r.error;
-
-    json regs = json::object();
-    for (const auto& [name, value] : r.regs) regs[name] = value;
-    out["regs"] = regs;
-
-    if (!r.trace.empty()) {
-        json arr = json::array();
-        for (const auto& t : r.trace)
-            arr.push_back({{"ip", t.ip}, {"text", t.text}});
-        out["trace"] = arr;
-    }
-    {
-        json arr = json::array();
-        for (const auto& w : r.writes) {
-            json e = {{"ip", w.ip}, {"addr", w.addr}, {"len", w.len}, {"value", w.value}};
-            if (w.truncated) e["truncated"] = true;
-            arr.push_back(std::move(e));
-        }
-        out["writes"] = arr;
-        out["total_writes"] = r.total_writes;
-    }
-    if (!req.imports.empty()) {
-        json arr = json::array();
-        for (const auto& c : r.api_calls) {
-            json a = json::array();
-            for (uint8_t i = 0; i < c.arg_count; ++i) a.push_back(c.args[i]);
-            arr.push_back({{"ip", c.ip}, {"ret", c.ret}, {"name", c.name}, {"args", std::move(a)}});
-        }
-        out["api_calls"]       = arr;
-        out["total_api_calls"] = r.total_api_calls;
-    }
-    if (r.total_syscalls) {
-        json arr = json::array();
-        for (const auto& sc : r.syscalls) {
-            json e = {{"ip", sc.ip}, {"num", sc.num}, {"ret", sc.ret},
-                      {"args", json::array({sc.args[0], sc.args[1], sc.args[2],
-                                            sc.args[3], sc.args[4], sc.args[5]})}};
-            if (!sc.name.empty()) e["name"] = sc.name;
-            arr.push_back(std::move(e));
-        }
-        out["syscalls"]       = arr;
-        out["total_syscalls"] = r.total_syscalls;
-    }
-    if (!api_returns.empty()) {
-        json keys = json::array();
-        for (const auto& [key, value] : api_returns) keys.push_back(key);
-        out["api_returns_unmatched"] = keys;
-    }
-    if (req.page_in) out["paged_in"] = r.paged_in;
-    if (!req.dumps.empty()) {
-        json arr = json::array();
-        for (size_t i = 0; i < r.memory.size(); ++i) {
-            const auto& m = r.memory[i];
-            arr.push_back({{"addr", m.addr}, {"len", m.bytes.size()},
-                           {"requested", req.dumps[i].len},
-                           {"hex", to_hex(m.bytes.data(), m.bytes.size())}});
-        }
-        out["memory"] = arr;
-    }
-    if (r.fault) {
-        out["fault"] = {{"ip", r.fault->ip}, {"addr", r.fault->addr},
-                        {"access", r.fault->access}};
-        if (r.page_in_exhausted)
-            out["note"] = "demand paging hit its 4096-page (16 MiB) budget; "
-                          "lower count or start closer to the code of interest";
-        else if (req.page_in)
-            out["note"] = "the address is outside the code source: file_addr "
-                          "pages come from the loaded image (its sections, "
-                          "inside SizeOfImage), target_addr pages from the "
-                          "attached process. Map anything else (heap, other "
-                          "modules, PEB.Ldr) with maps=[{addr,hex}]";
-        else
-            out["note"] = "only the requested code bytes (+ optional maps=) are "
-                          "mapped: CALL/JMP to unmapped callees and loads from "
-                          "unmapped data stop with invalid_mem_* (trace shows "
-                          "<unmapped>, never synthetic ADD [rax],al). Use "
-                          "file_addr/target_addr with page_in (default on) to "
-                          "pull the rest on demand, or map it via "
-                          "maps=[{addr,hex}]";
-    }
-
-    if (!req.taint_sources.empty()) {
-        json ranges = json::array();
-        for (const auto& rg : r.taint_ranges)
-            ranges.push_back({{"addr", rg.addr}, {"len", rg.len}});
-        json events = json::array();
-        for (const auto& e : r.taint_events)
-            events.push_back({{"ip", e.ip}, {"insn", e.insn},
-                              {"kind", e.kind}, {"target", e.target}});
-        out["taint_ranges"]   = ranges;
-        out["taint_events"]   = events;
-        out["output_tainted"] = r.output_tainted;
+                {"regs", regs_json(r.regs)},
+                {"snapshots", session.snapshot_count()}};
+    if (!r.stopped_reason.empty()) out["stopped_reason"] = r.stopped_reason;
+    if (!r.stdout_data.empty())
+        out["stdout"] = std::string(r.stdout_data.begin(), r.stdout_data.end());
+    if (r.syscall_enosys) out["syscall_enosys"] = r.syscall_enosys;
+    if (r.exited) {
+        out["exited"] = true;
+        out["exit_code"] = r.exit_code;
     }
     return out;
+}
+
+} // namespace
+
+json tool_emulate(const json& args, infra::cancel_token_t cancel) {
+    const std::string action = require_action(args);
+
+    // === run =================================================================
+    if (action == "run") {
+        auto parsed = build_request(args, cancel);
+        const emu::run_request_t& req = parsed.req;
+
+        auto r = emu::emulate_run(req);
+        if (!r.ok && !r.error.empty()) fail(r.error);
+
+        json out = {{"ok", r.ok},
+                    {"stopped_reason", r.stopped_reason},
+                    {"instructions", r.instructions},
+                    {"arch", emu::arch_name(req.arch)},
+                    {"abi", abi_label(req)}};
+        if (r.teb_mapped) out["teb_mapped"] = true;
+        if (r.tls_mapped) out["tls_mapped"] = true;
+        if (!r.error.empty()) out["error"] = r.error;
+
+        out["regs"] = regs_json(r.regs);
+
+        if (!r.trace.empty()) {
+            json arr = json::array();
+            for (const auto& t : r.trace)
+                arr.push_back({{"ip", t.ip}, {"text", t.text}});
+            out["trace"] = arr;
+        }
+        {
+            json arr = json::array();
+            for (const auto& w : r.writes) {
+                json e = {{"ip", w.ip}, {"addr", w.addr}, {"len", w.len}, {"value", w.value}};
+                if (w.truncated) e["truncated"] = true;
+                arr.push_back(std::move(e));
+            }
+            out["writes"] = arr;
+            out["total_writes"] = r.total_writes;
+        }
+        if (!req.imports.empty()) {
+            json arr = json::array();
+            for (const auto& c : r.api_calls) {
+                json a = json::array();
+                for (uint8_t i = 0; i < c.arg_count; ++i) a.push_back(c.args[i]);
+                arr.push_back({{"ip", c.ip}, {"ret", c.ret}, {"name", c.name}, {"args", std::move(a)}});
+            }
+            out["api_calls"]       = arr;
+            out["total_api_calls"] = r.total_api_calls;
+        }
+        if (r.total_syscalls) {
+            json arr = json::array();
+            for (const auto& sc : r.syscalls) {
+                json e = {{"ip", sc.ip}, {"num", sc.num}, {"ret", sc.ret},
+                          {"args", json::array({sc.args[0], sc.args[1], sc.args[2],
+                                                sc.args[3], sc.args[4], sc.args[5]})}};
+                if (!sc.name.empty()) e["name"] = sc.name;
+                if (sc.enosys) e["enosys"] = true;
+                arr.push_back(std::move(e));
+            }
+            out["syscalls"]       = arr;
+            out["total_syscalls"] = r.total_syscalls;
+        }
+        if (req.orbis_syscalls) {
+            if (!r.stdout_data.empty())
+                out["stdout"] = std::string(r.stdout_data.begin(), r.stdout_data.end());
+            out["syscall_enosys"] = r.syscall_enosys;
+            if (r.exited) {
+                out["exited"] = true;
+                out["exit_code"] = r.exit_code;
+            }
+        }
+        if (!parsed.unmatched_api_returns.empty()) {
+            json keys = json::array();
+            for (const auto& key : parsed.unmatched_api_returns) keys.push_back(key);
+            out["api_returns_unmatched"] = keys;
+        }
+        if (req.page_in) out["paged_in"] = r.paged_in;
+        if (!req.dumps.empty()) {
+            json arr = json::array();
+            for (size_t i = 0; i < r.memory.size(); ++i) {
+                const auto& m = r.memory[i];
+                arr.push_back({{"addr", m.addr}, {"len", m.bytes.size()},
+                               {"requested", req.dumps[i].len},
+                               {"hex", to_hex(m.bytes.data(), m.bytes.size())}});
+            }
+            out["memory"] = arr;
+        }
+        if (r.fault) {
+            out["fault"] = {{"ip", r.fault->ip}, {"addr", r.fault->addr},
+                            {"access", r.fault->access}};
+            if (r.page_in_exhausted)
+                out["note"] = "demand paging hit its 4096-page (16 MiB) budget; "
+                              "lower count or start closer to the code of interest";
+            else if (req.page_in)
+                out["note"] = "the address is outside the code source: file_addr "
+                              "pages come from the loaded image (its sections, "
+                              "inside SizeOfImage), target_addr pages from the "
+                              "attached process. Map anything else (heap, other "
+                              "modules, PEB.Ldr) with maps=[{addr,hex}]";
+            else
+                out["note"] = "only the requested code bytes (+ optional maps=) are "
+                              "mapped: CALL/JMP to unmapped callees and loads from "
+                              "unmapped data stop with invalid_mem_* (trace shows "
+                              "<unmapped>, never synthetic ADD [rax],al). Use "
+                              "file_addr/target_addr with page_in (default on) to "
+                              "pull the rest on demand, or map it via "
+                              "maps=[{addr,hex}]";
+        }
+
+        if (!req.taint_sources.empty()) {
+            json ranges = json::array();
+            for (const auto& rg : r.taint_ranges)
+                ranges.push_back({{"addr", rg.addr}, {"len", rg.len}});
+            json events = json::array();
+            for (const auto& e : r.taint_events)
+                events.push_back({{"ip", e.ip}, {"insn", e.insn},
+                                  {"kind", e.kind}, {"target", e.target}});
+            out["taint_ranges"]   = ranges;
+            out["taint_events"]   = events;
+            out["output_tainted"] = r.output_tainted;
+        }
+        // a recorded trace stays addressable for emulate.slice
+        if (req.trace && !r.trace.empty()) out["trace_id"] = store_trace(std::move(r));
+        return out;
+    }
+
+    // === slice ===============================================================
+    if (action == "slice") {
+        const uint64_t id = parse_addr(args, "trace_id");
+        emu::run_result_t run;
+        {
+            auto& s = trace_store();
+            std::lock_guard lk(s.mu);
+            const auto it = s.entries.find(id);
+            if (it == s.entries.end())
+                fail("unknown trace_id (run emulate.run with trace=true first; "
+                     "the store keeps the last 8 traces)");
+            run = it->second;
+        }
+        emu::slice_request_t sr;
+        if (auto it = args.find("reg"); it != args.end() && it->is_string())
+            sr.reg = it->get<std::string>();
+        if (args.contains("addr")) sr.addr = parse_addr(args, "addr");
+        if (args.contains("len"))  sr.len  = static_cast<size_t>(parse_addr(args, "len"));
+        if (args.contains("at"))   sr.at   = parse_addr(args, "at");
+        const auto r = emu::emulate_slice(run, sr);
+        if (!r.ok) fail(r.error);
+        json insns = json::array();
+        for (const auto& i : r.insns)
+            insns.push_back({{"ip", i.ip}, {"text", i.text}});
+        return json{{"ok", true}, {"trace_id", id}, {"count", r.insns.size()},
+                    {"instructions", std::move(insns)}};
+    }
+
+    // === persistent sessions ================================================
+    if (action == "session_create") {
+        auto parsed = build_request(args, cancel);
+        std::string err;
+        auto session = emu::emulation_session_t::create(parsed.req, &err);
+        if (!session) fail(err.empty() ? "session create failed" : err);
+        auto& store = session_store();
+        std::lock_guard lk(store.mu);
+        if (store.entries.size() >= kMaxSessions)
+            fail("too many live sessions (max 8): destroy one first");
+        const uint64_t id = store.next++;
+        json out = session_state_json(*session);
+        out["session"] = id;
+        out["abi"] = abi_label(parsed.req);
+        store.entries.emplace(id, std::move(session));
+        return out;
+    }
+
+    if (action == "session_step" || action == "session_run") {
+        const uint64_t id = parse_addr(args, "session");
+        std::shared_ptr<emu::emulation_session_t> session;
+        {
+            auto& store = session_store();
+            std::lock_guard lk(store.mu);
+            const auto it = store.entries.find(id);
+            if (it == store.entries.end()) fail("unknown session id");
+            session = it->second;
+        }
+        const uint64_t count = args.contains("count")
+            ? parse_addr(args, "count")
+            : (action == "session_run" ? 0 : 1);
+        const uint32_t timeout_ms = args.contains("timeout_ms")
+            ? static_cast<uint32_t>(std::min<uint64_t>(parse_addr(args, "timeout_ms"),
+                                                       emu::kMaxTimeoutMs))
+            : (action == "session_run" ? 5000u : 1000u);
+        std::string err;
+        if (!session->step(count, timeout_ms, cancel, &err))
+            fail(err.empty() ? "session step failed" : err);
+        json out = session_state_json(*session);
+        out["session"] = id;
+        return out;
+    }
+
+    if (action == "session_destroy") {
+        const uint64_t id = parse_addr(args, "session");
+        auto& store = session_store();
+        std::lock_guard lk(store.mu);
+        if (!store.entries.erase(id)) fail("unknown session id");
+        return json{{"ok", true}, {"session", id}, {"destroyed", true}};
+    }
+
+    if (action == "snapshot") {
+        const uint64_t id = parse_addr(args, "session");
+        std::shared_ptr<emu::emulation_session_t> session;
+        {
+            auto& store = session_store();
+            std::lock_guard lk(store.mu);
+            const auto it = store.entries.find(id);
+            if (it == store.entries.end()) fail("unknown session id");
+            session = it->second;
+        }
+        std::string err;
+        if (!session->snapshot(&err)) fail(err);
+        json out = session_state_json(*session);
+        out["session"] = id;
+        out["snapshot"] = session->snapshot_count();
+        out["pages"] = session->snapshot_pages();
+        return out;
+    }
+
+    if (action == "restore") {
+        const uint64_t id = parse_addr(args, "session");
+        std::shared_ptr<emu::emulation_session_t> session;
+        {
+            auto& store = session_store();
+            std::lock_guard lk(store.mu);
+            const auto it = store.entries.find(id);
+            if (it == store.entries.end()) fail("unknown session id");
+            session = it->second;
+        }
+        std::string err;
+        if (!session->restore(&err)) fail(err);
+        json out = session_state_json(*session);
+        out["session"] = id;
+        out["restored"] = true;
+        return out;
+    }
+
+    fail("emulate: unknown action");
 }
 
 } // namespace slop::core::mcp::detail

@@ -1,6 +1,6 @@
 #pragma once
 
-// raii wrapper over a unicorn x64 engine, headers stay confined to this folder
+// raii wrapper over a unicorn engine, headers stay confined to this folder
 
 #include <cstdint>
 #include <cstddef>
@@ -9,9 +9,11 @@ struct uc_struct;
 
 namespace slop::core::emu {
 
+enum class uc_arch_t : uint8_t { x86_64, arm64 };
+
 class unicorn_t {
 public:
-    unicorn_t();                                   // UC_ARCH_X86 / UC_MODE_64
+    explicit unicorn_t(uc_arch_t arch = uc_arch_t::x86_64);
     ~unicorn_t();
 
     unicorn_t(const unicorn_t&)            = delete;

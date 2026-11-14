@@ -17,9 +17,11 @@ constexpr uint64_t kPageMask = 0xFFFULL;
 uc_engine* eng(uc_struct* h) { return reinterpret_cast<uc_engine*>(h); }
 }
 
-unicorn_t::unicorn_t() {
+unicorn_t::unicorn_t(uc_arch_t arch) {
     uc_engine* e = nullptr;
-    if (uc_open(UC_ARCH_X86, UC_MODE_64, &e) == UC_ERR_OK)
+    const uc_arch a = arch == uc_arch_t::arm64 ? UC_ARCH_ARM64 : UC_ARCH_X86;
+    const uc_mode m = arch == uc_arch_t::arm64 ? UC_MODE_ARM : UC_MODE_64;
+    if (uc_open(a, m, &e) == UC_ERR_OK)
         uc_ = reinterpret_cast<uc_struct*>(e);
 }
 

@@ -38,7 +38,8 @@ set(FT_DISABLE_HARFBUZZ TRUE CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
 
 set(UNICORN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(UNICORN_ARCH "x86" CACHE STRING "" FORCE)
+# x86-64 for PE/ELF/PS4 code, aarch64 for the Mach-O/iOS emulation path
+set(UNICORN_ARCH "x86;aarch64" CACHE STRING "" FORCE)
 
 # hyperion engine deps
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
@@ -169,6 +170,16 @@ if(NOT WIN32)
 endif()
 
 FetchContent_MakeAvailable(freetype nlohmann_json zydis imgui httplib unicorn sqlite lua fmt spdlog capstone zlib_kr)
+
+# Unicorn's qemu util defines crc32() with the same CRC-32 algorithm zlib
+# exports (same table, same complement convention). Enabling the aarch64
+# target makes the ARM CRC32 helpers reference crc32c(), which pulls
+# qemu/util/crc32c.c in and with it a second crc32 definition. The two are
+# behaviourally identical, so let the linker accept the duplicate instead of
+# renaming a symbol that also feeds the generated TCG helper names
+if(MSVC AND TARGET unicorn)
+    target_link_options(unicorn INTERFACE /FORCE:MULTIPLE)
+endif()
 
 # zlib builds both a shared and a static lib, we only want the static one so
 # the exes stay freestanding

@@ -102,6 +102,8 @@ add_library(slop_core STATIC
     emu/taint.cpp
     emu/unicorn.hpp
     emu/unicorn.cpp
+    emu/orbis.hpp
+    emu/orbis.cpp
     emu/session.hpp
     emu/session.cpp
     disasm/engine.hpp
