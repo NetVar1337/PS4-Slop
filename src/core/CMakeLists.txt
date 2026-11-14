@@ -66,6 +66,10 @@ add_library(slop_core STATIC
     network/http_proxy.cpp
     network/parsers.hpp
     network/parsers.cpp
+    network/redact.hpp
+    network/redact.cpp
+    network/pcap_import.hpp
+    network/pcap_import.cpp
     network/net_socket.hpp
     network/net_socket.cpp
     network/tls_stream.hpp

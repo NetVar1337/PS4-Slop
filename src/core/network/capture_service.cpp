@@ -582,12 +582,16 @@ net_stats_t stats() {
 }
 
 std::string export_pcap(traffic_store_t& store, const std::string& path,
-                        uint32_t max_packets, size_t* exported, bool* truncated) {
+                        uint32_t max_packets, size_t* exported, bool* truncated,
+                        const std::string& format) {
+    if (format != "pcap" && format != "pcapng")
+        return "format must be pcap or pcapng, got '" + format + "'";
     while (poll(store, 4096) > 0) {}
     const auto page = store.packets_tail(max_packets);
     std::string err;
-    if (!store.write_pcap(path, page.items, &err))
-        return err.empty() ? "pcap write failed" : err;
+    const bool ok = format == "pcapng" ? store.write_pcapng(path, page.items, &err)
+                                       : store.write_pcap(path, page.items, &err);
+    if (!ok) return err.empty() ? format + " write failed" : err;
     if (exported) *exported = page.items.size();
     if (truncated) *truncated = page.truncated;
     return {};

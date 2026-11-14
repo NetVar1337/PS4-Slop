@@ -32,6 +32,7 @@ struct packet_record_t {
     uint32_t              tcp_seq = 0;
     uint32_t              tcp_ack = 0;
     uint8_t               tcp_flags = 0;
+    uint64_t              stream_id = 0;   // assigned by the store
     std::vector<uint8_t>  payload;         // captured payload (may be a prefix of the wire payload)
 };
 
@@ -113,6 +114,17 @@ public:
                     const std::vector<packet_record_t>& pkts,
                     std::string* error = nullptr) const;
 
+    // pcapng (LINKTYPE_RAW) export: one EPB per packet, carrying the packet's
+    // annotation as an epb_comment when it has one (a stream annotation applies
+    // to every packet of that stream)
+    bool write_pcapng(const std::string& path,
+                      const std::vector<packet_record_t>& pkts,
+                      std::string* error = nullptr) const;
+
+    // annotations for pcapng export; false when the id is unknown
+    bool annotate_packet(uint64_t id, std::string comment);
+    bool annotate_stream(uint64_t id, std::string comment);
+
     size_t size() const;
 
     struct stats_t {
@@ -123,6 +135,7 @@ public:
         uint64_t streams_evicted = 0;       // LRU-evicted (count or byte budget)
         uint64_t stream_bytes_dropped = 0;  // payload not kept (per-direction cap)
         uint64_t packets_total = 0;         // ever added
+        uint64_t quic_packets = 0;          // UDP/443 packets with a QUIC long header
     };
     stats_t stats() const;
     // streams with activity in [now_ms - window_ms, now_ms]
@@ -169,8 +182,10 @@ private:
     uint64_t next_stream_id_ = 1;
     size_t   stream_bytes_ = 0;
     uint64_t packets_evicted_ = 0, streams_evicted_ = 0, bytes_dropped_ = 0;
+    uint64_t quic_packets_ = 0;
+    std::map<uint64_t, std::string> pkt_notes_, stream_notes_;
 
-    void index_stream(const packet_record_t& p);
+    void index_stream(packet_record_t& p);
     void evict_streams(const stream_rec_t* keep);
     stream_summary_t summarize(const stream_rec_t& s) const;
 };

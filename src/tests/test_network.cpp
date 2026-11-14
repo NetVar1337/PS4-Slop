@@ -12,6 +12,8 @@
 #include "core/network/mitm_pki.hpp"
 #include "core/network/net_socket.hpp"
 #include "core/network/parsers.hpp"
+#include "core/network/pcap_import.hpp"
+#include "core/network/redact.hpp"
 #include "core/network/tls_stream.hpp"
 #include "core/network/traffic_store.hpp"
 #include "core/mcp/mcp_tools.hpp"
@@ -265,6 +267,14 @@ struct origin_t {
         });
         srv.Post("/echo", [](const httplib::Request& req, httplib::Response& res) {
             res.set_content("echo:" + req.body, "text/plain");
+        });
+        // echoes the credential headers so a replay can be checked for them
+        srv.Get("/auth", [](const httplib::Request& req, httplib::Response& res) {
+            res.set_header("Set-Cookie", "sid=set-cookie-secret; HttpOnly");
+            res.set_content("auth:" + req.get_header_value("Authorization") +
+                                "|cookie:" + req.get_header_value("Cookie") +
+                                "|target:" + req.target,
+                            "text/plain");
         });
         port = srv.bind_to_any_port("127.0.0.1");
         th = std::thread([this] { srv.listen_after_bind(); });
@@ -1576,4 +1586,412 @@ TEST_CASE(network_proxy_mitm_intercepts_https) {
     proxy.set_mitm(nullptr);
     REQUIRE_FALSE(proxy.mitm_enabled());
     proxy.stop();
+}
+
+// redaction, pcap import/export, QUIC
+
+TEST_CASE(network_redact_secrets_helpers) {
+    using namespace slop::core::network::redact;
+    const std::string head =
+        "GET /x?token=abc&ok=1 HTTP/1.1\r\n"
+        "Host: h\r\n"
+        "Authorization: Bearer s3cret\r\n"
+        "Cookie: sid=s3cret\r\n"
+        "Accept: */*\r\n"
+        "\r\n"
+        "body Authorization: Bearer s3cret";
+    const std::string masked = http_head(head);
+    // the head carries no secret; the body keeps its bytes verbatim
+    const size_t blank = masked.find("\r\n\r\n");
+    REQUIRE(blank != std::string::npos);
+    REQUIRE(masked.substr(0, blank).find("s3cret") == std::string::npos);
+    REQUIRE(masked.find("Authorization: <redacted>") != std::string::npos);
+    REQUIRE(masked.find("Cookie: <redacted>") != std::string::npos);
+    REQUIRE(masked.find("token=<redacted>") != std::string::npos);
+    REQUIRE(masked.find("ok=1") != std::string::npos);
+    REQUIRE(masked.find("Accept: */*") != std::string::npos);
+    // the body is never rewritten
+    REQUIRE(masked.find("body Authorization: Bearer s3cret") != std::string::npos);
+
+    const std::string stripped = strip_secrets(head);
+    const size_t sblank = stripped.find("\r\n\r\n");
+    REQUIRE(sblank != std::string::npos);
+    const std::string shead = stripped.substr(0, sblank);
+    REQUIRE(shead.find("Authorization") == std::string::npos);
+    REQUIRE(shead.find("Cookie") == std::string::npos);
+    REQUIRE(shead.find("token") == std::string::npos);
+    REQUIRE(shead.find("GET /x?ok=1 HTTP/1.1") != std::string::npos);
+    REQUIRE(stripped.find("body Authorization: Bearer s3cret") != std::string::npos);
+
+    // a head without secrets is unchanged, and a response line is not a target
+    const std::string plain = "GET /a HTTP/1.1\r\nHost: h\r\n\r\n";
+    REQUIRE_STR_EQ(http_head(plain), plain);
+    REQUIRE_STR_EQ(strip_secrets(plain), plain);
+    REQUIRE_STR_EQ(http_head("HTTP/1.1 200 OK\r\nSet-Cookie: a=b\r\n\r\n"),
+                   std::string("HTTP/1.1 200 OK\r\nSet-Cookie: <redacted>\r\n\r\n"));
+    REQUIRE_STR_EQ(query("/p?key=1&x=2"), std::string("/p?key=<redacted>&x=2"));
+    REQUIRE_STR_EQ(query("/p"), std::string("/p"));
+}
+
+TEST_CASE(network_proxy_redacts_and_replays_without_secrets) {
+    origin_t origin;
+    const std::string op = std::to_string(origin.port);
+    http_proxy_t proxy;
+    proxy_options_t o;
+    o.port = 0;
+    std::string err;
+    REQUIRE(proxy.start(o, &err));
+    REQUIRE(o.redact_secrets);
+
+    const std::string req = "GET http://127.0.0.1:" + op +
+                            "/auth?token=abc HTTP/1.1\r\nHost: 127.0.0.1:" + op +
+                            "\r\nAuthorization: Bearer s3cret\r\nCookie: sid=s3cret\r\n\r\n";
+    const std::string resp = exchange(proxy.port(), req);
+    REQUIRE(resp.find(" 200 ") != std::string::npos);
+
+    auto entries = proxy.recent(8);
+    REQUIRE_EQ(entries.size(), 1u);
+    const proxy_entry_t& e = entries.back();
+    REQUIRE(e.redacted);
+    REQUIRE(e.replayable);
+    const std::string stored(e.raw_request.begin(), e.raw_request.end());
+    REQUIRE(stored.find("s3cret") == std::string::npos);
+    REQUIRE(stored.find("Authorization: <redacted>") != std::string::npos);
+    REQUIRE(stored.find("token=<redacted>") != std::string::npos);
+    REQUIRE(e.path.find("token=<redacted>") != std::string::npos);
+    const std::string rhead(e.response_head.begin(), e.response_head.end());
+    REQUIRE(rhead.find("set-cookie-secret") == std::string::npos);
+    REQUIRE(rhead.find("Set-Cookie: <redacted>") != std::string::npos);
+
+    // the unmasked copy is memory only and reachable by id
+    const auto raw = proxy.raw_request(e.id);
+    REQUIRE(std::string(raw.begin(), raw.end()).find("Bearer s3cret") != std::string::npos);
+
+    // default replay strips the secret headers and query params
+    auto r = proxy.replay(e.id, &err);
+    REQUIRE(r.has_value());
+    const std::string text(r->bytes.begin(), r->bytes.end());
+    REQUIRE(text.find("auth:") != std::string::npos);
+    REQUIRE(text.find("s3cret") == std::string::npos);
+    REQUIRE(text.find("target:/auth") != std::string::npos);
+
+    // with_secrets re-sends the captured request verbatim
+    auto rs = proxy.replay(e.id, &err, 15000, true);
+    REQUIRE(rs.has_value());
+    const std::string stext(rs->bytes.begin(), rs->bytes.end());
+    REQUIRE(stext.find("auth:Bearer s3cret") != std::string::npos);
+    REQUIRE(stext.find("target:/auth?token=abc") != std::string::npos);
+
+    // redaction off keeps the legacy behaviour: the request is stored verbatim
+    proxy.stop();
+    proxy_options_t plain_o;
+    plain_o.port = 0;
+    plain_o.redact_secrets = false;
+    REQUIRE(proxy.start(plain_o, &err));
+    exchange(proxy.port(), req);
+    auto plain_entries = proxy.recent(8);
+    REQUIRE_EQ(plain_entries.size(), 2u);
+    REQUIRE_FALSE(plain_entries.back().redacted);
+    const std::string praw(plain_entries.back().raw_request.begin(),
+                           plain_entries.back().raw_request.end());
+    REQUIRE(praw.find("Bearer s3cret") != std::string::npos);
+    proxy.stop();
+}
+
+namespace {
+
+void put_le32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 24) & 0xFF));
+}
+
+void put_be32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(static_cast<uint8_t>(x >> 24));
+    v.push_back(static_cast<uint8_t>((x >> 16) & 0xFF));
+    v.push_back(static_cast<uint8_t>((x >> 8) & 0xFF));
+    v.push_back(static_cast<uint8_t>(x & 0xFF));
+}
+
+// classic pcap with one Ethernet-framed IPv4/TCP record
+std::vector<uint8_t> classic_pcap(bool big_endian, bool nano) {
+    std::vector<uint8_t> f;
+    const uint32_t magic = nano ? 0xa1b23c4du : 0xa1b2c3d4u;
+    if (big_endian) put_be32(f, magic); else put_le32(f, magic);
+    // version 2.4 as one u32, then thiszone, sigfigs, snaplen, linktype
+    if (big_endian) put_be32(f, 0x00040002u); else put_le32(f, 0x00040002u);
+    if (big_endian) { put_be32(f, 0); put_be32(f, 0); } else { put_le32(f, 0); put_le32(f, 0); }
+    if (big_endian) put_be32(f, 65535); else put_le32(f, 65535);
+    if (big_endian) put_be32(f, 1); else put_le32(f, 1);          // LINKTYPE_ETHERNET
+
+    std::vector<uint8_t> frame = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,   // dst
+                                  0x11, 0x22, 0x33, 0x44, 0x55, 0x66,   // src
+                                  0x08, 0x00};                          // IPv4
+    const auto ip = ipv4("10.0.0.2", "1.2.3.4", 6, tcp_seg(1234, 80, "GET / HTTP/1.1\r\n\r\n"));
+    frame.insert(frame.end(), ip.begin(), ip.end());
+
+    if (big_endian) { put_be32(f, 1700000000); put_be32(f, 500000); }
+    else { put_le32(f, 1700000000); put_le32(f, 500000); }
+    if (big_endian) { put_be32(f, static_cast<uint32_t>(frame.size())); put_be32(f, static_cast<uint32_t>(frame.size())); }
+    else { put_le32(f, static_cast<uint32_t>(frame.size())); put_le32(f, static_cast<uint32_t>(frame.size())); }
+    f.insert(f.end(), frame.begin(), frame.end());
+    return f;
+}
+
+} // namespace
+
+TEST_CASE(network_pcap_import_roundtrip) {
+    // export -> import keeps addresses, ports, protocol and payload
+    traffic_store_t src;
+    src.add(mk_packet(1234, 80, "10.0.0.2", "1.2.3.4", 0, "hello-http"));
+    auto udp = mk_packet(5353, 53, "fe80::1", "2001:db8::53", 0, "dnsq");
+    udp.protocol = 17;
+    udp.ip_version = 6;
+    src.add(udp);
+
+    const std::string path = temp_path("roundtrip.pcap");
+    std::string err;
+    REQUIRE(src.write_pcap(path, src.packets(0, 10).items, &err));
+    traffic_store_t dst;
+    slop::core::network::pcap::import_result_t r;
+    REQUIRE_STR_EQ(slop::core::network::pcap::import_file(dst, path, &r), std::string{});
+    REQUIRE_STR_EQ(r.format, std::string("pcap"));
+    REQUIRE_EQ(r.packets, 2u);
+    REQUIRE_EQ(r.skipped, 0u);
+    const auto page = dst.packets(0, 10);
+    REQUIRE_EQ(page.items.size(), 2u);
+    REQUIRE_STR_EQ(page.items[0].local_addr, "10.0.0.2");
+    REQUIRE_STR_EQ(page.items[0].remote_addr, "1.2.3.4");
+    REQUIRE_EQ(page.items[0].local_port, 1234);
+    REQUIRE_EQ(page.items[0].remote_port, 80);
+    REQUIRE_EQ(page.items[0].protocol, 6u);
+    REQUIRE_STR_EQ(std::string(page.items[0].payload.begin(), page.items[0].payload.end()),
+                   "hello-http");
+    REQUIRE_STR_EQ(page.items[1].local_addr, "fe80::1");
+    REQUIRE_EQ(page.items[1].ip_version, 6);
+    REQUIRE_EQ(page.items[1].protocol, 17u);
+    // streams and stats work on imported captures
+    REQUIRE_EQ(dst.streams().size(), 2u);
+    REQUIRE_EQ(dst.stats().packets, 2u);
+
+    // pcapng with a stream annotation becomes an epb_comment and survives import
+    const auto streams = dst.streams();
+    REQUIRE(dst.annotate_stream(streams.front().id, "login flow"));
+    const std::string ng = temp_path("roundtrip.pcapng");
+    REQUIRE(dst.write_pcapng(ng, page.items, &err));
+    const auto bytes = read_all(ng);
+    REQUIRE_GE(bytes.size(), 28u);
+    REQUIRE_EQ(le32(bytes, 0), 0x0A0D0D0Au);
+    REQUIRE(std::string(bytes.begin(), bytes.end()).find("login flow") != std::string::npos);
+    traffic_store_t dst2;
+    slop::core::network::pcap::import_result_t r2;
+    REQUIRE_STR_EQ(slop::core::network::pcap::import_file(dst2, ng, &r2), std::string{});
+    REQUIRE_STR_EQ(r2.format, std::string("pcapng"));
+    REQUIRE_EQ(r2.packets, 2u);
+    const auto page2 = dst2.packets(0, 10);
+    REQUIRE_EQ(page2.items.size(), 2u);
+    REQUIRE_STR_EQ(page2.items[0].local_addr, "10.0.0.2");
+    REQUIRE_STR_EQ(std::string(page2.items[0].payload.begin(), page2.items[0].payload.end()),
+                   "hello-http");
+
+    // both classic byte orders and nanosecond timestamps import
+    for (int variant = 0; variant < 4; ++variant) {
+        const std::string p = temp_path("variant.pcap");
+        const auto file = classic_pcap(variant >= 2, (variant & 1) != 0);
+        std::FILE* fp = nullptr;
+        REQUIRE(fopen_s(&fp, p.c_str(), "wb") == 0);
+        REQUIRE(fp != nullptr);
+        std::fwrite(file.data(), 1, file.size(), fp);
+        std::fclose(fp);
+        traffic_store_t v;
+        slop::core::network::pcap::import_result_t vr;
+        REQUIRE_STR_EQ(slop::core::network::pcap::import_file(v, p, &vr), std::string{});
+        REQUIRE_EQ(vr.packets, 1u);
+        REQUIRE_EQ(v.size(), 1u);
+        const auto vp = v.packets(0, 1);
+        REQUIRE_STR_EQ(vp.items[0].local_addr, "10.0.0.2");
+        REQUIRE_EQ(vp.items[0].local_port, 1234);
+        std::remove(p.c_str());
+    }
+    std::remove(path.c_str());
+    std::remove(ng.c_str());
+}
+
+TEST_CASE(network_pcap_import_rejects_malformed) {
+    namespace pcap = slop::core::network::pcap;
+    traffic_store_t store;
+    auto write = [](const char* name, const std::vector<uint8_t>& bytes) {
+        const std::string p = temp_path(name);
+        std::FILE* fp = nullptr;
+        if (fopen_s(&fp, p.c_str(), "wb") != 0 || !fp) return std::string{};
+        std::fwrite(bytes.data(), 1, bytes.size(), fp);
+        std::fclose(fp);
+        return p;
+    };
+
+    // empty file
+    std::string p = write("empty.pcap", {});
+    REQUIRE(pcap::import_file(store, p).find("empty") != std::string::npos);
+    std::remove(p.c_str());
+
+    // bad magic
+    p = write("magic.pcap", {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                             16, 17, 18, 19, 20, 21, 22, 23});
+    REQUIRE(pcap::import_file(store, p).find("bad magic") != std::string::npos);
+    std::remove(p.c_str());
+
+    // truncated global header
+    p = write("short.pcap", {0xd4, 0xc3, 0xb2, 0xa1, 0, 0, 0, 0, 0, 0});
+    REQUIRE(pcap::import_file(store, p).find("truncated global header") != std::string::npos);
+    std::remove(p.c_str());
+
+    // unsupported link type
+    {
+        std::vector<uint8_t> f;
+        put_le32(f, 0xa1b2c3d4u);
+        put_le32(f, 0x00040002u); put_le32(f, 0); put_le32(f, 0);
+        put_le32(f, 65535); put_le32(f, 105);
+        p = write("link.pcap", f);
+        REQUIRE(pcap::import_file(store, p).find("unsupported link type") != std::string::npos);
+        std::remove(p.c_str());
+    }
+
+    // a record claiming more bytes than the cap
+    {
+        std::vector<uint8_t> f;
+        put_le32(f, 0xa1b2c3d4u);
+        put_le32(f, 0x00040002u); put_le32(f, 0); put_le32(f, 0);
+        put_le32(f, 65535); put_le32(f, 101);
+        put_le32(f, 1); put_le32(f, 0); put_le32(f, 0x7FFFFFFFu); put_le32(f, 0x7FFFFFFFu);
+        p = write("huge.pcap", f);
+        REQUIRE(pcap::import_file(store, p).find("exceeds the cap") != std::string::npos);
+        std::remove(p.c_str());
+    }
+
+    // a record whose data is cut short
+    {
+        std::vector<uint8_t> f;
+        put_le32(f, 0xa1b2c3d4u);
+        put_le32(f, 0x00040002u); put_le32(f, 0); put_le32(f, 0);
+        put_le32(f, 65535); put_le32(f, 101);
+        put_le32(f, 1); put_le32(f, 0); put_le32(f, 100); put_le32(f, 100);
+        f.insert(f.end(), 10, 0x45);
+        p = write("cut.pcap", f);
+        REQUIRE(pcap::import_file(store, p).find("truncated record") != std::string::npos);
+        std::remove(p.c_str());
+    }
+
+    // pcapng: truncated section header, block length mismatch, unknown interface
+    {
+        std::vector<uint8_t> f = {0x0a, 0x0d, 0x0d, 0x0a, 0x1c, 0x00, 0x00, 0x00};
+        p = write("shb.pcapng", f);
+        REQUIRE(pcap::import_file(store, p).find("truncated section header") != std::string::npos);
+        std::remove(p.c_str());
+    }
+    {
+        std::vector<uint8_t> f;
+        put_le32(f, 0x0A0D0D0Au); put_le32(f, 28); put_le32(f, 0x1A2B3C4Du);
+        f.push_back(1); f.push_back(0); f.push_back(0); f.push_back(0);
+        put_le32(f, 0xFFFFFFFFu); put_le32(f, 0xFFFFFFFFu);
+        put_le32(f, 32);                                    // does not match the leading length
+        p = write("mismatch.pcapng", f);
+        REQUIRE(pcap::import_file(store, p).find("block length mismatch") != std::string::npos);
+        std::remove(p.c_str());
+    }
+    {
+        // SHB + IDB + EPB for interface 7
+        std::vector<uint8_t> f;
+        put_le32(f, 0x0A0D0D0Au); put_le32(f, 28); put_le32(f, 0x1A2B3C4Du);
+        f.push_back(1); f.push_back(0); f.push_back(0); f.push_back(0);
+        put_le32(f, 0xFFFFFFFFu); put_le32(f, 0xFFFFFFFFu); put_le32(f, 28);
+        put_le32(f, 1); put_le32(f, 20); put_le32(f, 101);   // IDB: linktype + reserved
+        put_le32(f, 65535); put_le32(f, 20);                  // snaplen, trailing length
+        std::vector<uint8_t> body;
+        put_le32(body, 7); put_le32(body, 0); put_le32(body, 0);
+        put_le32(body, 0); put_le32(body, 0);
+        put_le32(f, 6); put_le32(f, static_cast<uint32_t>(12 + body.size()));
+        f.insert(f.end(), body.begin(), body.end());
+        put_le32(f, static_cast<uint32_t>(12 + body.size()));
+        p = write("iface.pcapng", f);
+        REQUIRE(pcap::import_file(store, p).find("unknown interface") != std::string::npos);
+        std::remove(p.c_str());
+    }
+
+    // a missing file is an error, not a crash
+    REQUIRE(pcap::import_file(store, temp_path("nope.pcap")).find("cannot open") !=
+            std::string::npos);
+    REQUIRE_EQ(store.size(), 0u);
+}
+
+TEST_CASE(network_quic_long_headers) {
+    // initial: long header, version 1, 8-byte DCID, empty SCID, no token
+    std::vector<uint8_t> init = {0xC0, 0x00, 0x00, 0x00, 0x01, 0x08};
+    for (int i = 0; i < 8; ++i) init.push_back(static_cast<uint8_t>(0xA0 + i));
+    init.push_back(0x00);          // scid length
+    init.push_back(0x00);          // token length
+    init.push_back(0x08);          // payload length varint
+    init.insert(init.end(), 8, 0x00);
+    const auto q = parse::parse_quic(init.data(), init.size());
+    REQUIRE(q.has_value());
+    REQUIRE_EQ(q->version, 1u);
+    REQUIRE_EQ(q->type, 0);
+    REQUIRE_STR_EQ(q->dcid, std::string("a0a1a2a3a4a5a6a7"));
+    REQUIRE(q->scid.empty());
+    REQUIRE(q->has_length);
+    REQUIRE_EQ(q->length, 8u);
+    REQUIRE_STR_EQ(parse::quic_version_name(q->version), std::string("1"));
+    REQUIRE_STR_EQ(parse::quic_type_name(q->type), std::string("initial"));
+
+    // retry: no length field
+    std::vector<uint8_t> retry = {0xF0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00};
+    retry.insert(retry.end(), 16, 0x00);
+    const auto qr = parse::parse_quic(retry.data(), retry.size());
+    REQUIRE(qr.has_value());
+    REQUIRE_EQ(qr->type, 3);
+    REQUIRE_FALSE(qr->has_length);
+
+    // version negotiation (version 0) and short headers / truncation
+    std::vector<uint8_t> vn = {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    REQUIRE(parse::parse_quic(vn.data(), vn.size()).has_value());
+    std::vector<uint8_t> short_hdr = {0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
+    REQUIRE_FALSE(parse::parse_quic(short_hdr.data(), short_hdr.size()).has_value());
+    REQUIRE_FALSE(parse::parse_quic(init.data(), 4).has_value());
+    REQUIRE_FALSE(parse::parse_quic(init.data(), 6).has_value());   // DCID cut short
+
+    // the store counts QUIC and deep_inspect labels it
+    traffic_store_t s;
+    auto p = mk_packet(50000, 443, "10.0.0.2", "1.2.3.4");
+    p.protocol = 17;
+    p.payload = init;
+    s.add(p);
+    REQUIRE_EQ(s.stats().quic_packets, 1u);
+    auto plain = mk_packet(50000, 443, "10.0.0.2", "1.2.3.4");
+    plain.protocol = 17;
+    plain.payload.assign({0x01, 0x02, 0x03, 0x04});
+    s.add(plain);
+    REQUIRE_EQ(s.stats().quic_packets, 1u);
+
+    namespace cap = slop::core::network::capture;
+    namespace mcp = slop::core::mcp;
+    using json = nlohmann::json;
+    bool error = false;
+    mcp::call_tool("network", {{"action", "clear"}}, error);
+    cap::testing::reset();
+    REQUIRE(cap::testing::set_filter({}).empty());
+    const auto dgram = ipv4("10.0.0.2", "1.2.3.4", 17, udp_dgram(50000, 443, init));
+    cap::testing::inject(dgram.data(), dgram.size(), 2000);
+    json r = mcp::call_tool("network", {{"action", "packets"}}, error);
+    REQUIRE_FALSE(error);
+    r = mcp::call_tool("network", {{"action", "stats"}}, error);
+    REQUIRE_FALSE(error);
+    REQUIRE_EQ(r["quic_packets"].get<size_t>(), 1u);
+    r = mcp::call_tool("network", {{"action", "deep_inspect"}, {"port", 443}}, error);
+    REQUIRE_FALSE(error);
+    REQUIRE_EQ(r["count"].get<size_t>(), 1u);
+    REQUIRE_STR_EQ(r["results"][0]["app_protocol"].get<std::string>(), "QUIC");
+    REQUIRE_STR_EQ(r["results"][0]["quic_version"].get<std::string>(), "1");
+    REQUIRE_STR_EQ(r["results"][0]["quic_type"].get<std::string>(), "initial");
+    mcp::call_tool("network", {{"action", "clear"}}, error);
+    cap::testing::reset();
 }

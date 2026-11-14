@@ -195,6 +195,22 @@ std::optional<dns_record_t> parse_dns(const uint8_t* d, size_t n);
 // or not a valid hostname
 std::string extract_sni(const uint8_t* d, size_t n);
 
+// QUIC
+
+// long-header packet (RFC 9000 §17.2): version, connection ids and the packet
+// type. Short headers carry no version, so they are not identified. nullopt
+// when the bytes are not a complete long header
+struct quic_info_t {
+    uint32_t    version = 0;
+    uint8_t     type = 0;          // 0 initial, 1 0-RTT, 2 handshake, 3 retry
+    std::string dcid, scid;        // hex, 0..20 bytes each
+    bool        has_length = false;
+    uint64_t    length = 0;        // declared bytes after the length field
+};
+std::optional<quic_info_t> parse_quic(const uint8_t* d, size_t n);
+const char* quic_type_name(uint8_t type);
+const char* quic_version_name(uint32_t version);
+
 // HTTP/1.x
 
 struct http_head_t {

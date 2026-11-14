@@ -13,6 +13,7 @@
 #include "core/network/mitm_pki.hpp"
 #include "core/network/net_socket.hpp"
 #include "core/network/parsers.hpp"
+#include "core/network/redact.hpp"
 #include "core/network/tls_stream.hpp"
 
 #include <algorithm>
@@ -97,6 +98,14 @@ std::string text_of(const std::vector<uint8_t>& v, size_t n) {
     return std::string(reinterpret_cast<const char*>(v.data()), std::min(n, v.size()));
 }
 
+// masks the secret headers and query values of a captured request/response
+std::vector<uint8_t> redact_bytes(const std::vector<uint8_t>& raw) {
+    if (raw.empty()) return {};
+    const std::string masked =
+        redact::http_head(std::string_view(reinterpret_cast<const char*>(raw.data()), raw.size()));
+    return std::vector<uint8_t>(masked.begin(), masked.end());
+}
+
 } // namespace
 
 // connection bookkeeping
@@ -161,6 +170,8 @@ struct http_proxy_t::impl_t {
     std::shared_ptr<mitm::pki_t> mitm;
     std::map<std::string, std::shared_ptr<tls::server_cred_t>> creds;
     std::deque<proxy_entry_t> log;
+    // unmasked request bytes of redacted entries: memory only, never exported
+    std::map<uint64_t, std::vector<uint8_t>> secrets;
     size_t log_bytes = 0;
     uint64_t next_id = 1;
 
@@ -181,6 +192,7 @@ struct http_proxy_t::impl_t {
             log_bytes -= entry_bytes(log.front());
             log.pop_front();
         }
+        if (!log.empty()) secrets.erase(secrets.begin(), secrets.lower_bound(log.front().id));
     }
 
     uint64_t record(proxy_entry_t e) {
@@ -210,6 +222,12 @@ struct http_proxy_t::impl_t {
         f(*e);
         log_bytes += entry_bytes(*e);
         trim_locked();
+    }
+
+    void keep_secrets(uint64_t id, std::vector<uint8_t> raw) {
+        if (!id) return;
+        std::lock_guard lk(mu);
+        secrets[id] = std::move(raw);
     }
 
     std::shared_ptr<tls::server_cred_t> cred_for(const std::string& host,
@@ -261,15 +279,20 @@ struct recorder_t {
     bool trunc = false;
     uint64_t cur_resp = 0;
     size_t resp_total = 0;
+    bool redact_on = true;
 
-    recorder_t(http_proxy_t::impl_t& p, proxy_entry_t t) : px(p), tmpl(std::move(t)) {}
+    recorder_t(http_proxy_t::impl_t& p, proxy_entry_t t) : px(p), tmpl(std::move(t)) {
+        std::lock_guard lk(px.mu);
+        redact_on = px.opt.redact_secrets;
+    }
 
     void begin(const std::string& head) {
         proxy_entry_t e = tmpl;
         e.at_ms = now_ms();
         if (auto h = parse::parse_http_head(head, false)) {
             e.method = parse::escape_nonprintable(h->method);
-            e.path = parse::escape_nonprintable(h->target);
+            const std::string target = parse::escape_nonprintable(h->target);
+            e.path = redact_on ? redact::query(target) : target;
             if (e.kind == "https") {
                 if (const std::string* host = h->get("host")) {
                     std::string hn;
@@ -284,7 +307,7 @@ struct recorder_t {
         raw.assign(head.begin(), head.begin() + static_cast<std::ptrdiff_t>(std::min(head.size(), kMaxLogHead)));
         head_len = raw.size();
         req_total = head.size();
-        e.raw_request = raw;
+        e.raw_request = redact_on ? redact_bytes(raw) : raw;
         e.req_bytes = req_total;
         e.request_truncated = true;          // until the message end is seen
         cur_req = px.record(std::move(e));
@@ -306,12 +329,22 @@ struct recorder_t {
         if (!capturing) return;
         capturing = false;
         const bool t = trunc || !complete;
+        std::vector<uint8_t> stored;
+        bool masked = false;
+        if (redact_on) {
+            stored = redact_bytes(raw);
+            masked = stored != raw;
+        } else {
+            stored = std::move(raw);
+        }
         px.update(cur_req, [&](proxy_entry_t& e) {
-            e.raw_request = std::move(raw);
+            e.raw_request = std::move(stored);
+            e.redacted = masked;
             e.req_bytes = req_total;
             e.request_truncated = t;
             e.replayable = !t;
         });
+        if (masked) px.keep_secrets(cur_req, std::move(raw));
         raw.clear();
     }
 
@@ -355,12 +388,11 @@ struct recorder_t {
                 resp_total = e.head.size();
                 const auto h = parse::parse_http_head(e.head, true);
                 const uint32_t status = h ? h->status : 0;
-                const std::string& head = e.head;
+                std::string head = e.head.substr(0, std::min(e.head.size(), kMaxResponseHead));
+                if (redact_on) head = redact::http_head(head);
                 px.update(cur_resp, [&](proxy_entry_t& en) {
                     en.status = status;
-                    en.response_head.assign(head.begin(),
-                                            head.begin() + static_cast<std::ptrdiff_t>(
-                                                               std::min(head.size(), kMaxResponseHead)));
+                    en.response_head.assign(head.begin(), head.end());
                     en.resp_bytes = resp_total;
                 });
             } else {
@@ -992,7 +1024,14 @@ http_proxy_t::stats_t http_proxy_t::stats() const {
     return s;
 }
 
-std::optional<replay_result_t> http_proxy_t::replay(uint64_t id, std::string* error, int timeout_ms) {
+std::vector<uint8_t> http_proxy_t::raw_request(uint64_t id) const {
+    std::lock_guard lk(p_->mu);
+    auto it = p_->secrets.find(id);
+    return it == p_->secrets.end() ? std::vector<uint8_t>{} : it->second;
+}
+
+std::optional<replay_result_t> http_proxy_t::replay(uint64_t id, std::string* error, int timeout_ms,
+                                                    bool with_secrets) {
     auto fail = [&](const std::string& why) -> std::optional<replay_result_t> {
         if (error) *error = why;
         return std::nullopt;
@@ -1005,6 +1044,21 @@ std::optional<replay_result_t> http_proxy_t::replay(uint64_t id, std::string* er
         return fail(e->raw_request.empty() ? "entry has no captured request"
                                            : "request was not captured completely (body over 64 KiB, "
                                              "chunked past the cap, or the client aborted)");
+    // a redacted entry replays without its secrets unless the caller asked for
+    // them explicitly; the masked placeholder is never sent
+    std::vector<uint8_t> request = e->raw_request;
+    if (e->redacted) {
+        if (with_secrets) {
+            request = raw_request(id);
+            if (request.empty())
+                return fail("the unmasked request is no longer held in memory; "
+                            "replay without with_secrets strips the secret headers instead");
+        } else {
+            const std::string stripped = redact::strip_secrets(
+                std::string_view(reinterpret_cast<const char*>(request.data()), request.size()));
+            request.assign(stripped.begin(), stripped.end());
+        }
+    }
     const proxy_options_t o = options();
     uint16_t p = 0;
     std::string h;
@@ -1034,7 +1088,7 @@ std::optional<replay_result_t> http_proxy_t::replay(uint64_t id, std::string* er
     }
     sock::set_timeouts(s, timeout_ms, timeout_ms);
     endpoint_t ep{s, t.get()};
-    if (!ep.write(e->raw_request.data(), e->raw_request.size())) {
+    if (!ep.write(request.data(), request.size())) {
         sock::close(s);
         return fail("sending the request failed");
     }

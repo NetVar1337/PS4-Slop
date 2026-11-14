@@ -706,6 +706,86 @@ std::string extract_sni(const uint8_t* d, size_t n) {
     return {};
 }
 
+// QUIC
+
+namespace {
+
+// QUIC variable-length integer (RFC 9000 §16): the top two bits give the width
+bool read_varint(const uint8_t* d, size_t n, size_t& pos, uint64_t& out) {
+    if (pos >= n) return false;
+    const size_t len = size_t{1} << (d[pos] >> 6);
+    if (pos + len > n) return false;
+    uint64_t v = d[pos] & 0x3F;
+    for (size_t i = 1; i < len; ++i) v = (v << 8) | d[pos + i];
+    pos += len;
+    out = v;
+    return true;
+}
+
+std::string hex_bytes(const uint8_t* d, size_t n) {
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        out += kHex[d[i] >> 4];
+        out += kHex[d[i] & 0x0F];
+    }
+    return out;
+}
+
+} // namespace
+
+const char* quic_type_name(uint8_t type) {
+    switch (type) {
+        case 0: return "initial";
+        case 1: return "0-rtt";
+        case 2: return "handshake";
+        case 3: return "retry";
+        default: return "unknown";
+    }
+}
+
+const char* quic_version_name(uint32_t version) {
+    switch (version) {
+        case 0x00000000: return "negotiation";
+        case 0x00000001: return "1";
+        case 0x6b3343cf: return "2";
+        case 0xff00001d: return "draft-29";
+        default: return "unknown";
+    }
+}
+
+std::optional<quic_info_t> parse_quic(const uint8_t* d, size_t n) {
+    if (!d || n < 7) return std::nullopt;
+    if ((d[0] & 0x80) == 0) return std::nullopt;          // short header: no version
+    quic_info_t q;
+    q.version = be32(d + 1);
+    q.type = static_cast<uint8_t>((d[0] >> 4) & 0x03);
+    size_t pos = 5;
+    const size_t dlen = d[pos++];
+    if (dlen > 20 || pos + dlen > n) return std::nullopt;
+    q.dcid = hex_bytes(d + pos, dlen);
+    pos += dlen;
+    if (pos >= n) return std::nullopt;
+    const size_t slen = d[pos++];
+    if (slen > 20 || pos + slen > n) return std::nullopt;
+    q.scid = hex_bytes(d + pos, slen);
+    pos += slen;
+    if (q.version == 0) return q;                         // version negotiation
+    if (q.type == 3) return q;                            // retry: integrity tag, no length
+    if (q.type == 0) {                                    // initial: token
+        uint64_t token_len = 0;
+        if (!read_varint(d, n, pos, token_len)) return std::nullopt;
+        if (token_len > n - pos) return std::nullopt;
+        pos += static_cast<size_t>(token_len);
+    }
+    uint64_t len = 0;
+    if (!read_varint(d, n, pos, len)) return std::nullopt;
+    q.has_length = true;
+    q.length = len;
+    return q;
+}
+
 // HTTP
 
 const std::string* http_head_t::get(std::string_view name) const {

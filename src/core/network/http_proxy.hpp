@@ -45,6 +45,7 @@ struct proxy_entry_t {
     std::string error;
     bool        replayable = false;
     bool        request_truncated = false;   // body over the replay cap, or not fully seen
+    bool        redacted = false;            // stored request/response had secrets masked
     std::vector<uint8_t> raw_request;        // head (<= 16 KiB) + body (<= 64 KiB) as sent upstream
     std::vector<uint8_t> response_head;      // <= 8 KiB
 };
@@ -60,6 +61,10 @@ struct proxy_options_t {
     int         header_timeout_ms = 15000;
     int         idle_timeout_ms = 120000;
     int         connect_timeout_ms = 10000;
+    // mask Authorization/Proxy-Authorization/Cookie/Set-Cookie and token-ish
+    // query values in the stored entry (proxy_redact_secrets, default on). The
+    // unmasked request is kept in memory for an explicit with_secrets replay
+    bool        redact_secrets = true;
 };
 
 struct replay_result_t {
@@ -93,8 +98,15 @@ public:
     void clear_log();
 
     // re-sends a logged http/https request and reads the response until its
-    // framing completes, the peer closes, 1 MiB, or the deadline
-    std::optional<replay_result_t> replay(uint64_t id, std::string* error, int timeout_ms = 15000);
+    // framing completes, the peer closes, 1 MiB, or the deadline. A redacted
+    // entry replays with the secret headers and query parameters stripped;
+    // with_secrets re-sends the unmasked request kept in memory
+    std::optional<replay_result_t> replay(uint64_t id, std::string* error, int timeout_ms = 15000,
+                                          bool with_secrets = false);
+
+    // the unmasked captured request of a redacted entry (empty when the entry
+    // is unknown, was not redacted, or the copy was trimmed from the log)
+    std::vector<uint8_t> raw_request(uint64_t id) const;
 
     struct stats_t {
         size_t   active_connections = 0;

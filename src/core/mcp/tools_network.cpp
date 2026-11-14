@@ -5,6 +5,8 @@
 
 #include "core/infra/paths.hpp"
 #include "core/network/parsers.hpp"
+#include "core/network/pcap_import.hpp"
+#include "core/network/redact.hpp"
 
 namespace slop::core::mcp::detail {
 
@@ -164,84 +166,12 @@ std::vector<std::string> string_list(const json& args, const char* key) {
     return out;
 }
 
-// Captured traffic is credentials by default: redact the head lines that carry
-// auth before anything leaves the engine (proxy.entry, the audit log, an agent).
-std::string redact_http_head(const std::string& in) {
-    static const char* kSensitive[] = {
-        "authorization", "proxy-authorization", "cookie", "set-cookie",
-        "x-api-key", "x-auth-token", "x-csrf-token"
-    };
-    std::string out;
-    out.reserve(in.size());
-    size_t pos = 0;
-    while (pos < in.size()) {
-        const size_t eol = in.find("\r\n", pos);
-        const size_t end = eol == std::string::npos ? in.size() : eol;
-        const std::string line = in.substr(pos, end - pos);
-        if (line.empty()) {                 // end of head: body stays verbatim
-            out.append(in, pos, std::string::npos);
-            break;
-        }
-        const size_t colon = line.find(':');
-        bool redacted = false;
-        if (colon != std::string::npos) {
-            std::string name = line.substr(0, colon);
-            for (char& c : name)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            for (const char* n : kSensitive) {
-                if (name == n) {
-                    out += line.substr(0, colon + 1);
-                    out += " <redacted>";
-                    redacted = true;
-                    break;
-                }
-            }
-        }
-        if (!redacted) out += line;
-        if (eol == std::string::npos) break;
-        out += "\r\n";
-        pos = eol + 2;
-    }
-    return out;
-}
-
-// Mask token-ish query values in a URL path (kept for display/replay safety).
-std::string redact_query(std::string path) {
-    static const char* kKeys[] = {"token", "key", "auth", "sig", "session", "password"};
-    const size_t q = path.find('?');
-    if (q == std::string::npos) return path;
-    std::string out = path.substr(0, q + 1);
-    size_t pos = q + 1;
-    while (pos <= path.size()) {
-        const size_t amp = path.find('&', pos);
-        const size_t end = amp == std::string::npos ? path.size() : amp;
-        std::string pair = path.substr(pos, end - pos);
-        const size_t eq = pair.find('=');
-        if (eq != std::string::npos) {
-            std::string name = pair.substr(0, eq);
-            for (char& c : name)
-                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            for (const char* k : kKeys) {
-                if (name.find(k) != std::string::npos) {
-                    pair = pair.substr(0, eq + 1) + "<redacted>";
-                    break;
-                }
-            }
-        }
-        out += pair;
-        if (amp == std::string::npos) break;
-        out += '&';
-        pos = amp + 1;
-    }
-    return out;
-}
-
 json entry_summary(const network::proxy_entry_t& e) {
     json o = {{"id", e.id}, {"at_ms", e.at_ms}, {"kind", e.kind}, {"client", e.client},
               {"method", e.method}, {"host", e.host}, {"port", e.port},
-              {"path", redact_query(e.path)}, {"status", e.status},
+              {"path", network::redact::query(e.path)}, {"status", e.status},
               {"req_bytes", e.req_bytes}, {"resp_bytes", e.resp_bytes},
-              {"replayable", e.replayable}};
+              {"replayable", e.replayable}, {"redacted", e.redacted}};
     if (!e.sni.empty()) o["sni"] = e.sni;
     if (e.intercepted) o["intercepted"] = true;
     if (!e.tls.empty()) o["tls"] = e.tls;
@@ -357,19 +287,51 @@ json tool_network(const json& args) {
                     {"active_streams_60s", g_traffic.active_streams(now, 60000)},
                     {"stream_bytes", st.stream_bytes},
                     {"streams_evicted", st.streams_evicted},
-                    {"stream_bytes_dropped", st.stream_bytes_dropped}};
+                    {"stream_bytes_dropped", st.stream_bytes_dropped},
+                    {"quic_packets", st.quic_packets}};
     }
     if (action == "export_pcap") {
         if (!args.contains("path")) fail("missing path");
+        const std::string format = args.value("format", std::string{"pcap"});
+        if (format != "pcap" && format != "pcapng")
+            fail("format must be pcap or pcapng");
         const uint64_t maxp = args.contains("max_packets") ? parse_addr(args, "max_packets") : 4096;
         size_t exported = 0;
         bool truncated = false;
         auto err = network::capture::export_pcap(
             g_traffic, args.at("path").get<std::string>(),
-            static_cast<uint32_t>(std::min<uint64_t>(maxp, 65536ull)), &exported, &truncated);
+            static_cast<uint32_t>(std::min<uint64_t>(maxp, 65536ull)), &exported, &truncated,
+            format);
         if (!err.empty()) fail(err);
-        return {{"exported", true}, {"path", args.at("path")}, {"packets", exported},
-                {"older_omitted", truncated}, {"linktype", "raw (101)"}};
+        json out = {{"exported", true}, {"path", args.at("path")}, {"packets", exported},
+                    {"older_omitted", truncated}, {"format", format},
+                    {"linktype", "raw (101)"}};
+        if (format == "pcapng") out["comments"] = "packet and stream annotations become epb_comment";
+        return out;
+    }
+    if (action == "import_pcap") {
+        if (!args.contains("path")) fail("missing path");
+        network::pcap::import_result_t r;
+        const std::string err =
+            network::pcap::import_file(g_traffic, args.at("path").get<std::string>(), &r);
+        if (!err.empty()) fail(err);
+        return {{"imported", true}, {"path", args.at("path")}, {"format", r.format},
+                {"packets", r.packets}, {"skipped", r.skipped}, {"truncated", r.truncated},
+                {"store_packets", g_traffic.size()}};
+    }
+    if (action == "annotate") {
+        const uint64_t id = parse_addr(args, "id");
+        if (!args.contains("comment") || !args.at("comment").is_string())
+            fail("comment must be a string");
+        const std::string comment = args.at("comment").get<std::string>();
+        if (comment.size() > 512) fail("comment is capped at 512 bytes");
+        const std::string kind = args.value("kind", std::string{"packet"});
+        if (kind != "packet" && kind != "stream") fail("kind must be packet or stream");
+        const bool ok = kind == "stream" ? g_traffic.annotate_stream(id, comment)
+                                         : g_traffic.annotate_packet(id, comment);
+        if (!ok) fail("unknown " + kind + " id " + std::to_string(id));
+        return {{"annotated", true}, {"kind", kind}, {"id", id}, {"comment", comment},
+                {"cleared", comment.empty()}};
     }
     if (action == "streams") {
         network::capture::poll(g_traffic, 4096);
@@ -517,6 +479,15 @@ json tool_network(const json& args) {
                         const std::string sni = parse::extract_sni(b.data(), b.size());
                         if (!sni.empty()) o["tls_sni"] = sni;
                     }
+                } else if (p.protocol == 17 && (p.local_port == 443 || p.remote_port == 443)) {
+                    // QUIC long header: version and connection ids, no decryption
+                    if (auto q = parse::parse_quic(b.data(), b.size())) {
+                        o["app_protocol"]  = "QUIC";
+                        o["quic_version"]  = parse::quic_version_name(q->version);
+                        o["quic_type"]     = parse::quic_type_name(q->type);
+                        o["quic_dcid"]     = q->dcid;
+                        o["quic_scid"]     = q->scid;
+                    }
                 }
                 arr.push_back(std::move(o));
             }
@@ -530,7 +501,8 @@ json tool_network(const json& args) {
         return {{"cleared", true}};
     }
     fail("network: unknown action (status|capture_start|capture_stop|packets|dns|"
-         "stats|export_pcap|streams|stream_data|reassemble_stream|connections|deep_inspect|clear)");
+         "stats|export_pcap|import_pcap|annotate|streams|stream_data|reassemble_stream|"
+         "connections|deep_inspect|clear)");
 }
 
 
@@ -553,6 +525,7 @@ json tool_proxy(const json& args) {
             o.max_connections = static_cast<size_t>(
                 std::clamp<uint64_t>(parse_addr(args, "max_connections"), 1, 1024));
         o.token = infra::settings::get<std::string>("proxy_token", "");
+        o.redact_secrets = infra::settings::get<bool>("proxy_redact_secrets", true);
         std::string err;
         if (!g_proxy.start(o, &err)) fail(err);
         return {{"running", true}, {"port", g_proxy.port()}, {"bind", o.bind},
@@ -566,11 +539,29 @@ json tool_proxy(const json& args) {
     if (action == "status") {
         const auto o = g_proxy.options();
         const auto s = g_proxy.stats();
+        auto& k = pki();
+        k.load_existing();
+        json mitm = {{"enabled", g_proxy.mitm_enabled()},
+                     {"ca_exists", k.has_ca()},
+                     {"ca_path", k.has_ca() ? k.ca_path() : std::string{}},
+                     {"ca_thumbprint", k.has_ca() ? k.ca_thumbprint() : std::string{}},
+                     {"root_installed", k.root_installed()},
+                     {"leaf_certs_issued", k.issued()},
+                     {"key_storage",
+                      "the CA private key is a CNG key in the Microsoft Software KSP "
+                      "(DPAPI-protected per user); only the public ca.cer is written to disk "
+                      "and leaf certificates stay in memory"},
+                     {"uninstall_hint",
+                      k.root_installed()
+                          ? "proxy.mitm_uninstall removes the CA trust, the CNG keys and ca.cer"
+                          : "the CA is not trusted; nothing to uninstall"}};
         return json{{"running", g_proxy.running()}, {"port", g_proxy.port()},
                     {"bind", g_proxy.running() ? o.bind : std::string{}},
                     {"token_required", g_proxy.running() && !o.token.empty()},
                     {"allow_hosts", o.allow_hosts}, {"allow_clients", o.allow_clients},
                     {"mitm", g_proxy.mitm_enabled()},
+                    {"mitm_state", mitm},
+                    {"redact_secrets", o.redact_secrets},
                     {"active_connections", s.active_connections},
                     {"total_connections", s.total_connections},
                     {"rejected", {{"capacity", s.rejected_capacity}, {"auth", s.rejected_auth},
@@ -591,20 +582,25 @@ json tool_proxy(const json& args) {
         if (!e) fail("unknown entry id");
         json o = entry_summary(*e);
         o["request_truncated"] = e->request_truncated;
-        // Credentials are redacted unless the caller explicitly asks to reveal
-        // them; the audit log only ever sees the redacted form.
+        // A redacted entry stores only the masked form; reveal:true returns the
+        // unmasked request kept in memory, and stays redacted for the audit log.
         const bool reveal = args.value("reveal", false);
-        o["redacted"] = !reveal;
-        if (!e->raw_request.empty()) {
-            const size_t n = std::min<size_t>(e->raw_request.size(), 4096);
-            std::string head = printable(e->raw_request.data(), n);
-            o["request_text"] = reveal ? head : redact_http_head(head);
-            o["request_bytes_captured"] = e->raw_request.size();
+        std::vector<uint8_t> raw = e->raw_request;
+        if (reveal && e->redacted) {
+            auto kept = g_proxy.raw_request(id);
+            if (!kept.empty()) raw = std::move(kept);
+        }
+        o["redacted"] = e->redacted && !reveal;
+        if (!raw.empty()) {
+            const size_t n = std::min<size_t>(raw.size(), 4096);
+            std::string head = printable(raw.data(), n);
+            o["request_text"] = reveal ? head : network::redact::http_head(head);
+            o["request_bytes_captured"] = raw.size();
         }
         if (!e->response_head.empty()) {
             std::string head = printable(e->response_head.data(),
                                          std::min<size_t>(e->response_head.size(), 4096));
-            o["response_head_text"] = reveal ? head : redact_http_head(head);
+            o["response_head_text"] = reveal ? head : network::redact::http_head(head);
         }
         return o;
     }
@@ -612,11 +608,13 @@ json tool_proxy(const json& args) {
         std::string err;
         const int timeout = static_cast<int>(std::clamp<uint64_t>(
             args.contains("timeout_ms") ? parse_addr(args, "timeout_ms") : 15000, 1000, 60000));
-        auto r = g_proxy.replay(parse_addr(args, "id"), &err, timeout);
+        const bool with_secrets = args.value("with_secrets", false);
+        auto r = g_proxy.replay(parse_addr(args, "id"), &err, timeout, with_secrets);
         if (!r) fail(err);
         const size_t n = std::min<size_t>(r->bytes.size(), 16384);
         json out = {{"status", r->status}, {"bytes", r->bytes.size()}, {"complete", r->complete},
                     {"truncated", r->truncated}, {"text_truncated", r->bytes.size() > n},
+                    {"with_secrets", with_secrets},
                     {"text", printable(r->bytes.data(), n)}};
         if (!r->note.empty()) out["note"] = r->note;
         return out;

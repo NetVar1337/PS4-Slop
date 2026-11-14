@@ -76,10 +76,11 @@ std::vector<dns_record_t> dns_queries(const std::string& host = {});
 net_stats_t stats();
 
 // drains pending packets into the store, then writes the newest
-// `max_packets` stored packets as pcap
+// `max_packets` stored packets as pcap (default) or pcapng; pcapng carries the
+// store's annotations as per-packet comments
 std::string export_pcap(traffic_store_t& store, const std::string& path,
                         uint32_t max_packets = 4096, size_t* exported = nullptr,
-                        bool* truncated = nullptr);
+                        bool* truncated = nullptr, const std::string& format = "pcap");
 
 // deterministic hooks: feed datagrams through the exact socket-thread path
 namespace testing {
