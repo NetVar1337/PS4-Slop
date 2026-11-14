@@ -9,6 +9,7 @@ import { kThemes, useTheme } from "@/store/theme";
 import { useMotion } from "@/store/motion";
 import { layoutChanges, layoutFile, parseLayout, parseLayoutFile, useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
+import { useTypes } from "@/store/types";
 import * as events from "@/lib/events";
 import { flushPromises, mockApi } from "@/test/api";
 import { EventSourceStub } from "@/test/setup";
@@ -20,6 +21,7 @@ const initial = {
   targets: useTargets.getState(),
   watch: useWatch.getState(),
   output: useOutput.getState(),
+  types: useTypes.getState(),
 };
 
 beforeEach(() => {
@@ -29,6 +31,7 @@ beforeEach(() => {
   useTargets.setState(initial.targets, true);
   useWatch.setState(initial.watch, true);
   useOutput.setState(initial.output, true);
+  useTypes.setState(initial.types, true);
 });
 
 describe("engine backend (item 80)", () => {
@@ -485,5 +488,54 @@ describe("layout + themes (items 107, 116, 117)", () => {
     const { useMotion } = await import("@/store/motion");
     expect(useMotion.getState().motion).toBe("auto");
     expect(document.documentElement.getAttribute("data-motion")).toBe("auto");
+  });
+});
+
+describe("struct catalog store (item 114)", () => {
+  it("re-reads the catalog after a mutation and flags the decompiler cache", async () => {
+    const fields = [{ name: "hp", type: "u32", offset: 0, size: 4, array_count: 0 }];
+    const def = () => ({
+      name: "Player",
+      size: fields.length * 4,
+      packed: false,
+      fields: [...fields],
+    });
+    const { calls } = mockApi(({ action, params }) => {
+      if (action === "list_structs") return { structs: [def()] };
+      if (action === "list_enums") return { enums: [] };
+      if (action === "get_struct") return def();
+      if (action === "add_member") {
+        fields.push({
+          name: String(params.field),
+          type: String(params.type),
+          offset: 4,
+          size: 4,
+          array_count: 0,
+        });
+        return def();
+      }
+      if (action === "declare") {
+        fields.splice(0, fields.length);
+        return { declared: 1 };
+      }
+      return {};
+    });
+
+    await useTypes.getState().load();
+    expect(useTypes.getState().selected).toBe("Player");
+
+    expect(
+      await useTypes
+        .getState()
+        .addMember({ name: "mp", type: "u32", offset: 0, size: 0, array_count: 0 }),
+    ).toBe(true);
+    expect(useTypes.getState().invalidated).toBe(1);
+    expect(useTypes.getState().structs[0].fields.map((f) => f.name)).toEqual(["hp", "mp"]);
+
+    // removal is a declare rebuild: no remove_member action exists
+    await useTypes.getState().removeMember("hp");
+    expect(
+      calls.some((c) => c.action === "declare" && c.params.decl === "struct Player { u32 mp; };"),
+    ).toBe(true);
   });
 });

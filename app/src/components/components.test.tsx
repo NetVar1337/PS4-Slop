@@ -15,7 +15,9 @@ import MemoryView from "@/components/panels/MemoryView";
 import ScannerPanel from "@/components/panels/ScannerPanel";
 import ScriptsPanel from "@/components/panels/ScriptsPanel";
 import StringsView from "@/components/panels/StringsView";
+import StructEditor from "@/components/panels/StructEditor";
 import TargetsPanel from "@/components/panels/TargetsPanel";
+import UnpackerView from "@/components/panels/UnpackerView";
 import WorkspacePanel from "@/components/panels/WorkspacePanel";
 import { hex } from "@/lib/format";
 import { setEndpoint } from "@/lib/rpc";
@@ -28,6 +30,7 @@ import { useMemory } from "@/store/memory";
 import { useSettings } from "@/store/settings";
 import { useTargets } from "@/store/targets";
 import { useTheme } from "@/store/theme";
+import { useTypes } from "@/store/types";
 import { useUi } from "@/store/ui";
 import { useWatch } from "@/store/watch";
 import { mockApi } from "@/test/api";
@@ -83,6 +86,7 @@ const initial = {
   debugger: useDebugger.getState(),
   decomp: useDecomp.getState(),
   settings: useSettings.getState(),
+  types: useTypes.getState(),
 };
 
 beforeEach(() => {
@@ -95,6 +99,7 @@ beforeEach(() => {
   useDebugger.setState(initial.debugger, true);
   useDecomp.setState(initial.decomp, true);
   useSettings.setState(initial.settings, true);
+  useTypes.setState(initial.types, true);
   setEndpoint({ port: 8765, token: "" });
 });
 
@@ -789,5 +794,147 @@ describe("CFG graph layout", () => {
     await userEvent.keyboard("{Enter}");
     expect(useUi.getState().workspaceTab).toBe("decomp");
     expect(useDecomp.getState().split).toBe(true);
+  });
+});
+
+describe("struct editor (item 114)", () => {
+  it("adds and removes members through the engine catalog", async () => {
+    const fields = [{ name: "hp", type: "u32", offset: 0, size: 4, array_count: 0 }];
+    const def = () => ({
+      name: "Player",
+      size: fields.length * 4,
+      packed: false,
+      fields: [...fields],
+    });
+    const { calls } = mockApi(({ tool, action, params }) => {
+      if (tool !== "types") return {};
+      if (action === "list_structs") return { structs: [def()], count: 1 };
+      if (action === "list_enums") return { enums: [], count: 0 };
+      if (action === "get_struct") return def();
+      if (action === "add_member") {
+        fields.push({
+          name: String(params.field),
+          type: String(params.type),
+          offset: fields.length * 4,
+          size: 4,
+          array_count: 0,
+        });
+        return def();
+      }
+      if (action === "declare") {
+        // the test only removes members, so the rebuilt struct is empty
+        fields.splice(0, fields.length);
+        return { declared: 1 };
+      }
+      return {};
+    });
+    render(<StructEditor />);
+    await screen.findByRole("button", { name: /^Player/ });
+    await userEvent.type(screen.getByLabelText("Member name"), "mp");
+    await userEvent.click(screen.getByRole("button", { name: "add member" }));
+    await waitFor(() =>
+      expect(calls.some((c) => c.action === "add_member" && c.params.field === "mp")).toBe(true),
+    );
+    await screen.findByText("mp");
+    expect(screen.getByText(/decompiler cache invalidated/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Remove member mp" }));
+    await waitFor(() =>
+      expect(
+        calls.some((c) => c.action === "declare" && !String(c.params.decl).includes("mp")),
+      ).toBe(true),
+    );
+    await waitFor(() => expect(screen.queryByText("mp")).not.toBeInTheDocument());
+  });
+});
+
+describe("unpacker view (item 112)", () => {
+  it("shows the journal and reverts it behind an explicit button", async () => {
+    let reverted = false;
+    const { calls } = mockApi(({ tool, action }) => {
+      if (tool === "analyze" && action === "packer")
+        return {
+          image: "eboot.bin",
+          packed: true,
+          family: "upx",
+          confidence: 0.9,
+          file_entropy: 7.4,
+          detections: [{ type: "section", protector: "UPX", detail: "UPX0", location: "UPX0" }],
+          sections: [
+            { name: "UPX0", rva: 0x1000, raw_size: 0x200, entropy: 7.9, writable_exec: true },
+          ],
+        };
+      if (tool === "patch" && action === "journal")
+        return reverted
+          ? { patches: [], total: 0 }
+          : { patches: [{ va: 0x401000, before: 0x90, after: 0xcc }], total: 1 };
+      if (tool === "patch" && action === "revert_all") {
+        reverted = true;
+        return { ok: true, bytes_changed: 1, journal_total: 0 };
+      }
+      return {};
+    });
+    render(<UnpackerView />);
+    expect(await screen.findByText("000000401000")).toBeInTheDocument();
+    expect(screen.getByText("packed")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /revert all/ }));
+    await waitFor(() => expect(calls.some((c) => c.action === "revert_all")).toBe(true));
+    expect(await screen.findByText("no edits recorded")).toBeInTheDocument();
+  });
+});
+
+describe("memory snapshot diff (item 83)", () => {
+  it("highlights changed bytes from a fixture diff", async () => {
+    mockApi(({ tool, action }) => {
+      if (tool === "target" && action === "regions")
+        return { regions: [{ base: 0x400000, size: 0x10000, protect: 4, state: 0x1000, type: 0 }] };
+      if (tool === "memory" && action === "snapshots")
+        return {
+          snapshots: [
+            { id: 1, addr: 0x400000, size: 0x1000, bytes: 0x1000, complete: true },
+            { id: 2, addr: 0x400000, size: 0x1000, bytes: 0x1000, complete: true },
+          ],
+        };
+      if (tool === "memory" && action === "diff")
+        return { changed: [{ offset: 1, length: 2 }], count: 1, truncated: false };
+      if (tool === "memory" && action === "read") return { hex: "90".repeat(0x1000) };
+      return {};
+    });
+    useEngine.setState({ target: attached });
+    const { container } = render(<MemoryView />);
+    await userEvent.click(screen.getByRole("button", { name: "Snapshot diff" }));
+    const compare = await screen.findByRole("button", { name: "compare" });
+    await waitFor(() => expect(compare).toBeEnabled());
+    await userEvent.click(compare);
+    await waitFor(() =>
+      expect(container.querySelectorAll('.hex-cell[data-diff="true"]').length).toBe(2),
+    );
+  });
+});
+
+describe("memory caret inspector (item 83)", () => {
+  it("formats the caret bytes and the selected struct at that address", async () => {
+    mockApi(({ tool, action }) => {
+      if (tool === "target" && action === "regions")
+        return { regions: [{ base: 0x400000, size: 0x10000, protect: 4, state: 0x1000, type: 0 }] };
+      if (tool === "memory" && action === "read")
+        return { hex: "4142434400000000" + "00".repeat(8) };
+      if (tool === "types" && action === "format_at")
+        return {
+          ok: true,
+          addr: 0x400000,
+          type: "Player",
+          source: "file",
+          rendered: "Player { hp: 65 }",
+        };
+      return {};
+    });
+    useEngine.setState({ target: attached });
+    useTypes.setState({ selected: "Player" });
+    render(<MemoryView />);
+    // 41 42 43 44 little-endian u32 (u64 shares the same digits here)
+    await screen.findByText("ABCD");
+    expect(screen.getByText("u32").closest(".mem-value")?.textContent).toContain("1145258561");
+    expect(await screen.findByText("Player { hp: 65 }")).toBeInTheDocument();
   });
 });

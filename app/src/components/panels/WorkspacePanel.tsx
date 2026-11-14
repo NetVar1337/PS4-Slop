@@ -10,6 +10,8 @@ import DebuggerView from "@/components/panels/DebuggerView";
 import MemoryView from "@/components/panels/MemoryView";
 import PeView from "@/components/panels/PeView";
 import StringsView from "@/components/panels/StringsView";
+import StructEditor from "@/components/panels/StructEditor";
+import UnpackerView from "@/components/panels/UnpackerView";
 import { browserLabel, formatLabel } from "@/lib/format";
 import { openBinary } from "@/lib/openBinary";
 import { useEngine } from "@/store/engine";
@@ -27,6 +29,8 @@ const kTabs: readonly { id: WorkspaceTab; label: string; needs: "image" | "targe
   { id: "memory", label: "Memory", needs: "target" },
   { id: "debugger", label: "Debugger", needs: "none" },
   { id: "pe", label: "Image Browser", needs: "image" },
+  { id: "structs", label: "Structs", needs: "image" },
+  { id: "unpacker", label: "Unpacker", needs: "image" },
 ];
 
 export default function WorkspacePanel() {
@@ -106,6 +110,10 @@ export default function WorkspacePanel() {
         return <MemoryView />;
       case "debugger":
         return <DebuggerView />;
+      case "structs":
+        return <StructEditor />;
+      case "unpacker":
+        return <UnpackerView />;
     }
   };
 

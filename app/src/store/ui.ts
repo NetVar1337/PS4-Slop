@@ -8,7 +8,15 @@ import { kMotionOptions, useMotion, type MotionPref } from "@/store/motion";
 import { kThemes, useTheme, type ThemeName } from "@/store/theme";
 
 export type RailView = "targets" | "modules" | "scripts";
-export type WorkspaceTab = "disassembly" | "decomp" | "strings" | "memory" | "debugger" | "pe";
+export type WorkspaceTab =
+  | "disassembly"
+  | "decomp"
+  | "strings"
+  | "memory"
+  | "debugger"
+  | "pe"
+  | "structs"
+  | "unpacker";
 export type OutputTab = "output" | "log";
 
 /** Splitter-driven CSS variables and their defaults (px), see app.css. */
@@ -46,6 +54,8 @@ const kWorkspaceTabs: readonly WorkspaceTab[] = [
   "memory",
   "debugger",
   "pe",
+  "structs",
+  "unpacker",
 ];
 
 /** Parse persisted layout defensively: a hand-edited or stale blob must not break boot. */

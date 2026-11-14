@@ -56,6 +56,8 @@ type MemoryStore = {
   writeBytes: (addr: number, data: Uint8Array) => Promise<boolean>;
   setGotoText: (text: string) => void;
   setScrollTop: (px: number) => void;
+  /** Move the caret without scrolling (the hex grid sets it on click). */
+  setCursor: (addr: number) => void;
   reset: () => void;
 };
 
@@ -214,6 +216,7 @@ export const useMemory = create<MemoryStore>((set, get) => {
 
     setGotoText: (gotoText) => set({ gotoText }),
     setScrollTop: (scrollTop) => set({ scrollTop }),
+    setCursor: (addr) => set({ cursor: addr }),
 
     reset: () =>
       set({

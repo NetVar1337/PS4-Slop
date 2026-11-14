@@ -4,13 +4,23 @@
 // The grid scrolls continuously through a 1 MiB window of the region, pages
 // are read as they scroll in; prev/next move the window along the region
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { ArrowRight, ChevronLeft, ChevronRight, Microscope, RefreshCw, X } from "lucide-react";
+import {
+  ArrowRight,
+  Camera,
+  ChevronLeft,
+  ChevronRight,
+  GitCompare,
+  Microscope,
+  RefreshCw,
+  X,
+} from "lucide-react";
 import IconButton from "@/components/IconButton";
-import { hex, parseAddress } from "@/lib/format";
+import { escapeControl, hex, parseAddress } from "@/lib/format";
 import { call, errorText } from "@/lib/rpc";
 import { byteAt, kHexCols, kHexRowPx, kWindowBytes, protectName, useMemory } from "@/store/memory";
+import { useTypes } from "@/store/types";
 
 const kRow = kHexRowPx;
 const kCols = kHexCols;
@@ -69,6 +79,232 @@ function DissectPane({ addr, onClose }: { addr: number; onClose: () => void }) {
             <span style={{ minWidth: 150 }}>{r.hex}</span>
             <span style={{ minWidth: 70 }}>{r.kind}</span>
             <span>{describe(r)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+type SnapshotRec = { id: number; addr: number; size: number; bytes: number; complete: boolean };
+type DiffRange = { offset: number; length: number };
+
+function bytesOf(text: string): Uint8Array {
+  const clean = text.replace(/[^0-9a-fA-F]/g, "");
+  const out = new Uint8Array(clean.length >> 1);
+  for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(clean.slice(i * 2, i * 2 + 2), 16);
+  return out;
+}
+
+/** The caret's bytes as every width the engine can read, little-endian. */
+function interpret(bytes: Uint8Array): { label: string; text: string }[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const has = (n: number) => bytes.byteLength >= n;
+  const text = new TextDecoder().decode(bytes).split("\0")[0] ?? "";
+  return [
+    { label: "u8", text: has(1) ? String(view.getUint8(0)) : "—" },
+    { label: "u16", text: has(2) ? String(view.getUint16(0, true)) : "—" },
+    { label: "u32", text: has(4) ? String(view.getUint32(0, true)) : "—" },
+    { label: "u64", text: has(8) ? String(view.getBigUint64(0, true)) : "—" },
+    { label: "f32", text: has(4) ? view.getFloat32(0, true).toPrecision(6) : "—" },
+    { label: "f64", text: has(8) ? view.getFloat64(0, true).toPrecision(10) : "—" },
+    { label: "utf8", text: escapeControl(text) },
+    {
+      label: "pointer",
+      text: has(8)
+        ? `0x${view.getBigUint64(0, true).toString(16).toUpperCase().padStart(16, "0")}`
+        : "—",
+    },
+  ];
+}
+
+/** Side pane: interpreted caret value, plus the selected struct rendered there. */
+function CaretInspector({ addr }: { addr: number }) {
+  const structType = useTypes((s) => s.selected);
+  const [bytes, setBytes] = useState<Uint8Array | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [rendered, setRendered] = useState<string | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    setError(null);
+    call<{ hex?: string }>("memory", "read", { addr, len: 16, format: "hex" })
+      .then((r) => {
+        if (alive) setBytes(bytesOf(r.hex ?? ""));
+      })
+      .catch((e: unknown) => {
+        if (!alive) return;
+        setBytes(null);
+        setError(errorText(e));
+      });
+    return () => {
+      alive = false;
+    };
+  }, [addr]);
+
+  useEffect(() => {
+    if (structType === null) {
+      setRendered(null);
+      return;
+    }
+    let alive = true;
+    call<{ rendered: string }>("types", "format_at", { addr, type: structType })
+      .then((r) => {
+        if (alive) setRendered(r.rendered);
+      })
+      .catch((e: unknown) => {
+        if (alive) setRendered(`format_at ${structType}: ${errorText(e)}`);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [addr, structType]);
+
+  return (
+    <div className="mem-inspect">
+      <div className="view-bar" style={{ padding: "var(--pad-sm)" }}>
+        <span className="panel-title">Caret</span>
+        <div className="spacer" />
+        <span className="faint mono">{hex(addr, 12)}</span>
+      </div>
+      <div className="panel-body mono mem-values">
+        {error !== null && (
+          <div className="error-text" role="alert">
+            {error}
+          </div>
+        )}
+        {bytes !== null &&
+          interpret(bytes).map((r) => (
+            <div key={r.label} className="mem-value">
+              <span className="faint">{r.label}</span>
+              <span>{r.text}</span>
+            </div>
+          ))}
+        {rendered !== null && <pre className="mem-struct">{rendered}</pre>}
+      </div>
+    </div>
+  );
+}
+
+/** Snapshot capture/compare pane; the diff it produces highlights the grid. */
+function SnapshotPane({
+  base,
+  size,
+  onDiff,
+  onClose,
+}: {
+  base: number;
+  size: number;
+  onDiff: (diff: { base: number; ranges: DiffRange[] } | null) => void;
+  onClose: () => void;
+}) {
+  const [snaps, setSnaps] = useState<SnapshotRec[]>([]);
+  const [a, setA] = useState<number | null>(null);
+  const [b, setB] = useState<number | null>(null);
+  const [ranges, setRanges] = useState<DiffRange[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const res = await call<{ snapshots: SnapshotRec[] }>("memory", "snapshots");
+      const list = res.snapshots ?? [];
+      setSnaps(list);
+      setA((v) => v ?? list[0]?.id ?? null);
+      setB((v) => v ?? list[1]?.id ?? null);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const capture = async () => {
+    setError(null);
+    try {
+      await call("memory", "snapshot", { addr: base, len: size });
+      await load();
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  const compare = async () => {
+    if (a === null || b === null) return;
+    setError(null);
+    try {
+      const res = await call<{ changed: DiffRange[] }>("memory", "diff", { a, b, limit: 512 });
+      const snap = snaps.find((s) => s.id === a);
+      setRanges(res.changed);
+      onDiff(snap ? { base: snap.addr, ranges: res.changed } : null);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  return (
+    <div className="stack mem-snap">
+      <div className="view-bar">
+        <span className="panel-title">Snapshot diff</span>
+        <select
+          className="select"
+          aria-label="Snapshot A"
+          value={a ?? ""}
+          onChange={(e) => setA(Number(e.target.value))}
+        >
+          <option value="">A…</option>
+          {snaps.map((s) => (
+            <option key={s.id} value={s.id}>
+              {`#${s.id} ${hex(s.addr, 12)} (${s.size})`}
+            </option>
+          ))}
+        </select>
+        <select
+          className="select"
+          aria-label="Snapshot B"
+          value={b ?? ""}
+          onChange={(e) => setB(Number(e.target.value))}
+        >
+          <option value="">B…</option>
+          {snaps.map((s) => (
+            <option key={s.id} value={s.id}>
+              {`#${s.id} ${hex(s.addr, 12)} (${s.size})`}
+            </option>
+          ))}
+        </select>
+        <button
+          type="button"
+          className="row-action"
+          disabled={a === null || b === null || a === b}
+          onClick={() => void compare()}
+        >
+          compare
+        </button>
+        <IconButton
+          tip="Capture snapshot of this window"
+          disabled={size === 0}
+          onClick={() => void capture()}
+        >
+          <Camera size={13} />
+        </IconButton>
+        <div className="spacer" />
+        {ranges !== null && <span className="faint">{ranges.length} changed ranges</span>}
+        <IconButton tip="Close snapshot diff" onClick={onClose}>
+          <X size={13} />
+        </IconButton>
+      </div>
+      <div className="panel-body mono" style={{ fontSize: 11, padding: "var(--pad-sm)" }}>
+        {error !== null && (
+          <div className="error-text" role="alert">
+            {error}
+          </div>
+        )}
+        {snaps.length === 0 && <div className="faint">no snapshots yet, capture one above</div>}
+        {ranges?.map((r) => (
+          <div key={r.offset}>
+            <span className="faint">+{r.offset.toString(16).toUpperCase().padStart(4, "0")}</span>{" "}
+            <span>{r.length} bytes</span>
           </div>
         ))}
       </div>
@@ -139,11 +375,21 @@ export default function MemoryView() {
   const error = useMemory((s) => s.error);
   const gotoText = useMemory((s) => s.gotoText);
   const gotoSeq = useMemory((s) => s.gotoSeq);
-  const { loadRegions, goto, ensurePages, writeBytes, setGotoText, setScrollTop, reload } =
-    useMemory.getState();
+  const {
+    loadRegions,
+    goto,
+    ensurePages,
+    writeBytes,
+    setGotoText,
+    setScrollTop,
+    reload,
+    setCursor,
+  } = useMemory.getState();
   const [edit, setEdit] = useState<number | null>(null);
   const [gotoError, setGotoError] = useState(false);
   const [dissectAt, setDissectAt] = useState<number | null>(null);
+  const [snapOpen, setSnapOpen] = useState(false);
+  const [diff, setDiff] = useState<{ base: number; ranges: DiffRange[] } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -231,6 +477,16 @@ export default function MemoryView() {
           </span>
           <div className="spacer" />
           <IconButton
+            tip="Snapshot diff"
+            pressed={snapOpen}
+            onClick={() => {
+              setSnapOpen((v) => !v);
+              if (snapOpen) setDiff(null);
+            }}
+          >
+            <GitCompare size={13} />
+          </IconButton>
+          <IconButton
             tip="Dissect the structure at the cursor"
             disabled={windowSize === 0}
             onClick={() => setDissectAt(cursor)}
@@ -272,6 +528,14 @@ export default function MemoryView() {
             {items.map((v) => {
               const rowAddr = windowBase + v.index * kCols;
               const cells = Array.from({ length: kCols }, (_, i) => byteAt(pages, rowAddr + i));
+              // changed spans are snapshot-relative; mark the cells this row covers
+              const changed = diff === null ? null : new Uint8Array(kCols);
+              if (diff !== null && changed !== null)
+                for (const r of diff.ranges) {
+                  const start = Math.max(0, diff.base + r.offset - rowAddr);
+                  const end = Math.min(kCols, diff.base + r.offset + r.length - rowAddr);
+                  for (let i = start; i < end; i++) changed[i] = 1;
+                }
               return (
                 <div key={rowAddr} className="hex-row mono" style={{ top: v.start, height: kRow }}>
                   <span className="insn-va">{hex(rowAddr, 12)}</span>
@@ -301,9 +565,13 @@ export default function MemoryView() {
                           className="hex-cell"
                           data-zero={b === 0}
                           data-unread={b === undefined}
+                          data-diff={changed?.[i] === 1}
                           disabled={b === undefined}
-                          aria-label={`${hex(addr, 12)} = ${text}`}
-                          onClick={() => setEdit(addr)}
+                          aria-label={`${hex(addr, 12)} = ${text}${changed?.[i] === 1 ? " (changed)" : ""}`}
+                          onClick={() => {
+                            setCursor(addr);
+                            setEdit(addr);
+                          }}
                           data-tip={b === undefined ? undefined : `${hex(addr, 12)} = ${b}`}
                         >
                           {text}
@@ -317,8 +585,21 @@ export default function MemoryView() {
             })}
           </div>
         </div>
+        {snapOpen && (
+          <SnapshotPane
+            base={windowBase}
+            size={windowSize}
+            onDiff={setDiff}
+            onClose={() => {
+              setSnapOpen(false);
+              setDiff(null);
+            }}
+          />
+        )}
         {dissectAt !== null && <DissectPane addr={dissectAt} onClose={() => setDissectAt(null)} />}
       </div>
+
+      <CaretInspector addr={cursor} />
     </div>
   );
 }
