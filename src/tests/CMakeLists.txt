@@ -73,7 +73,9 @@ foreach(_area IN LISTS _slop_test_areas)
     set_tests_properties("slop_tests_${_area}" PROPERTIES
         ENVIRONMENT "SLOP_TEST_AREA=${_area}"
         LABELS "slop;area"
-        TIMEOUT 1800
+        # the per-test watchdog is the real guard; this caps a wedged process
+        # (600 s leaves room for the 4x-slower ASan lane, healthy areas take < 40 s)
+        TIMEOUT 600
     )
 endforeach()
 
@@ -84,7 +86,7 @@ add_test(NAME slop_tests_mcp_noemu COMMAND slop_tests)
 set_tests_properties(slop_tests_mcp_noemu PROPERTIES
     ENVIRONMENT "SLOP_TEST_AREA=mcp;SLOP_TEST_EXCLUDE=emulate"
     LABELS "slop;asan;mcpnoemu"
-    TIMEOUT 1800
+    TIMEOUT 600
 )
 
 add_test(NAME slop_tests_all COMMAND slop_tests)

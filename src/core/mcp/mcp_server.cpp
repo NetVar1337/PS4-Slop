@@ -471,6 +471,12 @@ bool start(const server_config_t& cfg) {
     }
     g_max_streams = std::max<size_t>(1, cfg.max_streams);
     auto srv = std::make_unique<httplib::Server>();
+    // httplib's default SO_REUSEADDR lets a second process bind the same
+    // 127.0.0.1 port on Windows and silently take half the connections
+    srv->set_socket_options([](socket_t s) {
+        BOOL excl = TRUE;
+        ::setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&excl), sizeof(excl));
+    });
 
     // long lived sse streams each pin a worker, so the pool is sized well past the stream cap
     const size_t workers = std::max(cfg.worker_threads, g_max_streams + 8);

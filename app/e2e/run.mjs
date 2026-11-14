@@ -29,7 +29,8 @@ const mode = process.argv[2] ?? "smoke";
 
 const PORT = Number(process.env.SLOP_E2E_PORT ?? 8791);
 const TOKEN = process.env.SLOP_E2E_TOKEN ?? crypto.randomBytes(18).toString("hex");
-const ENGINE = process.env.SLOP_E2E_ENGINE ?? path.join(repo, "build/src/engine/reverse-slop-engine.exe");
+const ENGINE =
+  process.env.SLOP_E2E_ENGINE ?? path.join(repo, "build/src/engine/reverse-slop-engine.exe");
 const FIXTURE = process.env.SLOP_E2E_FIXTURE ?? path.join(repo, "build/src/app/SlopTarget.exe");
 const OUT = process.env.SLOP_E2E_OUT ?? path.join(repo, "docs/screenshots");
 
@@ -55,7 +56,8 @@ async function api(tool, action, params = {}) {
     throw new Error(`http ${r.status} on ${tool}.${action}: ${body.slice(0, 200)}`);
   }
   const j = await r.json();
-  if (j.ok === false) throw new Error(`${tool}.${action}: ${JSON.stringify(j.data ?? null).slice(0, 200)}`);
+  if (j.ok === false)
+    throw new Error(`${tool}.${action}: ${JSON.stringify(j.data ?? null).slice(0, 200)}`);
   return j.data;
 }
 
@@ -139,7 +141,9 @@ async function main() {
     ["fixture", FIXTURE],
   ]) {
     if (!fs.existsSync(exe)) {
-      console.error(`missing ${label}: ${exe}\nbuild first: powershell -File tools/build.ps1 -NoFrontend`);
+      console.error(
+        `missing ${label}: ${exe}\nbuild first: powershell -File tools/build.ps1 -NoFrontend`,
+      );
       process.exitCode = 2;
       return;
     }
@@ -147,7 +151,11 @@ async function main() {
 
   // fixture first so the engine sees it in the process list
   // fixture quits on stdin EOF: keep a pipe open; it prints its value addresses
-  const fixture = spawn(FIXTURE, [], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"], env: process.env });
+  const fixture = spawn(FIXTURE, [], {
+    windowsHide: true,
+    stdio: ["pipe", "pipe", "pipe"],
+    env: process.env,
+  });
   fixture.stdout.on("data", (d) => (fixtureOut += d));
   fixturePid = fixture.pid;
   await sleep(800);
@@ -155,11 +163,11 @@ async function main() {
   let ready = false;
   let lastLog = "";
   for (let attempt = 1; attempt <= 3 && !ready; attempt++) {
-    engine = launch(
-      ENGINE,
-      ["--no-onboard", "--quiet", "--port", String(PORT)],
-      { ...process.env, SLOP_MCP_TOKEN: TOKEN, SLOP_MCP_PORT: String(PORT) }
-    );
+    engine = launch(ENGINE, ["--no-onboard", "--quiet", "--port", String(PORT)], {
+      ...process.env,
+      SLOP_MCP_TOKEN: TOKEN,
+      SLOP_MCP_PORT: String(PORT),
+    });
     enginePid = engine.pid;
     const a = await awaitAnnounce(engine);
     lastLog = a.log;
@@ -185,7 +193,7 @@ async function main() {
         // just coalesces onto it again
         console.error(
           `existing engine at ${healthUrl} did not accept this driver\n` +
-            String(a.log).trim().slice(-300)
+            String(a.log).trim().slice(-300),
         );
         process.exitCode = 1;
         return;
@@ -205,7 +213,9 @@ async function main() {
   if (!ready) {
     fail("engine health", "no healthy engine after 3 attempts");
     console.error(String(lastLog ?? "").slice(-2000));
-    console.error("hint: a stale %LOCALAPPDATA%\\reverse-slop\\engine.json can advertise dead engines");
+    console.error(
+      "hint: a stale %LOCALAPPDATA%\\reverse-slop\\engine.json can advertise dead engines",
+    );
     return; // finally still cleans up
   }
 
@@ -269,7 +279,11 @@ async function smoke() {
   else fail("memory.read", JSON.stringify(read).slice(0, 120));
 
   await api("memory", "watch_clear").catch(() => {});
-  const added = await api("memory", "watch_add", { addr: at(0x20), width: "u32", label: "e2e.probe" });
+  const added = await api("memory", "watch_add", {
+    addr: at(0x20),
+    width: "u32",
+    label: "e2e.probe",
+  });
   const list = await api("memory", "watch_list");
   const hit = (list.entries ?? []).find((e) => e.label === "e2e.probe");
   if (hit) ok("watchlist roundtrip", `id ${hit.id}`);
@@ -300,7 +314,11 @@ async function shots() {
   await attachFixture();
 
   await api("memory", "watch_clear").catch(() => {});
-  await api("memory", "watch_add", { addr: addrOf("health"), width: "u32", label: "player.health" });
+  await api("memory", "watch_add", {
+    addr: addrOf("health"),
+    width: "u32",
+    label: "player.health",
+  });
   await api("memory", "watch_add", { addr: addrOf("speed"), width: "f32", label: "player.speed" });
   await api("memory", "watch_add", { addr: addrOf("gold"), width: "u64", label: "game.gold" });
 
@@ -321,11 +339,16 @@ async function shots() {
     process.exitCode = 2;
     return;
   }
-  vite = launch(process.execPath, [viteBin], {
-    ...process.env,
-    VITE_SLOP_PORT: String(healthPort),
-    VITE_SLOP_TOKEN: TOKEN,
-  }, path.join(repo, "app"));
+  vite = launch(
+    process.execPath,
+    [viteBin],
+    {
+      ...process.env,
+      VITE_SLOP_PORT: String(healthPort),
+      VITE_SLOP_TOKEN: TOKEN,
+    },
+    path.join(repo, "app"),
+  );
   vitePid = vite.pid;
   await poll(() => portOpen(1420), 30_000);
   ok("vite dev server", "http://localhost:1420");
@@ -352,7 +375,10 @@ async function shots() {
 
   try {
     await page.goto("http://localhost:1420", { waitUntil: "networkidle" });
-    await poll(async () => (await page.locator("text=waiting for the engine").count()) === 0, 90_000);
+    await poll(
+      async () => (await page.locator("text=waiting for the engine").count()) === 0,
+      90_000,
+    );
     await sleep(2500);
     // browser-only badge; not part of the shipped app
     await page.addStyleTag({ content: ".insecure-badge{display:none!important}" });
@@ -360,17 +386,33 @@ async function shots() {
     const shot = (name) => page.screenshot({ path: path.join(OUT, `${name}.png`) });
 
     // never publish the real host process list: hide it before any capture
-    await page.getByText("List this PC's processes instead").first().click().catch(() => {});
+    await page
+      .getByText("List this PC's processes instead")
+      .first()
+      .click()
+      .catch(() => {});
     await sleep(800);
-    await page.getByText("hide host list").first().click().catch(() => {});
+    await page
+      .getByText("hide host list")
+      .first()
+      .click()
+      .catch(() => {});
     await page.locator('input[placeholder="value"]').first().fill("1000");
-    await page.getByRole("button", { name: /first/i }).first().click().catch(() => {});
+    await page
+      .getByRole("button", { name: /first/i })
+      .first()
+      .click()
+      .catch(() => {});
     await sleep(1500);
     await shot("workspace");
 
     await page.keyboard.press("Control+1");
     await sleep(1200);
-    await page.locator(".fn-row", { hasText: "sub_140001600" }).first().click().catch(() => {});
+    await page
+      .locator(".fn-row", { hasText: "sub_140001600" })
+      .first()
+      .click()
+      .catch(() => {});
     await page.locator(".insn-row").first().waitFor({ timeout: 15_000 });
     await sleep(1200);
     await shot("disassembly");
@@ -391,16 +433,20 @@ async function shots() {
     await sleep(1500);
     await shot("pe");
 
-    await page.getByRole("button", { name: /scripts/i }).first().click().catch(() => {});
+    await page
+      .getByRole("button", { name: /scripts/i })
+      .first()
+      .click()
+      .catch(() => {});
     await sleep(800);
     await page
       .locator("textarea")
       .first()
       .fill(
         "-- live from the attached fixture process\n" +
-          'local st = slop.target.status()\n' +
+          "local st = slop.target.status()\n" +
           'print("backend:", st.backend, st.name, "pid", st.pid)\n' +
-          "return slop.version()"
+          "return slop.version()",
       );
     await page.keyboard.press("Control+Enter");
     await sleep(2500);
@@ -428,7 +474,11 @@ async function shots() {
     await sleep(600);
     await page.keyboard.press("Control+1");
     await sleep(900);
-    await page.locator(".fn-row", { hasText: "sub_140001600" }).first().click().catch(() => {});
+    await page
+      .locator(".fn-row", { hasText: "sub_140001600" })
+      .first()
+      .click()
+      .catch(() => {});
     await page.locator(".insn-row").first().waitFor({ timeout: 15_000 });
     await sleep(1200);
     await shot("theme-nord");
@@ -451,5 +501,5 @@ main().then(
   (e) => {
     console.error(e.message ?? e);
     process.exit(1);
-  }
+  },
 );

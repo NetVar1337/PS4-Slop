@@ -981,8 +981,6 @@ struct backend_ps4_t::impl_t {
     // records still describe what was armed and are re-armed after a
     // reconnect, so they are only marked stale instead of wiped.
     void end_debug_session_locked(const std::string& why, bool keep_slots = false) {
-        if (dbg_pid.exchange(0) != 0 && !why.empty())
-            infra::diag::info("ps4", "debug session ended: " + why);
         dbg_held.store(false);
         if (keep_slots) {
             std::lock_guard lk(slot_mu);
@@ -990,6 +988,9 @@ struct backend_ps4_t::impl_t {
         } else {
             wipe_slots();
         }
+        // last: "detached" must never be observable with the old slots still listed
+        if (dbg_pid.exchange(0) != 0 && !why.empty())
+            infra::diag::info("ps4", "debug session ended: " + why);
     }
 
     // ---- events -------------------------------------------------------
@@ -998,6 +999,10 @@ struct backend_ps4_t::impl_t {
         if (!ps4_decode_event(pkt, ps4::kDebugEventSize, e)) return;
         ev_received.fetch_add(1);
         const bool killed = e.signal == 9;   // SIGKILL tears the session down
+        // a stop event freezes the debuggee until continue; publish that before
+        // the event is visible, or a waiter that takes it could still read
+        // "running" and skip the resume its next composite needs
+        dbg_held.store(!killed);
         {
             std::lock_guard lk(ev_mu);
             if (evq.size() >= kMaxQueuedEvents) {   // drop oldest, count it
@@ -1006,7 +1011,6 @@ struct backend_ps4_t::impl_t {
             }
             evq.push_back(std::move(e));
         }
-        dbg_held.store(!killed);   // a stop event freezes the debuggee until continue
         ev_cv.notify_all();
         if (killed) {
             std::lock_guard lk(dbg_mu);
@@ -1015,12 +1019,28 @@ struct backend_ps4_t::impl_t {
     }
 
     void on_event_channel_closed(uint64_t attach_id) {
-        std::lock_guard lk(dbg_mu);
         // only the channel of the live attach means "session gone"; failed
         // attach attempts and earlier sessions close their channels too
-        if (attach_id != 0 && attach_id == live_attach && dbg_pid.load() != 0)
+        const auto live = [&] {
+            return attach_id != 0 && attach_id == live_attach && dbg_pid.load() != 0;
+        };
+        {
+            std::lock_guard lk(dbg_mu);
+            if (!live()) return;
+        }
+        // Probe the command socket under the command lock and without dbg_mu
+        // (commands take conn->mu, then dbg_mu). Unlocked, the probe raced a
+        // command's reply read and then blocked in recv while holding dbg_mu,
+        // deadlocking that command (the slop_tests_ps4 watchdog hang).
+        bool cmd_gone = false;
+        {
+            std::lock_guard cl(conn->mu);
+            cmd_gone = conn->peer_gone();
+        }
+        std::lock_guard lk(dbg_mu);
+        if (live())
             end_debug_session_locked("the payload closed the debug-event channel",
-                                     /*keep_slots=*/conn->peer_gone());
+                                     /*keep_slots=*/cmd_gone);
     }
 
     void clear_events() {
@@ -2415,9 +2435,12 @@ io_result_t backend_ps4_t::ps4_continue(uint32_t stop) {
     if (m_impl->dbg_pid.load() == 0) return err_result(ps4::kErrNotAttached);
     ps4::debug_continue_packet_t pkt{};
     pkt.stop = stop;
+    // clear before the send: the stop event this resume provokes can arrive
+    // before the reply is read, and its "held" must not be overwritten
+    const bool was_held = stop == ps4::kStopResume && m_impl->dbg_held.exchange(false);
     auto r = simple_debug_cmd(*m_impl->conn, m_impl->cmd_budget_ms, ps4::CMD_DEBUG_CONTINUE,
                               &pkt, sizeof(pkt));
-    if (r.ok && stop == ps4::kStopResume) m_impl->dbg_held.store(false);
+    if (!r.ok && was_held) m_impl->dbg_held.store(true);
     return r;
 }
 

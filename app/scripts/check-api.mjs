@@ -8,7 +8,7 @@
 // runtime, and nothing before the user clicking Dump could have caught it
 // Types cannot help here, the wire contract lives in C++
 //
-//   node scripts/check-api.mjs [port]
+//   node scripts/check-api.mjs [port]      (SLOP_MCP_TOKEN = the engine's bearer token)
 //
 // Exits non-zero on any unknown tool, action, or parameter
 
@@ -37,7 +37,10 @@ const kAppActions = {
 async function schemas() {
   const res = await fetch(`${base}/mcp`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(process.env.SLOP_MCP_TOKEN && { Authorization: `Bearer ${process.env.SLOP_MCP_TOKEN}` }),
+    },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
   });
   if (!res.ok) throw new Error(`tools/list failed: HTTP ${res.status}`);

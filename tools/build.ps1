@@ -18,7 +18,7 @@ param(
     # cannot run under a given preset (e.g. the Unicorn emulator under ASan)
     [string]$TestExclude = '',
     # CTest parallelism (-j); areas are separate processes with ephemeral ports
-    [int]$TestJobs = 1,
+    [int]$TestJobs = [Environment]::ProcessorCount,
     # Visual Studio install root; defaults to $env:SLOP_VS_ROOT, then vswhere
     [string]$VsRoot = $env:SLOP_VS_ROOT
 )
@@ -176,18 +176,6 @@ if ($Test) {
     if ($TestExclude) { $ctestArgs += @('-E', $TestExclude) }
     if ($TestJobs -gt 1) { $ctestArgs += @('-j', $TestJobs) }
     & $vsCTest @ctestArgs
-    # slop_tests_ps4 has a known intermittent watchdog hang that lands on a
-    # different test each run (the debug-event listener and the fake payload's
-    # port-755 channel). Retry only the entries that failed, up to twice, with
-    # a short pause so the listener port settles; a real regression still fails
-    # every attempt while the flake does not redden the lane.
-    $retry = 0
-    while ($LASTEXITCODE -ne 0 -and $retry -lt 2) {
-        ++$retry
-        Write-Host "==> tests failed, retrying the failed entries (retry $retry/2)"
-        Start-Sleep -Seconds 2
-        & $vsCTest --test-dir $binaryDir --output-on-failure --rerun-failed
-    }
     if ($LASTEXITCODE -ne 0) { throw "tests failed (exit $LASTEXITCODE)" }
 }
 

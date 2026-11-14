@@ -30,5 +30,5 @@ If another live engine is already advertised the engine coalesces onto it (by
 product design); the driver then uses that endpoint and **leaves it running**
 instead of shutting it down.
 
-CI: `.github/workflows/e2e.yml` runs `smoke` nightly and on demand. Screenshots
+CI: the nightly `tests` lane of `.github/workflows/build.yml` runs `smoke` against the engine it just built. Screenshots
 mode is not in CI (image-compare flakiness); run it by hand when the UI changes.

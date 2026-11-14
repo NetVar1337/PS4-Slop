@@ -202,7 +202,12 @@ function PayloadCard({ host }: { host: string }) {
         {latest !== null ? ` · latest v${latest.tag}` : ""}
       </div>
       <div className="payload-actions">
-        <button type="button" className="row-action" disabled={busy !== null} onClick={() => void check()}>
+        <button
+          type="button"
+          className="row-action"
+          disabled={busy !== null}
+          onClick={() => void check()}
+        >
           {busy === "check" ? "Checking…" : "Check latest"}
         </button>
         {newer && (

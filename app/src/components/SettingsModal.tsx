@@ -154,7 +154,9 @@ export default function SettingsModal({ onClose }: Props) {
         <div className="settings-brand">
           <img src={logoUrl} alt="" draggable={false} />
           <div className="settings-brand-name">SlopStation</div>
-          <div className="settings-brand-sub">v{appVersion || "dev"} · {backend.badge} engine</div>
+          <div className="settings-brand-sub">
+            v{appVersion || "dev"} · {backend.badge} engine
+          </div>
         </div>
 
         <fieldset className="settings-group">

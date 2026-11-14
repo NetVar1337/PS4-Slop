@@ -77,15 +77,18 @@ jobs:
               - 'app/**'
               - '.github/workflows/build.yml'
 
-  # Every test area registered with CTest (one entry per src/tests/test_*.cpp).
+  # Every test area registered with CTest (one entry per src/tests/test_*.cpp),
+  # plus the shipped engine artifact and the legacy ImGui shell compile check.
   tests:
     needs: changes
-    if: github.ref_type != 'tag' && (github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true')
+    if: github.event_name != 'pull_request' || needs.changes.outputs.cpp == 'true'
     runs-on: windows-2022
     timeout-minutes: 45
     env:
       CMAKE_C_COMPILER_LAUNCHER: sccache
       CMAKE_CXX_COMPILER_LAUNCHER: sccache
+      # the slowest healthy case is ~7 s; a hang should cost 30 s, not 300 s
+      SLOP_TEST_TIMEOUT_SEC: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -104,7 +107,7 @@ jobs:
 
       - name: build + run tests (ctest -L area)
         shell: pwsh
-        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=OFF" -Test -TestLabel area -TestJobs 4
+        run: powershell -NoProfile -File tools\build.ps1 -NoFrontend -Targets "slop_tests,reverse-slop-engine,reverse-slop" -CmakeExtra "-DSLOP_BUILD_TESTS=ON -DSLOP_BUILD_TEST_TARGET=ON -DSLOP_BUILD_UI=ON" -Test -TestLabel area
 
       - name: upload engine artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -118,6 +121,11 @@ jobs:
         shell: pwsh
         run: python tools/mcp_live_test.py --results mcp_live_results.json
 
+      # every (tool, action, param) the UI sends vs the engine's tools/list
+      - name: frontend/engine API contract
+        shell: pwsh
+        run: ./tools/check_api.ps1
+
       - name: upload live battery results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -125,6 +133,23 @@ jobs:
           name: mcp-live-results
           path: mcp_live_results.json
           if-no-files-found: ignore
+
+      # Nightly e2e smoke against the engine + SlopTarget this job just built
+      # (was a separate workflow that rebuilt the whole tree).
+      - name: setup node (e2e)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/e2e/package-lock.json
+
+      - name: e2e smoke (engine + SlopTarget over /api)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          npm --prefix app/e2e ci --prefer-offline --no-audit --no-fund
+          npm --prefix app/e2e run smoke
 
   # Same suite under MSVC AddressSanitizer (preset ninja-msvc-asan). Main,
   # tags and manual runs only: it is the slowest lane and PRs already get the
@@ -311,6 +336,14 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
 
+      - name: install
+        working-directory: app
+        run: npm ci --prefer-offline --no-audit --no-fund
+
+      - name: lint + format
+        working-directory: app
+        run: npm run lint && npm run format:check
+
       - name: run frontend tests
         working-directory: app
-        run: npm ci --prefer-offline --no-audit --no-fund && npm test
+        run: npm test
